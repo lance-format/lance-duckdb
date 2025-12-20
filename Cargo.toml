@@ -16,6 +16,7 @@ strip = true
 
 # Lance and Arrow dependencies - using compatible versions
 lance = "0.32.1"
+lance-encoding = { version = "0.32.1", features = ["protoc"] }
 arrow = "55.1"
 arrow-array = "55.1"
 arrow-schema = "55.1"
