@@ -98,25 +98,67 @@ set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo")
 set(RUST_DEBUG_LIB "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/debug/${RUST_STATICLIB_NAME}")
 set(RUST_RELEASE_LIB "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/release/${RUST_STATICLIB_NAME}")
 
-add_custom_command(
-  OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-    CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
-    cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
-  COMMAND
-    ${CMAKE_COMMAND} -E env
-    CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
-    cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
-  WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-  DEPENDS ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
-          ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs
-          ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs
-  VERBATIM)
+set(RUST_FFI_DEPENDS
+    ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
+    ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
+    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs)
 
-add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}")
+# Building both debug and release Rust artifacts is expensive and can trigger OOMs in CI.
+# For single-config generators (Ninja/Makefiles), only build the active configuration's artifact.
+if(CMAKE_CONFIGURATION_TYPES)
+  add_custom_command(
+    OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
+    COMMAND
+      ${CMAKE_COMMAND} -E env
+      CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+      MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+    COMMAND
+      ${CMAKE_COMMAND} -E env
+      CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+      MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    DEPENDS ${RUST_FFI_DEPENDS}
+    VERBATIM)
+
+  add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}")
+else()
+  if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
+    set(CMAKE_BUILD_TYPE Release)
+  endif()
+
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_custom_command(
+      OUTPUT "${RUST_DEBUG_LIB}"
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+        CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+        MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+      DEPENDS ${RUST_FFI_DEPENDS}
+      VERBATIM)
+
+    add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}")
+  else()
+    add_custom_command(
+      OUTPUT "${RUST_RELEASE_LIB}"
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+        CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+        MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+      WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+      DEPENDS ${RUST_FFI_DEPENDS}
+      VERBATIM)
+
+    add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_RELEASE_LIB}")
+  endif()
+endif()
 
 target_link_libraries(
   ${EXTENSION_NAME}
