@@ -2898,6 +2898,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "roaring",
  "snafu",
  "tempfile",
@@ -2947,6 +2948,7 @@ dependencies = [
  "object_store",
  "prost",
  "prost-build",
+ "protobuf-src",
  "rand 0.8.5",
  "rayon",
  "roaring",
@@ -3053,6 +3055,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "rand 0.8.5",
  "rangemap",
  "roaring",
@@ -3077,6 +3080,9 @@ dependencies = [
  "futures",
  "lance",
  "lance-encoding",
+ "lance-file",
+ "lance-index",
+ "lance-table",
  "tokio",
 ]
 
