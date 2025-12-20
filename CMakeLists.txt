@@ -31,7 +31,7 @@ if(APPLE)
 elseif(UNIX)
   set(PLATFORM_LIBS m c)
 elseif(WIN32)
-  set(PLATFORM_LIBS ws2_32 userenv advapi32)
+  set(PLATFORM_LIBS ws2_32 userenv advapi32 crypt32 ntdll bcrypt ncrypt secur32)
 endif()
 
 # Build and link Rust staticlib (lance_duckdb_ffi)
