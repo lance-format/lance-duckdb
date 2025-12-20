@@ -1,5 +1,11 @@
 {
-  "dependencies": ["openssl", "protobuf"],
+  "dependencies": [
+    "openssl",
+    {
+      "name": "protobuf",
+      "features": ["tools"]
+    }
+  ],
   "vcpkg-configuration": {
     "overlay-ports": ["./extension-ci-tools/vcpkg_ports"]
   }
