@@ -5,12 +5,14 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_util.hpp"
 
 namespace duckdb {
 
 // Forward declaration
 void RegisterLanceScan(DatabaseInstance &instance);
+void RegisterLanceReplacement(DBConfig &config);
 
 static void LoadInternal(DatabaseInstance &instance) {
 	// Register the lance_scan table function
@@ -19,6 +21,10 @@ static void LoadInternal(DatabaseInstance &instance) {
 
 void LanceExtension::Load(DuckDB &db) {
 	LoadInternal(*db.instance);
+
+	// Enable SELECT * FROM '.../dataset.lance'
+	auto &config = DBConfig::GetConfig(*db.instance);
+	RegisterLanceReplacement(config);
 }
 
 std::string LanceExtension::Name() {

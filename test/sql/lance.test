@@ -10,9 +10,18 @@ SELECT 1
 ----
 1
 
-# Test that lance_scan function exists (it will return no rows)
+# Test that lance_scan can read a local dataset root
 statement ok
+SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1
+
+# Test replacement scan for SELECT * FROM '.../dataset.lance'
+statement ok
+SELECT * FROM 'test/test_data.lance' LIMIT 1
+
+# Test error handling - invalid dataset root
+statement error
 SELECT * FROM lance_scan('dummy_path.lance')
+----
 
 # Test error handling - requires at least one argument
 statement error

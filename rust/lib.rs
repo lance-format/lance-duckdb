@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StructArray};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use lance::Dataset;
 use tokio::runtime::Runtime;
@@ -81,6 +81,27 @@ pub unsafe extern "C" fn lance_free_schema(schema: *mut c_void) {
             let _ = Box::from_raw(schema as *mut Arc<Schema>);
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_schema_to_arrow(
+    schema: *mut c_void,
+    out_schema: *mut FFI_ArrowSchema,
+) -> i32 {
+    if schema.is_null() || out_schema.is_null() {
+        return -1;
+    }
+
+    let schema = unsafe { &*(schema as *const Arc<Schema>) };
+    let data_type = DataType::Struct(schema.fields().clone());
+
+    let ffi_schema = match FFI_ArrowSchema::try_from(&data_type) {
+        Ok(schema) => schema,
+        Err(_) => return -1,
+    };
+
+    std::ptr::write_unaligned(out_schema, ffi_schema);
+    0
 }
 
 #[no_mangle]
