@@ -104,26 +104,21 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs)
+    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs
+    ${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.sh
+    ${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.cmd)
 
 set(PROTOC_BIN "")
-if(DEFINED ENV{VCPKG_ROOT})
-  if(DEFINED ENV{VCPKG_HOST_TRIPLET})
-    set(PROTOC_BIN "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_HOST_TRIPLET}/tools/protobuf/protoc")
-  elseif(DEFINED ENV{VCPKG_TARGET_TRIPLET})
-    set(PROTOC_BIN "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}/tools/protobuf/protoc")
-  endif()
-endif()
-if(WIN32 AND NOT PROTOC_BIN STREQUAL "" AND NOT PROTOC_BIN MATCHES "\\.exe$")
-  set(PROTOC_BIN "${PROTOC_BIN}.exe")
+if(WIN32)
+  set(PROTOC_BIN "${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.cmd")
+else()
+  set(PROTOC_BIN "${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.sh")
 endif()
 
 set(RUST_CARGO_ENV
     CARGO_TARGET_DIR=${RUST_TARGET_DIR}
     MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
-if(NOT PROTOC_BIN STREQUAL "")
-  list(APPEND RUST_CARGO_ENV PROTOC=${PROTOC_BIN})
-endif()
+list(APPEND RUST_CARGO_ENV PROTOC=${PROTOC_BIN})
 
 # Building both debug and release Rust artifacts is expensive and can trigger OOMs in CI.
 # For single-config generators (Ninja/Makefiles), only build the active configuration's artifact.
