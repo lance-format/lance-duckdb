@@ -6,12 +6,16 @@ if [ -n "${PROTOC_REAL:-}" ] && [ -x "${PROTOC_REAL}" ]; then
 fi
 
 vcpkg_root="${VCPKG_ROOT:-}"
+installed_root="${VCPKG_INSTALLED_DIR:-}"
 host_triplet="${VCPKG_HOST_TRIPLET:-${VCPKG_TARGET_TRIPLET:-}}"
 
 if [ -n "${vcpkg_root}" ] && [ -n "${host_triplet}" ]; then
+  if [ -z "${installed_root}" ]; then
+    installed_root="${vcpkg_root}/installed"
+  fi
   for candidate in \
-    "${vcpkg_root}/installed/${host_triplet}/tools/protobuf/protoc" \
-    "${vcpkg_root}/installed/${host_triplet}/tools/protobuf/protoc-"* \
+    "${installed_root}/${host_triplet}/tools/protobuf/protoc" \
+    "${installed_root}/${host_triplet}/tools/protobuf/protoc-"* \
     "${vcpkg_root}/packages/protobuf_${host_triplet}/tools/protobuf/protoc" \
     "${vcpkg_root}/packages/protobuf_${host_triplet}/tools/protobuf/protoc-"*; do
     if [ -x "${candidate}" ]; then
