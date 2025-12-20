@@ -106,6 +106,25 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs)
 
+set(PROTOC_BIN "")
+if(DEFINED ENV{VCPKG_ROOT})
+  if(DEFINED ENV{VCPKG_HOST_TRIPLET})
+    set(PROTOC_BIN "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_HOST_TRIPLET}/tools/protobuf/protoc")
+  elseif(DEFINED ENV{VCPKG_TARGET_TRIPLET})
+    set(PROTOC_BIN "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}/tools/protobuf/protoc")
+  endif()
+endif()
+if(WIN32 AND NOT PROTOC_BIN STREQUAL "" AND NOT PROTOC_BIN MATCHES "\\.exe$")
+  set(PROTOC_BIN "${PROTOC_BIN}.exe")
+endif()
+
+set(RUST_CARGO_ENV
+    CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+if(NOT PROTOC_BIN STREQUAL "")
+  list(APPEND RUST_CARGO_ENV PROTOC=${PROTOC_BIN})
+endif()
+
 # Building both debug and release Rust artifacts is expensive and can trigger OOMs in CI.
 # For single-config generators (Ninja/Makefiles), only build the active configuration's artifact.
 if(CMAKE_CONFIGURATION_TYPES)
@@ -113,13 +132,11 @@ if(CMAKE_CONFIGURATION_TYPES)
     OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
     COMMAND
       ${CMAKE_COMMAND} -E env
-      CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-      MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+      ${RUST_CARGO_ENV}
       cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
     COMMAND
       ${CMAKE_COMMAND} -E env
-      CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-      MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+      ${RUST_CARGO_ENV}
       cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
     DEPENDS ${RUST_FFI_DEPENDS}
@@ -136,8 +153,7 @@ else()
       OUTPUT "${RUST_DEBUG_LIB}"
       COMMAND
         ${CMAKE_COMMAND} -E env
-        CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-        MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+        ${RUST_CARGO_ENV}
         cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}
@@ -149,8 +165,7 @@ else()
       OUTPUT "${RUST_RELEASE_LIB}"
       COMMAND
         ${CMAKE_COMMAND} -E env
-        CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-        MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+        ${RUST_CARGO_ENV}
         cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}

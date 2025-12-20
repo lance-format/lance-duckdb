@@ -2859,7 +2859,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.8.5",
  "seq-macro",
  "snafu",
@@ -2898,7 +2897,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "roaring",
  "snafu",
  "tempfile",
@@ -2948,7 +2946,6 @@ dependencies = [
  "object_store",
  "prost",
  "prost-build",
- "protobuf-src",
  "rand 0.8.5",
  "rayon",
  "roaring",
@@ -3055,7 +3052,6 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.8.5",
  "rangemap",
  "roaring",
@@ -3079,10 +3075,6 @@ dependencies = [
  "async-trait",
  "futures",
  "lance",
- "lance-encoding",
- "lance-file",
- "lance-index",
- "lance-table",
  "tokio",
 ]
 
@@ -3882,15 +3874,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "protobuf-src"
-version = "2.1.1+27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6217c3504da19b85a3a4b2e9a5183d635822d83507ba0986624b5c05b83bfc40"
-dependencies = [
- "cmake",
 ]
 
 [[package]]
