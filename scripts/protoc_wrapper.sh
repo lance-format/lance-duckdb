@@ -11,7 +11,12 @@ host_triplet="${VCPKG_HOST_TRIPLET:-${VCPKG_TARGET_TRIPLET:-}}"
 
 if [ -n "${vcpkg_root}" ] && [ -n "${host_triplet}" ]; then
   if [ -z "${installed_root}" ]; then
-    installed_root="${vcpkg_root}/installed"
+    repo_root="$(cd "$(dirname "${vcpkg_root}")" && pwd)"
+    if [ -d "${repo_root}/vcpkg_installed" ]; then
+      installed_root="${repo_root}/vcpkg_installed"
+    else
+      installed_root="${vcpkg_root}/installed"
+    fi
   fi
   for candidate in \
     "${installed_root}/${host_triplet}/tools/protobuf/protoc" \

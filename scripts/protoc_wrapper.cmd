@@ -16,7 +16,13 @@ if "%TRIPLET%"=="" set "TRIPLET=%VCPKG_TARGET_TRIPLET%"
 if "%TRIPLET%"=="" goto :fallback
 
 set "INSTALLED=%VCPKG_INSTALLED_DIR%"
-if "%INSTALLED%"=="" set "INSTALLED=%VCPKG_ROOT%\\installed"
+if "%INSTALLED%"=="" (
+  if exist "%VCPKG_ROOT%\\..\\vcpkg_installed\\." (
+    set "INSTALLED=%VCPKG_ROOT%\\..\\vcpkg_installed"
+  ) else (
+    set "INSTALLED=%VCPKG_ROOT%\\installed"
+  )
+)
 
 set "BASE1=%INSTALLED%\\%TRIPLET%\\tools\\protobuf"
 for %%F in ("%BASE1%\\protoc.exe" "%BASE1%\\protoc-*.exe") do (
