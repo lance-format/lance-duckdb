@@ -56,7 +56,7 @@ jobs:
 
       - name: Build
         run: |
-          GEN=ninja make debug -j 4
+          GEN=ninja make release -j 4
       - name: Test
         run: |
           GEN=ninja make test
