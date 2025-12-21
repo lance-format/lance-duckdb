@@ -56,10 +56,10 @@ jobs:
 
       - name: Build
         run: |
-          GEN=ninja make debug
+          GEN=ninja make debug -j 4
       - name: Test
         run: |
-          GEN=ninja make test -j 4
+          GEN=ninja make test
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
