@@ -55,7 +55,6 @@ duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'
 
 - Projection and filter pushdown are currently disabled in `lance_scan`.
 - Stream consumption is serialized with a global mutex, which limits parallelism.
-- The `cpp/` directory contains WIP COPY support that is not part of the current CMake build.
 
 ## Contributing
 

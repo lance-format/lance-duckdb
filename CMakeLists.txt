@@ -108,9 +108,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs)
+    ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
 
 set(RUST_CARGO_ENV
     CARGO_TARGET_DIR=${RUST_TARGET_DIR}

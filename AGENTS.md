@@ -60,7 +60,6 @@ cargo clippy --manifest-path Cargo.toml --all-targets
 #### Source layout
 
 - Primary C++ extension sources are under `src/` (see `CMakeLists.txt` for `EXTENSION_SOURCES`).
-- The `cpp/` directory contains an alternative/WIP implementation (e.g. COPY support) that is currently not part of the CMake build.
 
 #### DuckDB layer (C++)
 
@@ -82,7 +81,6 @@ cargo clippy --manifest-path Cargo.toml --all-targets
 
 - `rust/lib.rs`: C ABI for opening datasets, exporting schema and batches via Arrow C Data Interface, and streaming RecordBatches.
 - `rust/scanner.rs`: wraps Lance scanning as a `RecordBatch` stream.
-- `rust/types.rs`: string <-> Arrow type helpers for auxiliary FFI APIs; defaults to `Utf8` on unknown types.
 
 #### Naming Strategy
 
