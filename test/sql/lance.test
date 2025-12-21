@@ -1,6 +1,6 @@
 # name: test/sql/lance.test
 # description: Test the lance extension
-# group: [lance]
+# group: [sql]
 
 require lance
 

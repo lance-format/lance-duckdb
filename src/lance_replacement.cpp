@@ -8,24 +8,26 @@
 
 namespace duckdb {
 
-static unique_ptr<TableRef> LanceReplacementScan(ClientContext &context, ReplacementScanInput &input,
-                                                 optional_ptr<ReplacementScanData> data) {
-	const auto &table_name = input.table_name;
-	if (!StringUtil::EndsWith(table_name, ".lance")) {
-		return nullptr;
-	}
+static unique_ptr<TableRef>
+LanceReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                     optional_ptr<ReplacementScanData> data) {
+  const auto &table_name = input.table_name;
+  if (!StringUtil::EndsWith(table_name, ".lance")) {
+    return nullptr;
+  }
 
-	auto table_function = make_uniq<TableFunctionRef>();
-	auto function_expr = make_uniq<FunctionExpression>("lance_scan", vector<unique_ptr<ParsedExpression>>());
-	function_expr->children.push_back(make_uniq<ConstantExpression>(Value(table_name)));
-	table_function->function = std::move(function_expr);
-	return std::move(table_function);
+  auto table_function = make_uniq<TableFunctionRef>();
+  auto function_expr = make_uniq<FunctionExpression>(
+      "lance_scan", vector<unique_ptr<ParsedExpression>>());
+  function_expr->children.push_back(
+      make_uniq<ConstantExpression>(Value(table_name)));
+  table_function->function = std::move(function_expr);
+  return std::move(table_function);
 }
 
 void RegisterLanceReplacement(DBConfig &config) {
-	auto replacement_scan = ReplacementScan(LanceReplacementScan);
-	config.replacement_scans.push_back(std::move(replacement_scan));
+  auto replacement_scan = ReplacementScan(LanceReplacementScan);
+  config.replacement_scans.push_back(std::move(replacement_scan));
 }
 
 } // namespace duckdb
-
