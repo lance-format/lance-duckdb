@@ -3,13 +3,11 @@ on:
   pull_request:
     paths-ignore:
       - "**.md"
-      - ".github/workflows/**"
   push:
     branches:
-      - "**"
+      - "main"
     paths-ignore:
       - "**.md"
-      - ".github/workflows/**"
   workflow_dispatch:
 
 concurrency:
