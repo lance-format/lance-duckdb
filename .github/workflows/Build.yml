@@ -25,10 +25,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+          sudo apt install -y protobuf-compiler libssl-dev ninja-build
       - name: Build
         run: |
-          make build
+          GEN=ninja make debug
       - name: Test
         run: |
-          make test
+          GEN=ninja make test
