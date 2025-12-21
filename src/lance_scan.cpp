@@ -86,8 +86,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   lance_free_schema(schema_handle);
 
   auto &config = DBConfig::GetConfig(context);
-  ArrowTableFunction::PopulateArrowTableSchema(config, result->arrow_table,
-                                               result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
   names = result->arrow_table.GetNames();
   return_types = result->arrow_table.GetTypes();
   return std::move(result);
