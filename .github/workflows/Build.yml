@@ -18,13 +18,6 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    env:
-      CCACHE_BASEDIR: ${{ github.workspace }}
-      CCACHE_COMPRESS: "true"
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 500M
-      CCACHE_NOHASHDIR: "true"
-      EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,34 +30,38 @@ jobs:
 
       - name: Prepare cache directories
         run: |
-          mkdir -p .ccache
+          mkdir -p build/debug
 
-      - name: Restore ccache
-        id: cache-ccache
+      - name: Restore build cache
+        id: cache-build
         uses: actions/cache/restore@v4
         with:
           path: |
-            .ccache
-          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ github.sha }}
+            build/debug
+            !build/debug/cargo
+            !build/debug/cargo/**
+          key: build-debug-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ hashFiles('extension_config.cmake', 'CMakeLists.txt', 'vcpkg.json') }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-
+            build-debug-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ hashFiles('extension_config.cmake', 'CMakeLists.txt', 'vcpkg.json') }}-
 
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache
+          sudo apt install -y protobuf-compiler libssl-dev ninja-build
 
       - name: Build
         run: |
-          GEN=ninja make release -j 4
+          GEN=ninja make debug -j 4
       - name: Test
         run: |
-          GEN=ninja make test
+          GEN=ninja make test_debug
 
-      - name: Save ccache
+      - name: Save build cache
         if: github.ref == 'refs/heads/main' && success()
         uses: actions/cache/save@v4
         with:
           path: |
-            .ccache
-          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ github.sha }}
+            build/debug
+            !build/debug/cargo
+            !build/debug/cargo/**
+          key: build-debug-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ hashFiles('extension_config.cmake', 'CMakeLists.txt', 'vcpkg.json') }}-${{ github.sha }}
