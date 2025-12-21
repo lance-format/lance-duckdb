@@ -110,21 +110,11 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/types.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs
-    ${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.sh
-    ${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.cmd)
-
-set(PROTOC_BIN "")
-if(WIN32)
-  set(PROTOC_BIN "${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.cmd")
-else()
-  set(PROTOC_BIN "${CMAKE_CURRENT_LIST_DIR}/scripts/protoc_wrapper.sh")
-endif()
+    ${CMAKE_CURRENT_LIST_DIR}/rust/writer.rs)
 
 set(RUST_CARGO_ENV
     CARGO_TARGET_DIR=${RUST_TARGET_DIR}
     MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
-list(APPEND RUST_CARGO_ENV PROTOC=${PROTOC_BIN})
 if(DEFINED VCPKG_ROOT)
   list(APPEND RUST_CARGO_ENV VCPKG_ROOT=${VCPKG_ROOT})
 endif()
