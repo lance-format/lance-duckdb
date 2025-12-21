@@ -6,33 +6,34 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/copy_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 #include "duckdb/main/config.hpp"
 
 // Forward declarations for functions defined in other files
 namespace duckdb {
-    void RegisterLanceScan(DatabaseInstance &db);
-    void RegisterLanceCopy(DatabaseInstance &db);
+    void RegisterLanceScan(ExtensionLoader &loader);
+    void RegisterLanceCopy(ExtensionLoader &loader);
     void RegisterLanceReplacement(DBConfig &config);
 }
 
 namespace duckdb {
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
     // Register table function for lance_scan
-    RegisterLanceScan(instance);
+    RegisterLanceScan(loader);
     
     // Register copy function for COPY TO/FROM
-    RegisterLanceCopy(instance);
+    RegisterLanceCopy(loader);
 }
 
-void LanceExtension::Load(DuckDB &db) {
-    LoadInternal(*db.instance);
+void LanceExtension::Load(ExtensionLoader &loader) {
+    LoadInternal(loader);
     
     // Register replacement scan
-    auto &config = DBConfig::GetConfig(*db.instance);
+    auto &instance = loader.GetDatabaseInstance();
+    auto &config = DBConfig::GetConfig(instance);
     RegisterLanceReplacement(config);
 }
 
@@ -52,9 +53,14 @@ std::string LanceExtension::Version() const {
 
 extern "C" {
 
+DUCKDB_CPP_EXTENSION_ENTRY(lance, loader) {
+    duckdb::LanceExtension extension;
+    extension.Load(loader);
+}
+
 DUCKDB_EXTENSION_API void lance_init(duckdb::DatabaseInstance &db) {
     duckdb::DuckDB db_wrapper(db);
-    db_wrapper.LoadExtension<duckdb::LanceExtension>();
+    db_wrapper.LoadStaticExtension<duckdb::LanceExtension>();
 }
 
 DUCKDB_EXTENSION_API const char *lance_version() {

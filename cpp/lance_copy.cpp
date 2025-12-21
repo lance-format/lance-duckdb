@@ -2,7 +2,7 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 // Arrow integration headers would go here when available
 
@@ -229,7 +229,7 @@ static void LanceCopyFromFunction(ExecutionContext &context,
     output.SetCardinality(0);
 }
 
-void RegisterLanceCopy(DatabaseInstance &db) {
+void RegisterLanceCopy(ExtensionLoader &loader) {
     CopyFunction lance_copy("lance");
     
     // COPY TO functions
@@ -246,7 +246,7 @@ void RegisterLanceCopy(DatabaseInstance &db) {
     
     lance_copy.extension = "lance";
     
-    ExtensionUtil::RegisterFunction(db, lance_copy);
+    loader.RegisterFunction(lance_copy);
 }
 
 } // namespace duckdb
