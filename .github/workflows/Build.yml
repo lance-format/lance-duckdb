@@ -22,9 +22,13 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPRESS: "true"
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 500M
+      CCACHE_MAXSIZE: 2G
       CCACHE_NOHASHDIR: "true"
+      CUSTOM_LINKER: mold
       EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      GEN: ninja
+      BUILD_EXTENSION_TEST_DEPS: none
+
     steps:
       - uses: actions/checkout@v5
         with:
@@ -52,14 +56,15 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache
+          sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache mold
 
       - name: Build
         run: |
-          GEN=ninja make release -j 4
+          make debug -j 4
+
       - name: Test
         run: |
-          GEN=ninja make test
+          make test_debug
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
