@@ -9,8 +9,8 @@
 namespace duckdb {
 
 static unique_ptr<TableRef>
-LanceReplacementScan(ClientContext &context, ReplacementScanInput &input,
-                     optional_ptr<ReplacementScanData> data) {
+LanceReplacementScan(ClientContext &, ReplacementScanInput &input,
+                     optional_ptr<ReplacementScanData>) {
   const auto &table_name = input.table_name;
   if (!StringUtil::EndsWith(table_name, ".lance")) {
     return nullptr;
