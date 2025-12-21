@@ -20,5 +20,5 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.4.3
     with:
       extension_name: lance
-      duckdb_version: v1.3.2
+      duckdb_version: v1.4.3
       ci_tools_version: v1.4.3

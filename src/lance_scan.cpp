@@ -4,7 +4,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 #include <cstring>
 #include <mutex>
@@ -33,7 +33,7 @@ struct LanceScanBindData : public TableFunctionData {
   string file_path;
   void *dataset = nullptr;
   ArrowSchemaWrapper schema_root;
-  ArrowTableType arrow_table;
+  ArrowTableSchema arrow_table;
 
   ~LanceScanBindData() override {
     if (dataset) {
@@ -86,8 +86,10 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   lance_free_schema(schema_handle);
 
   auto &config = DBConfig::GetConfig(context);
-  ArrowTableFunction::PopulateArrowTableType(
-      config, result->arrow_table, result->schema_root, names, return_types);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  names = result->arrow_table.GetNames();
+  return_types = result->arrow_table.GetTypes();
   return std::move(result);
 }
 
@@ -170,13 +172,13 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
   output.Verify();
 }
 
-void RegisterLanceScan(DatabaseInstance &instance) {
+void RegisterLanceScan(ExtensionLoader &loader) {
   TableFunction lance_scan("lance_scan", {LogicalType::VARCHAR}, LanceScanFunc,
                            LanceScanBind, LanceScanInitGlobal,
                            LanceScanLocalInit);
   lance_scan.projection_pushdown = false;
   lance_scan.filter_pushdown = false;
-  ExtensionUtil::RegisterFunction(instance, lance_scan);
+  loader.RegisterFunction(lance_scan);
 }
 
 } // namespace duckdb

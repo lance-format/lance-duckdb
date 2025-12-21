@@ -6,24 +6,25 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 
 // Forward declaration
-void RegisterLanceScan(DatabaseInstance &instance);
+void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 
-static void LoadInternal(DatabaseInstance &instance) {
+static void LoadInternal(ExtensionLoader &loader) {
   // Register the lance_scan table function
-  RegisterLanceScan(instance);
+  RegisterLanceScan(loader);
 }
 
-void LanceExtension::Load(DuckDB &db) {
-  LoadInternal(*db.instance);
+void LanceExtension::Load(ExtensionLoader &loader) {
+  LoadInternal(loader);
 
   // Enable SELECT * FROM '.../dataset.lance'
-  auto &config = DBConfig::GetConfig(*db.instance);
+  auto &instance = loader.GetDatabaseInstance();
+  auto &config = DBConfig::GetConfig(instance);
   RegisterLanceReplacement(config);
 }
 
@@ -41,9 +42,14 @@ std::string LanceExtension::Version() const {
 
 extern "C" {
 
+DUCKDB_CPP_EXTENSION_ENTRY(lance, loader) {
+  duckdb::LanceExtension extension;
+  extension.Load(loader);
+}
+
 DUCKDB_EXTENSION_API void lance_init(duckdb::DatabaseInstance &db) {
   duckdb::DuckDB db_wrapper(db);
-  db_wrapper.LoadExtension<duckdb::LanceExtension>();
+  db_wrapper.LoadStaticExtension<duckdb::LanceExtension>();
 }
 
 DUCKDB_EXTENSION_API const char *lance_version() {

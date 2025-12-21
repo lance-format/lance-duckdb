@@ -4,7 +4,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <memory>
@@ -249,7 +249,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data, Data
     global_state.current_batch = nullptr;
 }
 
-void RegisterLanceScan(DatabaseInstance &db) {
+void RegisterLanceScan(ExtensionLoader &loader) {
     TableFunction lance_scan("lance_scan", {LogicalType::VARCHAR}, LanceScanFunc, LanceScanBind, 
                             LanceScanInit, LanceScanLocalInit);
     
@@ -257,7 +257,7 @@ void RegisterLanceScan(DatabaseInstance &db) {
     lance_scan.projection_pushdown = false;  // TODO: implement later
     lance_scan.filter_pushdown = false;      // TODO: implement later
     
-    ExtensionUtil::RegisterFunction(db, lance_scan);
+    loader.RegisterFunction(lance_scan);
 }
 
 } // namespace duckdb
