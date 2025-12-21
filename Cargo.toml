@@ -11,6 +11,7 @@ path = "rust/lib.rs"
 [profile.release]
 lto = "thin"
 strip = true
+panic = "abort"
 
 [dependencies]
 
