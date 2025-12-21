@@ -9,8 +9,9 @@ crate-type = ["staticlib"]
 path = "rust/lib.rs"
 
 [profile.release]
-lto = true
+lto = "thin"
 strip = true
+panic = "abort"
 
 [dependencies]
 
