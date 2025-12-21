@@ -1,0 +1,26 @@
+name: Extension Code Quality
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - ".github/workflows/**"
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - "**.md"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  code-quality:
+    name: Code Quality
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.4.3
+    with:
+      extension_name: lance
+      duckdb_version: v1.3.2
+      ci_tools_version: v1.4.3

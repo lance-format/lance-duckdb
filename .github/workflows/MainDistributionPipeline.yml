@@ -1,9 +1,8 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
+    tags:
+      - "*"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
@@ -19,3 +18,22 @@ jobs:
       extension_name: lance
       extra_toolchains: "rust"
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw"
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: duckdb-stable-build
+    permissions:
+      contents: write
+    steps:
+      - name: Download extension artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lance-*-extension-*
+          path: artifacts
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
