@@ -19,6 +19,7 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     env:
+      CUSTOM_LINKER: mold
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPRESS: "true"
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -52,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache
+          sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache mold
 
       - name: Build
         run: |
