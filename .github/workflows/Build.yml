@@ -36,6 +36,11 @@ jobs:
         run: |
           echo "sha=$(git -C duckdb rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Compute Build SHA
+        id: build-sha
+        run: |
+          echo "sha=${{ hashFiles('CMakeLists.txt', 'extension_config.cmake', 'Makefile') }}" >> "$GITHUB_OUTPUT"
+
       - name: Prepare cache directories
         run: |
           mkdir -p .ccache
@@ -46,9 +51,9 @@ jobs:
         with:
           path: |
             .ccache
-          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-
+            ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-
 
       - name: Install dependencies
         run: |
@@ -68,4 +73,4 @@ jobs:
         with:
           path: |
             .ccache
-          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-${{ github.sha }}
