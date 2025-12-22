@@ -37,9 +37,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            build/debug
-            !build/debug/cargo
-            !build/debug/cargo/**
+            build/release
+            !build/release/cargo
+            !build/release/cargo/**
           key: build-release-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ hashFiles('extension_config.cmake', 'CMakeLists.txt', 'vcpkg.json') }}-${{ github.sha }}
           restore-keys: |
             build-release-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ hashFiles('extension_config.cmake', 'CMakeLists.txt', 'vcpkg.json') }}-
