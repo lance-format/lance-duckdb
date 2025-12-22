@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use arrow::array::RecordBatch;
 use futures::stream::Stream;
-use lance::Dataset;
+use lance::dataset::scanner::Scanner;
 use tokio::runtime::Handle;
 
 /// A stream wrapper that holds the Lance RecordBatchStream
@@ -12,11 +12,9 @@ pub struct LanceStream {
 }
 
 impl LanceStream {
-    /// Create a new stream from a dataset path
-    pub fn new(dataset: &Dataset) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Create a new stream from a Lance scanner
+    pub fn from_scanner(scanner: Scanner) -> Result<Self, Box<dyn std::error::Error>> {
         let handle = crate::runtime::handle()?;
-        let scanner = dataset.scan();
-
         let stream = handle.block_on(async { scanner.try_into_stream().await })?;
 
         Ok(Self {

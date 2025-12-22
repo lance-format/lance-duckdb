@@ -14,6 +14,25 @@ SELECT 1
 statement ok
 SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1
 
+# Test parallel scan + filter pushdown
+statement ok
+PRAGMA threads=4
+
+query I
+SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30
+----
+3
+
+query I
+SELECT count(*) FROM 'test/test_data.lance' WHERE name IN ('Alice', 'Eve')
+----
+2
+
+query I
+SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 AND score < 90
+----
+2
+
 # Test replacement scan for SELECT * FROM '.../dataset.lance'
 statement ok
 SELECT * FROM 'test/test_data.lance' LIMIT 1

@@ -105,7 +105,103 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
 
     let handle = unsafe { &*(dataset as *const DatasetHandle) };
 
-    match LanceStream::new(&handle.dataset) {
+    let scanner = handle.dataset.scan();
+    match LanceStream::from_scanner(scanner) {
+        Ok(stream) => Box::into_raw(Box::new(stream)) as *mut c_void,
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_fragments(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut u64 {
+    if dataset.is_null() || out_len.is_null() {
+        return ptr::null_mut();
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let ids: Vec<u64> = handle.dataset.fragments().iter().map(|f| f.id).collect();
+
+    let mut boxed = ids.into_boxed_slice();
+    let len = boxed.len();
+    let data = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+
+    unsafe {
+        ptr::write_unaligned(out_len, len);
+    }
+    data
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = Box::<[u64]>::from_raw(slice);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_fragment_stream(
+    dataset: *mut c_void,
+    fragment_id: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_sql: *const c_char,
+) -> *mut c_void {
+    if dataset.is_null() {
+        return ptr::null_mut();
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let fragment_id_usize = match usize::try_from(fragment_id) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let fragment = match handle.dataset.get_fragment(fragment_id_usize) {
+        Some(f) => f,
+        None => return ptr::null_mut(),
+    };
+
+    let mut scan = fragment.scan();
+
+    if !columns.is_null() && columns_len > 0 {
+        let mut projection = Vec::with_capacity(columns_len);
+        for idx in 0..columns_len {
+            let col_ptr = unsafe { *columns.add(idx) };
+            if col_ptr.is_null() {
+                return ptr::null_mut();
+            }
+            let col_name = match unsafe { CStr::from_ptr(col_ptr) }.to_str() {
+                Ok(v) => v,
+                Err(_) => return ptr::null_mut(),
+            };
+            projection.push(col_name.to_string());
+        }
+        if scan.project(&projection).is_err() {
+            return ptr::null_mut();
+        }
+    }
+
+    if !filter_sql.is_null() {
+        let filter = match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
+            Ok(v) => v,
+            Err(_) => return ptr::null_mut(),
+        };
+        if !filter.is_empty() && scan.filter(filter).is_err() {
+            return ptr::null_mut();
+        }
+    }
+
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
         Ok(stream) => Box::into_raw(Box::new(stream)) as *mut c_void,
         Err(_) => ptr::null_mut(),
     }
