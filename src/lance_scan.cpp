@@ -13,9 +13,9 @@
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
-#include <cstring>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 extern "C" {
 void *lance_open_dataset(const char *path);
@@ -59,8 +59,8 @@ struct LanceScanBindData : public TableFunctionData {
 };
 
 struct LanceScanGlobalState : public GlobalTableFunctionState {
-  std::atomic<idx_t> next_fragment_idx {0};
-  std::atomic<idx_t> lines_read {0};
+  std::atomic<idx_t> next_fragment_idx{0};
+  std::atomic<idx_t> lines_read{0};
 
   vector<uint64_t> fragment_ids;
   idx_t max_threads = 1;
@@ -79,8 +79,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
   explicit LanceScanLocalState(unique_ptr<ArrowArrayWrapper> current_chunk,
                                ClientContext &context)
       : ArrowScanLocalState(std::move(current_chunk), context),
-        filter_sel(STANDARD_VECTOR_SIZE) {
-  }
+        filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
   idx_t fragment_pos = 0;
@@ -139,7 +138,8 @@ static bool LanceFilterPushdownSupported(const TableFilter &filter) {
     return true;
   }
   default:
-    // Exclude DYNAMIC_FILTER, STRUCT_EXTRACT, EXPRESSION_FILTER, OPTIONAL_FILTER, etc.
+    // Exclude DYNAMIC_FILTER, STRUCT_EXTRACT, EXPRESSION_FILTER,
+    // OPTIONAL_FILTER, etc.
     return false;
   }
 }
@@ -231,13 +231,14 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     if (!fragments_ptr) {
       throw IOException("Failed to list Lance fragments");
     }
-    scan_state.fragment_ids.assign(fragments_ptr, fragments_ptr + fragment_count);
+    scan_state.fragment_ids.assign(fragments_ptr,
+                                   fragments_ptr + fragment_count);
   }
   lance_free_fragment_list(fragments_ptr, fragment_count);
 
   auto threads = context.db->NumberOfThreads();
-  scan_state.max_threads =
-      MaxValue<idx_t>(1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
+  scan_state.max_threads = MaxValue<idx_t>(
+      1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
 
   scan_state.projection_ids = input.projection_ids;
   if (!input.projection_ids.empty()) {
@@ -303,17 +304,18 @@ static bool LanceScanOpenStream(ClientContext &context,
     columns.push_back(name.c_str());
   }
 
-  const char *filter_sql =
-      global_state.lance_filter_sql.empty() ? nullptr : global_state.lance_filter_sql.c_str();
-  auto stream = lance_create_fragment_stream(bind_data.dataset, fragment_id,
-                                             columns.data(), columns.size(),
-                                             filter_sql);
+  const char *filter_sql = global_state.lance_filter_sql.empty()
+                               ? nullptr
+                               : global_state.lance_filter_sql.c_str();
+  auto stream =
+      lance_create_fragment_stream(bind_data.dataset, fragment_id,
+                                   columns.data(), columns.size(), filter_sql);
   if (!stream && filter_sql) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
-    stream = lance_create_fragment_stream(bind_data.dataset, fragment_id,
-                                          columns.data(), columns.size(),
-                                          nullptr);
+    stream =
+        lance_create_fragment_stream(bind_data.dataset, fragment_id,
+                                     columns.data(), columns.size(), nullptr);
   }
   if (!stream) {
     throw IOException("Failed to create Lance fragment stream");
@@ -371,8 +373,8 @@ static void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
     if (!combined) {
       combined = std::move(expr);
     } else {
-      auto conj =
-          make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+      auto conj = make_uniq<BoundConjunctionExpression>(
+          ExpressionType::CONJUNCTION_AND);
       conj->children.push_back(std::move(combined));
       conj->children.push_back(std::move(expr));
       combined = std::move(conj);
@@ -414,9 +416,8 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       }
     }
 
-    auto remaining =
-        NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
-        local_state.chunk_offset;
+    auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
+                     local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     auto start = global_state.lines_read.fetch_add(output_size);
 
@@ -428,16 +429,16 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                                         local_state.all_columns, start);
       local_state.chunk_offset += output_size;
       if (local_state.filters) {
-        ApplyDuckDBFilters(context, *local_state.filters, local_state.all_columns,
-                           local_state.filter_sel);
+        ApplyDuckDBFilters(context, *local_state.filters,
+                           local_state.all_columns, local_state.filter_sel);
       }
-      output.ReferenceColumns(local_state.all_columns, global_state.projection_ids);
+      output.ReferenceColumns(local_state.all_columns,
+                              global_state.projection_ids);
       output.SetCardinality(local_state.all_columns);
     } else {
       output.SetCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
-                                        output, start);
+      ArrowTableFunction::ArrowToDuckDB(
+          local_state, bind_data.arrow_table.GetColumns(), output, start);
       local_state.chunk_offset += output_size;
       if (local_state.filters) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
