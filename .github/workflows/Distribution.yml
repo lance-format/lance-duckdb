@@ -1,10 +1,22 @@
 name: Main Extension Distribution Pipeline
 on:
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "Makefile"
+      - "extension_config.cmake"
+      - "vcpkg.json"
+      - ".github/workflows/Distribution.yml"
   push:
-    tags:
-      - "*"
-    paths-ignore:
-      - "**.md"
+    branches:
+      - "main"
+    paths:
+      - "CMakeLists.txt"
+      - "Makefile"
+      - "extension_config.cmake"
+      - "vcpkg.json"
+      - ".github/workflows/Distribution.yml"
+  create:
   workflow_dispatch:
 
 concurrency:
@@ -14,6 +26,7 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
+    if: ${{ github.event_name != 'create' || github.event.ref_type == 'tag' }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.3
     with:
       duckdb_version: v1.4.3
@@ -21,9 +34,12 @@ jobs:
       extension_name: lance
       extra_toolchains: "rust"
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw"
+      test_config: >-
+        {"test_env_variables":{"PROTOC":"/duckdb_build_dir/.ci/protoc"}}
 
   release:
     name: Create GitHub release
+    if: ${{ github.event_name == 'create' && github.event.ref_type == 'tag' }}
     runs-on: ubuntu-latest
     needs: duckdb-stable-build
     permissions:
@@ -38,5 +54,6 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
           files: artifacts/*
           generate_release_notes: true

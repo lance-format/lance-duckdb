@@ -12,3 +12,7 @@ endif
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
+
+.PHONY: configure_ci
+configure_ci:
+	@bash scripts/configure_ci.sh
