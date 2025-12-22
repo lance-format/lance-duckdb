@@ -33,6 +33,14 @@ SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 AND score < 90
 ----
 2
 
+# Projection + filter correctness (also exercises projection pushdown path)
+query T
+SELECT name FROM 'test/test_data.lance' WHERE age > 30 ORDER BY name
+----
+Charlie
+David
+Eve
+
 # Test replacement scan for SELECT * FROM '.../dataset.lance'
 statement ok
 SELECT * FROM 'test/test_data.lance' LIMIT 1

@@ -83,6 +83,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
 
   void *stream = nullptr;
   idx_t fragment_pos = 0;
+  bool filter_pushed_down = false;
   SelectionVector filter_sel;
 
   ~LanceScanLocalState() override {
@@ -156,14 +157,14 @@ static string BuildLanceFilterSQL(const LanceScanBindData &bind_data,
     auto scan_col_idx = it.first;
     auto &filter = *it.second;
     if (scan_col_idx >= input.column_ids.size()) {
-      continue;
+      return "";
     }
     if (!LanceFilterPushdownSupported(filter)) {
-      continue;
+      return "";
     }
     auto col_id = input.column_ids[scan_col_idx];
     if (col_id >= bind_data.names.size()) {
-      continue;
+      return "";
     }
     auto col_name = EscapeLanceColumnName(bind_data.names[col_id]);
     predicates.push_back(filter.ToString(col_name));
@@ -173,6 +174,34 @@ static string BuildLanceFilterSQL(const LanceScanBindData &bind_data,
     return "";
   }
   return StringUtil::Join(predicates, " AND ");
+}
+
+static bool LanceSupportsPushdownType(const FunctionData &bind_data,
+                                      idx_t col_idx) {
+  auto &scan_bind = bind_data.Cast<LanceScanBindData>();
+  if (col_idx >= scan_bind.types.size()) {
+    return false;
+  }
+  const auto &type = scan_bind.types[col_idx];
+  switch (type.id()) {
+  case LogicalTypeId::BOOLEAN:
+  case LogicalTypeId::TINYINT:
+  case LogicalTypeId::SMALLINT:
+  case LogicalTypeId::INTEGER:
+  case LogicalTypeId::BIGINT:
+  case LogicalTypeId::UTINYINT:
+  case LogicalTypeId::USMALLINT:
+  case LogicalTypeId::UINTEGER:
+  case LogicalTypeId::UBIGINT:
+  case LogicalTypeId::FLOAT:
+  case LogicalTypeId::DOUBLE:
+  case LogicalTypeId::VARCHAR:
+    return true;
+  default:
+    // Be conservative: unsupported types are handled by DuckDB with a
+    // PhysicalFilter above the scan to preserve correctness.
+    return false;
+  }
 }
 
 static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
@@ -292,6 +321,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     lance_close_stream(local_state.stream);
     local_state.stream = nullptr;
   }
+  local_state.filter_pushed_down = false;
 
   if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
     return false;
@@ -310,6 +340,9 @@ static bool LanceScanOpenStream(ClientContext &context,
   auto stream =
       lance_create_fragment_stream(bind_data.dataset, fragment_id,
                                    columns.data(), columns.size(), filter_sql);
+  if (stream && filter_sql) {
+    local_state.filter_pushed_down = true;
+  }
   if (!stream && filter_sql) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -428,7 +461,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters) {
+      if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
                            local_state.all_columns, local_state.filter_sel);
       }
@@ -440,7 +473,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters) {
+      if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
                            local_state.filter_sel);
       }
@@ -461,6 +494,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.projection_pushdown = true;
   lance_scan.filter_pushdown = true;
   lance_scan.filter_prune = true;
+  lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
   loader.RegisterFunction(lance_scan);
 }
 
