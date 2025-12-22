@@ -8,8 +8,8 @@ use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use lance::Dataset;
-use tokio::runtime::Runtime;
 
+mod runtime;
 mod scanner;
 
 use scanner::LanceStream;
@@ -32,14 +32,9 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
         }
     };
 
-    let runtime = match Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let dataset = match runtime.block_on(Dataset::open(path_str)) {
-        Ok(ds) => Arc::new(ds),
-        Err(_) => return ptr::null_mut(),
+    let dataset = match runtime::block_on(Dataset::open(path_str)) {
+        Ok(Ok(ds)) => Arc::new(ds),
+        _ => return ptr::null_mut(),
     };
 
     let handle = Box::new(DatasetHandle { dataset });
@@ -110,13 +105,7 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
 
     let handle = unsafe { &*(dataset as *const DatasetHandle) };
 
-    // Create a new runtime for this stream to avoid conflicts
-    let runtime = match Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    match LanceStream::new(&handle.dataset, runtime) {
+    match LanceStream::new(&handle.dataset) {
         Ok(stream) => Box::into_raw(Box::new(stream)) as *mut c_void,
         Err(_) => ptr::null_mut(),
     }

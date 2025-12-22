@@ -3,23 +3,24 @@ use std::pin::Pin;
 use arrow::array::RecordBatch;
 use futures::stream::Stream;
 use lance::Dataset;
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 /// A stream wrapper that holds the Lance RecordBatchStream
 pub struct LanceStream {
-    runtime: Runtime,
+    handle: Handle,
     stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, lance::Error>> + Send>>,
 }
 
 impl LanceStream {
     /// Create a new stream from a dataset path
-    pub fn new(dataset: &Dataset, runtime: Runtime) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(dataset: &Dataset) -> Result<Self, Box<dyn std::error::Error>> {
+        let handle = crate::runtime::handle()?;
         let scanner = dataset.scan();
 
-        let stream = runtime.block_on(async { scanner.try_into_stream().await })?;
+        let stream = handle.block_on(async { scanner.try_into_stream().await })?;
 
         Ok(Self {
-            runtime,
+            handle,
             stream: Box::pin(stream),
         })
     }
@@ -28,7 +29,7 @@ impl LanceStream {
     pub fn next(&mut self) -> Option<RecordBatch> {
         use futures::StreamExt;
 
-        self.runtime.block_on(async {
+        self.handle.block_on(async {
             match self.stream.next().await {
                 Some(Ok(batch)) => Some(batch),
                 _ => None,
