@@ -26,8 +26,6 @@ jobs:
       extension_name: lance
       extra_toolchains: "rust"
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw"
-      test_config: >-
-        {"test_env_variables":{"PROTOC":"/duckdb_build_dir/.ci/protoc"}}
 
   release:
     name: Create GitHub release
