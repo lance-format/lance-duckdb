@@ -413,7 +413,7 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       }
       out_sql = "(" + child_sql +
                 (op.type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)"
-                                                              : " IS NOT NULL)");
+                                                             : " IS NOT NULL)");
       return true;
     }
     if (op.type == ExpressionType::COMPARE_IN ||
