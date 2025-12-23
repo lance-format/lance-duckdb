@@ -29,6 +29,11 @@ SELECT count(*) FROM 'test/test_data.lance' WHERE name IN ('Alice', 'Eve')
 2
 
 query I
+SELECT count(*) FROM 'test/test_data.lance'
+----
+5
+
+query I
 SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 AND score < 90
 ----
 2

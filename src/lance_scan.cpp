@@ -56,6 +56,8 @@ int32_t lance_last_error_code();
 const char *lance_last_error_message();
 void lance_free_string(const char *s);
 
+int64_t lance_dataset_count_rows(void *dataset);
+
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);
 void *lance_create_fragment_stream(void *dataset, uint64_t fragment_id,
@@ -126,6 +128,10 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
 
   vector<string> scan_column_names;
   string lance_filter_sql;
+
+  bool count_only = false;
+  idx_t count_only_total_rows = 0;
+  std::atomic<idx_t> count_only_offset{0};
 
   idx_t MaxThreads() const override { return max_threads; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -566,20 +572,6 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto state = make_uniq_base<GlobalTableFunctionState, LanceScanGlobalState>();
   auto &scan_state = state->Cast<LanceScanGlobalState>();
 
-  size_t fragment_count = 0;
-  auto fragments_ptr =
-      lance_dataset_list_fragments(bind_data.dataset, &fragment_count);
-  if (!fragments_ptr) {
-    throw IOException("Failed to list Lance fragments" +
-                      LanceFormatErrorSuffix());
-  }
-  scan_state.fragment_ids.assign(fragments_ptr, fragments_ptr + fragment_count);
-  lance_free_fragment_list(fragments_ptr, fragment_count);
-
-  auto threads = context.db->NumberOfThreads();
-  scan_state.max_threads = MaxValue<idx_t>(
-      1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
-
   scan_state.projection_ids = input.projection_ids;
   if (!input.projection_ids.empty()) {
     scan_state.scanned_types.reserve(input.column_ids.size());
@@ -608,6 +600,34 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.lance_filter_sql = "(" + bind_data.lance_complex_filter_sql +
                                   ") AND (" + table_filter_sql + ")";
   }
+
+  if (scan_state.scan_column_names.empty() &&
+      scan_state.lance_filter_sql.empty()) {
+    auto rows = lance_dataset_count_rows(bind_data.dataset);
+    if (rows < 0) {
+      throw IOException("Failed to count Lance rows" +
+                        LanceFormatErrorSuffix());
+    }
+    scan_state.count_only = true;
+    scan_state.count_only_total_rows = NumericCast<idx_t>(rows);
+    scan_state.max_threads = 1;
+    return state;
+  }
+
+  size_t fragment_count = 0;
+  auto fragments_ptr =
+      lance_dataset_list_fragments(bind_data.dataset, &fragment_count);
+  if (!fragments_ptr) {
+    throw IOException("Failed to list Lance fragments" +
+                      LanceFormatErrorSuffix());
+  }
+  scan_state.fragment_ids.assign(fragments_ptr, fragments_ptr + fragment_count);
+  lance_free_fragment_list(fragments_ptr, fragment_count);
+
+  auto threads = context.db->NumberOfThreads();
+  scan_state.max_threads = MaxValue<idx_t>(
+      1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
+
   return state;
 }
 
@@ -622,6 +642,9 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   result->filters = input.filters.get();
   if (scan_global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, scan_global.scanned_types);
+  }
+  if (scan_global.count_only) {
+    return std::move(result);
   }
   // Early stop: no fragments left for this thread.
   auto fragment_pos = scan_global.next_fragment_idx.fetch_add(1);
@@ -759,6 +782,18 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
   auto &bind_data = data.bind_data->Cast<LanceScanBindData>();
   auto &global_state = data.global_state->Cast<LanceScanGlobalState>();
   auto &local_state = data.local_state->Cast<LanceScanLocalState>();
+
+  if (global_state.count_only) {
+    auto start = global_state.count_only_offset.fetch_add(STANDARD_VECTOR_SIZE);
+    if (start >= global_state.count_only_total_rows) {
+      return;
+    }
+    auto output_size = MinValue<idx_t>(
+        STANDARD_VECTOR_SIZE, global_state.count_only_total_rows - start);
+    output.SetCardinality(output_size);
+    output.Verify();
+    return;
+  }
 
   while (true) {
     if (!local_state.stream) {

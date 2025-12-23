@@ -80,6 +80,40 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *mut c_void) -> i64 {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return -1;
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+
+    match runtime::block_on(handle.dataset.count_rows(None)) {
+        Ok(Ok(rows)) => {
+            clear_last_error();
+            match i64::try_from(rows) {
+                Ok(v) => v,
+                Err(_) => {
+                    set_last_error(ErrorCode::DatasetCountRows, "row count overflow");
+                    -1
+                }
+            }
+        }
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetCountRows,
+                format!("dataset count_rows: {err}"),
+            );
+            -1
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            -1
+        }
+    }
+}
+
 // Schema operations
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
