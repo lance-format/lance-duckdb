@@ -25,6 +25,21 @@
 #include <cstdint>
 #include <cstring>
 
+// FFI ownership contract (Arrow C Data Interface):
+// `lance_get_schema` returns an opaque schema handle; caller frees it via
+// `lance_free_schema` exactly once.
+// `lance_schema_to_arrow` populates `out_schema` on success (return 0) and
+// transfers ownership of the ArrowSchema to the caller, who must call
+// `out_schema->release(out_schema)` exactly once (or wrap it in RAII).
+// `lance_create_stream` and `lance_create_fragment_stream` return opaque stream
+// handles; caller closes them via `lance_close_stream` exactly once.
+// `lance_stream_next` returns an opaque RecordBatch handle; caller frees it via
+// `lance_free_batch` exactly once after use.
+// `lance_batch_to_arrow` populates `out_array` and `out_schema` on success
+// (return 0) and transfers ownership of both to the caller, who must call
+// `release` exactly once on each.
+// On error, the callee leaves output `ArrowSchema` / `ArrowArray` untouched; do
+// not call `release` unless the caller initialized them to a valid value.
 extern "C" {
 void *lance_open_dataset(const char *path);
 void lance_close_dataset(void *dataset);
@@ -524,6 +539,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
                       result->file_path + LanceFormatErrorSuffix());
   }
 
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
   if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
       0) {
     lance_free_schema(schema_handle);
@@ -677,6 +694,7 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   }
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
+  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
   ArrowSchema tmp_schema;
   memset(&tmp_schema, 0, sizeof(tmp_schema));
 
