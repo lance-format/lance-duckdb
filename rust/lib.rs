@@ -16,6 +16,18 @@ mod error;
 use scanner::LanceStream;
 use error::{clear_last_error, set_last_error, ErrorCode};
 
+// FFI ownership contract (Arrow C Data Interface):
+// - All `*_open/create/get` functions return opaque handles owned by the caller,
+//   which must be released exactly once via the matching `*_close/free` call.
+// - `lance_schema_to_arrow` transfers ownership of the populated ArrowSchema to
+//   the caller. The caller must call `release` exactly once on success.
+// - `lance_batch_to_arrow` transfers ownership of the populated ArrowArray and
+//   ArrowSchema to the caller. The caller must call `release` exactly once on
+//   each on success.
+// - On error (non-zero return), output ArrowSchema/ArrowArray are left
+//   untouched and must not be released unless the caller initialized them to a
+//   valid value before calling into this library.
+
 // Dataset operations - just holds the dataset
 struct DatasetHandle {
     dataset: Arc<Dataset>,
@@ -246,7 +258,6 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
             }
         }
     }
-
     scan.scan_in_order(false);
 
     match LanceStream::from_scanner(scan) {
