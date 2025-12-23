@@ -9,9 +9,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -265,7 +265,8 @@ static bool TrySerializeLanceLiteral(const Value &value, string &out_sql) {
 
 static bool TrySerializeLanceColumnRef(const LogicalGet &get,
                                        const LanceScanBindData &bind_data,
-                                       const Expression &expr, string &out_sql) {
+                                       const Expression &expr,
+                                       string &out_sql) {
   if (expr.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
     return false;
   }
@@ -330,8 +331,8 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
         !TrySerializeLanceExpr(get, bind_data, *cmp.right, rhs)) {
       return false;
     }
-    out_sql = "(" + lhs + " " + ExpressionTypeToOperator(cmp.type) + " " + rhs +
-              ")";
+    out_sql =
+        "(" + lhs + " " + ExpressionTypeToOperator(cmp.type) + " " + rhs + ")";
     return true;
   }
   case ExpressionClass::BOUND_CONJUNCTION: {
@@ -380,7 +381,7 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       }
       out_sql = "(" + child_sql +
                 (op.type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)"
-                                                           : " IS NOT NULL)");
+                                                             : " IS NOT NULL)");
       return true;
     }
     if (op.type == ExpressionType::COMPARE_IN ||
@@ -395,7 +396,8 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       vector<string> values;
       values.reserve(op.children.size() - 1);
       for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class != ExpressionClass::BOUND_CONSTANT) {
+        if (op.children[i]->expression_class !=
+            ExpressionClass::BOUND_CONSTANT) {
           return false;
         }
         auto &c = op.children[i]->Cast<BoundConstantExpression>();
@@ -405,9 +407,10 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
         }
         values.push_back(std::move(lit));
       }
-      out_sql = "(" + lhs_sql +
-                (op.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") +
-                StringUtil::Join(values, ", ") + "))";
+      out_sql =
+          "(" + lhs_sql +
+          (op.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") +
+          StringUtil::Join(values, ", ") + "))";
       return true;
     }
     return false;
@@ -431,9 +434,10 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
   }
 }
 
-static void LancePushdownComplexFilter(
-    ClientContext &, LogicalGet &get, FunctionData *bind_data,
-    vector<unique_ptr<Expression>> &filters) {
+static void
+LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
+                           FunctionData *bind_data,
+                           vector<unique_ptr<Expression>> &filters) {
   if (!bind_data || filters.empty()) {
     return;
   }
@@ -442,7 +446,8 @@ static void LancePushdownComplexFilter(
   vector<string> predicates;
   predicates.reserve(filters.size());
   for (auto &expr : filters) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile() || expr->CanThrow()) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile() ||
+        expr->CanThrow()) {
       continue;
     }
     string sql;
