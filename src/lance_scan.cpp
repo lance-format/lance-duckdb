@@ -107,7 +107,7 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
-  string lance_complex_filter_sql;
+  string lance_pushed_filter_sql;
 
   ~LanceScanBindData() override {
     if (dataset) {
@@ -488,7 +488,7 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
 }
 
 static void
-LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
+LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
                            FunctionData *bind_data,
                            vector<unique_ptr<Expression>> &filters) {
   if (!bind_data || filters.empty()) {
@@ -514,11 +514,11 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     return;
   }
   auto pushed_sql = StringUtil::Join(predicates, " AND ");
-  if (scan_bind.lance_complex_filter_sql.empty()) {
-    scan_bind.lance_complex_filter_sql = std::move(pushed_sql);
+  if (scan_bind.lance_pushed_filter_sql.empty()) {
+    scan_bind.lance_pushed_filter_sql = std::move(pushed_sql);
   } else {
-    scan_bind.lance_complex_filter_sql =
-        "(" + scan_bind.lance_complex_filter_sql + ") AND (" + pushed_sql + ")";
+    scan_bind.lance_pushed_filter_sql =
+        "(" + scan_bind.lance_pushed_filter_sql + ") AND (" + pushed_sql + ")";
   }
 }
 
@@ -592,13 +592,15 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   auto table_filter_sql = BuildLanceFilterSQL(bind_data, input);
-  if (bind_data.lance_complex_filter_sql.empty()) {
+  auto pushed_filter_sql = bind_data.lance_pushed_filter_sql;
+
+  if (pushed_filter_sql.empty()) {
     scan_state.lance_filter_sql = std::move(table_filter_sql);
   } else if (table_filter_sql.empty()) {
-    scan_state.lance_filter_sql = bind_data.lance_complex_filter_sql;
+    scan_state.lance_filter_sql = std::move(pushed_filter_sql);
   } else {
-    scan_state.lance_filter_sql = "(" + bind_data.lance_complex_filter_sql +
-                                  ") AND (" + table_filter_sql + ")";
+    scan_state.lance_filter_sql =
+        "(" + pushed_filter_sql + ") AND (" + table_filter_sql + ")";
   }
 
   if (scan_state.scan_column_names.empty() &&

@@ -14,7 +14,11 @@ SELECT 1
 statement ok
 SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1
 
-# Test parallel scan + filter pushdown
+# Baseline: materialize once and evaluate filters in DuckDB
+statement ok
+CREATE TEMP TABLE baseline AS SELECT * FROM 'test/test_data.lance'
+
+# Test parallel scan + filter pushdown correctness
 statement ok
 PRAGMA threads=4
 
@@ -38,7 +42,7 @@ SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 AND score < 90
 ----
 2
 
-# Test complex filter forms (OR across columns, NOT, BETWEEN, NOT IN)
+# Test complex filter forms
 query I
 SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 OR score < 90
 ----
@@ -66,6 +70,42 @@ SELECT name FROM 'test/test_data.lance' WHERE age > 30 ORDER BY name
 Charlie
 David
 Eve
+
+# Equivalence: baseline table (DuckDB evaluation) matches expected results
+query I
+SELECT count(*) FROM baseline WHERE age > 30
+----
+3
+
+query I
+SELECT count(*) FROM baseline WHERE name IN ('Alice', 'Eve')
+----
+2
+
+query I
+SELECT count(*) FROM baseline WHERE age > 30 AND score < 90
+----
+2
+
+query I
+SELECT count(*) FROM baseline WHERE age > 30 OR score < 90
+----
+4
+
+query I
+SELECT count(*) FROM baseline WHERE NOT (age > 30)
+----
+2
+
+query I
+SELECT count(*) FROM baseline WHERE age BETWEEN 26 AND 40
+----
+3
+
+query I
+SELECT count(*) FROM baseline WHERE name NOT IN ('Alice', 'Eve')
+----
+3
 
 # Test replacement scan for SELECT * FROM '.../dataset.lance'
 statement ok
