@@ -32,7 +32,7 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
         match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
             Err(err) => {
-                set_last_error(ErrorCode::Utf8, err.to_string());
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
                 return ptr::null_mut();
             }
         }
@@ -41,11 +41,14 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
     let dataset = match runtime::block_on(Dataset::open(path_str)) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
-            set_last_error(ErrorCode::DatasetOpen, err.to_string());
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("dataset open '{path_str}': {err}"),
+            );
             return ptr::null_mut();
         }
         Err(err) => {
-            set_last_error(ErrorCode::Runtime, err.to_string());
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
             return ptr::null_mut();
         }
     };
@@ -107,7 +110,7 @@ pub unsafe extern "C" fn lance_schema_to_arrow(
     let ffi_schema = match FFI_ArrowSchema::try_from(&data_type) {
         Ok(schema) => schema,
         Err(err) => {
-            set_last_error(ErrorCode::SchemaExport, err.to_string());
+            set_last_error(ErrorCode::SchemaExport, format!("schema export: {err}"));
             return -1;
         }
     };
@@ -134,7 +137,7 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
             Box::into_raw(Box::new(stream)) as *mut c_void
         }
         Err(err) => {
-            set_last_error(ErrorCode::StreamCreate, err.to_string());
+            set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
             ptr::null_mut()
         }
     }
@@ -193,7 +196,7 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
     let fragment_id_usize = match usize::try_from(fragment_id) {
         Ok(v) => v,
         Err(err) => {
-            set_last_error(ErrorCode::InvalidArgument, err.to_string());
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid fragment id: {err}"));
             return ptr::null_mut();
         }
     };
@@ -201,7 +204,10 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
     let fragment = match handle.dataset.get_fragment(fragment_id_usize) {
         Some(f) => f,
         None => {
-            set_last_error(ErrorCode::FragmentScan, "fragment not found");
+            set_last_error(
+                ErrorCode::FragmentScan,
+                format!("fragment not found: {fragment_id}"),
+            );
             return ptr::null_mut();
         }
     };
@@ -219,14 +225,14 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
             let col_name = match unsafe { CStr::from_ptr(col_ptr) }.to_str() {
                 Ok(v) => v,
                 Err(err) => {
-                    set_last_error(ErrorCode::Utf8, err.to_string());
+                    set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
                     return ptr::null_mut();
                 }
             };
             projection.push(col_name.to_string());
         }
         if let Err(err) = scan.project(&projection) {
-            set_last_error(ErrorCode::FragmentScan, err.to_string());
+            set_last_error(ErrorCode::FragmentScan, format!("fragment scan project: {err}"));
             return ptr::null_mut();
         }
     }
@@ -235,13 +241,13 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
         let filter = match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
             Ok(v) => v,
             Err(err) => {
-                set_last_error(ErrorCode::Utf8, err.to_string());
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
                 return ptr::null_mut();
             }
         };
         if !filter.is_empty() {
             if let Err(err) = scan.filter(filter) {
-                set_last_error(ErrorCode::FragmentScan, err.to_string());
+                set_last_error(ErrorCode::FragmentScan, format!("fragment scan filter: {err}"));
                 return ptr::null_mut();
             }
         }
@@ -255,17 +261,28 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
             Box::into_raw(Box::new(stream)) as *mut c_void
         }
         Err(err) => {
-            set_last_error(ErrorCode::StreamCreate, err.to_string());
+            set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
             ptr::null_mut()
         }
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_stream_next(stream: *mut c_void) -> *mut c_void {
+pub unsafe extern "C" fn lance_stream_next(
+    stream: *mut c_void,
+    out_batch: *mut *mut c_void,
+) -> i32 {
+    if out_batch.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_batch is null");
+        return -1;
+    }
+    unsafe {
+        ptr::write_unaligned(out_batch, ptr::null_mut());
+    }
+
     if stream.is_null() {
         set_last_error(ErrorCode::InvalidArgument, "stream is null");
-        return ptr::null_mut();
+        return -1;
     }
 
     let stream = unsafe { &mut *(stream as *mut LanceStream) };
@@ -273,15 +290,19 @@ pub unsafe extern "C" fn lance_stream_next(stream: *mut c_void) -> *mut c_void {
     match stream.next() {
         Ok(Some(batch)) => {
             clear_last_error();
-            Box::into_raw(Box::new(batch)) as *mut c_void
+            let batch_ptr = Box::into_raw(Box::new(batch)) as *mut c_void;
+            unsafe {
+                ptr::write_unaligned(out_batch, batch_ptr);
+            }
+            0
         }
         Ok(None) => {
             clear_last_error();
-            ptr::null_mut()
+            1
         }
         Err(err) => {
-            set_last_error(ErrorCode::StreamNext, err.to_string());
-            ptr::null_mut()
+            set_last_error(ErrorCode::StreamNext, format!("stream next: {err}"));
+            -1
         }
     }
 }
@@ -336,7 +357,7 @@ pub unsafe extern "C" fn lance_batch_to_arrow(
     let schema = match FFI_ArrowSchema::try_from(data.data_type()) {
         Ok(schema) => schema,
         Err(err) => {
-            set_last_error(ErrorCode::BatchExport, err.to_string());
+            set_last_error(ErrorCode::BatchExport, format!("batch export: {err}"));
             return -1;
         }
     };

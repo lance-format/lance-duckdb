@@ -53,18 +53,18 @@ pub extern "C" fn lance_last_error_code() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn lance_last_error_message() -> *mut c_char {
-    LAST_ERROR.with(|e| match e.borrow().as_ref() {
-        Some(err) => err.message.clone().into_raw(),
-        None => ptr::null_mut(),
+pub extern "C" fn lance_last_error_message() -> *const c_char {
+    LAST_ERROR.with(|e| match e.borrow_mut().take() {
+        Some(err) => err.message.into_raw() as *const c_char,
+        None => ptr::null(),
     })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_free_string(s: *mut c_char) {
+pub unsafe extern "C" fn lance_free_string(s: *const c_char) {
     if !s.is_null() {
         unsafe {
-            let _ = CString::from_raw(s);
+            let _ = CString::from_raw(s as *mut c_char);
         }
     }
 }
