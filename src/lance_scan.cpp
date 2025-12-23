@@ -584,10 +584,12 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
                                   ") AND (" + table_filter_sql + ")";
   }
 
-  if (scan_state.scan_column_names.empty() && scan_state.lance_filter_sql.empty()) {
+  if (scan_state.scan_column_names.empty() &&
+      scan_state.lance_filter_sql.empty()) {
     auto rows = lance_dataset_count_rows(bind_data.dataset);
     if (rows < 0) {
-      throw IOException("Failed to count Lance rows" + LanceFormatErrorSuffix());
+      throw IOException("Failed to count Lance rows" +
+                        LanceFormatErrorSuffix());
     }
     scan_state.count_only = true;
     scan_state.count_only_total_rows = NumericCast<idx_t>(rows);
