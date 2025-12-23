@@ -20,6 +20,7 @@ lance = "1.0.0"
 arrow = { version = "56.2.0", features = ["ffi"] }
 arrow-array = "56.2.0"
 arrow-schema = "56.2.0"
+bzip2-sys = { version = "0.1.13", features = ["static"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 anyhow = "1.0"

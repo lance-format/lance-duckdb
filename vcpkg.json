@@ -1,6 +1,5 @@
 {
   "dependencies": [
-    "bzip2",
     "protobuf"
   ],
   "vcpkg-configuration": {

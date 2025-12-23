@@ -3648,6 +3648,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bzip2-sys",
  "futures",
  "lance",
  "tokio",
