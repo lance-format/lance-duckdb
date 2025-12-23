@@ -4,6 +4,8 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=lance
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+CORE_EXTENSIONS=''
+
 # Default build: skip DuckDB's parquet extension.
 # Override by providing EXT_FLAGS that already contains -DSKIP_EXTENSIONS=...
 ifeq (,$(findstring -DSKIP_EXTENSIONS=,$(EXT_FLAGS)))
