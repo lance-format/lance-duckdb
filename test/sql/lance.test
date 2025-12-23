@@ -70,6 +70,7 @@ SELECT * FROM 'test/test_data.lance' LIMIT 1
 statement error
 SELECT * FROM lance_scan('dummy_path.lance')
 ----
+Lance error:
 
 # Test error handling - requires at least one argument
 statement error
