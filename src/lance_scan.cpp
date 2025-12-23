@@ -34,12 +34,12 @@ void lance_free_schema(void *schema);
 int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
 
 void *lance_create_stream(void *dataset);
-void *lance_stream_next(void *stream);
+int32_t lance_stream_next(void *stream, void **out_batch);
 void lance_close_stream(void *stream);
 
 int32_t lance_last_error_code();
-char *lance_last_error_message();
-void lance_free_string(char *s);
+const char *lance_last_error_message();
+void lance_free_string(const char *s);
 
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);
@@ -664,15 +664,16 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   if (!local_state.stream) {
     return false;
   }
-  auto *batch = lance_stream_next(local_state.stream);
-  if (!batch) {
-    auto err_suffix = LanceFormatErrorSuffix();
-    if (!err_suffix.empty()) {
-      throw IOException("Failed to read next Lance RecordBatch" + err_suffix);
-    }
+  void *batch = nullptr;
+  auto rc = lance_stream_next(local_state.stream, &batch);
+  if (rc == 1) {
     lance_close_stream(local_state.stream);
     local_state.stream = nullptr;
     return false;
+  }
+  if (rc != 0) {
+    throw IOException("Failed to read next Lance RecordBatch" +
+                      LanceFormatErrorSuffix());
   }
 
   auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
