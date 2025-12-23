@@ -29,9 +29,20 @@ FROM 'path/to/dataset.lance';
 
 ## Install
 
-This repository currently focuses on source builds.
+### Install from DuckDB Community Extensions (recommended)
 
-### Build from source
+If you just want to use the extension, install it directly from DuckDB's community extensions repository:
+
+```sql
+INSTALL lance FROM community;
+LOAD lance;
+```
+
+See DuckDB's extension page for `lance` for the latest details: https://duckdb.org/community_extensions/extensions/lance
+
+### Build from source (development)
+
+This repository focuses on source builds for development and CI.
 
 1. Initialize submodules:
 
