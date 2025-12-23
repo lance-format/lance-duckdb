@@ -11,8 +11,10 @@ use lance::Dataset;
 
 mod runtime;
 mod scanner;
+mod error;
 
 use scanner::LanceStream;
+use error::{clear_last_error, set_last_error, ErrorCode};
 
 // Dataset operations - just holds the dataset
 struct DatasetHandle {
@@ -22,22 +24,34 @@ struct DatasetHandle {
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
     if path.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "path is null");
         return ptr::null_mut();
     }
 
     let path_str = unsafe {
         match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, err.to_string());
+                return ptr::null_mut();
+            }
         }
     };
 
     let dataset = match runtime::block_on(Dataset::open(path_str)) {
         Ok(Ok(ds)) => Arc::new(ds),
-        _ => return ptr::null_mut(),
+        Ok(Err(err)) => {
+            set_last_error(ErrorCode::DatasetOpen, err.to_string());
+            return ptr::null_mut();
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, err.to_string());
+            return ptr::null_mut();
+        }
     };
 
     let handle = Box::new(DatasetHandle { dataset });
+    clear_last_error();
 
     Box::into_raw(handle) as *mut c_void
 }
@@ -55,6 +69,7 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
     if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
         return ptr::null_mut();
     }
 
@@ -63,6 +78,7 @@ pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
 
     let arrow_schema: Schema = schema.into();
 
+    clear_last_error();
     Box::into_raw(Box::new(Arc::new(arrow_schema))) as *mut c_void
 }
 
@@ -81,6 +97,7 @@ pub unsafe extern "C" fn lance_schema_to_arrow(
     out_schema: *mut FFI_ArrowSchema,
 ) -> i32 {
     if schema.is_null() || out_schema.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "schema or out_schema is null");
         return -1;
     }
 
@@ -89,10 +106,14 @@ pub unsafe extern "C" fn lance_schema_to_arrow(
 
     let ffi_schema = match FFI_ArrowSchema::try_from(&data_type) {
         Ok(schema) => schema,
-        Err(_) => return -1,
+        Err(err) => {
+            set_last_error(ErrorCode::SchemaExport, err.to_string());
+            return -1;
+        }
     };
 
     std::ptr::write_unaligned(out_schema, ffi_schema);
+    clear_last_error();
     0
 }
 
@@ -100,6 +121,7 @@ pub unsafe extern "C" fn lance_schema_to_arrow(
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_void {
     if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
         return ptr::null_mut();
     }
 
@@ -107,8 +129,14 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
 
     let scanner = handle.dataset.scan();
     match LanceStream::from_scanner(scanner) {
-        Ok(stream) => Box::into_raw(Box::new(stream)) as *mut c_void,
-        Err(_) => ptr::null_mut(),
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::StreamCreate, err.to_string());
+            ptr::null_mut()
+        }
     }
 }
 
@@ -118,6 +146,7 @@ pub unsafe extern "C" fn lance_dataset_list_fragments(
     out_len: *mut usize,
 ) -> *mut u64 {
     if dataset.is_null() || out_len.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset or out_len is null");
         return ptr::null_mut();
     }
 
@@ -132,6 +161,7 @@ pub unsafe extern "C" fn lance_dataset_list_fragments(
     unsafe {
         ptr::write_unaligned(out_len, len);
     }
+    clear_last_error();
     data
 }
 
@@ -155,18 +185,25 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
     filter_sql: *const c_char,
 ) -> *mut c_void {
     if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
         return ptr::null_mut();
     }
 
     let handle = unsafe { &*(dataset as *const DatasetHandle) };
     let fragment_id_usize = match usize::try_from(fragment_id) {
         Ok(v) => v,
-        Err(_) => return ptr::null_mut(),
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, err.to_string());
+            return ptr::null_mut();
+        }
     };
 
     let fragment = match handle.dataset.get_fragment(fragment_id_usize) {
         Some(f) => f,
-        None => return ptr::null_mut(),
+        None => {
+            set_last_error(ErrorCode::FragmentScan, "fragment not found");
+            return ptr::null_mut();
+        }
     };
 
     let mut scan = fragment.scan();
@@ -176,15 +213,20 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
         for idx in 0..columns_len {
             let col_ptr = unsafe { *columns.add(idx) };
             if col_ptr.is_null() {
+                set_last_error(ErrorCode::InvalidArgument, "column name is null");
                 return ptr::null_mut();
             }
             let col_name = match unsafe { CStr::from_ptr(col_ptr) }.to_str() {
                 Ok(v) => v,
-                Err(_) => return ptr::null_mut(),
+                Err(err) => {
+                    set_last_error(ErrorCode::Utf8, err.to_string());
+                    return ptr::null_mut();
+                }
             };
             projection.push(col_name.to_string());
         }
-        if scan.project(&projection).is_err() {
+        if let Err(err) = scan.project(&projection) {
+            set_last_error(ErrorCode::FragmentScan, err.to_string());
             return ptr::null_mut();
         }
     }
@@ -192,32 +234,55 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
     if !filter_sql.is_null() {
         let filter = match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
             Ok(v) => v,
-            Err(_) => return ptr::null_mut(),
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, err.to_string());
+                return ptr::null_mut();
+            }
         };
-        if !filter.is_empty() && scan.filter(filter).is_err() {
-            return ptr::null_mut();
+        if !filter.is_empty() {
+            if let Err(err) = scan.filter(filter) {
+                set_last_error(ErrorCode::FragmentScan, err.to_string());
+                return ptr::null_mut();
+            }
         }
     }
 
     scan.scan_in_order(false);
 
     match LanceStream::from_scanner(scan) {
-        Ok(stream) => Box::into_raw(Box::new(stream)) as *mut c_void,
-        Err(_) => ptr::null_mut(),
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::StreamCreate, err.to_string());
+            ptr::null_mut()
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_stream_next(stream: *mut c_void) -> *mut c_void {
     if stream.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "stream is null");
         return ptr::null_mut();
     }
 
     let stream = unsafe { &mut *(stream as *mut LanceStream) };
 
     match stream.next() {
-        Some(batch) => Box::into_raw(Box::new(batch)) as *mut c_void,
-        None => ptr::null_mut(),
+        Ok(Some(batch)) => {
+            clear_last_error();
+            Box::into_raw(Box::new(batch)) as *mut c_void
+        }
+        Ok(None) => {
+            clear_last_error();
+            ptr::null_mut()
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::StreamNext, err.to_string());
+            ptr::null_mut()
+        }
     }
 }
 
@@ -257,6 +322,7 @@ pub unsafe extern "C" fn lance_batch_to_arrow(
     out_schema: *mut FFI_ArrowSchema,
 ) -> i32 {
     if batch.is_null() || out_array.is_null() || out_schema.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "batch or out pointer is null");
         return -1;
     }
 
@@ -269,11 +335,15 @@ pub unsafe extern "C" fn lance_batch_to_arrow(
     let array = FFI_ArrowArray::new(&data);
     let schema = match FFI_ArrowSchema::try_from(data.data_type()) {
         Ok(schema) => schema,
-        Err(_) => return -1,
+        Err(err) => {
+            set_last_error(ErrorCode::BatchExport, err.to_string());
+            return -1;
+        }
     };
 
     std::ptr::write_unaligned(out_array, array);
     std::ptr::write_unaligned(out_schema, schema);
 
+    clear_last_error();
     0
 }

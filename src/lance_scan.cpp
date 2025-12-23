@@ -37,6 +37,10 @@ void *lance_create_stream(void *dataset);
 void *lance_stream_next(void *stream);
 void lance_close_stream(void *stream);
 
+int32_t lance_last_error_code();
+char *lance_last_error_message();
+void lance_free_string(char *s);
+
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);
 void *lance_create_fragment_stream(void *dataset, uint64_t fragment_id,
@@ -50,6 +54,34 @@ int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
 }
 
 namespace duckdb {
+
+static string LanceConsumeLastError() {
+  auto code = lance_last_error_code();
+  string message;
+  if (auto *ptr = lance_last_error_message()) {
+    message = ptr;
+    lance_free_string(ptr);
+  }
+
+  if (code == 0 && message.empty()) {
+    return "";
+  }
+  if (message.empty()) {
+    return "code=" + to_string(code);
+  }
+  if (code == 0) {
+    return message;
+  }
+  return message + " (code=" + to_string(code) + ")";
+}
+
+static string LanceFormatErrorSuffix() {
+  auto err = LanceConsumeLastError();
+  if (err.empty()) {
+    return "";
+  }
+  return " (Lance error: " + err + ")";
+}
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
@@ -482,20 +514,22 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
 
   result->dataset = lance_open_dataset(result->file_path.c_str());
   if (!result->dataset) {
-    throw IOException("Failed to open Lance dataset: " + result->file_path);
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
   }
 
   auto *schema_handle = lance_get_schema(result->dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset: " +
-                      result->file_path);
+                      result->file_path + LanceFormatErrorSuffix());
   }
 
   if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
       0) {
     lance_free_schema(schema_handle);
     throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface");
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
 
@@ -518,16 +552,11 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   size_t fragment_count = 0;
   auto fragments_ptr =
       lance_dataset_list_fragments(bind_data.dataset, &fragment_count);
-  if (!fragments_ptr && fragment_count != 0) {
-    throw IOException("Failed to list Lance fragments");
+  if (!fragments_ptr) {
+    throw IOException("Failed to list Lance fragments" +
+                      LanceFormatErrorSuffix());
   }
-  if (fragment_count > 0) {
-    if (!fragments_ptr) {
-      throw IOException("Failed to list Lance fragments");
-    }
-    scan_state.fragment_ids.assign(fragments_ptr,
-                                   fragments_ptr + fragment_count);
-  }
+  scan_state.fragment_ids.assign(fragments_ptr, fragments_ptr + fragment_count);
   lance_free_fragment_list(fragments_ptr, fragment_count);
 
   auto threads = context.db->NumberOfThreads();
@@ -624,7 +653,8 @@ static bool LanceScanOpenStream(ClientContext &context,
                                      columns.data(), columns.size(), nullptr);
   }
   if (!stream) {
-    throw IOException("Failed to create Lance fragment stream");
+    throw IOException("Failed to create Lance fragment stream" +
+                      LanceFormatErrorSuffix());
   }
   local_state.stream = stream;
   return true;
@@ -636,6 +666,10 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   }
   auto *batch = lance_stream_next(local_state.stream);
   if (!batch) {
+    auto err_suffix = LanceFormatErrorSuffix();
+    if (!err_suffix.empty()) {
+      throw IOException("Failed to read next Lance RecordBatch" + err_suffix);
+    }
     lance_close_stream(local_state.stream);
     local_state.stream = nullptr;
     return false;
@@ -648,7 +682,8 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
     lance_free_batch(batch);
     throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface");
+        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
   }
 
   lance_free_batch(batch);

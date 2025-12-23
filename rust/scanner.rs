@@ -24,13 +24,14 @@ impl LanceStream {
     }
 
     /// Get the next batch from the stream
-    pub fn next(&mut self) -> Option<RecordBatch> {
+    pub fn next(&mut self) -> Result<Option<RecordBatch>, lance::Error> {
         use futures::StreamExt;
 
         self.handle.block_on(async {
             match self.stream.next().await {
-                Some(Ok(batch)) => Some(batch),
-                _ => None,
+                Some(Ok(batch)) => Ok(Some(batch)),
+                Some(Err(err)) => Err(err),
+                None => Ok(None),
             }
         })
     }
