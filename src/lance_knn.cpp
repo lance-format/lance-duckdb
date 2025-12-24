@@ -408,7 +408,8 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
         return false;
       }
       string child_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *op.children[0], child_sql)) {
+      if (!TrySerializeLanceExpr(get, names, types, *op.children[0],
+                                 child_sql)) {
         return false;
       }
       out_sql = "(NOT " + child_sql + ")";
@@ -420,7 +421,8 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
         return false;
       }
       string child_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *op.children[0], child_sql)) {
+      if (!TrySerializeLanceExpr(get, names, types, *op.children[0],
+                                 child_sql)) {
         return false;
       }
       out_sql = "(" + child_sql +
@@ -440,7 +442,8 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       vector<string> values;
       values.reserve(op.children.size() - 1);
       for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class != ExpressionClass::BOUND_CONSTANT) {
+        if (op.children[i]->expression_class !=
+            ExpressionClass::BOUND_CONSTANT) {
           return false;
         }
         auto &c = op.children[i]->Cast<BoundConstantExpression>();
@@ -529,9 +532,10 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
   }
 };
 
-static void LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
-                                       FunctionData *bind_data,
-                                       vector<unique_ptr<Expression>> &filters) {
+static void
+LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
+                           FunctionData *bind_data,
+                           vector<unique_ptr<Expression>> &filters) {
   if (!bind_data || filters.empty()) {
     return;
   }
@@ -540,11 +544,13 @@ static void LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
   vector<string> predicates;
   predicates.reserve(filters.size());
   for (auto &expr : filters) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile() || expr->CanThrow()) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile() ||
+        expr->CanThrow()) {
       continue;
     }
     string sql;
-    if (!TrySerializeLanceExpr(get, scan_bind.names, scan_bind.types, *expr, sql)) {
+    if (!TrySerializeLanceExpr(get, scan_bind.names, scan_bind.types, *expr,
+                               sql)) {
       continue;
     }
     predicates.push_back(std::move(sql));
@@ -604,11 +610,10 @@ static unique_ptr<FunctionData> LanceKnnBind(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
-  auto *schema_handle =
-      lance_get_knn_schema(result->dataset, result->vector_column.c_str(),
-                           result->query.data(), result->query.size(),
-                           result->k, result->prefilter ? 1 : 0,
-                           result->use_index ? 1 : 0);
+  auto *schema_handle = lance_get_knn_schema(
+      result->dataset, result->vector_column.c_str(), result->query.data(),
+      result->query.size(), result->k, result->prefilter ? 1 : 0,
+      result->use_index ? 1 : 0);
   if (!schema_handle) {
     throw IOException("Failed to get Lance KNN schema: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -653,9 +658,8 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   string table_filter_sql;
-  bool supported =
-      TryBuildLanceFilterSQL(bind_data.names, bind_data.types, input,
-                             table_filter_sql);
+  bool supported = TryBuildLanceFilterSQL(bind_data.names, bind_data.types,
+                                          input, table_filter_sql);
 
   if (!supported) {
     if (bind_data.prefilter) {
