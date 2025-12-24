@@ -107,8 +107,19 @@ set(RUST_RELEASE_LIB "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/release/${RUST_
 set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
+    ${CMAKE_CURRENT_LIST_DIR}/rust/constants.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/error.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
