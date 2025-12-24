@@ -92,7 +92,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: build-release-${{ github.sha }}
-          path: .
+          path: build/release
 
       - name: Ensure test runner is executable
         run: |
@@ -113,7 +113,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: build-release-${{ github.sha }}
-          path: .
+          path: build/release
 
       - name: Ensure test runner is executable
         run: |
