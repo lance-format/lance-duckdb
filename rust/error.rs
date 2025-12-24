@@ -17,6 +17,7 @@ pub enum ErrorCode {
     BatchExport = 10,
     KnnSchema = 11,
     KnnStreamCreate = 12,
+    ExplainPlan = 13,
 }
 
 struct LastError {

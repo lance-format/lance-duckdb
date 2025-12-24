@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion_common::{Column, ScalarValue};
-use datafusion_expr::{Expr, ScalarUDF};
 use datafusion_expr::expr::{InList, ScalarFunction};
+use datafusion_expr::{Expr, ScalarUDF};
 use datafusion_functions::core::getfield::GetFieldFunc;
 
 const MAGIC: &[u8; 4] = b"LFT1";
@@ -221,7 +221,11 @@ fn parse_conjunction(cursor: &mut Cursor<'_>, is_and: bool) -> Result<Expr> {
     let mut iter = children.into_iter();
     let mut expr = iter.next().unwrap();
     for child in iter {
-        expr = if is_and { expr.and(child) } else { expr.or(child) };
+        expr = if is_and {
+            expr.and(child)
+        } else {
+            expr.or(child)
+        };
     }
     Ok(expr)
 }
