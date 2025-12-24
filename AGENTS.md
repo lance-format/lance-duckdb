@@ -6,6 +6,10 @@ This file provides guidance to coding agents working in this repository, includi
 
 This repository contains a DuckDB extension for querying Lance format datasets. The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
+## Documentation Language
+
+All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
+
 ## Essential Commands
 
 ### Building
@@ -38,10 +42,10 @@ GEN=ninja make test_debug     # Test with debug build
 GEN=ninja make test_release   # Test with release build
 
 # Run DuckDB with extension for manual testing
-./build/release/duckdb -c "SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1;"
+./build/release/duckdb -c "SELECT * FROM 'test/test_data.lance' LIMIT 1;"
 
 # Or load the loadable extension from a standalone DuckDB binary
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1;"
+duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM 'test/test_data.lance' LIMIT 1;"
 ```
 
 ### Development Iteration
