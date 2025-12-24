@@ -692,8 +692,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   auto &global = global_state->Cast<LanceKnnGlobalState>();
 
   auto chunk = make_uniq<ArrowArrayWrapper>();
-  auto result =
-      make_uniq<LanceKnnLocalState>(std::move(chunk), context.client);
+  auto result = make_uniq<LanceKnnLocalState>(std::move(chunk), context.client);
   result->column_ids = input.column_ids;
   result->filters = input.filters.get();
   result->filter_pushed_down = global.filter_pushed_down;
@@ -702,9 +701,10 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   }
 
   result->stream = lance_create_knn_stream(
-      bind_data.dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
-      bind_data.query.size(), bind_data.k, global.lance_filter_sql.c_str(),
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      bind_data.dataset, bind_data.vector_column.c_str(),
+      bind_data.query.data(), bind_data.query.size(), bind_data.k,
+      global.lance_filter_sql.c_str(), bind_data.prefilter ? 1 : 0,
+      bind_data.use_index ? 1 : 0);
   if (!result->stream) {
     throw IOException("Failed to create Lance KNN stream" +
                       LanceFormatErrorSuffix());
@@ -845,25 +845,23 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
 }
 
 void RegisterLanceKnn(ExtensionLoader &loader) {
-  TableFunction knn4("lance_knn",
-                     {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                      LogicalType::LIST(LogicalType::FLOAT),
-                      LogicalType::BIGINT},
-                     LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal,
-                     LanceKnnLocalInit);
+  TableFunction knn4(
+      "lance_knn",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT},
+      LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal, LanceKnnLocalInit);
   knn4.projection_pushdown = true;
   knn4.filter_pushdown = true;
   knn4.filter_prune = true;
   knn4.pushdown_complex_filter = LancePushdownComplexFilter;
   loader.RegisterFunction(knn4);
 
-  TableFunction knn6("lance_knn",
-                     {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                      LogicalType::LIST(LogicalType::FLOAT),
-                      LogicalType::BIGINT, LogicalType::BOOLEAN,
-                      LogicalType::BOOLEAN},
-                     LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal,
-                     LanceKnnLocalInit);
+  TableFunction knn6(
+      "lance_knn",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT,
+       LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+      LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal, LanceKnnLocalInit);
   knn6.projection_pushdown = true;
   knn6.filter_pushdown = true;
   knn6.filter_prune = true;
