@@ -16,7 +16,7 @@ panic = "abort"
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
-lance = "1.0.0"
+lance = { version = "1.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
 arrow = { version = "56.2.0", features = ["ffi"] }
 arrow-array = "56.2.0"
 arrow-schema = "56.2.0"
@@ -25,3 +25,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 anyhow = "1.0"
 async-trait = "0.1"
+datafusion-common = "50.3.0"
+datafusion-expr = "50.3.0"
+datafusion-functions = "50.3.0"

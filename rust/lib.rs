@@ -14,6 +14,7 @@ use lance::Dataset;
 mod runtime;
 mod scanner;
 mod error;
+mod filter_ir;
 
 use scanner::LanceStream;
 use error::{clear_last_error, set_last_error, ErrorCode};
@@ -152,6 +153,40 @@ pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
         unsafe {
             let _ = Box::from_raw(dataset as *mut DatasetHandle);
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_count_rows(dataset: *mut c_void) -> i64 {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return -1;
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+
+    match runtime::block_on(handle.dataset.count_rows(None)) {
+        Ok(Ok(rows)) => {
+            clear_last_error();
+            match i64::try_from(rows) {
+                Ok(v) => v,
+                Err(_) => {
+                    set_last_error(ErrorCode::DatasetCountRows, "row count overflow");
+                    -1
+                }
+            }
+        }
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetCountRows,
+                format!("dataset count_rows: {err}"),
+            );
+            -1
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            -1
         }
     }
 }
@@ -490,6 +525,94 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
             }
         }
     }
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_fragment_stream_ir(
+    dataset: *mut c_void,
+    fragment_id: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let fragment_id_usize = match usize::try_from(fragment_id) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid fragment id: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let fragment = match handle.dataset.get_fragment(fragment_id_usize) {
+        Some(f) => f,
+        None => {
+            set_last_error(
+                ErrorCode::FragmentScan,
+                format!("fragment not found: {fragment_id}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scan = fragment.scan();
+
+    if !columns.is_null() && columns_len > 0 {
+        let mut projection = Vec::with_capacity(columns_len);
+        for idx in 0..columns_len {
+            let col_ptr = unsafe { *columns.add(idx) };
+            if col_ptr.is_null() {
+                set_last_error(ErrorCode::InvalidArgument, "column name is null");
+                return ptr::null_mut();
+            }
+            let col_name = match unsafe { CStr::from_ptr(col_ptr) }.to_str() {
+                Ok(v) => v,
+                Err(err) => {
+                    set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+                    return ptr::null_mut();
+                }
+            };
+            projection.push(col_name.to_string());
+        }
+        if let Err(err) = scan.project(&projection) {
+            set_last_error(ErrorCode::FragmentScan, format!("fragment scan project: {err}"));
+            return ptr::null_mut();
+        }
+    }
+
+    if !filter_ir.is_null() && filter_ir_len > 0 {
+        let bytes = unsafe { std::slice::from_raw_parts(filter_ir, filter_ir_len) };
+        let expr = match crate::filter_ir::parse_filter_ir(bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                set_last_error(
+                    ErrorCode::FragmentScan,
+                    format!("fragment scan filter_ir: {err}"),
+                );
+                return ptr::null_mut();
+            }
+        };
+        scan.filter_expr(expr);
+    }
+
     scan.scan_in_order(false);
 
     match LanceStream::from_scanner(scan) {

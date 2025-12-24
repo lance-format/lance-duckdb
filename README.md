@@ -1,30 +1,23 @@
 # Lance DuckDB Extension
 
-Query Lance datasets directly from DuckDB.
+Query [Lance](https://github.com/lance-format/lance/) datasets directly from DuckDB.
 
 Lance is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension brings Lance into a familiar SQL workflow.
 
-## What you can do today
-
-- Scan a Lance dataset root via `lance_scan(path)`.
-- Query a `*.lance` dataset path directly via replacement scan:
-  - `SELECT * FROM '.../dataset.lance'` is rewritten into `lance_scan('.../dataset.lance')`.
 
 ## Usage
 
-### Scan via table function
+### Query a `*.lance` path
 
 ```sql
+-- local file
 SELECT *
-FROM lance_scan('path/to/dataset.lance')
-LIMIT 10;
-```
-
-### Scan a `*.lance` path directly
-
-```sql
-SELECT count(*)
-FROM 'path/to/dataset.lance';
+  FROM 'path/to/dataset.lance'
+  LIMIT 10;
+-- s3
+SELECT *
+  FROM 's3://bucket/path/to/dataset.lance'
+  LIMIT 10;
 ```
 
 ## Install
@@ -36,6 +29,10 @@ If you just want to use the extension, install it directly from DuckDB's communi
 ```sql
 INSTALL lance FROM community;
 LOAD lance;
+
+SELECT *
+  FROM 'path/to/dataset.lance'
+  LIMIT 1;
 ```
 
 See DuckDB's extension page for `lance` for the latest details: https://duckdb.org/community_extensions/extensions/lance
@@ -61,11 +58,6 @@ GEN=ninja make release
 ```bash
 duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
 ```
-
-## Notes and limitations
-
-- Projection and filter pushdown are currently disabled in `lance_scan`.
-- Stream consumption is serialized with a global mutex, which limits parallelism.
 
 ## Contributing
 

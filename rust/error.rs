@@ -9,6 +9,7 @@ pub enum ErrorCode {
     Utf8 = 2,
     Runtime = 3,
     DatasetOpen = 4,
+    DatasetCountRows = 5,
     FragmentScan = 6,
     StreamCreate = 7,
     StreamNext = 8,
