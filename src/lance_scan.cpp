@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 // FFI ownership contract (Arrow C Data Interface):
 // `lance_get_schema` returns an opaque schema handle; caller frees it via
@@ -77,6 +78,12 @@ void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const uint8_t *filter_ir,
                                       size_t filter_ir_len);
 
+const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
+                                          size_t columns_len,
+                                          const uint8_t *filter_ir,
+                                          size_t filter_ir_len,
+                                          uint8_t verbose);
+
 void lance_free_batch(void *batch);
 int64_t lance_batch_num_rows(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
@@ -111,6 +118,49 @@ static string LanceFormatErrorSuffix() {
     return "";
   }
   return " (Lance error: " + err + ")";
+}
+
+static bool TryLanceExplainDatasetScan(void *dataset,
+                                       const vector<string> *columns,
+                                       const string *filter_ir, bool verbose,
+                                       string &out_plan, string &out_error) {
+  out_plan.clear();
+  out_error.clear();
+
+  if (!dataset) {
+    out_error = "dataset is null";
+    return false;
+  }
+
+  vector<const char *> col_ptrs;
+  if (columns) {
+    col_ptrs.reserve(columns->size());
+    for (auto &col : *columns) {
+      col_ptrs.push_back(col.c_str());
+    }
+  }
+
+  const uint8_t *filter_ptr = nullptr;
+  size_t filter_len = 0;
+  if (filter_ir && !filter_ir->empty()) {
+    filter_ptr = reinterpret_cast<const uint8_t *>(filter_ir->data()); // NOLINT
+    filter_len = filter_ir->size();
+  }
+
+  auto *plan_ptr = lance_explain_dataset_scan_ir(
+      dataset, col_ptrs.empty() ? nullptr : col_ptrs.data(), col_ptrs.size(),
+      filter_ptr, filter_len, verbose ? 1 : 0);
+  if (!plan_ptr) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+
+  out_plan = plan_ptr;
+  lance_free_string(plan_ptr);
+  return true;
 }
 
 static string NormalizeS3Scheme(const string &path) {
@@ -196,6 +246,7 @@ static void FillS3StorageOptionsFromSecrets(ClientContext &context,
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
+  bool explain_verbose = false;
   void *dataset = nullptr;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
@@ -213,6 +264,10 @@ struct LanceScanBindData : public TableFunctionData {
 struct LanceScanGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> next_fragment_idx{0};
   std::atomic<idx_t> lines_read{0};
+  std::atomic<idx_t> record_batches{0};
+  std::atomic<idx_t> record_batch_rows{0};
+  std::atomic<idx_t> streams_opened{0};
+  std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
   vector<uint64_t> fragment_ids;
   idx_t max_threads = 1;
@@ -227,6 +282,11 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   idx_t count_only_total_rows = 0;
   std::atomic<idx_t> count_only_offset{0};
 
+  std::atomic<bool> explain_computed{false};
+  string explain_plan;
+  string explain_error;
+  std::mutex explain_mutex;
+
   idx_t MaxThreads() const override { return max_threads; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
 };
@@ -238,6 +298,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
+  LanceScanGlobalState *global_state = nullptr;
   idx_t fragment_pos = 0;
   SelectionVector filter_sel;
 
@@ -884,6 +945,12 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
 
   auto result = make_uniq<LanceScanBindData>();
   result->file_path = input.inputs[0].GetValue<string>();
+  auto verbose_it = input.named_parameters.find("explain_verbose");
+  if (verbose_it != input.named_parameters.end() &&
+      !verbose_it->second.IsNull()) {
+    result->explain_verbose =
+        verbose_it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  }
 
   auto open_path = result->file_path;
   vector<string> option_keys;
@@ -1038,6 +1105,7 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       make_uniq<LanceScanLocalState>(std::move(chunk), context.client);
   result->column_ids = input.column_ids;
   result->filters = input.filters.get();
+  result->global_state = &scan_global;
   if (scan_global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, scan_global.scanned_types);
   }
@@ -1085,6 +1153,7 @@ static bool LanceScanOpenStream(ClientContext &context,
   if (!stream && filter_ir) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
+    global_state.filter_pushdown_fallbacks.fetch_add(1);
     stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
                                              columns.data(), columns.size(),
                                              nullptr, 0);
@@ -1093,6 +1162,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     throw IOException("Failed to create Lance fragment stream" +
                       LanceFormatErrorSuffix());
   }
+  global_state.streams_opened.fetch_add(1);
   local_state.stream = stream;
   return true;
 }
@@ -1126,6 +1196,12 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   }
 
   lance_free_batch(batch);
+
+  if (local_state.global_state) {
+    local_state.global_state->record_batches.fetch_add(1);
+    auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
+    local_state.global_state->record_batch_rows.fetch_add(rows);
+  }
 
   if (tmp_schema.release) {
     tmp_schema.release(&tmp_schema);
@@ -1246,15 +1322,129 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
   }
 }
 
+static InsertionOrderPreservingMap<string>
+LanceScanToString(TableFunctionToStringInput &input) {
+  InsertionOrderPreservingMap<string> result;
+  auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
+
+  result["Lance Path"] = bind_data.file_path;
+  result["Lance Explain Verbose"] =
+      bind_data.explain_verbose ? "true" : "false";
+  result["Lance Pushed Filter Parts"] =
+      to_string(bind_data.lance_pushed_filter_ir_parts.size());
+
+  string filter_ir_msg;
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    vector<string> parts;
+    parts.reserve(bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      parts.push_back(part);
+    }
+
+    string root_node;
+    if (parts.size() == 1) {
+      root_node = std::move(parts[0]);
+    } else if (!TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, parts,
+                                                  root_node)) {
+      root_node.clear();
+    }
+
+    if (!root_node.empty()) {
+      filter_ir_msg = LanceFilterIREncodeMessage(root_node);
+    }
+  }
+
+  result["Lance Filter IR Bytes (Bind)"] = to_string(filter_ir_msg.size());
+
+  string plan;
+  string error;
+  if (TryLanceExplainDatasetScan(bind_data.dataset, nullptr,
+                                 filter_ir_msg.empty() ? nullptr
+                                                       : &filter_ir_msg,
+                                 bind_data.explain_verbose, plan, error)) {
+    result["Lance Plan (Bind)"] = plan;
+  } else if (!error.empty()) {
+    result["Lance Plan Error (Bind)"] = error;
+  }
+
+  return result;
+}
+
+static InsertionOrderPreservingMap<string>
+LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
+  InsertionOrderPreservingMap<string> result;
+  auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
+  auto &global_state = input.global_state->Cast<LanceScanGlobalState>();
+
+  result["Lance Path"] = bind_data.file_path;
+  result["Lance Explain Verbose"] =
+      bind_data.explain_verbose ? "true" : "false";
+  result["Lance Fragments"] = to_string(global_state.fragment_ids.size());
+  result["Lance Max Threads"] = to_string(global_state.max_threads);
+  result["Lance Streams Opened"] =
+      to_string(global_state.streams_opened.load());
+  result["Lance Filter Pushdown Fallbacks"] =
+      to_string(global_state.filter_pushdown_fallbacks.load());
+  result["Lance Record Batches"] =
+      to_string(global_state.record_batches.load());
+  result["Lance Record Batch Rows"] =
+      to_string(global_state.record_batch_rows.load());
+  result["Lance Rows Out"] = to_string(global_state.lines_read.load());
+
+  if (global_state.count_only) {
+    result["Lance Count Only"] = "true";
+    result["Lance Count Total Rows"] =
+        to_string(global_state.count_only_total_rows);
+    return result;
+  }
+
+  result["Lance Filter IR Bytes"] =
+      to_string(global_state.lance_filter_ir.size());
+  if (!global_state.scan_column_names.empty()) {
+    result["Lance Projection"] =
+        StringUtil::Join(global_state.scan_column_names, "\n");
+  }
+
+  if (!global_state.explain_computed.load()) {
+    std::lock_guard<std::mutex> guard(global_state.explain_mutex);
+    if (!global_state.explain_computed.load()) {
+      string plan;
+      string error;
+      auto ok = TryLanceExplainDatasetScan(
+          bind_data.dataset, &global_state.scan_column_names,
+          global_state.lance_filter_ir.empty() ? nullptr
+                                               : &global_state.lance_filter_ir,
+          bind_data.explain_verbose, plan, error);
+      if (ok) {
+        global_state.explain_plan = std::move(plan);
+      } else {
+        global_state.explain_error = std::move(error);
+      }
+      global_state.explain_computed.store(true);
+    }
+  }
+
+  if (!global_state.explain_plan.empty()) {
+    result["Lance Plan"] = global_state.explain_plan;
+  } else if (!global_state.explain_error.empty()) {
+    result["Lance Plan Error"] = global_state.explain_error;
+  }
+
+  return result;
+}
+
 void RegisterLanceScan(ExtensionLoader &loader) {
   TableFunction lance_scan("lance_scan", {LogicalType::VARCHAR}, LanceScanFunc,
                            LanceScanBind, LanceScanInitGlobal,
                            LanceScanLocalInit);
+  lance_scan.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
   lance_scan.projection_pushdown = true;
   lance_scan.filter_pushdown = true;
   lance_scan.filter_prune = true;
   lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
   lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
+  lance_scan.to_string = LanceScanToString;
+  lance_scan.dynamic_to_string = LanceScanDynamicToString;
   loader.RegisterFunction(lance_scan);
 }
 

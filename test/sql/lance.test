@@ -87,6 +87,27 @@ SELECT count(*) FROM baseline WHERE age > 30 AND score < 90
 ----
 2
 
+# Explain output includes Lance-specific diagnostics (bind-time and runtime)
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Path": "test/test_data\.lance"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Plan \(Bind\)"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Rows Out"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Plan"[\s\S]*
+
 query I
 SELECT count(*) FROM baseline WHERE age > 30 OR score < 90
 ----

@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 extern "C" {
 void *lance_open_dataset(const char *path);
@@ -47,6 +48,12 @@ void lance_close_stream(void *stream);
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
 void lance_free_string(const char *s);
+
+const char *lance_explain_knn_scan(void *dataset, const char *vector_column,
+                                   const float *query_values, size_t query_len,
+                                   uint64_t k, const char *filter_sql,
+                                   uint8_t prefilter, uint8_t use_index,
+                                   uint8_t verbose);
 
 void lance_free_batch(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
@@ -81,6 +88,40 @@ static string LanceFormatErrorSuffix() {
     return "";
   }
   return " (Lance error: " + err + ")";
+}
+
+static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
+                               const vector<float> &query, uint64_t k,
+                               const string &filter_sql, bool prefilter,
+                               bool use_index, bool verbose, string &out_plan,
+                               string &out_error) {
+  out_plan.clear();
+  out_error.clear();
+
+  if (!dataset) {
+    out_error = "dataset is null";
+    return false;
+  }
+  if (query.empty()) {
+    out_error = "query is empty";
+    return false;
+  }
+
+  auto filter_ptr = filter_sql.empty() ? nullptr : filter_sql.c_str();
+  auto *plan_ptr = lance_explain_knn_scan(
+      dataset, vector_column.c_str(), query.data(), query.size(), k, filter_ptr,
+      prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
+  if (!plan_ptr) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+
+  out_plan = plan_ptr;
+  lance_free_string(plan_ptr);
+  return true;
 }
 
 static vector<float> ParseQueryVector(const Value &value) {
@@ -487,6 +528,7 @@ struct LanceKnnBindData : public TableFunctionData {
   uint64_t k = 0;
   bool prefilter = true;
   bool use_index = true;
+  bool explain_verbose = false;
 
   void *dataset = nullptr;
   ArrowSchemaWrapper schema_root;
@@ -505,11 +547,18 @@ struct LanceKnnBindData : public TableFunctionData {
 
 struct LanceKnnGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
+  std::atomic<idx_t> record_batches{0};
+  std::atomic<idx_t> record_batch_rows{0};
   string lance_filter_sql;
   bool filter_pushed_down = false;
 
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
+
+  std::atomic<bool> explain_computed{false};
+  string explain_plan;
+  string explain_error;
+  std::mutex explain_mutex;
 
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -522,6 +571,7 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
+  LanceKnnGlobalState *global_state = nullptr;
   bool filter_pushed_down = false;
   SelectionVector filter_sel;
 
@@ -590,6 +640,12 @@ static unique_ptr<FunctionData> LanceKnnBind(ClientContext &context,
   result->file_path = input.inputs[0].GetValue<string>();
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2]);
+  auto verbose_it = input.named_parameters.find("explain_verbose");
+  if (verbose_it != input.named_parameters.end() &&
+      !verbose_it->second.IsNull()) {
+    result->explain_verbose =
+        verbose_it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  }
 
   auto k_val = input.inputs[3].GetValue<int64_t>();
   if (k_val <= 0) {
@@ -699,6 +755,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   auto result = make_uniq<LanceKnnLocalState>(std::move(chunk), context.client);
   result->column_ids = input.column_ids;
   result->filters = input.filters.get();
+  result->global_state = &global;
   result->filter_pushed_down = global.filter_pushed_down;
   if (global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, global.scanned_types);
@@ -747,6 +804,12 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
   }
 
   lance_free_batch(batch);
+
+  if (local_state.global_state) {
+    local_state.global_state->record_batches.fetch_add(1);
+    auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
+    local_state.global_state->record_batch_rows.fetch_add(rows);
+  }
 
   if (tmp_schema.release) {
     tmp_schema.release(&tmp_schema);
@@ -848,16 +911,105 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
   }
 }
 
+static InsertionOrderPreservingMap<string>
+LanceKnnToString(TableFunctionToStringInput &input) {
+  InsertionOrderPreservingMap<string> result;
+  auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
+
+  result["Lance Path"] = bind_data.file_path;
+  result["Lance Vector Column"] = bind_data.vector_column;
+  result["Lance K"] = to_string(bind_data.k);
+  result["Lance Query Dim"] = to_string(bind_data.query.size());
+  result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
+  result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
+  result["Lance Explain Verbose"] =
+      bind_data.explain_verbose ? "true" : "false";
+
+  if (!bind_data.lance_complex_filter_sql.empty()) {
+    result["Lance Filter SQL (Bind)"] = bind_data.lance_complex_filter_sql;
+  }
+
+  string plan;
+  string error;
+  if (TryLanceExplainKnn(
+          bind_data.dataset, bind_data.vector_column, bind_data.query,
+          bind_data.k, bind_data.lance_complex_filter_sql, bind_data.prefilter,
+          bind_data.use_index, bind_data.explain_verbose, plan, error)) {
+    result["Lance Plan (Bind)"] = plan;
+  } else if (!error.empty()) {
+    result["Lance Plan Error (Bind)"] = error;
+  }
+
+  return result;
+}
+
+static InsertionOrderPreservingMap<string>
+LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
+  InsertionOrderPreservingMap<string> result;
+  auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
+  auto &global_state = input.global_state->Cast<LanceKnnGlobalState>();
+
+  result["Lance Path"] = bind_data.file_path;
+  result["Lance Vector Column"] = bind_data.vector_column;
+  result["Lance K"] = to_string(bind_data.k);
+  result["Lance Query Dim"] = to_string(bind_data.query.size());
+  result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
+  result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
+  result["Lance Explain Verbose"] =
+      bind_data.explain_verbose ? "true" : "false";
+
+  result["Lance Filter Pushed Down"] =
+      global_state.filter_pushed_down ? "true" : "false";
+  if (!global_state.lance_filter_sql.empty()) {
+    result["Lance Filter SQL"] = global_state.lance_filter_sql;
+  }
+
+  result["Lance Record Batches"] =
+      to_string(global_state.record_batches.load());
+  result["Lance Record Batch Rows"] =
+      to_string(global_state.record_batch_rows.load());
+  result["Lance Rows Out"] = to_string(global_state.lines_read.load());
+
+  if (!global_state.explain_computed.load()) {
+    std::lock_guard<std::mutex> guard(global_state.explain_mutex);
+    if (!global_state.explain_computed.load()) {
+      string plan;
+      string error;
+      auto ok = TryLanceExplainKnn(
+          bind_data.dataset, bind_data.vector_column, bind_data.query,
+          bind_data.k, global_state.lance_filter_sql, bind_data.prefilter,
+          bind_data.use_index, bind_data.explain_verbose, plan, error);
+      if (ok) {
+        global_state.explain_plan = std::move(plan);
+      } else {
+        global_state.explain_error = std::move(error);
+      }
+      global_state.explain_computed.store(true);
+    }
+  }
+
+  if (!global_state.explain_plan.empty()) {
+    result["Lance Plan"] = global_state.explain_plan;
+  } else if (!global_state.explain_error.empty()) {
+    result["Lance Plan Error"] = global_state.explain_error;
+  }
+
+  return result;
+}
+
 void RegisterLanceKnn(ExtensionLoader &loader) {
   TableFunction knn4(
       "lance_knn",
       {LogicalType::VARCHAR, LogicalType::VARCHAR,
        LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT},
       LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal, LanceKnnLocalInit);
+  knn4.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
   knn4.projection_pushdown = true;
   knn4.filter_pushdown = true;
   knn4.filter_prune = true;
   knn4.pushdown_complex_filter = LancePushdownComplexFilter;
+  knn4.to_string = LanceKnnToString;
+  knn4.dynamic_to_string = LanceKnnDynamicToString;
   loader.RegisterFunction(knn4);
 
   TableFunction knn6(
@@ -866,10 +1018,13 @@ void RegisterLanceKnn(ExtensionLoader &loader) {
        LogicalType::LIST(LogicalType::FLOAT), LogicalType::BIGINT,
        LogicalType::BOOLEAN, LogicalType::BOOLEAN},
       LanceKnnFunc, LanceKnnBind, LanceKnnInitGlobal, LanceKnnLocalInit);
+  knn6.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
   knn6.projection_pushdown = true;
   knn6.filter_pushdown = true;
   knn6.filter_prune = true;
   knn6.pushdown_complex_filter = LancePushdownComplexFilter;
+  knn6.to_string = LanceKnnToString;
+  knn6.dynamic_to_string = LanceKnnDynamicToString;
   loader.RegisterFunction(knn6);
 }
 
