@@ -145,7 +145,6 @@ struct LanceScanLocalState : public ArrowScanLocalState {
 
   void *stream = nullptr;
   idx_t fragment_pos = 0;
-  bool filter_pushed_down = false;
   SelectionVector filter_sel;
 
   ~LanceScanLocalState() override {
@@ -207,6 +206,32 @@ static bool LanceFilterPushdownSupported(const TableFilter &filter) {
   }
 }
 
+static bool LanceSupportsFilterSQLLogicalType(const LogicalType &type) {
+  // This controls whether we attempt Lance-side filter pushdown by passing a
+  // SQL string to `fragment.scan().filter(...)`.
+  //
+  // NOTE: This is deliberately conservative. `TableFilter::ToString()` uses
+  // DuckDB syntax (e.g. `::DATE`) that Lance may not parse, and silently
+  // accepting/ignoring such filters breaks correctness.
+  switch (type.id()) {
+  case LogicalTypeId::BOOLEAN:
+  case LogicalTypeId::TINYINT:
+  case LogicalTypeId::SMALLINT:
+  case LogicalTypeId::INTEGER:
+  case LogicalTypeId::BIGINT:
+  case LogicalTypeId::UTINYINT:
+  case LogicalTypeId::USMALLINT:
+  case LogicalTypeId::UINTEGER:
+  case LogicalTypeId::UBIGINT:
+  case LogicalTypeId::FLOAT:
+  case LogicalTypeId::DOUBLE:
+  case LogicalTypeId::VARCHAR:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static string BuildLanceFilterSQL(const LanceScanBindData &bind_data,
                                   const TableFunctionInitInput &input) {
   if (!input.filters) {
@@ -228,6 +253,12 @@ static string BuildLanceFilterSQL(const LanceScanBindData &bind_data,
     if (col_id >= bind_data.names.size()) {
       return "";
     }
+    if (col_id >= bind_data.types.size()) {
+      return "";
+    }
+    if (!LanceSupportsFilterSQLLogicalType(bind_data.types[col_id])) {
+      return "";
+    }
     auto col_name = EscapeLanceColumnName(bind_data.names[col_id]);
     predicates.push_back(filter.ToString(col_name));
   }
@@ -245,6 +276,7 @@ static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
   case LogicalTypeId::SMALLINT:
   case LogicalTypeId::INTEGER:
   case LogicalTypeId::BIGINT:
+  case LogicalTypeId::DATE:
   case LogicalTypeId::UTINYINT:
   case LogicalTypeId::USMALLINT:
   case LogicalTypeId::UINTEGER:
@@ -665,7 +697,6 @@ static bool LanceScanOpenStream(ClientContext &context,
     lance_close_stream(local_state.stream);
     local_state.stream = nullptr;
   }
-  local_state.filter_pushed_down = false;
 
   if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
     return false;
@@ -684,9 +715,6 @@ static bool LanceScanOpenStream(ClientContext &context,
   auto stream =
       lance_create_fragment_stream(bind_data.dataset, fragment_id,
                                    columns.data(), columns.size(), filter_sql);
-  if (stream && filter_sql) {
-    local_state.filter_pushed_down = true;
-  }
   if (!stream && filter_sql) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -825,7 +853,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters && !local_state.filter_pushed_down) {
+      if (local_state.filters) {
         ApplyDuckDBFilters(context, *local_state.filters,
                            local_state.all_columns, local_state.filter_sel);
       }
@@ -837,7 +865,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters && !local_state.filter_pushed_down) {
+      if (local_state.filters) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
                            local_state.filter_sel);
       }
