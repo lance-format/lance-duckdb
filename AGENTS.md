@@ -29,6 +29,14 @@ cargo check --manifest-path Cargo.toml
 cargo clippy --manifest-path Cargo.toml --all-targets
 ```
 
+### Formatting
+
+This repository is configured with `uv`, so you can run formatting via:
+
+```bash
+uv run make format
+```
+
 ### Testing
 
 The `release` build can be slow. For fast iteration, prefer `test_debug` when available.
