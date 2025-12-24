@@ -32,6 +32,7 @@ extern "C" {
 void *lance_open_dataset(const char *path);
 void lance_close_dataset(void *dataset);
 
+void *lance_get_schema(void *dataset);
 void *lance_get_knn_schema(void *dataset, const char *vector_column,
                            const float *query_values, size_t query_len,
                            uint64_t k, uint8_t prefilter, uint8_t use_index);
@@ -205,6 +206,10 @@ static string EscapeLanceColumnName(const string &name) {
   return result;
 }
 
+static bool IsComputedSearchColumn(const string &name) {
+  return name == "_distance" || name == "_score" || name == "_hybrid_score";
+}
+
 static bool LanceFilterPushdownSupported(const TableFilter &filter) {
   switch (filter.filter_type) {
   case TableFilterType::CONSTANT_COMPARISON:
@@ -255,16 +260,19 @@ static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
   }
 }
 
-static bool TryBuildLanceFilterSQL(const vector<string> &names,
-                                   const vector<LogicalType> &types,
-                                   const TableFunctionInitInput &input,
-                                   string &out_sql) {
-  out_sql.clear();
-  if (!input.filters) {
-    return true;
-  }
-  if (input.filters->filters.empty()) {
-    return true;
+struct LanceFilterBuildResult {
+  string pushed_sql;
+  bool all_filters_pushed = true;
+  bool all_prefilterable_filters_pushed = true;
+};
+
+static LanceFilterBuildResult
+BuildLanceFilterSQL(const vector<string> &names,
+                    const vector<LogicalType> &types,
+                    const TableFunctionInitInput &input) {
+  LanceFilterBuildResult result;
+  if (!input.filters || input.filters->filters.empty()) {
+    return result;
   }
 
   vector<string> predicates;
@@ -274,27 +282,35 @@ static bool TryBuildLanceFilterSQL(const vector<string> &names,
     auto scan_col_idx = it.first;
     auto &filter = *it.second;
     if (scan_col_idx >= input.column_ids.size()) {
-      return false;
-    }
-    if (!LanceFilterPushdownSupported(filter)) {
-      return false;
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
     }
     auto col_id = input.column_ids[scan_col_idx];
     if (col_id >= names.size() || col_id >= types.size()) {
-      return false;
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
     }
-    if (!LanceSupportsPushdownLogicalType(types[col_id])) {
-      return false;
+    if (IsComputedSearchColumn(names[col_id])) {
+      result.all_filters_pushed = false;
+      continue;
+    }
+
+    if (!LanceFilterPushdownSupported(filter) ||
+        !LanceSupportsPushdownLogicalType(types[col_id])) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
     }
     auto col_name = EscapeLanceColumnName(names[col_id]);
     predicates.push_back(filter.ToString(col_name));
   }
 
-  if (predicates.empty()) {
-    return true;
+  if (!predicates.empty()) {
+    result.pushed_sql = StringUtil::Join(predicates, " AND ");
   }
-  out_sql = StringUtil::Join(predicates, " AND ");
-  return true;
+  return result;
 }
 
 static bool TrySerializeLanceLiteral(const Value &value, string &out_sql) {
@@ -374,6 +390,9 @@ static bool TrySerializeLanceColumnRef(const LogicalGet &get,
   }
   auto col_id = col_index.GetPrimaryIndex();
   if (col_id >= names.size() || col_id >= types.size()) {
+    return false;
+  }
+  if (IsComputedSearchColumn(names[col_id])) {
     return false;
   }
   if (!LanceSupportsPushdownLogicalType(types[col_id])) {
@@ -696,6 +715,172 @@ static unique_ptr<FunctionData> LanceKnnBind(ClientContext &context,
   return std::move(result);
 }
 
+static string InferDefaultVectorColumn(ClientContext &context, void *dataset,
+                                       const string &path) {
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get Lance schema: " + path +
+                      LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  ArrowTableSchema arrow_table;
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+                                               schema_root.arrow_schema);
+  auto col_names = arrow_table.GetNames();
+  auto col_types = arrow_table.GetTypes();
+
+  vector<string> candidates;
+  candidates.reserve(col_names.size());
+  for (idx_t i = 0; i < col_names.size() && i < col_types.size(); i++) {
+    auto &t = col_types[i];
+    if (t.id() == LogicalTypeId::LIST) {
+      auto &child = ListType::GetChildType(t);
+      if (child.id() == LogicalTypeId::FLOAT) {
+        candidates.push_back(col_names[i]);
+      }
+    } else if (t.id() == LogicalTypeId::ARRAY) {
+      auto &child = ArrayType::GetChildType(t);
+      if (child.id() == LogicalTypeId::FLOAT) {
+        candidates.push_back(col_names[i]);
+      }
+    }
+  }
+
+  if (candidates.empty()) {
+    throw InvalidInputException(
+        "lance_search requires parameter vector_column = '<vector_column>'");
+  }
+  if (candidates.size() != 1) {
+    throw InvalidInputException(
+        "lance_search requires parameter vector_column = '<vector_column>' "
+        "(multiple vector columns found: " +
+        StringUtil::Join(candidates, ", ") + ")");
+  }
+  return candidates[0];
+}
+
+static unique_ptr<FunctionData>
+LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
+                      vector<LogicalType> &return_types,
+                      vector<string> &names) {
+  if (input.inputs.size() < 2) {
+    throw InvalidInputException("lance_search requires (path, query)");
+  }
+  if (input.inputs[0].IsNull()) {
+    throw InvalidInputException("lance_search requires a dataset root path");
+  }
+  if (input.inputs[1].IsNull()) {
+    throw InvalidInputException(
+        "lance_search requires a non-null query vector");
+  }
+
+  auto result = make_uniq<LanceKnnBindData>();
+  result->file_path = input.inputs[0].GetValue<string>();
+  result->query = ParseQueryVector(input.inputs[1]);
+  result->prefilter = false;
+
+  auto verbose_it = input.named_parameters.find("explain_verbose");
+  if (verbose_it != input.named_parameters.end() &&
+      !verbose_it->second.IsNull()) {
+    result->explain_verbose =
+        verbose_it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  }
+
+  int64_t k_val = 10;
+  bool has_positional_k = false;
+  if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+    k_val = input.inputs[2].GetValue<int64_t>();
+    has_positional_k = true;
+  }
+  auto k_named = input.named_parameters.find("k");
+  if (k_named != input.named_parameters.end() && !k_named->second.IsNull()) {
+    if (has_positional_k) {
+      throw InvalidInputException(
+          "lance_search requires k to be specified either positionally or as "
+          "named parameter k");
+    }
+    k_val =
+        k_named->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+  }
+  if (k_val <= 0) {
+    throw InvalidInputException("lance_search requires k > 0");
+  }
+  result->k = NumericCast<uint64_t>(k_val);
+
+  auto prefilter_named = input.named_parameters.find("prefilter");
+  if (prefilter_named != input.named_parameters.end() &&
+      !prefilter_named->second.IsNull()) {
+    result->prefilter =
+        prefilter_named->second.DefaultCastAs(LogicalType::BOOLEAN)
+            .GetValue<bool>();
+  }
+  auto use_index_named = input.named_parameters.find("use_index");
+  if (use_index_named != input.named_parameters.end() &&
+      !use_index_named->second.IsNull()) {
+    result->use_index =
+        use_index_named->second.DefaultCastAs(LogicalType::BOOLEAN)
+            .GetValue<bool>();
+  }
+
+  result->dataset = lance_open_dataset(result->file_path.c_str());
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto column_named = input.named_parameters.find("vector_column");
+  if (column_named == input.named_parameters.end()) {
+    column_named = input.named_parameters.find("column");
+  }
+  if (column_named != input.named_parameters.end() &&
+      !column_named->second.IsNull()) {
+    result->vector_column = column_named->second.GetValue<string>();
+  } else {
+    result->vector_column =
+        InferDefaultVectorColumn(context, result->dataset, result->file_path);
+  }
+
+  auto *schema_handle = lance_get_knn_schema(
+      result->dataset, result->vector_column.c_str(), result->query.data(),
+      result->query.size(), result->k, result->prefilter ? 1 : 0,
+      result->use_index ? 1 : 0);
+  if (!schema_handle) {
+    throw IOException("Failed to get Lance KNN schema: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
+      0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance KNN schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+  names = result->names;
+  return_types = result->types;
+  return std::move(result);
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceKnnBindData>();
@@ -713,35 +898,24 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  string table_filter_sql;
-  bool supported = TryBuildLanceFilterSQL(bind_data.names, bind_data.types,
-                                          input, table_filter_sql);
-
-  if (!supported) {
-    if (bind_data.prefilter) {
-      throw InvalidInputException(
-          "lance_knn requires filter pushdown when prefilter=true");
-    }
-    global.lance_filter_sql.clear();
-    global.filter_pushed_down = false;
-    return state;
+  auto filter_build =
+      BuildLanceFilterSQL(bind_data.names, bind_data.types, input);
+  if (bind_data.prefilter && !filter_build.all_prefilterable_filters_pushed) {
+    throw InvalidInputException(
+        "lance_knn requires filter pushdown for prefilterable columns when "
+        "prefilter=true");
   }
 
   if (bind_data.lance_complex_filter_sql.empty()) {
-    global.lance_filter_sql = std::move(table_filter_sql);
-  } else if (table_filter_sql.empty()) {
+    global.lance_filter_sql = std::move(filter_build.pushed_sql);
+  } else if (filter_build.pushed_sql.empty()) {
     global.lance_filter_sql = bind_data.lance_complex_filter_sql;
   } else {
     global.lance_filter_sql = "(" + bind_data.lance_complex_filter_sql +
-                              ") AND (" + table_filter_sql + ")";
+                              ") AND (" + filter_build.pushed_sql + ")";
   }
-  global.filter_pushed_down = !global.lance_filter_sql.empty();
-
-  if (bind_data.prefilter && input.filters && !input.filters->filters.empty() &&
-      !global.filter_pushed_down) {
-    throw InvalidInputException(
-        "lance_knn requires filter pushdown when prefilter=true");
-  }
+  global.filter_pushed_down =
+      filter_build.all_filters_pushed && !global.lance_filter_sql.empty();
   return state;
 }
 
@@ -1026,6 +1200,80 @@ void RegisterLanceKnn(ExtensionLoader &loader) {
   knn6.to_string = LanceKnnToString;
   knn6.dynamic_to_string = LanceKnnDynamicToString;
   loader.RegisterFunction(knn6);
+
+  TableFunction search2(
+      "lance_search",
+      {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::FLOAT)},
+      LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
+      LanceKnnLocalInit);
+  search2.named_parameters["vector_column"] = LogicalType::VARCHAR;
+  search2.named_parameters["k"] = LogicalType::BIGINT;
+  search2.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  search2.named_parameters["use_index"] = LogicalType::BOOLEAN;
+  search2.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
+  search2.projection_pushdown = true;
+  search2.filter_pushdown = true;
+  search2.filter_prune = true;
+  search2.pushdown_complex_filter = LancePushdownComplexFilter;
+  search2.to_string = LanceKnnToString;
+  search2.dynamic_to_string = LanceKnnDynamicToString;
+  loader.RegisterFunction(search2);
+
+  TableFunction search3("lance_search",
+                        {LogicalType::VARCHAR,
+                         LogicalType::LIST(LogicalType::FLOAT),
+                         LogicalType::BIGINT},
+                        LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
+                        LanceKnnLocalInit);
+  search3.named_parameters["vector_column"] = LogicalType::VARCHAR;
+  search3.named_parameters["k"] = LogicalType::BIGINT;
+  search3.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  search3.named_parameters["use_index"] = LogicalType::BOOLEAN;
+  search3.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
+  search3.projection_pushdown = true;
+  search3.filter_pushdown = true;
+  search3.filter_prune = true;
+  search3.pushdown_complex_filter = LancePushdownComplexFilter;
+  search3.to_string = LanceKnnToString;
+  search3.dynamic_to_string = LanceKnnDynamicToString;
+  loader.RegisterFunction(search3);
+
+  TableFunction search2_f64(
+      "lance_search",
+      {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::DOUBLE)},
+      LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
+      LanceKnnLocalInit);
+  search2_f64.named_parameters["vector_column"] = LogicalType::VARCHAR;
+  search2_f64.named_parameters["k"] = LogicalType::BIGINT;
+  search2_f64.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  search2_f64.named_parameters["use_index"] = LogicalType::BOOLEAN;
+  search2_f64.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
+  search2_f64.projection_pushdown = true;
+  search2_f64.filter_pushdown = true;
+  search2_f64.filter_prune = true;
+  search2_f64.pushdown_complex_filter = LancePushdownComplexFilter;
+  search2_f64.to_string = LanceKnnToString;
+  search2_f64.dynamic_to_string = LanceKnnDynamicToString;
+  loader.RegisterFunction(search2_f64);
+
+  TableFunction search3_f64("lance_search",
+                            {LogicalType::VARCHAR,
+                             LogicalType::LIST(LogicalType::DOUBLE),
+                             LogicalType::BIGINT},
+                            LanceKnnFunc, LanceSearchVectorBind,
+                            LanceKnnInitGlobal, LanceKnnLocalInit);
+  search3_f64.named_parameters["vector_column"] = LogicalType::VARCHAR;
+  search3_f64.named_parameters["k"] = LogicalType::BIGINT;
+  search3_f64.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  search3_f64.named_parameters["use_index"] = LogicalType::BOOLEAN;
+  search3_f64.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
+  search3_f64.projection_pushdown = true;
+  search3_f64.filter_pushdown = true;
+  search3_f64.filter_prune = true;
+  search3_f64.pushdown_complex_filter = LancePushdownComplexFilter;
+  search3_f64.to_string = LanceKnnToString;
+  search3_f64.dynamic_to_string = LanceKnnDynamicToString;
+  loader.RegisterFunction(search3_f64);
 }
 
 } // namespace duckdb
