@@ -12,11 +12,13 @@ namespace duckdb {
 
 // Forward declaration
 void RegisterLanceScan(ExtensionLoader &loader);
+void RegisterLanceKnn(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 
 static void LoadInternal(ExtensionLoader &loader) {
   // Register the lance_scan table function
   RegisterLanceScan(loader);
+  RegisterLanceKnn(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {

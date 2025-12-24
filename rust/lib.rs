@@ -8,6 +8,8 @@ use std::sync::Arc;
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow_array::Float32Array;
+use arrow_array::builder::Float32Builder;
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 
@@ -34,6 +36,80 @@ use error::{clear_last_error, set_last_error, ErrorCode};
 // Dataset operations - just holds the dataset
 struct DatasetHandle {
     dataset: Arc<Dataset>,
+}
+
+const DISTANCE_COLUMN: &str = "_distance";
+
+fn normalize_distance_column(batch: &RecordBatch) -> Result<RecordBatch, String> {
+    let schema = batch.schema();
+    let idx = match schema.index_of(DISTANCE_COLUMN) {
+        Ok(v) => v,
+        Err(_) => return Ok(batch.clone()),
+    };
+
+    let col = batch.column(idx);
+    if col.data_type() != &DataType::Float32 {
+        return Ok(batch.clone());
+    }
+
+    let col = col
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| "distance column is not Float32Array".to_string())?;
+
+    // Ensure the exported distance buffer has a simple, owned layout.
+    let mut builder = Float32Builder::with_capacity(col.len());
+    for i in 0..col.len() {
+        if col.is_null(i) {
+            builder.append_null();
+        } else {
+            builder.append_value(col.value(i));
+        }
+    }
+    let normalized = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+    let mut cols: Vec<Arc<dyn Array>> = batch.columns().iter().cloned().collect();
+    cols[idx] = normalized;
+
+    RecordBatch::try_new(schema.clone(), cols).map_err(|e| format!("{e}"))
+}
+
+fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> Result<&'a str, ()> {
+    if ptr.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, format!("{what} is null"));
+        return Err(());
+    }
+    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+            Err(())
+        }
+    }
+}
+
+fn slice_from_ptr<'a, T>(ptr: *const T, len: usize, what: &'static str) -> Result<&'a [T], ()> {
+    if ptr.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, format!("{what} is null"));
+        return Err(());
+    }
+    // SAFETY: Caller guarantees ptr points to at least len elements.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+fn build_default_knn_projection(dataset: &Dataset, vector_column: &str) -> Arc<[String]> {
+    let schema: Schema = dataset.schema().into();
+    // Exclude the vector column from the output by default. DuckDB's Arrow
+    // conversion can mis-handle FixedSizeList columns.
+    let mut cols = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if field.name() == vector_column {
+            continue;
+        }
+        cols.push(field.name().to_string());
+    }
+    cols.push(DISTANCE_COLUMN.to_string());
+    cols.into()
 }
 
 #[no_mangle]
@@ -247,6 +323,71 @@ pub unsafe extern "C" fn lance_schema_to_arrow(
     0
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_get_knn_schema(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    k: u64,
+    prefilter: u8,
+    use_index: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_knn_projection(&handle.dataset, vector_column);
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let k_usize = match usize::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+    if let Err(err) = scan.nearest(vector_column, &query, k_usize) {
+        set_last_error(ErrorCode::KnnSchema, format!("knn schema nearest: {err}"));
+        return ptr::null_mut();
+    }
+    scan.use_index(use_index != 0);
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(ErrorCode::KnnSchema, format!("knn schema project: {err}"));
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    let schema = match LanceStream::from_scanner(scan) {
+        Ok(stream) => stream.schema(),
+        Err(err) => {
+            set_last_error(ErrorCode::KnnSchema, format!("knn schema: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    clear_last_error();
+    Box::into_raw(Box::new(schema)) as *mut c_void
+}
+
 // Stream operations
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_void {
@@ -265,6 +406,91 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
         }
         Err(err) => {
             set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_knn_stream(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    k: u64,
+    filter_sql: *const c_char,
+    prefilter: u8,
+    use_index: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = if filter_sql.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_knn_projection(&handle.dataset, vector_column);
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        if let Err(err) = scan.filter(filter) {
+            set_last_error(ErrorCode::KnnStreamCreate, format!("knn scan filter: {err}"));
+            return ptr::null_mut();
+        }
+    }
+    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let k_usize = match usize::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+    if let Err(err) = scan.nearest(vector_column, &query, k_usize) {
+        set_last_error(ErrorCode::KnnStreamCreate, format!("knn scan nearest: {err}"));
+        return ptr::null_mut();
+    }
+    scan.use_index(use_index != 0);
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(ErrorCode::KnnStreamCreate, format!("knn scan project: {err}"));
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::KnnStreamCreate, format!("knn stream create: {err}"));
             ptr::null_mut()
         }
     }
@@ -562,9 +788,16 @@ pub unsafe extern "C" fn lance_batch_to_arrow(
     }
 
     let batch = unsafe { &*(batch as *const RecordBatch) };
+    let batch = match normalize_distance_column(batch) {
+        Ok(b) => b,
+        Err(err) => {
+            set_last_error(ErrorCode::BatchExport, format!("batch export: {err}"));
+            return -1;
+        }
+    };
 
     // Convert RecordBatch to StructArray for FFI export
-    let struct_array: Arc<dyn Array> = Arc::new(StructArray::from(batch.clone()));
+    let struct_array: Arc<dyn Array> = Arc::new(StructArray::from(batch));
 
     let data = struct_array.to_data();
     let array = FFI_ArrowArray::new(&data);

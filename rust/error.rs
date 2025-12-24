@@ -15,6 +15,8 @@ pub enum ErrorCode {
     StreamNext = 8,
     SchemaExport = 9,
     BatchExport = 10,
+    KnnSchema = 11,
+    KnnStreamCreate = 12,
 }
 
 struct LastError {

@@ -11,7 +11,7 @@ duckdb_unittest_tempdir/
 # Python
 __pycache__/
 *.py[cod]
-venv/
+.venv/
 .ropeproject/
 
 # IDE
@@ -21,10 +21,6 @@ venv/
 *.swo
 *~
 .DS_Store
-
-# Test data
-test/data/*.lance
-test/data/*.parquet
 
 # Temporary files
 *.tmp
