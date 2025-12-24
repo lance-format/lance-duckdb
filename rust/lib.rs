@@ -123,6 +123,33 @@ fn slice_from_ptr<'a, T>(ptr: *const T, len: usize, what: &'static str) -> Resul
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
+fn parse_optional_filter_ir(
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    code: ErrorCode,
+    what: &'static str,
+) -> Result<Option<datafusion_expr::Expr>, ()> {
+    if filter_ir_len == 0 {
+        return Ok(None);
+    }
+    if filter_ir.is_null() {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            format!("{what} is null with non-zero length"),
+        );
+        return Err(());
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(filter_ir, filter_ir_len) };
+    match crate::filter_ir::parse_filter_ir(bytes) {
+        Ok(v) => Ok(Some(v)),
+        Err(err) => {
+            set_last_error(code, format!("{what} parse: {err}"));
+            Err(())
+        }
+    }
+}
+
 fn build_default_knn_projection(dataset: &Dataset, vector_column: &str) -> Arc<[String]> {
     let schema: Schema = dataset.schema().into();
     // Exclude the vector column from the output by default. DuckDB's Arrow
@@ -637,6 +664,94 @@ pub unsafe extern "C" fn lance_explain_knn_scan(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lance_explain_knn_scan_ir(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    k: u64,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    prefilter: u8,
+    use_index: u8,
+    verbose: u8,
+) -> *const c_char {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null(),
+    };
+
+    let filter = match parse_optional_filter_ir(filter_ir, filter_ir_len, ErrorCode::ExplainPlan, "knn filter_ir") {
+        Ok(v) => v,
+        Err(()) => return ptr::null(),
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_knn_projection(&handle.dataset, vector_column);
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        scan.filter_expr(filter);
+    }
+    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let k_usize = match usize::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null();
+        }
+    };
+    if let Err(err) = scan.nearest(vector_column, &query, k_usize) {
+        set_last_error(ErrorCode::ExplainPlan, format!("knn scan nearest: {err}"));
+        return ptr::null();
+    }
+    scan.use_index(use_index != 0);
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(ErrorCode::ExplainPlan, format!("knn scan project: {err}"));
+        return ptr::null();
+    }
+    scan.scan_in_order(false);
+
+    let plan = match runtime::block_on(scan.explain_plan(verbose != 0)) {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::ExplainPlan,
+                format!("knn scan explain_plan: {err}"),
+            );
+            return ptr::null();
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            return ptr::null();
+        }
+    };
+
+    let out = match std::ffi::CString::new(plan.as_str()) {
+        Ok(v) => v,
+        Err(_) => std::ffi::CString::new(plan.replace('\0', "\\0"))
+            .unwrap_or_else(|_| std::ffi::CString::new("invalid plan").unwrap()),
+    };
+    clear_last_error();
+    out.into_raw() as *const c_char
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lance_create_knn_stream(
     dataset: *mut c_void,
     vector_column: *const c_char,
@@ -691,6 +806,95 @@ pub unsafe extern "C" fn lance_create_knn_stream(
             );
             return ptr::null_mut();
         }
+    }
+    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let k_usize = match usize::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+    if let Err(err) = scan.nearest(vector_column, &query, k_usize) {
+        set_last_error(
+            ErrorCode::KnnStreamCreate,
+            format!("knn scan nearest: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.use_index(use_index != 0);
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(
+            ErrorCode::KnnStreamCreate,
+            format!("knn scan project: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(
+                ErrorCode::KnnStreamCreate,
+                format!("knn stream create: {err}"),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_knn_stream_ir(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    k: u64,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    prefilter: u8,
+    use_index: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = match parse_optional_filter_ir(
+        filter_ir,
+        filter_ir_len,
+        ErrorCode::KnnStreamCreate,
+        "knn filter_ir",
+    ) {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_knn_projection(&handle.dataset, vector_column);
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        scan.filter_expr(filter);
     }
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     let k_usize = match usize::try_from(k) {
@@ -1123,6 +1327,97 @@ pub unsafe extern "C" fn lance_create_fts_stream(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_fts_stream_ir(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    prefilter: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query = match cstr_to_str(query, "query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = match parse_optional_filter_ir(
+        filter_ir,
+        filter_ir_len,
+        ErrorCode::FtsStreamCreate,
+        "fts filter_ir",
+    ) {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let k_i64 = match i64::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_fts_projection(&handle.dataset);
+
+    let fts_query =
+        match FullTextSearchQuery::new(query.to_string()).with_column(text_column.to_string()) {
+            Ok(v) => v.limit(Some(k_i64)),
+            Err(err) => {
+                set_last_error(ErrorCode::FtsStreamCreate, format!("fts query: {err}"));
+                return ptr::null_mut();
+            }
+        };
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        scan.filter_expr(filter);
+    }
+    if let Err(err) = scan.full_text_search(fts_query) {
+        set_last_error(
+            ErrorCode::FtsStreamCreate,
+            format!("fts scan search: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(
+            ErrorCode::FtsStreamCreate,
+            format!("fts scan project: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(
+                ErrorCode::FtsStreamCreate,
+                format!("fts stream create: {err}"),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
 fn normalize_range(values: &[f32]) -> (f32, f32) {
     let mut min_v = f32::INFINITY;
     let mut max_v = f32::NEG_INFINITY;
@@ -1187,59 +1482,47 @@ pub unsafe extern "C" fn lance_get_hybrid_schema(dataset: *mut c_void) -> *mut c
     Box::into_raw(Box::new(Arc::new(Schema::new(fields)))) as *mut c_void
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn lance_create_hybrid_stream(
-    dataset: *mut c_void,
-    vector_column: *const c_char,
-    query_values: *const f32,
-    query_len: usize,
-    text_column: *const c_char,
-    text_query: *const c_char,
+enum HybridFilter {
+    Sql(String),
+    Expr(datafusion_expr::Expr),
+}
+
+fn apply_hybrid_filter(
+    scan: &mut lance::dataset::scanner::Scanner,
+    filter: Option<&HybridFilter>,
+    context: &'static str,
+) -> Result<(), ()> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+
+    match filter {
+        HybridFilter::Sql(sql) => match scan.filter(sql.as_str()) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                set_last_error(ErrorCode::HybridStreamCreate, format!("{context} filter: {err}"));
+                Err(())
+            }
+        },
+        HybridFilter::Expr(expr) => {
+            scan.filter_expr(expr.clone());
+            Ok(())
+        }
+    }
+}
+
+fn create_hybrid_stream_impl(
+    handle: &DatasetHandle,
+    vector_column: &str,
+    query_values: &[f32],
+    text_column: &str,
+    text_query: &str,
     k: u64,
-    filter_sql: *const c_char,
+    filter: Option<HybridFilter>,
     prefilter: u8,
     alpha: f32,
     oversample_factor: u32,
 ) -> *mut c_void {
-    if dataset.is_null() {
-        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
-        return ptr::null_mut();
-    }
-    if query_len == 0 {
-        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
-        return ptr::null_mut();
-    }
-
-    let vector_column = match cstr_to_str(vector_column, "vector_column") {
-        Ok(v) => v,
-        Err(()) => return ptr::null_mut(),
-    };
-    let text_column = match cstr_to_str(text_column, "text_column") {
-        Ok(v) => v,
-        Err(()) => return ptr::null_mut(),
-    };
-    let text_query = match cstr_to_str(text_query, "text_query") {
-        Ok(v) => v,
-        Err(()) => return ptr::null_mut(),
-    };
-    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
-        Ok(v) => v,
-        Err(()) => return ptr::null_mut(),
-    };
-
-    let filter = if filter_sql.is_null() {
-        None
-    } else {
-        match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
-            Ok(v) if !v.is_empty() => Some(v),
-            Ok(_) => None,
-            Err(err) => {
-                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
-                return ptr::null_mut();
-            }
-        }
-    };
-
     let k_usize = match usize::try_from(k) {
         Ok(v) if v > 0 => v,
         Ok(_) => {
@@ -1252,22 +1535,17 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
         }
     };
 
-    let handle = unsafe { &*(dataset as *const DatasetHandle) };
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     let oversample = k_usize
         .saturating_mul(oversample_factor.max(1) as usize)
         .max(k_usize);
 
+    let filter = filter.as_ref();
+
     let mut vector_scan = handle.dataset.scan();
     vector_scan.prefilter(prefilter != 0);
-    if let Some(filter) = filter {
-        if let Err(err) = vector_scan.filter(filter) {
-            set_last_error(
-                ErrorCode::HybridStreamCreate,
-                format!("hybrid vector filter: {err}"),
-            );
-            return ptr::null_mut();
-        }
+    if apply_hybrid_filter(&mut vector_scan, filter, "hybrid vector").is_err() {
+        return ptr::null_mut();
     }
     if let Err(err) = vector_scan.nearest(vector_column, &query, oversample) {
         set_last_error(
@@ -1323,8 +1601,14 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
                         return ptr::null_mut();
                     }
                 };
-                let rowids = batch.column(idx_rowid).as_any().downcast_ref::<arrow_array::UInt64Array>();
-                let dists = batch.column(idx_dist).as_any().downcast_ref::<Float32Array>();
+                let rowids = batch
+                    .column(idx_rowid)
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>();
+                let dists = batch
+                    .column(idx_dist)
+                    .as_any()
+                    .downcast_ref::<Float32Array>();
                 let (Some(rowids), Some(dists)) = (rowids, dists) else {
                     set_last_error(
                         ErrorCode::HybridStreamCreate,
@@ -1350,27 +1634,22 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
         }
     }
 
-    let fts_query = match FullTextSearchQuery::new(text_query.to_string()).with_column(text_column.to_string()) {
-        Ok(v) => v.limit(Some(oversample as i64)),
-        Err(err) => {
-            set_last_error(
-                ErrorCode::HybridStreamCreate,
-                format!("hybrid fts query: {err}"),
-            );
-            return ptr::null_mut();
-        }
-    };
+    let fts_query =
+        match FullTextSearchQuery::new(text_query.to_string()).with_column(text_column.to_string()) {
+            Ok(v) => v.limit(Some(oversample as i64)),
+            Err(err) => {
+                set_last_error(
+                    ErrorCode::HybridStreamCreate,
+                    format!("hybrid fts query: {err}"),
+                );
+                return ptr::null_mut();
+            }
+        };
 
     let mut fts_scan = handle.dataset.scan();
     fts_scan.prefilter(prefilter != 0);
-    if let Some(filter) = filter {
-        if let Err(err) = fts_scan.filter(filter) {
-            set_last_error(
-                ErrorCode::HybridStreamCreate,
-                format!("hybrid fts filter: {err}"),
-            );
-            return ptr::null_mut();
-        }
+    if apply_hybrid_filter(&mut fts_scan, filter, "hybrid fts").is_err() {
+        return ptr::null_mut();
     }
     if let Err(err) = fts_scan.full_text_search(fts_query) {
         set_last_error(
@@ -1425,8 +1704,14 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
                         return ptr::null_mut();
                     }
                 };
-                let rowids = batch.column(idx_rowid).as_any().downcast_ref::<arrow_array::UInt64Array>();
-                let scores = batch.column(idx_score).as_any().downcast_ref::<Float32Array>();
+                let rowids = batch
+                    .column(idx_rowid)
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>();
+                let scores = batch
+                    .column(idx_score)
+                    .as_any()
+                    .downcast_ref::<Float32Array>();
                 let (Some(rowids), Some(scores)) = (rowids, scores) else {
                     set_last_error(
                         ErrorCode::HybridStreamCreate,
@@ -1480,8 +1765,15 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
         .collect();
 
     ranked.sort_by(|a, b| {
-        b.3.partial_cmp(&a.3)
-            .unwrap_or_else(|| if b.3.is_nan() && a.3.is_nan() { Ordering::Equal } else if b.3.is_nan() { Ordering::Less } else { Ordering::Greater })
+        b.3.partial_cmp(&a.3).unwrap_or_else(|| {
+            if b.3.is_nan() && a.3.is_nan() {
+                Ordering::Equal
+            } else if b.3.is_nan() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        })
     });
     ranked.truncate(k_usize);
 
@@ -1567,6 +1859,141 @@ pub unsafe extern "C" fn lance_create_hybrid_stream(
 
     clear_last_error();
     Box::into_raw(Box::new(StreamHandle::Batches(vec![rows]))) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_hybrid_stream(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    text_column: *const c_char,
+    text_query: *const c_char,
+    k: u64,
+    filter_sql: *const c_char,
+    prefilter: u8,
+    alpha: f32,
+    oversample_factor: u32,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_query = match cstr_to_str(text_query, "text_query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = if filter_sql.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let filter_hybrid = filter.map(|v| HybridFilter::Sql(v.to_string()));
+    return create_hybrid_stream_impl(
+        handle,
+        vector_column,
+        query_values,
+        text_column,
+        text_query,
+        k,
+        filter_hybrid,
+        prefilter,
+        alpha,
+        oversample_factor,
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    text_column: *const c_char,
+    text_query: *const c_char,
+    k: u64,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    prefilter: u8,
+    alpha: f32,
+    oversample_factor: u32,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_query = match cstr_to_str(text_query, "text_query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = match parse_optional_filter_ir(
+        filter_ir,
+        filter_ir_len,
+        ErrorCode::HybridStreamCreate,
+        "hybrid filter_ir",
+    ) {
+        Ok(v) => v.map(HybridFilter::Expr),
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    create_hybrid_stream_impl(
+        handle,
+        vector_column,
+        query_values,
+        text_column,
+        text_query,
+        k,
+        filter,
+        prefilter,
+        alpha,
+        oversample_factor,
+    )
 }
 
 #[no_mangle]

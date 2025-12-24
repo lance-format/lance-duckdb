@@ -12,6 +12,8 @@ test-env LANCE_S3_BUCKET lance-test
 
 test-env LANCE_S3_DATASET_PREFIX test_data.lance
 
+test-env LANCE_S3_SEARCH_DATASET_PREFIX search_test_data.lance
+
 test-env LANCE_S3_ACCESS_KEY_ID minioadmin
 
 test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
@@ -41,3 +43,39 @@ query I
 SELECT count(*) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_DATASET_PREFIX}';
 ----
 5
+
+query I
+SELECT count(*) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}';
+----
+5
+
+query I
+SELECT count(*) FROM lance_search(
+  's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}',
+  'puppy',
+  text_column = 'text',
+  k = 10
+);
+----
+2
+
+query I
+SELECT id
+FROM lance_search(
+  's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}',
+  lance_hybrid_query(
+    [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+    'puppy',
+    'vec',
+    'text',
+    0.5,
+    4
+  ),
+  k = 3,
+  prefilter = false
+)
+ORDER BY _hybrid_score DESC;
+----
+1
+3
+2

@@ -10,7 +10,8 @@ project(${TARGET_NAME})
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
-                      src/lance_knn.cpp src/lance_fts.cpp
+                      src/lance_knn.cpp src/lance_fts.cpp src/lance_common.cpp
+                      src/lance_filter_ir.cpp
                       src/lance_replacement.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -107,6 +108,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
     ${CMAKE_CURRENT_LIST_DIR}/rust/error.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)

@@ -3,7 +3,6 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
@@ -15,11 +14,14 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
+
+#include "lance_common.hpp"
+#include "lance_ffi.hpp"
+#include "lance_filter_ir.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -28,72 +30,11 @@
 #include <limits>
 #include <mutex>
 
-extern "C" {
-void *lance_open_dataset(const char *path);
-void lance_close_dataset(void *dataset);
-
-void *lance_get_schema(void *dataset);
-void *lance_get_knn_schema(void *dataset, const char *vector_column,
-                           const float *query_values, size_t query_len,
-                           uint64_t k, uint8_t prefilter, uint8_t use_index);
-void lance_free_schema(void *schema);
-int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
-
-void *lance_create_knn_stream(void *dataset, const char *vector_column,
-                              const float *query_values, size_t query_len,
-                              uint64_t k, const char *filter_sql,
-                              uint8_t prefilter, uint8_t use_index);
-int32_t lance_stream_next(void *stream, void **out_batch);
-void lance_close_stream(void *stream);
-
-int32_t lance_last_error_code();
-const char *lance_last_error_message();
-void lance_free_string(const char *s);
-
-const char *lance_explain_knn_scan(void *dataset, const char *vector_column,
-                                   const float *query_values, size_t query_len,
-                                   uint64_t k, const char *filter_sql,
-                                   uint8_t prefilter, uint8_t use_index,
-                                   uint8_t verbose);
-
-void lance_free_batch(void *batch);
-int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
-                             ArrowSchema *out_schema);
-}
-
 namespace duckdb {
-
-static string LanceConsumeLastError() {
-  auto code = lance_last_error_code();
-  string message;
-  if (auto *ptr = lance_last_error_message()) {
-    message = ptr;
-    lance_free_string(ptr);
-  }
-
-  if (code == 0 && message.empty()) {
-    return "";
-  }
-  if (message.empty()) {
-    return "code=" + to_string(code);
-  }
-  if (code == 0) {
-    return message;
-  }
-  return message + " (code=" + to_string(code) + ")";
-}
-
-static string LanceFormatErrorSuffix() {
-  auto err = LanceConsumeLastError();
-  if (err.empty()) {
-    return "";
-  }
-  return " (Lance error: " + err + ")";
-}
 
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
-                               const string &filter_sql, bool prefilter,
+                               const string *filter_ir, bool prefilter,
                                bool use_index, bool verbose, string &out_plan,
                                string &out_error) {
   out_plan.clear();
@@ -108,10 +49,16 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
     return false;
   }
 
-  auto filter_ptr = filter_sql.empty() ? nullptr : filter_sql.c_str();
-  auto *plan_ptr = lance_explain_knn_scan(
+  const uint8_t *filter_ptr = nullptr;
+  size_t filter_len = 0;
+  if (filter_ir && !filter_ir->empty()) {
+    filter_ptr = reinterpret_cast<const uint8_t *>(filter_ir->data());
+    filter_len = filter_ir->size();
+  }
+
+  auto *plan_ptr = lance_explain_knn_scan_ir(
       dataset, vector_column.c_str(), query.data(), query.size(), k, filter_ptr,
-      prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
+      filter_len, prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -188,358 +135,6 @@ static vector<float> ParseQueryVector(const Value &value) {
   return out;
 }
 
-static string EscapeLanceColumnName(const string &name) {
-  string result;
-  idx_t start = 0;
-  for (idx_t i = 0; i <= name.size(); i++) {
-    if (i == name.size() || name[i] == '.') {
-      auto segment = name.substr(start, i - start);
-      if (!result.empty()) {
-        result += ".";
-      }
-      result += "`";
-      result += StringUtil::Replace(segment, "`", "``");
-      result += "`";
-      start = i + 1;
-    }
-  }
-  return result;
-}
-
-static bool IsComputedSearchColumn(const string &name) {
-  return name == "_distance" || name == "_score" || name == "_hybrid_score";
-}
-
-static bool LanceFilterPushdownSupported(const TableFilter &filter) {
-  switch (filter.filter_type) {
-  case TableFilterType::CONSTANT_COMPARISON:
-  case TableFilterType::IS_NULL:
-  case TableFilterType::IS_NOT_NULL:
-  case TableFilterType::IN_FILTER:
-    return true;
-  case TableFilterType::CONJUNCTION_AND: {
-    auto &f = filter.Cast<ConjunctionAndFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  case TableFilterType::CONJUNCTION_OR: {
-    auto &f = filter.Cast<ConjunctionOrFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  default:
-    return false;
-  }
-}
-
-static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
-  switch (type.id()) {
-  case LogicalTypeId::BOOLEAN:
-  case LogicalTypeId::TINYINT:
-  case LogicalTypeId::SMALLINT:
-  case LogicalTypeId::INTEGER:
-  case LogicalTypeId::BIGINT:
-  case LogicalTypeId::UTINYINT:
-  case LogicalTypeId::USMALLINT:
-  case LogicalTypeId::UINTEGER:
-  case LogicalTypeId::UBIGINT:
-  case LogicalTypeId::FLOAT:
-  case LogicalTypeId::DOUBLE:
-  case LogicalTypeId::VARCHAR:
-    return true;
-  default:
-    return false;
-  }
-}
-
-struct LanceFilterBuildResult {
-  string pushed_sql;
-  bool all_filters_pushed = true;
-  bool all_prefilterable_filters_pushed = true;
-};
-
-static LanceFilterBuildResult
-BuildLanceFilterSQL(const vector<string> &names,
-                    const vector<LogicalType> &types,
-                    const TableFunctionInitInput &input) {
-  LanceFilterBuildResult result;
-  if (!input.filters || input.filters->filters.empty()) {
-    return result;
-  }
-
-  vector<string> predicates;
-  predicates.reserve(input.filters->filters.size());
-
-  for (auto &it : input.filters->filters) {
-    auto scan_col_idx = it.first;
-    auto &filter = *it.second;
-    if (scan_col_idx >= input.column_ids.size()) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    auto col_id = input.column_ids[scan_col_idx];
-    if (col_id >= names.size() || col_id >= types.size()) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    if (IsComputedSearchColumn(names[col_id])) {
-      result.all_filters_pushed = false;
-      continue;
-    }
-
-    if (!LanceFilterPushdownSupported(filter) ||
-        !LanceSupportsPushdownLogicalType(types[col_id])) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    auto col_name = EscapeLanceColumnName(names[col_id]);
-    predicates.push_back(filter.ToString(col_name));
-  }
-
-  if (!predicates.empty()) {
-    result.pushed_sql = StringUtil::Join(predicates, " AND ");
-  }
-  return result;
-}
-
-static bool TrySerializeLanceLiteral(const Value &value, string &out_sql) {
-  if (value.IsNull()) {
-    out_sql = "NULL";
-    return true;
-  }
-  switch (value.type().id()) {
-  case LogicalTypeId::BOOLEAN:
-    out_sql = value.GetValue<bool>() ? "TRUE" : "FALSE";
-    return true;
-  case LogicalTypeId::TINYINT:
-  case LogicalTypeId::SMALLINT:
-  case LogicalTypeId::INTEGER:
-  case LogicalTypeId::BIGINT:
-    out_sql = to_string(value.GetValue<int64_t>());
-    return true;
-  case LogicalTypeId::UTINYINT:
-  case LogicalTypeId::USMALLINT:
-  case LogicalTypeId::UINTEGER:
-  case LogicalTypeId::UBIGINT:
-    out_sql = to_string(value.GetValue<uint64_t>());
-    return true;
-  case LogicalTypeId::FLOAT: {
-    auto v = value.GetValue<float>();
-    if (!std::isfinite(v)) {
-      return false;
-    }
-    out_sql = to_string(v);
-    return true;
-  }
-  case LogicalTypeId::DOUBLE: {
-    auto v = value.GetValue<double>();
-    if (!std::isfinite(v)) {
-      return false;
-    }
-    out_sql = to_string(v);
-    return true;
-  }
-  case LogicalTypeId::VARCHAR: {
-    auto v = value.GetValue<string>();
-    out_sql = "'";
-    out_sql += StringUtil::Replace(v, "'", "''");
-    out_sql += "'";
-    return true;
-  }
-  default:
-    return false;
-  }
-}
-
-static bool TrySerializeLanceColumnRef(const LogicalGet &get,
-                                       const vector<string> &names,
-                                       const vector<LogicalType> &types,
-                                       const Expression &expr,
-                                       string &out_sql) {
-  if (expr.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
-    return false;
-  }
-  auto &colref = expr.Cast<BoundColumnRefExpression>();
-  if (colref.depth != 0) {
-    return false;
-  }
-  if (colref.binding.table_index != get.table_index) {
-    return false;
-  }
-  auto &column_ids = get.GetColumnIds();
-  if (colref.binding.column_index >= column_ids.size()) {
-    return false;
-  }
-  auto &col_index = column_ids[colref.binding.column_index];
-  if (col_index.IsVirtualColumn()) {
-    return false;
-  }
-  if (!col_index.GetChildIndexes().empty()) {
-    return false;
-  }
-  auto col_id = col_index.GetPrimaryIndex();
-  if (col_id >= names.size() || col_id >= types.size()) {
-    return false;
-  }
-  if (IsComputedSearchColumn(names[col_id])) {
-    return false;
-  }
-  if (!LanceSupportsPushdownLogicalType(types[col_id])) {
-    return false;
-  }
-  out_sql = EscapeLanceColumnName(names[col_id]);
-  return true;
-}
-
-static bool TrySerializeLanceExpr(const LogicalGet &get,
-                                  const vector<string> &names,
-                                  const vector<LogicalType> &types,
-                                  const Expression &expr, string &out_sql) {
-  switch (expr.expression_class) {
-  case ExpressionClass::BOUND_COLUMN_REF:
-    return TrySerializeLanceColumnRef(get, names, types, expr, out_sql);
-  case ExpressionClass::BOUND_CONSTANT: {
-    auto &c = expr.Cast<BoundConstantExpression>();
-    return TrySerializeLanceLiteral(c.value, out_sql);
-  }
-  case ExpressionClass::BOUND_CAST: {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (cast.try_cast) {
-      return false;
-    }
-    if (cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
-      return false;
-    }
-    auto &c = cast.child->Cast<BoundConstantExpression>();
-    return TrySerializeLanceLiteral(c.value, out_sql);
-  }
-  case ExpressionClass::BOUND_COMPARISON: {
-    auto &cmp = expr.Cast<BoundComparisonExpression>();
-    if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
-        cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      return false;
-    }
-    string lhs, rhs;
-    if (!TrySerializeLanceExpr(get, names, types, *cmp.left, lhs) ||
-        !TrySerializeLanceExpr(get, names, types, *cmp.right, rhs)) {
-      return false;
-    }
-    out_sql =
-        "(" + lhs + " " + ExpressionTypeToOperator(cmp.type) + " " + rhs + ")";
-    return true;
-  }
-  case ExpressionClass::BOUND_CONJUNCTION: {
-    auto &conj = expr.Cast<BoundConjunctionExpression>();
-    const char *op = nullptr;
-    if (conj.type == ExpressionType::CONJUNCTION_AND) {
-      op = " AND ";
-    } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
-      op = " OR ";
-    } else {
-      return false;
-    }
-    vector<string> parts;
-    parts.reserve(conj.children.size());
-    for (auto &child : conj.children) {
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *child, child_sql)) {
-        return false;
-      }
-      parts.push_back(std::move(child_sql));
-    }
-    out_sql = "(" + StringUtil::Join(parts, op) + ")";
-    return true;
-  }
-  case ExpressionClass::BOUND_OPERATOR: {
-    auto &op = expr.Cast<BoundOperatorExpression>();
-    if (op.type == ExpressionType::OPERATOR_NOT) {
-      if (op.children.size() != 1) {
-        return false;
-      }
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *op.children[0],
-                                 child_sql)) {
-        return false;
-      }
-      out_sql = "(NOT " + child_sql + ")";
-      return true;
-    }
-    if (op.type == ExpressionType::OPERATOR_IS_NULL ||
-        op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-      if (op.children.size() != 1) {
-        return false;
-      }
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *op.children[0],
-                                 child_sql)) {
-        return false;
-      }
-      out_sql = "(" + child_sql +
-                (op.type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)"
-                                                             : " IS NOT NULL)");
-      return true;
-    }
-    if (op.type == ExpressionType::COMPARE_IN ||
-        op.type == ExpressionType::COMPARE_NOT_IN) {
-      if (op.children.size() < 2) {
-        return false;
-      }
-      string lhs_sql;
-      if (!TrySerializeLanceExpr(get, names, types, *op.children[0], lhs_sql)) {
-        return false;
-      }
-      vector<string> values;
-      values.reserve(op.children.size() - 1);
-      for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class !=
-            ExpressionClass::BOUND_CONSTANT) {
-          return false;
-        }
-        auto &c = op.children[i]->Cast<BoundConstantExpression>();
-        string lit;
-        if (!TrySerializeLanceLiteral(c.value, lit)) {
-          return false;
-        }
-        values.push_back(std::move(lit));
-      }
-      out_sql =
-          "(" + lhs_sql +
-          (op.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") +
-          StringUtil::Join(values, ", ") + "))";
-      return true;
-    }
-    return false;
-  }
-  case ExpressionClass::BOUND_BETWEEN: {
-    auto &between = expr.Cast<BoundBetweenExpression>();
-    string input_sql, lower_sql, upper_sql;
-    if (!TrySerializeLanceExpr(get, names, types, *between.input, input_sql) ||
-        !TrySerializeLanceExpr(get, names, types, *between.lower, lower_sql) ||
-        !TrySerializeLanceExpr(get, names, types, *between.upper, upper_sql)) {
-      return false;
-    }
-    auto lower_op = ExpressionTypeToOperator(between.LowerComparisonType());
-    auto upper_op = ExpressionTypeToOperator(between.UpperComparisonType());
-    out_sql = "((" + input_sql + " " + lower_op + " " + lower_sql + ") AND (" +
-              input_sql + " " + upper_op + " " + upper_sql + "))";
-    return true;
-  }
-  default:
-    return false;
-  }
-}
-
 struct LanceKnnBindData : public TableFunctionData {
   string file_path;
   string vector_column;
@@ -555,7 +150,7 @@ struct LanceKnnBindData : public TableFunctionData {
   vector<string> names;
   vector<LogicalType> types;
 
-  string lance_complex_filter_sql;
+  vector<string> lance_pushed_filter_ir_parts;
 
   ~LanceKnnBindData() override {
     if (dataset) {
@@ -568,8 +163,9 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
   std::atomic<idx_t> record_batches{0};
   std::atomic<idx_t> record_batch_rows{0};
-  string lance_filter_sql;
+  string lance_filter_ir;
   bool filter_pushed_down = false;
+  std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
@@ -610,30 +206,17 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
   }
   auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
 
-  vector<string> predicates;
-  predicates.reserve(filters.size());
   for (auto &expr : filters) {
     if (!expr || expr->HasParameter() || expr->IsVolatile() ||
         expr->CanThrow()) {
       continue;
     }
-    string sql;
-    if (!TrySerializeLanceExpr(get, scan_bind.names, scan_bind.types, *expr,
-                               sql)) {
+    string filter_ir;
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
+                                   *expr, filter_ir)) {
       continue;
     }
-    predicates.push_back(std::move(sql));
-  }
-
-  if (predicates.empty()) {
-    return;
-  }
-  auto pushed_sql = StringUtil::Join(predicates, " AND ");
-  if (scan_bind.lance_complex_filter_sql.empty()) {
-    scan_bind.lance_complex_filter_sql = std::move(pushed_sql);
-  } else {
-    scan_bind.lance_complex_filter_sql =
-        "(" + scan_bind.lance_complex_filter_sql + ") AND (" + pushed_sql + ")";
+    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
   }
 }
 
@@ -679,7 +262,7 @@ static unique_ptr<FunctionData> LanceKnnBind(ClientContext &context,
     result->use_index = input.inputs[5].GetValue<bool>();
   }
 
-  result->dataset = lance_open_dataset(result->file_path.c_str());
+  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -833,7 +416,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  result->dataset = lance_open_dataset(result->file_path.c_str());
+  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -898,24 +481,37 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  auto filter_build =
-      BuildLanceFilterSQL(bind_data.names, bind_data.types, input);
-  if (bind_data.prefilter && !filter_build.all_prefilterable_filters_pushed) {
+  auto table_filters =
+      BuildLanceTableFilterIRParts(bind_data.names, bind_data.types, input, true);
+  if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException(
         "lance_knn requires filter pushdown for prefilterable columns when "
         "prefilter=true");
   }
 
-  if (bind_data.lance_complex_filter_sql.empty()) {
-    global.lance_filter_sql = std::move(filter_build.pushed_sql);
-  } else if (filter_build.pushed_sql.empty()) {
-    global.lance_filter_sql = bind_data.lance_complex_filter_sql;
-  } else {
-    global.lance_filter_sql = "(" + bind_data.lance_complex_filter_sql +
-                              ") AND (" + filter_build.pushed_sql + ")";
+  bool has_table_filter_parts = !table_filters.parts.empty();
+  auto filter_parts = std::move(table_filters.parts);
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    filter_parts.reserve(filter_parts.size() +
+                         bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      filter_parts.push_back(part);
+    }
+  }
+
+  string filter_ir_msg;
+  if (!filter_parts.empty()) {
+    if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
+      filter_ir_msg.clear();
+    }
+    global.lance_filter_ir = std::move(filter_ir_msg);
+  }
+  if (bind_data.prefilter && has_table_filter_parts &&
+      global.lance_filter_ir.empty()) {
+    throw IOException("Failed to encode Lance filter IR");
   }
   global.filter_pushed_down =
-      filter_build.all_filters_pushed && !global.lance_filter_sql.empty();
+      table_filters.all_filters_pushed && !global.lance_filter_ir.empty();
   return state;
 }
 
@@ -935,11 +531,27 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
 
-  result->stream = lance_create_knn_stream(
+  const uint8_t *filter_ir = global.lance_filter_ir.empty()
+                                 ? nullptr
+                                 : reinterpret_cast<const uint8_t *>(
+                                       global.lance_filter_ir.data());
+  auto filter_ir_len = global.lance_filter_ir.size();
+  result->stream = lance_create_knn_stream_ir(
       bind_data.dataset, bind_data.vector_column.c_str(),
       bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      global.lance_filter_sql.c_str(), bind_data.prefilter ? 1 : 0,
+      filter_ir, filter_ir_len, bind_data.prefilter ? 1 : 0,
       bind_data.use_index ? 1 : 0);
+  if (!result->stream && filter_ir && !bind_data.prefilter) {
+    // Best-effort: if filter pushdown failed, retry without it and rely on
+    // DuckDB-side filter execution for correctness.
+    global.filter_pushdown_fallbacks.fetch_add(1);
+    global.filter_pushed_down = false;
+    result->filter_pushed_down = false;
+    result->stream = lance_create_knn_stream_ir(
+        bind_data.dataset, bind_data.vector_column.c_str(),
+        bind_data.query.data(), bind_data.query.size(), bind_data.k, nullptr, 0,
+        bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+  }
   if (!result->stream) {
     throw IOException("Failed to create Lance KNN stream" +
                       LanceFormatErrorSuffix());
@@ -992,40 +604,6 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
   local_state.chunk = std::move(new_chunk);
   local_state.Reset();
   return true;
-}
-
-static void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
-                               DataChunk &chunk, SelectionVector &sel) {
-  if (chunk.size() == 0) {
-    return;
-  }
-  unique_ptr<Expression> combined;
-  for (auto &it : filters.filters) {
-    auto scan_col_idx = it.first;
-    if (scan_col_idx >= chunk.ColumnCount()) {
-      continue;
-    }
-    BoundReferenceExpression col_expr(chunk.data[scan_col_idx].GetType(),
-                                      NumericCast<storage_t>(scan_col_idx));
-    auto expr = it.second->ToExpression(col_expr);
-    if (!combined) {
-      combined = std::move(expr);
-    } else {
-      auto conj = make_uniq<BoundConjunctionExpression>(
-          ExpressionType::CONJUNCTION_AND);
-      conj->children.push_back(std::move(combined));
-      conj->children.push_back(std::move(expr));
-      combined = std::move(conj);
-    }
-  }
-  if (!combined) {
-    return;
-  }
-  ExpressionExecutor executor(context, *combined);
-  auto selected = executor.SelectExpression(chunk, sel);
-  if (selected != chunk.size()) {
-    chunk.Slice(sel, selected);
-  }
 }
 
 static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
@@ -1099,15 +677,21 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   result["Lance Explain Verbose"] =
       bind_data.explain_verbose ? "true" : "false";
 
-  if (!bind_data.lance_complex_filter_sql.empty()) {
-    result["Lance Filter SQL (Bind)"] = bind_data.lance_complex_filter_sql;
+  result["Lance Pushed Filter Parts"] =
+      to_string(bind_data.lance_pushed_filter_ir_parts.size());
+  string filter_ir_msg;
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    TryEncodeLanceFilterIRMessage(bind_data.lance_pushed_filter_ir_parts,
+                                  filter_ir_msg);
   }
+  result["Lance Filter IR Bytes (Bind)"] = to_string(filter_ir_msg.size());
 
   string plan;
   string error;
   if (TryLanceExplainKnn(
           bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k, bind_data.lance_complex_filter_sql, bind_data.prefilter,
+          bind_data.k,
+          filter_ir_msg.empty() ? nullptr : &filter_ir_msg, bind_data.prefilter,
           bind_data.use_index, bind_data.explain_verbose, plan, error)) {
     result["Lance Plan (Bind)"] = plan;
   } else if (!error.empty()) {
@@ -1134,9 +718,9 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
 
   result["Lance Filter Pushed Down"] =
       global_state.filter_pushed_down ? "true" : "false";
-  if (!global_state.lance_filter_sql.empty()) {
-    result["Lance Filter SQL"] = global_state.lance_filter_sql;
-  }
+  result["Lance Filter Pushdown Fallbacks"] =
+      to_string(global_state.filter_pushdown_fallbacks.load());
+  result["Lance Filter IR Bytes"] = to_string(global_state.lance_filter_ir.size());
 
   result["Lance Record Batches"] =
       to_string(global_state.record_batches.load());
@@ -1151,7 +735,9 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
       string error;
       auto ok = TryLanceExplainKnn(
           bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k, global_state.lance_filter_sql, bind_data.prefilter,
+          bind_data.k,
+          global_state.lance_filter_ir.empty() ? nullptr : &global_state.lance_filter_ir,
+          bind_data.prefilter,
           bind_data.use_index, bind_data.explain_verbose, plan, error);
       if (ok) {
         global_state.explain_plan = std::move(plan);
