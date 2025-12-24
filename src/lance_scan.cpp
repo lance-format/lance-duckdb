@@ -144,15 +144,17 @@ static void FillS3StorageOptionsFromSecrets(ClientContext &context,
     return;
   }
 
-  auto *kv_secret =
-      dynamic_cast<const KeyValueSecret *>(secret_match.secret_entry->secret.get());
+  auto *kv_secret = dynamic_cast<const KeyValueSecret *>(
+      secret_match.secret_entry->secret.get());
   if (!kv_secret) {
     return;
   }
 
   auto key_id = SecretValueToString(kv_secret->TryGetValue("key_id"));
-  auto secret_access_key = SecretValueToString(kv_secret->TryGetValue("secret"));
-  auto session_token = SecretValueToString(kv_secret->TryGetValue("session_token"));
+  auto secret_access_key =
+      SecretValueToString(kv_secret->TryGetValue("secret"));
+  auto session_token =
+      SecretValueToString(kv_secret->TryGetValue("session_token"));
   auto region = SecretValueToString(kv_secret->TryGetValue("region"));
   auto endpoint = SecretValueToString(kv_secret->TryGetValue("endpoint"));
   auto url_style = SecretValueToString(kv_secret->TryGetValue("url_style"));
@@ -173,7 +175,8 @@ static void FillS3StorageOptionsFromSecrets(ClientContext &context,
       StringUtil::CIEquals(url_style, "virtual_hosted")) {
     AddIfNotEmpty(out_keys, out_values, "virtual_hosted_style_request", "true");
   } else if (StringUtil::CIEquals(url_style, "path")) {
-    AddIfNotEmpty(out_keys, out_values, "virtual_hosted_style_request", "false");
+    AddIfNotEmpty(out_keys, out_values, "virtual_hosted_style_request",
+                  "false");
   }
 
   if (!use_ssl.empty()) {
@@ -657,7 +660,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
       StringUtil::StartsWith(open_path, "s3a://") ||
       StringUtil::StartsWith(open_path, "s3n://")) {
     open_path = NormalizeS3Scheme(open_path);
-    FillS3StorageOptionsFromSecrets(context, open_path, option_keys, option_values);
+    FillS3StorageOptionsFromSecrets(context, open_path, option_keys,
+                                    option_values);
   }
 
   if (!option_keys.empty()) {
@@ -670,7 +674,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
       value_ptrs.push_back(option_values[i].c_str());
     }
     result->dataset = lance_open_dataset_with_storage_options(
-        open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size());
+        open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+        option_keys.size());
   } else {
     result->dataset = lance_open_dataset(open_path.c_str());
   }

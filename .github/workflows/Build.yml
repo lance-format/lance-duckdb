@@ -92,6 +92,10 @@ jobs:
           name: build-release-${{ github.sha }}
           path: .
 
+      - name: Ensure test runner is executable
+        run: |
+          chmod +x ./build/release/test/unittest
+
       - name: Run tests
         run: |
           ./build/release/test/unittest "test/*"
@@ -108,6 +112,10 @@ jobs:
         with:
           name: build-release-${{ github.sha }}
           path: .
+
+      - name: Ensure test runner is executable
+        run: |
+          chmod +x ./build/release/test/unittest
 
       - name: Start MinIO
         run: |
