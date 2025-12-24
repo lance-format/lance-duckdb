@@ -25,3 +25,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 anyhow = "1.0"
 async-trait = "0.1"
+datafusion-common = "50.3.0"
+datafusion-expr = "50.3.0"
+datafusion-functions = "50.3.0"
