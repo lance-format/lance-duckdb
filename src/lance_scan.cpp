@@ -15,8 +15,10 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
@@ -24,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 // FFI ownership contract (Arrow C Data Interface):
 // `lance_get_schema` returns an opaque schema handle; caller frees it via
@@ -63,6 +66,10 @@ void lance_free_fragment_list(uint64_t *ptr, size_t len);
 void *lance_create_fragment_stream(void *dataset, uint64_t fragment_id,
                                    const char **columns, size_t columns_len,
                                    const char *filter_sql);
+void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
+                                      const char **columns, size_t columns_len,
+                                      const uint8_t *filter_ir,
+                                      size_t filter_ir_len);
 
 void lance_free_batch(void *batch);
 int64_t lance_batch_num_rows(void *batch);
@@ -107,7 +114,7 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
-  string lance_pushed_filter_sql;
+  vector<string> lance_pushed_filter_ir_parts;
 
   ~LanceScanBindData() override {
     if (dataset) {
@@ -127,7 +134,8 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   vector<LogicalType> scanned_types;
 
   vector<string> scan_column_names;
-  string lance_filter_sql;
+  string lance_filter_ir;
+  bool table_filters_pushed_down = false;
 
   bool count_only = false;
   idx_t count_only_total_rows = 0;
@@ -154,89 +162,6 @@ struct LanceScanLocalState : public ArrowScanLocalState {
     }
   }
 };
-
-static string EscapeLanceColumnName(const string &name) {
-  // Match Lance's backtick escaping strategy for nested column names.
-  // Split by '.' and escape each segment.
-  string result;
-  idx_t start = 0;
-  for (idx_t i = 0; i <= name.size(); i++) {
-    if (i == name.size() || name[i] == '.') {
-      auto segment = name.substr(start, i - start);
-      if (!result.empty()) {
-        result += ".";
-      }
-      result += "`";
-      result += StringUtil::Replace(segment, "`", "``");
-      result += "`";
-      start = i + 1;
-    }
-  }
-  return result;
-}
-
-static bool LanceFilterPushdownSupported(const TableFilter &filter) {
-  switch (filter.filter_type) {
-  case TableFilterType::CONSTANT_COMPARISON:
-  case TableFilterType::IS_NULL:
-  case TableFilterType::IS_NOT_NULL:
-  case TableFilterType::IN_FILTER:
-    return true;
-  case TableFilterType::CONJUNCTION_AND: {
-    auto &f = filter.Cast<ConjunctionAndFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  case TableFilterType::CONJUNCTION_OR: {
-    auto &f = filter.Cast<ConjunctionOrFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  default:
-    // Exclude DYNAMIC_FILTER, STRUCT_EXTRACT, EXPRESSION_FILTER,
-    // OPTIONAL_FILTER, etc.
-    return false;
-  }
-}
-
-static string BuildLanceFilterSQL(const LanceScanBindData &bind_data,
-                                  const TableFunctionInitInput &input) {
-  if (!input.filters) {
-    return "";
-  }
-  vector<string> predicates;
-  predicates.reserve(input.filters->filters.size());
-
-  for (auto &it : input.filters->filters) {
-    auto scan_col_idx = it.first;
-    auto &filter = *it.second;
-    if (scan_col_idx >= input.column_ids.size()) {
-      return "";
-    }
-    if (!LanceFilterPushdownSupported(filter)) {
-      return "";
-    }
-    auto col_id = input.column_ids[scan_col_idx];
-    if (col_id >= bind_data.names.size()) {
-      return "";
-    }
-    auto col_name = EscapeLanceColumnName(bind_data.names[col_id]);
-    predicates.push_back(filter.ToString(col_name));
-  }
-
-  if (predicates.empty()) {
-    return "";
-  }
-  return StringUtil::Join(predicates, " AND ");
-}
 
 static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
   switch (type.id()) {
@@ -267,33 +192,177 @@ static bool LanceSupportsPushdownType(const FunctionData &bind_data,
   return LanceSupportsPushdownLogicalType(scan_bind.types[col_idx]);
 }
 
-static bool TrySerializeLanceLiteral(const Value &value, string &out_sql) {
+static constexpr char LANCE_FILTER_IR_MAGIC[] = {'L', 'F', 'T', '1'};
+static constexpr uint8_t LANCE_FILTER_IR_VERSION = 1;
+
+enum class LanceFilterIRTag : uint8_t {
+  COLUMN_REF = 1,
+  LITERAL = 2,
+  AND = 3,
+  OR = 4,
+  NOT = 5,
+  COMPARISON = 6,
+  IS_NULL = 7,
+  IS_NOT_NULL = 8,
+  IN_LIST = 9,
+};
+
+enum class LanceFilterIRLiteralTag : uint8_t {
+  NULL_VALUE = 0,
+  BOOL = 1,
+  I64 = 2,
+  U64 = 3,
+  F32 = 4,
+  F64 = 5,
+  STRING = 6,
+};
+
+enum class LanceFilterIRComparisonOp : uint8_t {
+  EQ = 0,
+  NOT_EQ = 1,
+  LT = 2,
+  LT_EQ = 3,
+  GT = 4,
+  GT_EQ = 5,
+};
+
+static void LanceFilterIRAppendU8(string &out, uint8_t v) {
+  out.push_back(static_cast<char>(v));
+}
+
+static void LanceFilterIRAppendU32(string &out, uint32_t v) {
+  uint8_t buf[4];
+  buf[0] = static_cast<uint8_t>(v & 0xFF);
+  buf[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+  buf[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+  buf[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+  out.append(reinterpret_cast<const char *>(buf), sizeof(buf));
+}
+
+static void LanceFilterIRAppendU64(string &out, uint64_t v) {
+  uint8_t buf[8];
+  for (idx_t i = 0; i < 8; i++) {
+    buf[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFF);
+  }
+  out.append(reinterpret_cast<const char *>(buf), sizeof(buf));
+}
+
+static void LanceFilterIRAppendI64(string &out, int64_t v) {
+  LanceFilterIRAppendU64(out, static_cast<uint64_t>(v));
+}
+
+static void LanceFilterIRAppendF32(string &out, float v) {
+  uint32_t bits = 0;
+  memcpy(&bits, &v, sizeof(bits));
+  LanceFilterIRAppendU32(out, bits);
+}
+
+static void LanceFilterIRAppendF64(string &out, double v) {
+  uint64_t bits = 0;
+  memcpy(&bits, &v, sizeof(bits));
+  LanceFilterIRAppendU64(out, bits);
+}
+
+static bool LanceFilterIRAppendLenPrefixed(string &out, const string &bytes) {
+  if (bytes.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  LanceFilterIRAppendU32(out, static_cast<uint32_t>(bytes.size()));
+  out.append(bytes);
+  return true;
+}
+
+static bool LanceFilterIRAppendLenPrefixedString(string &out,
+                                                 const string &value) {
+  if (value.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  LanceFilterIRAppendU32(out, static_cast<uint32_t>(value.size()));
+  out.append(value);
+  return true;
+}
+
+static string LanceFilterIREncodeMessage(const string &root_node) {
+  string out;
+  out.append(LANCE_FILTER_IR_MAGIC, sizeof(LANCE_FILTER_IR_MAGIC));
+  LanceFilterIRAppendU8(out, LANCE_FILTER_IR_VERSION);
+  out.append(root_node);
+  return out;
+}
+
+static bool SplitLanceColumnPath(const string &name, vector<string> &segments) {
+  segments.clear();
+  idx_t start = 0;
+  for (idx_t i = 0; i <= name.size(); i++) {
+    if (i == name.size() || name[i] == '.') {
+      if (i == start) {
+        return false;
+      }
+      segments.push_back(name.substr(start, i - start));
+      start = i + 1;
+    }
+  }
+  return !segments.empty();
+}
+
+static bool TryEncodeLanceFilterIRColumnRef(const string &name,
+                                            string &out_ir) {
+  vector<string> segments;
+  if (!SplitLanceColumnPath(name, segments)) {
+    return false;
+  }
+
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir,
+                        static_cast<uint8_t>(LanceFilterIRTag::COLUMN_REF));
+  if (segments.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(segments.size()));
+  for (auto &segment : segments) {
+    if (!LanceFilterIRAppendLenPrefixedString(out_ir, segment)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRTag::LITERAL));
+
   if (value.IsNull()) {
-    out_sql = "NULL";
+    LanceFilterIRAppendU8(
+        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::NULL_VALUE));
     return true;
   }
+
   switch (value.type().id()) {
   case LogicalTypeId::BOOLEAN:
-    out_sql = value.GetValue<bool>() ? "TRUE" : "FALSE";
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::BOOL));
+    LanceFilterIRAppendU8(out_ir, value.GetValue<bool>() ? 1 : 0);
     return true;
   case LogicalTypeId::TINYINT:
   case LogicalTypeId::SMALLINT:
   case LogicalTypeId::INTEGER:
   case LogicalTypeId::BIGINT:
-    out_sql = to_string(value.GetValue<int64_t>());
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::I64));
+    LanceFilterIRAppendI64(out_ir, value.GetValue<int64_t>());
     return true;
   case LogicalTypeId::UTINYINT:
   case LogicalTypeId::USMALLINT:
   case LogicalTypeId::UINTEGER:
   case LogicalTypeId::UBIGINT:
-    out_sql = to_string(value.GetValue<uint64_t>());
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::U64));
+    LanceFilterIRAppendU64(out_ir, value.GetValue<uint64_t>());
     return true;
   case LogicalTypeId::FLOAT: {
     auto v = value.GetValue<float>();
     if (!std::isfinite(v)) {
       return false;
     }
-    out_sql = to_string(v);
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::F32));
+    LanceFilterIRAppendF32(out_ir, v);
     return true;
   }
   case LogicalTypeId::DOUBLE: {
@@ -301,25 +370,212 @@ static bool TrySerializeLanceLiteral(const Value &value, string &out_sql) {
     if (!std::isfinite(v)) {
       return false;
     }
-    out_sql = to_string(v);
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::F64));
+    LanceFilterIRAppendF64(out_ir, v);
     return true;
   }
   case LogicalTypeId::VARCHAR: {
     auto v = value.GetValue<string>();
-    out_sql = "'";
-    out_sql += StringUtil::Replace(v, "'", "''");
-    out_sql += "'";
-    return true;
+    LanceFilterIRAppendU8(
+        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::STRING));
+    return LanceFilterIRAppendLenPrefixedString(out_ir, v);
   }
   default:
     return false;
   }
 }
 
-static bool TrySerializeLanceColumnRef(const LogicalGet &get,
-                                       const LanceScanBindData &bind_data,
-                                       const Expression &expr,
-                                       string &out_sql) {
+static bool TryEncodeLanceFilterIRComparisonOp(ExpressionType type,
+                                               uint8_t &out_op) {
+  switch (type) {
+  case ExpressionType::COMPARE_EQUAL:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::EQ);
+    return true;
+  case ExpressionType::COMPARE_NOTEQUAL:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::NOT_EQ);
+    return true;
+  case ExpressionType::COMPARE_LESSTHAN:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::LT);
+    return true;
+  case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::LT_EQ);
+    return true;
+  case ExpressionType::COMPARE_GREATERTHAN:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::GT);
+    return true;
+  case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::GT_EQ);
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool TryEncodeLanceFilterIRConjunction(LanceFilterIRTag tag,
+                                              const vector<string> &children,
+                                              string &out_ir) {
+  if (children.empty()) {
+    return false;
+  }
+  if (children.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(tag));
+  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(children.size()));
+  for (auto &child : children) {
+    if (!LanceFilterIRAppendLenPrefixed(out_ir, child)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool TryEncodeLanceFilterIRUnary(LanceFilterIRTag tag,
+                                        const string &child, string &out_ir) {
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(tag));
+  return LanceFilterIRAppendLenPrefixed(out_ir, child);
+}
+
+static bool TryEncodeLanceFilterIRComparison(uint8_t op, const string &left,
+                                             const string &right,
+                                             string &out_ir) {
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir,
+                        static_cast<uint8_t>(LanceFilterIRTag::COMPARISON));
+  LanceFilterIRAppendU8(out_ir, op);
+  return LanceFilterIRAppendLenPrefixed(out_ir, left) &&
+         LanceFilterIRAppendLenPrefixed(out_ir, right);
+}
+
+static bool TryEncodeLanceFilterIRInList(bool negated, const string &expr,
+                                         const vector<string> &list,
+                                         string &out_ir) {
+  if (list.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir,
+                        static_cast<uint8_t>(LanceFilterIRTag::IN_LIST));
+  LanceFilterIRAppendU8(out_ir, negated ? 1 : 0);
+  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr)) {
+    return false;
+  }
+  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(list.size()));
+  for (auto &item : list) {
+    if (!LanceFilterIRAppendLenPrefixed(out_ir, item)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
+                                           const TableFilter &filter,
+                                           string &out_ir) {
+  switch (filter.filter_type) {
+  case TableFilterType::CONSTANT_COMPARISON: {
+    auto &f = filter.Cast<ConstantFilter>();
+    uint8_t op = 0;
+    if (!TryEncodeLanceFilterIRComparisonOp(f.comparison_type, op)) {
+      return false;
+    }
+    string lit_ir;
+    if (!TryEncodeLanceFilterIRLiteral(f.constant, lit_ir)) {
+      return false;
+    }
+    return TryEncodeLanceFilterIRComparison(op, col_ref_ir, lit_ir, out_ir);
+  }
+  case TableFilterType::IS_NULL:
+    return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::IS_NULL, col_ref_ir,
+                                       out_ir);
+  case TableFilterType::IS_NOT_NULL:
+    return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::IS_NOT_NULL, col_ref_ir,
+                                       out_ir);
+  case TableFilterType::IN_FILTER: {
+    auto &f = filter.Cast<InFilter>();
+    vector<string> items;
+    items.reserve(f.values.size());
+    for (auto &value : f.values) {
+      string lit_ir;
+      if (!TryEncodeLanceFilterIRLiteral(value, lit_ir)) {
+        return false;
+      }
+      items.push_back(std::move(lit_ir));
+    }
+    return TryEncodeLanceFilterIRInList(false, col_ref_ir, items, out_ir);
+  }
+  case TableFilterType::CONJUNCTION_AND: {
+    auto &f = filter.Cast<ConjunctionAndFilter>();
+    vector<string> children;
+    children.reserve(f.child_filters.size());
+    for (auto &child : f.child_filters) {
+      string child_ir;
+      if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *child, child_ir)) {
+        return false;
+      }
+      children.push_back(std::move(child_ir));
+    }
+    return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
+                                             out_ir);
+  }
+  case TableFilterType::CONJUNCTION_OR: {
+    auto &f = filter.Cast<ConjunctionOrFilter>();
+    vector<string> children;
+    children.reserve(f.child_filters.size());
+    for (auto &child : f.child_filters) {
+      string child_ir;
+      if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *child, child_ir)) {
+        return false;
+      }
+      children.push_back(std::move(child_ir));
+    }
+    return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::OR, children,
+                                             out_ir);
+  }
+  default:
+    return false;
+  }
+}
+
+static bool BuildLanceTableFilterIRParts(const LanceScanBindData &bind_data,
+                                         const TableFunctionInitInput &input,
+                                         vector<string> &out_parts) {
+  if (!input.filters || input.filters->filters.empty()) {
+    return true;
+  }
+  out_parts.clear();
+  out_parts.reserve(input.filters->filters.size());
+
+  for (auto &it : input.filters->filters) {
+    auto scan_col_idx = it.first;
+    auto &filter = *it.second;
+    if (scan_col_idx >= input.column_ids.size()) {
+      return false;
+    }
+    auto col_id = input.column_ids[scan_col_idx];
+    if (col_id >= bind_data.names.size()) {
+      return false;
+    }
+    string col_ref_ir;
+    if (!TryEncodeLanceFilterIRColumnRef(bind_data.names[col_id], col_ref_ir)) {
+      return false;
+    }
+    string filter_ir;
+    if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, filter, filter_ir)) {
+      return false;
+    }
+    out_parts.push_back(std::move(filter_ir));
+  }
+
+  return true;
+}
+
+static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
+                                         const LanceScanBindData &bind_data,
+                                         const Expression &expr,
+                                         string &out_ir) {
   if (expr.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
     return false;
   }
@@ -348,19 +604,19 @@ static bool TrySerializeLanceColumnRef(const LogicalGet &get,
   if (!LanceSupportsPushdownLogicalType(bind_data.types[col_id])) {
     return false;
   }
-  out_sql = EscapeLanceColumnName(bind_data.names[col_id]);
-  return true;
+  return TryEncodeLanceFilterIRColumnRef(bind_data.names[col_id], out_ir);
 }
 
-static bool TrySerializeLanceExpr(const LogicalGet &get,
-                                  const LanceScanBindData &bind_data,
-                                  const Expression &expr, string &out_sql) {
+static bool TryBuildLanceExprFilterIR(const LogicalGet &get,
+                                      const LanceScanBindData &bind_data,
+                                      const Expression &expr,
+                                      string &out_ir) {
   switch (expr.expression_class) {
   case ExpressionClass::BOUND_COLUMN_REF:
-    return TrySerializeLanceColumnRef(get, bind_data, expr, out_sql);
+    return TryBuildLanceExprColumnRefIR(get, bind_data, expr, out_ir);
   case ExpressionClass::BOUND_CONSTANT: {
     auto &c = expr.Cast<BoundConstantExpression>();
-    return TrySerializeLanceLiteral(c.value, out_sql);
+    return TryEncodeLanceFilterIRLiteral(c.value, out_ir);
   }
   case ExpressionClass::BOUND_CAST: {
     auto &cast = expr.Cast<BoundCastExpression>();
@@ -371,7 +627,7 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       return false;
     }
     auto &c = cast.child->Cast<BoundConstantExpression>();
-    return TrySerializeLanceLiteral(c.value, out_sql);
+    return TryEncodeLanceFilterIRLiteral(c.value, out_ir);
   }
   case ExpressionClass::BOUND_COMPARISON: {
     auto &cmp = expr.Cast<BoundComparisonExpression>();
@@ -379,36 +635,37 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
         cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
       return false;
     }
-    string lhs, rhs;
-    if (!TrySerializeLanceExpr(get, bind_data, *cmp.left, lhs) ||
-        !TrySerializeLanceExpr(get, bind_data, *cmp.right, rhs)) {
+    uint8_t op = 0;
+    if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
       return false;
     }
-    out_sql =
-        "(" + lhs + " " + ExpressionTypeToOperator(cmp.type) + " " + rhs + ")";
-    return true;
+    string lhs_ir, rhs_ir;
+    if (!TryBuildLanceExprFilterIR(get, bind_data, *cmp.left, lhs_ir) ||
+        !TryBuildLanceExprFilterIR(get, bind_data, *cmp.right, rhs_ir)) {
+      return false;
+    }
+    return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_ir);
   }
   case ExpressionClass::BOUND_CONJUNCTION: {
     auto &conj = expr.Cast<BoundConjunctionExpression>();
-    const char *op = nullptr;
+    LanceFilterIRTag tag;
     if (conj.type == ExpressionType::CONJUNCTION_AND) {
-      op = " AND ";
+      tag = LanceFilterIRTag::AND;
     } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
-      op = " OR ";
+      tag = LanceFilterIRTag::OR;
     } else {
       return false;
     }
-    vector<string> parts;
-    parts.reserve(conj.children.size());
+    vector<string> children;
+    children.reserve(conj.children.size());
     for (auto &child : conj.children) {
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, bind_data, *child, child_sql)) {
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(get, bind_data, *child, child_ir)) {
         return false;
       }
-      parts.push_back(std::move(child_sql));
+      children.push_back(std::move(child_ir));
     }
-    out_sql = "(" + StringUtil::Join(parts, op) + ")";
-    return true;
+    return TryEncodeLanceFilterIRConjunction(tag, children, out_ir);
   }
   case ExpressionClass::BOUND_OPERATOR: {
     auto &op = expr.Cast<BoundOperatorExpression>();
@@ -416,71 +673,84 @@ static bool TrySerializeLanceExpr(const LogicalGet &get,
       if (op.children.size() != 1) {
         return false;
       }
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, bind_data, *op.children[0], child_sql)) {
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(get, bind_data, *op.children[0], child_ir)) {
         return false;
       }
-      out_sql = "(NOT " + child_sql + ")";
-      return true;
+      return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir, out_ir);
     }
     if (op.type == ExpressionType::OPERATOR_IS_NULL ||
         op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
       if (op.children.size() != 1) {
         return false;
       }
-      string child_sql;
-      if (!TrySerializeLanceExpr(get, bind_data, *op.children[0], child_sql)) {
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(get, bind_data, *op.children[0], child_ir)) {
         return false;
       }
-      out_sql = "(" + child_sql +
-                (op.type == ExpressionType::OPERATOR_IS_NULL ? " IS NULL)"
-                                                             : " IS NOT NULL)");
-      return true;
+      return TryEncodeLanceFilterIRUnary(
+          op.type == ExpressionType::OPERATOR_IS_NULL ? LanceFilterIRTag::IS_NULL
+                                                      : LanceFilterIRTag::IS_NOT_NULL,
+          child_ir, out_ir);
     }
     if (op.type == ExpressionType::COMPARE_IN ||
         op.type == ExpressionType::COMPARE_NOT_IN) {
       if (op.children.size() < 2) {
         return false;
       }
-      string lhs_sql;
-      if (!TrySerializeLanceExpr(get, bind_data, *op.children[0], lhs_sql)) {
+      string lhs_ir;
+      if (!TryBuildLanceExprFilterIR(get, bind_data, *op.children[0], lhs_ir)) {
         return false;
       }
       vector<string> values;
       values.reserve(op.children.size() - 1);
       for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class !=
-            ExpressionClass::BOUND_CONSTANT) {
+        if (op.children[i]->expression_class != ExpressionClass::BOUND_CONSTANT) {
           return false;
         }
         auto &c = op.children[i]->Cast<BoundConstantExpression>();
-        string lit;
-        if (!TrySerializeLanceLiteral(c.value, lit)) {
+        string lit_ir;
+        if (!TryEncodeLanceFilterIRLiteral(c.value, lit_ir)) {
           return false;
         }
-        values.push_back(std::move(lit));
+        values.push_back(std::move(lit_ir));
       }
-      out_sql =
-          "(" + lhs_sql +
-          (op.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (") +
-          StringUtil::Join(values, ", ") + "))";
-      return true;
+      return TryEncodeLanceFilterIRInList(
+          op.type == ExpressionType::COMPARE_NOT_IN, lhs_ir, values, out_ir);
     }
     return false;
   }
   case ExpressionClass::BOUND_BETWEEN: {
     auto &between = expr.Cast<BoundBetweenExpression>();
-    string input_sql, lower_sql, upper_sql;
-    if (!TrySerializeLanceExpr(get, bind_data, *between.input, input_sql) ||
-        !TrySerializeLanceExpr(get, bind_data, *between.lower, lower_sql) ||
-        !TrySerializeLanceExpr(get, bind_data, *between.upper, upper_sql)) {
+    uint8_t lower_op = 0;
+    uint8_t upper_op = 0;
+    if (!TryEncodeLanceFilterIRComparisonOp(between.LowerComparisonType(),
+                                           lower_op) ||
+        !TryEncodeLanceFilterIRComparisonOp(between.UpperComparisonType(),
+                                           upper_op)) {
       return false;
     }
-    auto lower_op = ExpressionTypeToOperator(between.LowerComparisonType());
-    auto upper_op = ExpressionTypeToOperator(between.UpperComparisonType());
-    out_sql = "((" + input_sql + " " + lower_op + " " + lower_sql + ") AND (" +
-              input_sql + " " + upper_op + " " + upper_sql + "))";
-    return true;
+    string input_ir, lower_ir, upper_ir;
+    if (!TryBuildLanceExprFilterIR(get, bind_data, *between.input, input_ir) ||
+        !TryBuildLanceExprFilterIR(get, bind_data, *between.lower, lower_ir) ||
+        !TryBuildLanceExprFilterIR(get, bind_data, *between.upper, upper_ir)) {
+      return false;
+    }
+    string lower_cmp_ir;
+    if (!TryEncodeLanceFilterIRComparison(lower_op, input_ir, lower_ir,
+                                          lower_cmp_ir)) {
+      return false;
+    }
+    string upper_cmp_ir;
+    if (!TryEncodeLanceFilterIRComparison(upper_op, input_ir, upper_ir,
+                                          upper_cmp_ir)) {
+      return false;
+    }
+    vector<string> children;
+    children.push_back(std::move(lower_cmp_ir));
+    children.push_back(std::move(upper_cmp_ir));
+    return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
+                                             out_ir);
   }
   default:
     return false;
@@ -496,29 +766,16 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
   }
   auto &scan_bind = bind_data->Cast<LanceScanBindData>();
 
-  vector<string> predicates;
-  predicates.reserve(filters.size());
   for (auto &expr : filters) {
     if (!expr || expr->HasParameter() || expr->IsVolatile() ||
         expr->CanThrow()) {
       continue;
     }
-    string sql;
-    if (!TrySerializeLanceExpr(get, scan_bind, *expr, sql)) {
+    string filter_ir;
+    if (!TryBuildLanceExprFilterIR(get, scan_bind, *expr, filter_ir)) {
       continue;
     }
-    predicates.push_back(std::move(sql));
-  }
-
-  if (predicates.empty()) {
-    return;
-  }
-  auto pushed_sql = StringUtil::Join(predicates, " AND ");
-  if (scan_bind.lance_pushed_filter_sql.empty()) {
-    scan_bind.lance_pushed_filter_sql = std::move(pushed_sql);
-  } else {
-    scan_bind.lance_pushed_filter_sql =
-        "(" + scan_bind.lance_pushed_filter_sql + ") AND (" + pushed_sql + ")";
+    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
   }
 }
 
@@ -591,20 +848,40 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.scan_column_names.push_back(bind_data.names[col_id]);
   }
 
-  auto table_filter_sql = BuildLanceFilterSQL(bind_data, input);
-  auto pushed_filter_sql = bind_data.lance_pushed_filter_sql;
+  vector<string> filter_parts;
 
-  if (pushed_filter_sql.empty()) {
-    scan_state.lance_filter_sql = std::move(table_filter_sql);
-  } else if (table_filter_sql.empty()) {
-    scan_state.lance_filter_sql = std::move(pushed_filter_sql);
-  } else {
-    scan_state.lance_filter_sql =
-        "(" + pushed_filter_sql + ") AND (" + table_filter_sql + ")";
+  vector<string> table_filter_parts;
+  auto table_filters_ok =
+      BuildLanceTableFilterIRParts(bind_data, input, table_filter_parts);
+  if (table_filters_ok) {
+    filter_parts = std::move(table_filter_parts);
+    scan_state.table_filters_pushed_down =
+        input.filters && !input.filters->filters.empty();
+  }
+
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    filter_parts.reserve(filter_parts.size() +
+                         bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      filter_parts.push_back(part);
+    }
+  }
+
+  if (!filter_parts.empty()) {
+    string root_node;
+    if (filter_parts.size() == 1) {
+      root_node = std::move(filter_parts[0]);
+    } else if (!TryEncodeLanceFilterIRConjunction(
+                   LanceFilterIRTag::AND, filter_parts, root_node)) {
+      root_node.clear();
+    }
+    if (!root_node.empty()) {
+      scan_state.lance_filter_ir = LanceFilterIREncodeMessage(root_node);
+    }
   }
 
   if (scan_state.scan_column_names.empty() &&
-      scan_state.lance_filter_sql.empty()) {
+      scan_state.lance_filter_ir.empty()) {
     auto rows = lance_dataset_count_rows(bind_data.dataset);
     if (rows < 0) {
       throw IOException("Failed to count Lance rows" +
@@ -678,21 +955,24 @@ static bool LanceScanOpenStream(ClientContext &context,
     columns.push_back(name.c_str());
   }
 
-  const char *filter_sql = global_state.lance_filter_sql.empty()
-                               ? nullptr
-                               : global_state.lance_filter_sql.c_str();
-  auto stream =
-      lance_create_fragment_stream(bind_data.dataset, fragment_id,
-                                   columns.data(), columns.size(), filter_sql);
-  if (stream && filter_sql) {
-    local_state.filter_pushed_down = true;
+  const uint8_t *filter_ir =
+      global_state.lance_filter_ir.empty()
+          ? nullptr
+          : reinterpret_cast<const uint8_t *>(global_state.lance_filter_ir.data());
+  auto filter_ir_len = global_state.lance_filter_ir.size();
+
+  auto stream = lance_create_fragment_stream_ir(
+      bind_data.dataset, fragment_id, columns.data(), columns.size(), filter_ir,
+      filter_ir_len);
+  if (stream && filter_ir) {
+    local_state.filter_pushed_down = global_state.table_filters_pushed_down;
   }
-  if (!stream && filter_sql) {
+  if (!stream && filter_ir) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
-    stream =
-        lance_create_fragment_stream(bind_data.dataset, fragment_id,
-                                     columns.data(), columns.size(), nullptr);
+    stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
+                                             columns.data(), columns.size(),
+                                             nullptr, 0);
   }
   if (!stream) {
     throw IOException("Failed to create Lance fragment stream" +
