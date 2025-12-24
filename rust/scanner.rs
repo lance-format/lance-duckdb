@@ -1,14 +1,15 @@
 use std::pin::Pin;
 
 use arrow::array::RecordBatch;
-use futures::stream::Stream;
-use lance::dataset::scanner::Scanner;
+use arrow::datatypes::SchemaRef;
+use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::io::RecordBatchStream;
 use tokio::runtime::Handle;
 
 /// A stream wrapper that holds the Lance RecordBatchStream
 pub struct LanceStream {
     handle: Handle,
-    stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, lance::Error>> + Send>>,
+    stream: Pin<Box<DatasetRecordBatchStream>>,
 }
 
 impl LanceStream {
@@ -21,6 +22,10 @@ impl LanceStream {
             handle,
             stream: Box::pin(stream),
         })
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.stream.schema()
     }
 
     /// Get the next batch from the stream

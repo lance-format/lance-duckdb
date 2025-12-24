@@ -1,0 +1,20 @@
+{
+  "seed": 1337,
+  "dim": 16,
+  "rows": 2048,
+  "queries": 32,
+  "k": 10,
+  "metric": "L2",
+  "label_rule": "label=1 iff id % 8 == 0",
+  "bucket_rule": "bucket = id % 16",
+  "clusters": {
+    "label0_center": 0.0,
+    "label1_center": 10.0,
+    "noise_stddev": 0.35
+  },
+  "packages": {
+    "numpy": "2.4.0",
+    "pyarrow": "22.0.0",
+    "pylance": "1.0.0"
+  }
+}
