@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CUSTOM_LINKER: mold
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -69,7 +69,9 @@ jobs:
         with:
           name: build-release-${{ github.sha }}
           path: |
-            build/release
+            build/release/test/unittest
+            build/release/src/libduckdb.so*
+          if-no-files-found: error
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
@@ -81,7 +83,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     steps:
       - uses: actions/checkout@v5
@@ -102,7 +104,7 @@ jobs:
 
   test_s3:
     name: Test S3 (MinIO)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     steps:
       - uses: actions/checkout@v5
