@@ -2,12 +2,14 @@
 
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 
 mod runtime;
 mod scanner;
@@ -51,6 +53,84 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
     };
 
     let dataset = match runtime::block_on(Dataset::open(path_str)) {
+        Ok(Ok(ds)) => Arc::new(ds),
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("dataset open '{path_str}': {err}"),
+            );
+            return ptr::null_mut();
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let handle = Box::new(DatasetHandle { dataset });
+    clear_last_error();
+
+    Box::into_raw(handle) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+) -> *mut c_void {
+    if path.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "path is null");
+        return ptr::null_mut();
+    }
+    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "option_keys/option_values is null with non-zero length",
+        );
+        return ptr::null_mut();
+    }
+
+    let path_str = match CStr::from_ptr(path).to_str() {
+        Ok(s) => s,
+        Err(err) => {
+            set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let mut storage_options = HashMap::<String, String>::new();
+    for i in 0..options_len {
+        let key_ptr = *option_keys.add(i);
+        let value_ptr = *option_values.add(i);
+        if key_ptr.is_null() || value_ptr.is_null() {
+            set_last_error(ErrorCode::InvalidArgument, "option key/value is null");
+            return ptr::null_mut();
+        }
+        let key = match CStr::from_ptr(key_ptr).to_str() {
+            Ok(s) => s,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode key: {err}"));
+                return ptr::null_mut();
+            }
+        };
+        let value = match CStr::from_ptr(value_ptr).to_str() {
+            Ok(s) => s,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode value: {err}"));
+                return ptr::null_mut();
+            }
+        };
+        storage_options.insert(key.to_string(), value.to_string());
+    }
+
+    let dataset = match runtime::block_on(async {
+        DatasetBuilder::from_uri(path_str)
+            .with_storage_options(storage_options)
+            .load()
+            .await
+    }) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
             set_last_error(

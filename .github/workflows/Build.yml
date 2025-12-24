@@ -63,9 +63,13 @@ jobs:
       - name: Build
         run: |
           GEN=ninja make release -j 4
-      - name: Test
-        run: |
-          GEN=ninja make test
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-release-${{ github.sha }}
+          path: |
+            build/release
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
@@ -74,3 +78,74 @@ jobs:
           path: |
             .ccache
           key: ccache-${{ runner.os }}-${{ steps.duckdb-sha.outputs.sha }}-${{ steps.build-sha.outputs.sha }}-${{ github.sha }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-release-${{ github.sha }}
+          path: .
+
+      - name: Run tests
+        run: |
+          ./build/release/test/unittest "test/*"
+
+  test_s3:
+    name: Test S3 (MinIO)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-release-${{ github.sha }}
+          path: .
+
+      - name: Start MinIO
+        run: |
+          docker run -d --rm \
+            --name lance-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-01-20T14-49-07Z \
+            server /data
+
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:9000/minio/health/ready" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready" >&2
+          exit 1
+
+      - name: Upload test dataset to MinIO
+        run: |
+          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/mc" -o mc
+          chmod +x mc
+          ./mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
+          ./mc mb -p local/lance-test || true
+          ./mc mirror --overwrite test/test_data.lance local/lance-test/test_data.lance
+
+      - name: Run S3 tests
+        env:
+          LANCE_TEST_S3: "1"
+        run: |
+          ./build/release/test/unittest "test/*"
+
+      - name: Cleanup MinIO
+        if: always()
+        run: |
+          docker logs lance-minio || true
+          docker rm -f lance-minio || true
