@@ -481,8 +481,8 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  auto table_filters =
-      BuildLanceTableFilterIRParts(bind_data.names, bind_data.types, input, true);
+  auto table_filters = BuildLanceTableFilterIRParts(
+      bind_data.names, bind_data.types, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException(
         "lance_knn requires filter pushdown for prefilterable columns when "
@@ -531,16 +531,15 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
 
-  const uint8_t *filter_ir = global.lance_filter_ir.empty()
-                                 ? nullptr
-                                 : reinterpret_cast<const uint8_t *>(
-                                       global.lance_filter_ir.data());
+  const uint8_t *filter_ir =
+      global.lance_filter_ir.empty()
+          ? nullptr
+          : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
   auto filter_ir_len = global.lance_filter_ir.size();
   result->stream = lance_create_knn_stream_ir(
       bind_data.dataset, bind_data.vector_column.c_str(),
-      bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      filter_ir, filter_ir_len, bind_data.prefilter ? 1 : 0,
-      bind_data.use_index ? 1 : 0);
+      bind_data.query.data(), bind_data.query.size(), bind_data.k, filter_ir,
+      filter_ir_len, bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   if (!result->stream && filter_ir && !bind_data.prefilter) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -688,11 +687,11 @@ LanceKnnToString(TableFunctionToStringInput &input) {
 
   string plan;
   string error;
-  if (TryLanceExplainKnn(
-          bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k,
-          filter_ir_msg.empty() ? nullptr : &filter_ir_msg, bind_data.prefilter,
-          bind_data.use_index, bind_data.explain_verbose, plan, error)) {
+  if (TryLanceExplainKnn(bind_data.dataset, bind_data.vector_column,
+                         bind_data.query, bind_data.k,
+                         filter_ir_msg.empty() ? nullptr : &filter_ir_msg,
+                         bind_data.prefilter, bind_data.use_index,
+                         bind_data.explain_verbose, plan, error)) {
     result["Lance Plan (Bind)"] = plan;
   } else if (!error.empty()) {
     result["Lance Plan Error (Bind)"] = error;
@@ -720,7 +719,8 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
       global_state.filter_pushed_down ? "true" : "false";
   result["Lance Filter Pushdown Fallbacks"] =
       to_string(global_state.filter_pushdown_fallbacks.load());
-  result["Lance Filter IR Bytes"] = to_string(global_state.lance_filter_ir.size());
+  result["Lance Filter IR Bytes"] =
+      to_string(global_state.lance_filter_ir.size());
 
   result["Lance Record Batches"] =
       to_string(global_state.record_batches.load());
@@ -733,12 +733,13 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
     if (!global_state.explain_computed.load()) {
       string plan;
       string error;
-      auto ok = TryLanceExplainKnn(
-          bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k,
-          global_state.lance_filter_ir.empty() ? nullptr : &global_state.lance_filter_ir,
-          bind_data.prefilter,
-          bind_data.use_index, bind_data.explain_verbose, plan, error);
+      auto ok = TryLanceExplainKnn(bind_data.dataset, bind_data.vector_column,
+                                   bind_data.query, bind_data.k,
+                                   global_state.lance_filter_ir.empty()
+                                       ? nullptr
+                                       : &global_state.lance_filter_ir,
+                                   bind_data.prefilter, bind_data.use_index,
+                                   bind_data.explain_verbose, plan, error);
       if (ok) {
         global_state.explain_plan = std::move(plan);
       } else {

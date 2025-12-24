@@ -30,4 +30,3 @@ bool TryEncodeLanceFilterIRMessage(const vector<string> &parts,
                                    string &out_msg);
 
 } // namespace duckdb
-

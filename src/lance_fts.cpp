@@ -244,10 +244,10 @@ static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
                                      const LanceSearchBindData &bind_data,
                                      LanceSearchGlobalState &global) {
   if (!local_state.stream) {
-    const uint8_t *filter_ir = global.lance_filter_ir.empty()
-                                   ? nullptr
-                                   : reinterpret_cast<const uint8_t *>(
-                                         global.lance_filter_ir.data());
+    const uint8_t *filter_ir =
+        global.lance_filter_ir.empty()
+            ? nullptr
+            : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
     auto filter_ir_len = global.lance_filter_ir.size();
 
     auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
@@ -566,8 +566,8 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  auto table_filters = BuildLanceTableFilterIRParts(bind_data.names,
-                                                    bind_data.types, input, true);
+  auto table_filters = BuildLanceTableFilterIRParts(
+      bind_data.names, bind_data.types, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException(
         "lance_search requires filter pushdown for prefilterable columns when "

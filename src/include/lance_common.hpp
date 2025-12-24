@@ -15,4 +15,3 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
 void *LanceOpenDataset(ClientContext &context, const string &path);
 
 } // namespace duckdb
-

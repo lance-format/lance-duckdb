@@ -525,12 +525,10 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     string lhs_ir, rhs_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types,
-                                   exclude_computed_columns, *cmp.left,
-                                   lhs_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types,
-                                   exclude_computed_columns, *cmp.right,
-                                   rhs_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *cmp.left, lhs_ir) ||
+        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *cmp.right, rhs_ir)) {
       return false;
     }
     return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_ir);
@@ -549,9 +547,8 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     children.reserve(conj.children.size());
     for (auto &child : conj.children) {
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *child,
-                                     child_ir)) {
+      if (!TryBuildLanceExprFilterIR(
+              get, names, types, exclude_computed_columns, *child, child_ir)) {
         return false;
       }
       children.push_back(std::move(child_ir));
@@ -631,15 +628,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     string input_ir, lower_ir, upper_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types,
-                                   exclude_computed_columns, *between.input,
-                                   input_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types,
-                                   exclude_computed_columns, *between.lower,
-                                   lower_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types,
-                                   exclude_computed_columns, *between.upper,
-                                   upper_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *between.input, input_ir) ||
+        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *between.lower, lower_ir) ||
+        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *between.upper, upper_ir)) {
       return false;
     }
     string lower_cmp_ir;

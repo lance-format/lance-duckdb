@@ -254,9 +254,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
   vector<string> filter_parts;
 
-  auto table_filters =
-      BuildLanceTableFilterIRParts(bind_data.names, bind_data.types, input,
-                                   false);
+  auto table_filters = BuildLanceTableFilterIRParts(
+      bind_data.names, bind_data.types, input, false);
   filter_parts = std::move(table_filters.parts);
 
   if (!bind_data.lance_pushed_filter_ir_parts.empty()) {

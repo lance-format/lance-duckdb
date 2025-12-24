@@ -148,10 +148,9 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
     key_ptrs.push_back(option_keys[i].c_str());
     value_ptrs.push_back(option_values[i].c_str());
   }
-  return lance_open_dataset_with_storage_options(open_path.c_str(),
-                                                 key_ptrs.data(),
-                                                 value_ptrs.data(),
-                                                 option_keys.size());
+  return lance_open_dataset_with_storage_options(
+      open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+      option_keys.size());
 }
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
@@ -189,4 +188,3 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
 }
 
 } // namespace duckdb
-
