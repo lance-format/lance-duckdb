@@ -88,22 +88,22 @@ static vector<float> ParseQueryVector(const Value &value) {
     throw InvalidInputException("lance_knn requires a non-null query vector");
   }
   if (value.type().id() != LogicalTypeId::LIST) {
-    throw InvalidInputException(
-        "lance_knn requires query vector to be a LIST");
+    throw InvalidInputException("lance_knn requires query vector to be a LIST");
   }
   auto children = ListValue::GetChildren(value);
   if (children.empty()) {
-    throw InvalidInputException(
-        "lance_knn requires a non-empty query vector");
+    throw InvalidInputException("lance_knn requires a non-empty query vector");
   }
 
   auto cast_f32 = [](double v) {
     if (!std::isfinite(v)) {
-      throw InvalidInputException("lance_knn query vector contains non-finite value");
+      throw InvalidInputException(
+          "lance_knn query vector contains non-finite value");
     }
     auto max_v = static_cast<double>(std::numeric_limits<float>::max());
     if (v > max_v || v < -max_v) {
-      throw InvalidInputException("lance_knn query vector value is out of float32 range");
+      throw InvalidInputException(
+          "lance_knn query vector value is out of float32 range");
     }
     return static_cast<float>(v);
   };
@@ -215,9 +215,9 @@ static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
 }
 
 static bool TryBuildLanceFilterSQL(const vector<string> &names,
-                                  const vector<LogicalType> &types,
-                                  const TableFunctionInitInput &input,
-                                  string &out_sql) {
+                                   const vector<LogicalType> &types,
+                                   const TableFunctionInitInput &input,
+                                   string &out_sql) {
   out_sql.clear();
   if (!input.filters) {
     return true;
