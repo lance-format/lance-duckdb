@@ -20,6 +20,18 @@ SELECT *
   LIMIT 10;
 ```
 
+### S3 authentication via DuckDB Secrets
+
+For `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
+
+```sql
+CREATE SECRET (TYPE S3, provider credential_chain);
+
+SELECT *
+  FROM 's3://bucket/path/to/dataset.lance'
+  LIMIT 10;
+```
+
 ## Install
 
 ### Install from DuckDB Community Extensions (recommended)
