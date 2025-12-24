@@ -1,0 +1,1003 @@
+#include "duckdb.hpp"
+#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
+
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+extern "C" {
+void *lance_open_dataset(const char *path);
+void lance_close_dataset(void *dataset);
+
+void *lance_get_schema(void *dataset);
+void lance_free_schema(void *schema);
+int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
+
+void *lance_get_fts_schema(void *dataset, const char *text_column,
+                           const char *query, uint64_t k, uint8_t prefilter);
+void *lance_create_fts_stream(void *dataset, const char *text_column,
+                              const char *query, uint64_t k,
+                              const char *filter_sql, uint8_t prefilter);
+
+void *lance_get_hybrid_schema(void *dataset);
+void *lance_create_hybrid_stream(void *dataset, const char *vector_column,
+                                 const float *query_values, size_t query_len,
+                                 const char *text_column,
+                                 const char *text_query, uint64_t k,
+                                 const char *filter_sql, uint8_t prefilter,
+                                 float alpha, uint32_t oversample_factor);
+
+int32_t lance_stream_next(void *stream, void **out_batch);
+void lance_close_stream(void *stream);
+
+int32_t lance_last_error_code();
+const char *lance_last_error_message();
+void lance_free_string(const char *s);
+
+void lance_free_batch(void *batch);
+int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
+                             ArrowSchema *out_schema);
+}
+
+namespace duckdb {
+
+static string LanceConsumeLastError() {
+  auto code = lance_last_error_code();
+  string message;
+  if (auto *ptr = lance_last_error_message()) {
+    message = ptr;
+    lance_free_string(ptr);
+  }
+
+  if (code == 0 && message.empty()) {
+    return "";
+  }
+  if (message.empty()) {
+    return "code=" + to_string(code);
+  }
+  if (code == 0) {
+    return message;
+  }
+  return message + " (code=" + to_string(code) + ")";
+}
+
+static string LanceFormatErrorSuffix() {
+  auto err = LanceConsumeLastError();
+  if (err.empty()) {
+    return "";
+  }
+  return " (Lance error: " + err + ")";
+}
+
+static bool IsComputedSearchColumn(const string &name) {
+  return name == "_distance" || name == "_score" || name == "_hybrid_score";
+}
+
+static string EscapeLanceColumnName(const string &name) {
+  string result;
+  idx_t start = 0;
+  for (idx_t i = 0; i <= name.size(); i++) {
+    if (i == name.size() || name[i] == '.') {
+      auto segment = name.substr(start, i - start);
+      if (!result.empty()) {
+        result += ".";
+      }
+      result += "`";
+      result += StringUtil::Replace(segment, "`", "``");
+      result += "`";
+      start = i + 1;
+    }
+  }
+  return result;
+}
+
+static bool LanceFilterPushdownSupported(const TableFilter &filter) {
+  switch (filter.filter_type) {
+  case TableFilterType::CONSTANT_COMPARISON:
+  case TableFilterType::IS_NULL:
+  case TableFilterType::IS_NOT_NULL:
+  case TableFilterType::IN_FILTER:
+    return true;
+  case TableFilterType::CONJUNCTION_AND: {
+    auto &f = filter.Cast<ConjunctionAndFilter>();
+    for (auto &child : f.child_filters) {
+      if (!LanceFilterPushdownSupported(*child)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  case TableFilterType::CONJUNCTION_OR: {
+    auto &f = filter.Cast<ConjunctionOrFilter>();
+    for (auto &child : f.child_filters) {
+      if (!LanceFilterPushdownSupported(*child)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
+  switch (type.id()) {
+  case LogicalTypeId::BOOLEAN:
+  case LogicalTypeId::TINYINT:
+  case LogicalTypeId::SMALLINT:
+  case LogicalTypeId::INTEGER:
+  case LogicalTypeId::BIGINT:
+  case LogicalTypeId::UTINYINT:
+  case LogicalTypeId::USMALLINT:
+  case LogicalTypeId::UINTEGER:
+  case LogicalTypeId::UBIGINT:
+  case LogicalTypeId::FLOAT:
+  case LogicalTypeId::DOUBLE:
+  case LogicalTypeId::VARCHAR:
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct LanceFilterBuildResult {
+  string pushed_sql;
+  bool all_filters_pushed = true;
+  bool all_prefilterable_filters_pushed = true;
+};
+
+static LanceFilterBuildResult
+BuildLanceFilterSQL(const vector<string> &names,
+                    const vector<LogicalType> &types,
+                    const TableFunctionInitInput &input) {
+  LanceFilterBuildResult result;
+  if (!input.filters || input.filters->filters.empty()) {
+    return result;
+  }
+
+  vector<string> predicates;
+  predicates.reserve(input.filters->filters.size());
+
+  for (auto &it : input.filters->filters) {
+    auto scan_col_idx = it.first;
+    auto &filter = *it.second;
+    if (scan_col_idx >= input.column_ids.size()) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
+    }
+    auto col_id = input.column_ids[scan_col_idx];
+    if (col_id >= names.size() || col_id >= types.size()) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
+    }
+    if (IsComputedSearchColumn(names[col_id])) {
+      result.all_filters_pushed = false;
+      continue;
+    }
+
+    if (!LanceFilterPushdownSupported(filter) ||
+        !LanceSupportsPushdownLogicalType(types[col_id])) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
+    }
+    predicates.push_back(filter.ToString(EscapeLanceColumnName(names[col_id])));
+  }
+
+  if (!predicates.empty()) {
+    result.pushed_sql = StringUtil::Join(predicates, " AND ");
+  }
+  return result;
+}
+
+static vector<float> ParseQueryVector(const Value &value) {
+  if (value.IsNull()) {
+    throw InvalidInputException(
+        "lance_search(hybrid) requires a non-null query vector");
+  }
+  if (value.type().id() != LogicalTypeId::LIST) {
+    throw InvalidInputException(
+        "lance_search(hybrid) requires query vector to be a LIST");
+  }
+  auto children = ListValue::GetChildren(value);
+  if (children.empty()) {
+    throw InvalidInputException(
+        "lance_search(hybrid) requires a non-empty query vector");
+  }
+
+  auto cast_f32 = [](double v) {
+    if (!std::isfinite(v)) {
+      throw InvalidInputException(
+          "lance_search(hybrid) query vector contains non-finite value");
+    }
+    auto max_v = static_cast<double>(std::numeric_limits<float>::max());
+    if (v > max_v || v < -max_v) {
+      throw InvalidInputException(
+          "lance_search(hybrid) query vector value is out of float32 range");
+    }
+    return static_cast<float>(v);
+  };
+
+  vector<float> out;
+  out.reserve(children.size());
+  for (auto &child : children) {
+    if (child.IsNull()) {
+      throw InvalidInputException(
+          "lance_search(hybrid) query vector contains NULL");
+    }
+    switch (child.type().id()) {
+    case LogicalTypeId::FLOAT:
+      out.push_back(cast_f32(child.GetValue<float>()));
+      break;
+    case LogicalTypeId::DOUBLE:
+      out.push_back(cast_f32(child.GetValue<double>()));
+      break;
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+      out.push_back(cast_f32(static_cast<double>(child.GetValue<int64_t>())));
+      break;
+    case LogicalTypeId::UTINYINT:
+    case LogicalTypeId::USMALLINT:
+    case LogicalTypeId::UINTEGER:
+    case LogicalTypeId::UBIGINT:
+      out.push_back(cast_f32(static_cast<double>(child.GetValue<uint64_t>())));
+      break;
+    default:
+      try {
+        auto dbl = child.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+        out.push_back(cast_f32(dbl));
+      } catch (Exception &) {
+        throw InvalidInputException(
+            "lance_search(hybrid) query vector elements must be numeric");
+      }
+    }
+  }
+  return out;
+}
+
+static LogicalType LanceSearchQueryType() {
+  child_list_t<LogicalType> children;
+  children.push_back({"type", LogicalType::VARCHAR});
+  children.push_back({"query", LogicalType::VARCHAR});
+  children.push_back({"column", LogicalType::VARCHAR});
+  children.push_back({"vector", LogicalType::LIST(LogicalType::FLOAT)});
+  children.push_back({"text", LogicalType::VARCHAR});
+  children.push_back({"vector_column", LogicalType::VARCHAR});
+  children.push_back({"text_column", LogicalType::VARCHAR});
+  children.push_back({"alpha", LogicalType::FLOAT});
+  children.push_back({"oversample_factor", LogicalType::INTEGER});
+  return LogicalType::STRUCT(std::move(children));
+}
+
+static idx_t StructFieldIndex(const LogicalType &type, const string &name) {
+  auto &children = StructType::GetChildTypes(type);
+  for (idx_t i = 0; i < children.size(); i++) {
+    if (children[i].first == name) {
+      return i;
+    }
+  }
+  throw InvalidInputException("missing field '" + name + "'");
+}
+
+static Value GetStructField(const Value &val, const string &name) {
+  auto &type = val.type();
+  if (type.id() != LogicalTypeId::STRUCT) {
+    throw InvalidInputException("expected STRUCT");
+  }
+  auto idx = StructFieldIndex(type, name);
+  auto children = StructValue::GetChildren(val);
+  if (idx >= children.size()) {
+    return Value();
+  }
+  return children[idx];
+}
+
+static string InferDefaultTextColumn(ClientContext &context, void *dataset,
+                                     const string &path) {
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get Lance schema: " + path +
+                      LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  ArrowTableSchema arrow_table;
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+                                               schema_root.arrow_schema);
+  auto col_names = arrow_table.GetNames();
+  auto col_types = arrow_table.GetTypes();
+
+  vector<string> candidates;
+  candidates.reserve(col_names.size());
+  for (idx_t i = 0; i < col_names.size() && i < col_types.size(); i++) {
+    if (col_types[i].id() == LogicalTypeId::VARCHAR) {
+      candidates.push_back(col_names[i]);
+    }
+  }
+
+  if (candidates.empty()) {
+    throw InvalidInputException(
+        "lance_search requires parameter text_column = '<text_column>'");
+  }
+  if (candidates.size() != 1) {
+    throw InvalidInputException(
+        "lance_search requires parameter text_column = '<text_column>' "
+        "(multiple VARCHAR columns found: " +
+        StringUtil::Join(candidates, ", ") + ")");
+  }
+  return candidates[0];
+}
+
+enum class LanceSearchMode : uint8_t { Fts = 0, Hybrid = 1 };
+
+struct LanceSearchBindData : public TableFunctionData {
+  LanceSearchMode mode = LanceSearchMode::Fts;
+
+  string file_path;
+  bool prefilter = false;
+
+  // FTS mode
+  string text_column;
+  string query;
+
+  // Hybrid mode
+  string vector_column;
+  vector<float> vector_query;
+  string text_query;
+  float alpha = 0.5F;
+  uint32_t oversample_factor = 4;
+
+  uint64_t k = 10;
+
+  void *dataset = nullptr;
+  ArrowSchemaWrapper schema_root;
+  ArrowTableSchema arrow_table;
+  vector<string> names;
+  vector<LogicalType> types;
+
+  ~LanceSearchBindData() override {
+    if (dataset) {
+      lance_close_dataset(dataset);
+    }
+  }
+};
+
+struct LanceSearchGlobalState : public GlobalTableFunctionState {
+  std::atomic<idx_t> lines_read{0};
+  std::atomic<idx_t> record_batches{0};
+  std::atomic<idx_t> record_batch_rows{0};
+  string lance_filter_sql;
+  bool filter_pushed_down = false;
+
+  vector<idx_t> projection_ids;
+  vector<LogicalType> scanned_types;
+
+  idx_t MaxThreads() const override { return 1; }
+  bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
+};
+
+struct LanceSearchLocalState : public ArrowScanLocalState {
+  explicit LanceSearchLocalState(unique_ptr<ArrowArrayWrapper> current_chunk,
+                                 ClientContext &context)
+      : ArrowScanLocalState(std::move(current_chunk), context),
+        filter_sel(STANDARD_VECTOR_SIZE) {}
+
+  void *stream = nullptr;
+  LanceSearchGlobalState *global_state = nullptr;
+  bool filter_pushed_down = false;
+  SelectionVector filter_sel;
+
+  ~LanceSearchLocalState() override {
+    if (stream) {
+      lance_close_stream(stream);
+    }
+  }
+};
+
+static void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
+                               DataChunk &chunk, SelectionVector &sel) {
+  if (chunk.size() == 0) {
+    return;
+  }
+  unique_ptr<Expression> combined;
+  for (auto &it : filters.filters) {
+    auto scan_col_idx = it.first;
+    if (scan_col_idx >= chunk.ColumnCount()) {
+      continue;
+    }
+    BoundReferenceExpression col_expr(chunk.data[scan_col_idx].GetType(),
+                                      NumericCast<storage_t>(scan_col_idx));
+    auto expr = it.second->ToExpression(col_expr);
+    if (!combined) {
+      combined = std::move(expr);
+    } else {
+      auto conj = make_uniq<BoundConjunctionExpression>(
+          ExpressionType::CONJUNCTION_AND);
+      conj->children.push_back(std::move(combined));
+      conj->children.push_back(std::move(expr));
+      combined = std::move(conj);
+    }
+  }
+  if (!combined) {
+    return;
+  }
+  ExpressionExecutor executor(context, *combined);
+  auto selected = executor.SelectExpression(chunk, sel);
+  if (selected != chunk.size()) {
+    chunk.Slice(sel, selected);
+  }
+}
+
+static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
+                                     const LanceSearchBindData &bind_data,
+                                     const LanceSearchGlobalState &global) {
+  if (!local_state.stream) {
+    auto filter_ptr = global.lance_filter_sql.empty()
+                          ? nullptr
+                          : global.lance_filter_sql.c_str();
+
+    if (bind_data.mode == LanceSearchMode::Fts) {
+      local_state.stream = lance_create_fts_stream(
+          bind_data.dataset, bind_data.text_column.c_str(),
+          bind_data.query.c_str(), bind_data.k, filter_ptr,
+          bind_data.prefilter ? 1 : 0);
+    } else {
+      local_state.stream = lance_create_hybrid_stream(
+          bind_data.dataset, bind_data.vector_column.c_str(),
+          bind_data.vector_query.data(), bind_data.vector_query.size(),
+          bind_data.text_column.c_str(), bind_data.text_query.c_str(),
+          bind_data.k, filter_ptr, bind_data.prefilter ? 1 : 0, bind_data.alpha,
+          bind_data.oversample_factor);
+    }
+    if (!local_state.stream) {
+      throw IOException("Failed to create Lance search stream" +
+                        LanceFormatErrorSuffix());
+    }
+  }
+
+  void *batch = nullptr;
+  auto rc = lance_stream_next(local_state.stream, &batch);
+  if (rc == 1) {
+    lance_close_stream(local_state.stream);
+    local_state.stream = nullptr;
+    return false;
+  }
+  if (rc != 0) {
+    throw IOException("Failed to read next Lance RecordBatch" +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
+  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
+  ArrowSchema tmp_schema;
+  memset(&tmp_schema, 0, sizeof(tmp_schema));
+
+  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
+    lance_free_batch(batch);
+    throw IOException(
+        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_batch(batch);
+
+  local_state.global_state->record_batches.fetch_add(1);
+  auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
+  local_state.global_state->record_batch_rows.fetch_add(rows);
+
+  if (tmp_schema.release) {
+    tmp_schema.release(&tmp_schema);
+  }
+
+  local_state.chunk = std::move(new_chunk);
+  local_state.Reset();
+  return true;
+}
+
+static unique_ptr<FunctionData>
+LanceSearchBindFts(ClientContext &context, TableFunctionBindInput &input,
+                   vector<LogicalType> &return_types, vector<string> &names) {
+  if (input.inputs.size() < 2) {
+    throw InvalidInputException("lance_search requires (path, query)");
+  }
+  if (input.inputs[0].IsNull()) {
+    throw InvalidInputException("lance_search requires a dataset root path");
+  }
+  if (input.inputs[1].IsNull()) {
+    throw InvalidInputException("lance_search requires a non-null query");
+  }
+
+  auto result = make_uniq<LanceSearchBindData>();
+  result->mode = LanceSearchMode::Fts;
+  result->file_path = input.inputs[0].GetValue<string>();
+  result->query = input.inputs[1].GetValue<string>();
+
+  int64_t k_val = 10;
+  if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+    k_val = input.inputs[2].GetValue<int64_t>();
+  }
+  auto k_named = input.named_parameters.find("k");
+  if (k_named != input.named_parameters.end() && !k_named->second.IsNull()) {
+    k_val =
+        k_named->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+  }
+  if (k_val <= 0) {
+    throw InvalidInputException("lance_search requires k > 0");
+  }
+  result->k = NumericCast<uint64_t>(k_val);
+
+  auto prefilter_named = input.named_parameters.find("prefilter");
+  if (prefilter_named != input.named_parameters.end() &&
+      !prefilter_named->second.IsNull()) {
+    result->prefilter =
+        prefilter_named->second.DefaultCastAs(LogicalType::BOOLEAN)
+            .GetValue<bool>();
+  }
+
+  result->dataset = lance_open_dataset(result->file_path.c_str());
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto column_named = input.named_parameters.find("text_column");
+  if (column_named == input.named_parameters.end()) {
+    column_named = input.named_parameters.find("column");
+  }
+  if (column_named != input.named_parameters.end() &&
+      !column_named->second.IsNull()) {
+    result->text_column = column_named->second.GetValue<string>();
+  } else {
+    result->text_column =
+        InferDefaultTextColumn(context, result->dataset, result->file_path);
+  }
+
+  auto *schema_handle = lance_get_fts_schema(
+      result->dataset, result->text_column.c_str(), result->query.c_str(),
+      result->k, result->prefilter ? 1 : 0);
+  if (!schema_handle) {
+    throw IOException("Failed to get Lance FTS schema: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
+      0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance FTS schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+  names = result->names;
+  return_types = result->types;
+  return std::move(result);
+}
+
+static unique_ptr<FunctionData>
+LanceSearchBindStruct(ClientContext &context, TableFunctionBindInput &input,
+                      vector<LogicalType> &return_types,
+                      vector<string> &names) {
+  if (input.inputs.size() < 2) {
+    throw InvalidInputException("lance_search requires (path, query)");
+  }
+  if (input.inputs[0].IsNull()) {
+    throw InvalidInputException("lance_search requires a dataset root path");
+  }
+  if (input.inputs[1].IsNull()) {
+    throw InvalidInputException("lance_search requires a non-null query");
+  }
+
+  auto query_val = input.inputs[1];
+  auto type_val = GetStructField(query_val, "type");
+  if (type_val.IsNull()) {
+    throw InvalidInputException("lance_search query struct requires type");
+  }
+  auto type = type_val.GetValue<string>();
+
+  auto result = make_uniq<LanceSearchBindData>();
+  result->file_path = input.inputs[0].GetValue<string>();
+
+  int64_t k_val = 10;
+  if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+    k_val = input.inputs[2].GetValue<int64_t>();
+  }
+  auto k_named = input.named_parameters.find("k");
+  if (k_named != input.named_parameters.end() && !k_named->second.IsNull()) {
+    k_val =
+        k_named->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+  }
+  if (k_val <= 0) {
+    throw InvalidInputException("lance_search requires k > 0");
+  }
+  result->k = NumericCast<uint64_t>(k_val);
+
+  auto prefilter_named = input.named_parameters.find("prefilter");
+  if (prefilter_named != input.named_parameters.end() &&
+      !prefilter_named->second.IsNull()) {
+    result->prefilter =
+        prefilter_named->second.DefaultCastAs(LogicalType::BOOLEAN)
+            .GetValue<bool>();
+  }
+
+  result->dataset = lance_open_dataset(result->file_path.c_str());
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  if (StringUtil::CIEquals(type, "match")) {
+    result->mode = LanceSearchMode::Fts;
+    auto q = GetStructField(query_val, "query");
+    auto c = GetStructField(query_val, "column");
+    if (q.IsNull() || c.IsNull()) {
+      throw InvalidInputException(
+          "lance_search(match) requires query and column");
+    }
+    result->query = q.GetValue<string>();
+    result->text_column = c.GetValue<string>();
+
+    auto *schema_handle = lance_get_fts_schema(
+        result->dataset, result->text_column.c_str(), result->query.c_str(),
+        result->k, result->prefilter ? 1 : 0);
+    if (!schema_handle) {
+      throw IOException("Failed to get Lance FTS schema: " + result->file_path +
+                        LanceFormatErrorSuffix());
+    }
+
+    memset(&result->schema_root.arrow_schema, 0,
+           sizeof(result->schema_root.arrow_schema));
+    if (lance_schema_to_arrow(schema_handle,
+                              &result->schema_root.arrow_schema) != 0) {
+      lance_free_schema(schema_handle);
+      throw IOException(
+          "Failed to export Lance FTS schema to Arrow C Data Interface" +
+          LanceFormatErrorSuffix());
+    }
+    lance_free_schema(schema_handle);
+  } else if (StringUtil::CIEquals(type, "hybrid")) {
+    result->mode = LanceSearchMode::Hybrid;
+
+    auto vec = GetStructField(query_val, "vector");
+    auto text = GetStructField(query_val, "text");
+    auto vcol = GetStructField(query_val, "vector_column");
+    auto tcol = GetStructField(query_val, "text_column");
+    if (vec.IsNull() || text.IsNull() || vcol.IsNull() || tcol.IsNull()) {
+      throw InvalidInputException(
+          "lance_search(hybrid) requires vector, text, vector_column, "
+          "text_column");
+    }
+    result->vector_query = ParseQueryVector(vec);
+    result->text_query = text.GetValue<string>();
+    result->vector_column = vcol.GetValue<string>();
+    result->text_column = tcol.GetValue<string>();
+
+    auto alpha_val = GetStructField(query_val, "alpha");
+    if (!alpha_val.IsNull()) {
+      result->alpha =
+          alpha_val.DefaultCastAs(LogicalType::FLOAT).GetValue<float>();
+    }
+    auto oversample_val = GetStructField(query_val, "oversample_factor");
+    if (!oversample_val.IsNull()) {
+      auto v = oversample_val.DefaultCastAs(LogicalType::INTEGER)
+                   .GetValue<int32_t>();
+      if (v > 0) {
+        result->oversample_factor = NumericCast<uint32_t>(v);
+      }
+    }
+
+    auto *schema_handle = lance_get_hybrid_schema(result->dataset);
+    if (!schema_handle) {
+      throw IOException("Failed to get Lance hybrid schema: " +
+                        result->file_path + LanceFormatErrorSuffix());
+    }
+
+    memset(&result->schema_root.arrow_schema, 0,
+           sizeof(result->schema_root.arrow_schema));
+    if (lance_schema_to_arrow(schema_handle,
+                              &result->schema_root.arrow_schema) != 0) {
+      lance_free_schema(schema_handle);
+      throw IOException(
+          "Failed to export Lance hybrid schema to Arrow C Data Interface" +
+          LanceFormatErrorSuffix());
+    }
+    lance_free_schema(schema_handle);
+  } else {
+    throw InvalidInputException("lance_search query type is not supported: " +
+                                type);
+  }
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+  names = result->names;
+  return_types = result->types;
+  return std::move(result);
+}
+
+static unique_ptr<GlobalTableFunctionState>
+LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
+  auto state =
+      make_uniq_base<GlobalTableFunctionState, LanceSearchGlobalState>();
+  auto &global = state->Cast<LanceSearchGlobalState>();
+
+  global.projection_ids = input.projection_ids;
+  if (!input.projection_ids.empty()) {
+    global.scanned_types.reserve(input.column_ids.size());
+    for (auto col_id : input.column_ids) {
+      if (col_id >= bind_data.types.size()) {
+        throw IOException("Invalid column id in projection");
+      }
+      global.scanned_types.push_back(bind_data.types[col_id]);
+    }
+  }
+
+  auto filter_build =
+      BuildLanceFilterSQL(bind_data.names, bind_data.types, input);
+  if (bind_data.prefilter && !filter_build.all_prefilterable_filters_pushed) {
+    throw InvalidInputException(
+        "lance_search requires filter pushdown for prefilterable columns when "
+        "prefilter=true");
+  }
+  global.lance_filter_sql = std::move(filter_build.pushed_sql);
+  global.filter_pushed_down =
+      filter_build.all_filters_pushed && !global.lance_filter_sql.empty();
+  return state;
+}
+
+static unique_ptr<LocalTableFunctionState>
+LanceSearchLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
+                     GlobalTableFunctionState *global_state) {
+  auto &global = global_state->Cast<LanceSearchGlobalState>();
+
+  auto chunk = make_uniq<ArrowArrayWrapper>();
+  auto result =
+      make_uniq<LanceSearchLocalState>(std::move(chunk), context.client);
+  result->column_ids = input.column_ids;
+  result->filters = input.filters.get();
+  result->global_state = &global;
+  result->filter_pushed_down = global.filter_pushed_down;
+  if (global.CanRemoveFilterColumns()) {
+    result->all_columns.Initialize(context.client, global.scanned_types);
+  }
+  return std::move(result);
+}
+
+static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
+                            DataChunk &output) {
+  if (!data.local_state) {
+    return;
+  }
+
+  auto &bind_data = data.bind_data->Cast<LanceSearchBindData>();
+  auto &global_state = data.global_state->Cast<LanceSearchGlobalState>();
+  auto &local_state = data.local_state->Cast<LanceSearchLocalState>();
+
+  while (true) {
+    if (local_state.chunk_offset >=
+        NumericCast<idx_t>(local_state.chunk->arrow_array.length)) {
+      if (!LanceSearchLoadNextBatch(local_state, bind_data, global_state)) {
+        return;
+      }
+    }
+
+    auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
+                     local_state.chunk_offset;
+    auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
+    auto start = global_state.lines_read.fetch_add(output_size);
+
+    if (global_state.CanRemoveFilterColumns()) {
+      local_state.all_columns.Reset();
+      local_state.all_columns.SetCardinality(output_size);
+      ArrowTableFunction::ArrowToDuckDB(local_state,
+                                        bind_data.arrow_table.GetColumns(),
+                                        local_state.all_columns, start, false);
+      local_state.chunk_offset += output_size;
+      if (local_state.filters && !local_state.filter_pushed_down) {
+        ApplyDuckDBFilters(context, *local_state.filters,
+                           local_state.all_columns, local_state.filter_sel);
+      }
+      output.ReferenceColumns(local_state.all_columns,
+                              global_state.projection_ids);
+      output.SetCardinality(local_state.all_columns);
+    } else {
+      output.SetCardinality(output_size);
+      ArrowTableFunction::ArrowToDuckDB(local_state,
+                                        bind_data.arrow_table.GetColumns(),
+                                        output, start, false);
+      local_state.chunk_offset += output_size;
+      if (local_state.filters && !local_state.filter_pushed_down) {
+        ApplyDuckDBFilters(context, *local_state.filters, output,
+                           local_state.filter_sel);
+      }
+    }
+
+    if (output.size() == 0) {
+      continue;
+    }
+    output.Verify();
+    return;
+  }
+}
+
+static void LanceMatchQueryFunc(DataChunk &args, ExpressionState &,
+                                Vector &result) {
+  auto count = args.size();
+  auto type = LanceSearchQueryType();
+  result.SetVectorType(VectorType::FLAT_VECTOR);
+  for (idx_t i = 0; i < count; i++) {
+    auto query = args.data[0].GetValue(i);
+    auto column = args.data[1].GetValue(i);
+    if (query.IsNull() || column.IsNull()) {
+      FlatVector::SetNull(result, i, true);
+      continue;
+    }
+
+    std::vector<Value> children;
+    children.reserve(9);
+    children.push_back(Value("match"));
+    children.push_back(query);
+    children.push_back(column);
+    children.push_back(Value(LogicalType::LIST(LogicalType::FLOAT)));
+    children.push_back(Value(LogicalType::VARCHAR));
+    children.push_back(Value(LogicalType::VARCHAR));
+    children.push_back(Value(LogicalType::VARCHAR));
+    children.push_back(Value(LogicalType::FLOAT));
+    children.push_back(Value(LogicalType::INTEGER));
+    result.SetValue(i, Value::STRUCT(type, std::move(children)));
+  }
+}
+
+static void LanceHybridQueryFunc(DataChunk &args, ExpressionState &,
+                                 Vector &result) {
+  auto count = args.size();
+  auto type = LanceSearchQueryType();
+  result.SetVectorType(VectorType::FLAT_VECTOR);
+  for (idx_t i = 0; i < count; i++) {
+    auto vector_value = args.data[0].GetValue(i);
+    auto text = args.data[1].GetValue(i);
+    auto vector_column = args.data[2].GetValue(i);
+    auto text_column = args.data[3].GetValue(i);
+
+    if (vector_value.IsNull() || text.IsNull() || vector_column.IsNull() ||
+        text_column.IsNull()) {
+      FlatVector::SetNull(result, i, true);
+      continue;
+    }
+
+    Value alpha(LogicalType::FLOAT);
+    if (args.ColumnCount() >= 5) {
+      alpha = args.data[4].GetValue(i);
+    }
+    Value oversample(LogicalType::INTEGER);
+    if (args.ColumnCount() >= 6) {
+      oversample = args.data[5].GetValue(i);
+    }
+
+    std::vector<Value> children;
+    children.reserve(9);
+    children.push_back(Value("hybrid"));
+    children.push_back(Value(LogicalType::VARCHAR));
+    children.push_back(Value(LogicalType::VARCHAR));
+    children.push_back(vector_value);
+    children.push_back(text);
+    children.push_back(vector_column);
+    children.push_back(text_column);
+    children.push_back(alpha);
+    children.push_back(oversample);
+
+    result.SetValue(i, Value::STRUCT(type, std::move(children)));
+  }
+}
+
+void RegisterLanceFts(ExtensionLoader &loader) {
+  TableFunction fts2("lance_search",
+                     {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                     LanceSearchFunc, LanceSearchBindFts, LanceSearchInitGlobal,
+                     LanceSearchLocalInit);
+  fts2.named_parameters["text_column"] = LogicalType::VARCHAR;
+  fts2.named_parameters["k"] = LogicalType::BIGINT;
+  fts2.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  fts2.projection_pushdown = true;
+  fts2.filter_pushdown = true;
+  fts2.filter_prune = true;
+  loader.RegisterFunction(fts2);
+
+  TableFunction fts3(
+      "lance_search",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT},
+      LanceSearchFunc, LanceSearchBindFts, LanceSearchInitGlobal,
+      LanceSearchLocalInit);
+  fts3.named_parameters["text_column"] = LogicalType::VARCHAR;
+  fts3.named_parameters["k"] = LogicalType::BIGINT;
+  fts3.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  fts3.projection_pushdown = true;
+  fts3.filter_pushdown = true;
+  fts3.filter_prune = true;
+  loader.RegisterFunction(fts3);
+
+  TableFunction fts_struct("lance_search",
+                           {LogicalType::VARCHAR, LanceSearchQueryType()},
+                           LanceSearchFunc, LanceSearchBindStruct,
+                           LanceSearchInitGlobal, LanceSearchLocalInit);
+  fts_struct.named_parameters["k"] = LogicalType::BIGINT;
+  fts_struct.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  fts_struct.projection_pushdown = true;
+  fts_struct.filter_pushdown = true;
+  fts_struct.filter_prune = true;
+  loader.RegisterFunction(fts_struct);
+
+  TableFunction fts_struct_k(
+      "lance_search",
+      {LogicalType::VARCHAR, LanceSearchQueryType(), LogicalType::BIGINT},
+      LanceSearchFunc, LanceSearchBindStruct, LanceSearchInitGlobal,
+      LanceSearchLocalInit);
+  fts_struct_k.named_parameters["k"] = LogicalType::BIGINT;
+  fts_struct_k.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+  fts_struct_k.projection_pushdown = true;
+  fts_struct_k.filter_pushdown = true;
+  fts_struct_k.filter_prune = true;
+  loader.RegisterFunction(fts_struct_k);
+
+  ScalarFunction match_query("lance_match_query",
+                             {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                             LanceSearchQueryType(), LanceMatchQueryFunc);
+  loader.RegisterFunction(match_query);
+
+  ScalarFunctionSet hybrid_query_set("lance_hybrid_query");
+  hybrid_query_set.AddFunction(ScalarFunction(
+      {LogicalType::LIST(LogicalType::FLOAT), LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LanceSearchQueryType(), LanceHybridQueryFunc));
+  hybrid_query_set.AddFunction(ScalarFunction(
+      {LogicalType::LIST(LogicalType::FLOAT), LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::FLOAT},
+      LanceSearchQueryType(), LanceHybridQueryFunc));
+  hybrid_query_set.AddFunction(ScalarFunction(
+      {LogicalType::LIST(LogicalType::FLOAT), LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::FLOAT,
+       LogicalType::INTEGER},
+      LanceSearchQueryType(), LanceHybridQueryFunc));
+  loader.RegisterFunction(hybrid_query_set);
+}
+
+} // namespace duckdb

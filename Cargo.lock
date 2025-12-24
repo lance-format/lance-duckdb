@@ -3654,6 +3654,7 @@ dependencies = [
  "datafusion-functions",
  "futures",
  "lance",
+ "lance-index",
  "tokio",
 ]
 

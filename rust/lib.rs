@@ -11,7 +11,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::Float32Array;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::ProjectionRequest;
 use lance::Dataset;
+use lance_index::scalar::FullTextSearchQuery;
+use std::cmp::Ordering;
 
 mod error;
 mod filter_ir;
@@ -39,6 +42,29 @@ struct DatasetHandle {
 }
 
 const DISTANCE_COLUMN: &str = "_distance";
+const SCORE_COLUMN: &str = "_score";
+const HYBRID_SCORE_COLUMN: &str = "_hybrid_score";
+const ROW_ID_COLUMN: &str = "_rowid";
+
+enum StreamHandle {
+    Lance(LanceStream),
+    Batches(Vec<RecordBatch>),
+}
+
+impl StreamHandle {
+    fn next(&mut self) -> Result<Option<RecordBatch>, String> {
+        match self {
+            StreamHandle::Lance(stream) => stream.next().map_err(|e| format!("{e}")),
+            StreamHandle::Batches(batches) => {
+                if batches.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(batches.remove(0)))
+                }
+            }
+        }
+    }
+}
 
 fn normalize_distance_column(batch: &RecordBatch) -> Result<RecordBatch, String> {
     let schema = batch.schema();
@@ -68,7 +94,7 @@ fn normalize_distance_column(batch: &RecordBatch) -> Result<RecordBatch, String>
     }
     let normalized = Arc::new(builder.finish()) as Arc<dyn Array>;
 
-    let mut cols: Vec<Arc<dyn Array>> = batch.columns().iter().cloned().collect();
+    let mut cols: Vec<Arc<dyn Array>> = batch.columns().to_vec();
     cols[idx] = normalized;
 
     RecordBatch::try_new(schema.clone(), cols).map_err(|e| format!("{e}"))
@@ -109,6 +135,23 @@ fn build_default_knn_projection(dataset: &Dataset, vector_column: &str) -> Arc<[
         cols.push(field.name().to_string());
     }
     cols.push(DISTANCE_COLUMN.to_string());
+    cols.into()
+}
+
+fn is_default_excluded_field(field: &arrow::datatypes::Field) -> bool {
+    matches!(field.data_type(), DataType::FixedSizeList(_, _))
+}
+
+fn build_default_fts_projection(dataset: &Dataset) -> Arc<[String]> {
+    let schema: Schema = dataset.schema().into();
+    let mut cols = Vec::with_capacity(schema.fields().len() + 1);
+    for field in schema.fields() {
+        if is_default_excluded_field(field) {
+            continue;
+        }
+        cols.push(field.name().to_string());
+    }
+    cols.push(SCORE_COLUMN.to_string());
     cols.into()
 }
 
@@ -402,7 +445,7 @@ pub unsafe extern "C" fn lance_create_stream(dataset: *mut c_void) -> *mut c_voi
     match LanceStream::from_scanner(scanner) {
         Ok(stream) => {
             clear_last_error();
-            Box::into_raw(Box::new(stream)) as *mut c_void
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
         }
         Err(err) => {
             set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
@@ -678,7 +721,7 @@ pub unsafe extern "C" fn lance_create_knn_stream(
     match LanceStream::from_scanner(scan) {
         Ok(stream) => {
             clear_last_error();
-            Box::into_raw(Box::new(stream)) as *mut c_void
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
         }
         Err(err) => {
             set_last_error(
@@ -813,7 +856,7 @@ pub unsafe extern "C" fn lance_create_fragment_stream(
     match LanceStream::from_scanner(scan) {
         Ok(stream) => {
             clear_last_error();
-            Box::into_raw(Box::new(stream)) as *mut c_void
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
         }
         Err(err) => {
             set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
@@ -907,13 +950,623 @@ pub unsafe extern "C" fn lance_create_fragment_stream_ir(
     match LanceStream::from_scanner(scan) {
         Ok(stream) => {
             clear_last_error();
-            Box::into_raw(Box::new(stream)) as *mut c_void
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
         }
         Err(err) => {
             set_last_error(ErrorCode::StreamCreate, format!("stream create: {err}"));
             ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_get_fts_schema(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    prefilter: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query = match cstr_to_str(query, "query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let k_i64 = match i64::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_fts_projection(&handle.dataset);
+
+    let fts_query = match FullTextSearchQuery::new(query.to_string()).with_column(text_column.to_string()) {
+        Ok(v) => v.limit(Some(k_i64)),
+        Err(err) => {
+            set_last_error(ErrorCode::FtsSchema, format!("fts query: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Err(err) = scan.full_text_search(fts_query) {
+        set_last_error(ErrorCode::FtsSchema, format!("fts schema search: {err}"));
+        return ptr::null_mut();
+    }
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(ErrorCode::FtsSchema, format!("fts schema project: {err}"));
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    let schema = match LanceStream::from_scanner(scan) {
+        Ok(stream) => stream.schema(),
+        Err(err) => {
+            set_last_error(ErrorCode::FtsSchema, format!("fts schema: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    clear_last_error();
+    Box::into_raw(Box::new(schema)) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_fts_stream(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    filter_sql: *const c_char,
+    prefilter: u8,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query = match cstr_to_str(query, "query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = if filter_sql.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let k_i64 = match i64::try_from(k) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let projection = build_default_fts_projection(&handle.dataset);
+
+    let fts_query = match FullTextSearchQuery::new(query.to_string()).with_column(text_column.to_string()) {
+        Ok(v) => v.limit(Some(k_i64)),
+        Err(err) => {
+            set_last_error(ErrorCode::FtsStreamCreate, format!("fts query: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        if let Err(err) = scan.filter(filter) {
+            set_last_error(
+                ErrorCode::FtsStreamCreate,
+                format!("fts scan filter: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    }
+    if let Err(err) = scan.full_text_search(fts_query) {
+        set_last_error(
+            ErrorCode::FtsStreamCreate,
+            format!("fts scan search: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.disable_scoring_autoprojection();
+    if let Err(err) = scan.project(projection.as_ref()) {
+        set_last_error(
+            ErrorCode::FtsStreamCreate,
+            format!("fts scan project: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    scan.scan_in_order(false);
+
+    match LanceStream::from_scanner(scan) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(StreamHandle::Lance(stream))) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(
+                ErrorCode::FtsStreamCreate,
+                format!("fts stream create: {err}"),
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+fn normalize_range(values: &[f32]) -> (f32, f32) {
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &v in values {
+        if !v.is_finite() {
+            continue;
+        }
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    if !min_v.is_finite() {
+        (0.0, 0.0)
+    } else {
+        (min_v, max_v)
+    }
+}
+
+fn normalize_value(v: f32, min_v: f32, max_v: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    if (max_v - min_v).abs() < f32::EPSILON {
+        return 0.5;
+    }
+    ((v - min_v) / (max_v - min_v)).clamp(0.0, 1.0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_get_hybrid_schema(dataset: *mut c_void) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::HybridSchema, "dataset is null");
+        return ptr::null_mut();
+    }
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let schema: Schema = handle.dataset.schema().into();
+
+    let mut fields = Vec::with_capacity(schema.fields().len() + 3);
+    for field in schema.fields() {
+        if is_default_excluded_field(field) {
+            continue;
+        }
+        fields.push(field.clone());
+    }
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        DISTANCE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        SCORE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        HYBRID_SCORE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+
+    clear_last_error();
+    Box::into_raw(Box::new(Arc::new(Schema::new(fields)))) as *mut c_void
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_hybrid_stream(
+    dataset: *mut c_void,
+    vector_column: *const c_char,
+    query_values: *const f32,
+    query_len: usize,
+    text_column: *const c_char,
+    text_query: *const c_char,
+    k: u64,
+    filter_sql: *const c_char,
+    prefilter: u8,
+    alpha: f32,
+    oversample_factor: u32,
+) -> *mut c_void {
+    if dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "dataset is null");
+        return ptr::null_mut();
+    }
+    if query_len == 0 {
+        set_last_error(ErrorCode::InvalidArgument, "query vector must be non-empty");
+        return ptr::null_mut();
+    }
+
+    let vector_column = match cstr_to_str(vector_column, "vector_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_column = match cstr_to_str(text_column, "text_column") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let text_query = match cstr_to_str(text_query, "text_query") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+    let query_values = match slice_from_ptr(query_values, query_len, "query_values") {
+        Ok(v) => v,
+        Err(()) => return ptr::null_mut(),
+    };
+
+    let filter = if filter_sql.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(filter_sql) }.to_str() {
+            Ok(v) if !v.is_empty() => Some(v),
+            Ok(_) => None,
+            Err(err) => {
+                set_last_error(ErrorCode::Utf8, format!("utf8 decode: {err}"));
+                return ptr::null_mut();
+            }
+        }
+    };
+
+    let k_usize = match usize::try_from(k) {
+        Ok(v) if v > 0 => v,
+        Ok(_) => {
+            set_last_error(ErrorCode::InvalidArgument, "k must be > 0");
+            return ptr::null_mut();
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::InvalidArgument, format!("invalid k: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let handle = unsafe { &*(dataset as *const DatasetHandle) };
+    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let oversample = k_usize
+        .saturating_mul(oversample_factor.max(1) as usize)
+        .max(k_usize);
+
+    let mut vector_scan = handle.dataset.scan();
+    vector_scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        if let Err(err) = vector_scan.filter(filter) {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid vector filter: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    }
+    if let Err(err) = vector_scan.nearest(vector_column, &query, oversample) {
+        set_last_error(
+            ErrorCode::HybridStreamCreate,
+            format!("hybrid vector nearest: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    vector_scan.use_index(false);
+    vector_scan.with_row_id();
+    vector_scan.disable_scoring_autoprojection();
+    if let Err(err) = vector_scan.project(&[ROW_ID_COLUMN, DISTANCE_COLUMN]) {
+        set_last_error(
+            ErrorCode::HybridStreamCreate,
+            format!("hybrid vector project: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    vector_scan.scan_in_order(false);
+
+    let mut vector_stream = match LanceStream::from_scanner(vector_scan) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid vector stream: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut vector_rows = Vec::<(u64, f32)>::new();
+    loop {
+        match vector_stream.next() {
+            Ok(Some(batch)) => {
+                let idx_rowid = match batch.schema().index_of(ROW_ID_COLUMN) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        set_last_error(
+                            ErrorCode::HybridStreamCreate,
+                            "hybrid vector batch missing _rowid",
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                let idx_dist = match batch.schema().index_of(DISTANCE_COLUMN) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        set_last_error(
+                            ErrorCode::HybridStreamCreate,
+                            "hybrid vector batch missing _distance",
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                let rowids = batch.column(idx_rowid).as_any().downcast_ref::<arrow_array::UInt64Array>();
+                let dists = batch.column(idx_dist).as_any().downcast_ref::<Float32Array>();
+                let (Some(rowids), Some(dists)) = (rowids, dists) else {
+                    set_last_error(
+                        ErrorCode::HybridStreamCreate,
+                        "hybrid vector batch has unexpected column types",
+                    );
+                    return ptr::null_mut();
+                };
+                for i in 0..batch.num_rows() {
+                    if rowids.is_null(i) || dists.is_null(i) {
+                        continue;
+                    }
+                    vector_rows.push((rowids.value(i), dists.value(i)));
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                set_last_error(
+                    ErrorCode::HybridStreamCreate,
+                    format!("hybrid vector next: {err}"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    }
+
+    let fts_query = match FullTextSearchQuery::new(text_query.to_string()).with_column(text_column.to_string()) {
+        Ok(v) => v.limit(Some(oversample as i64)),
+        Err(err) => {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid fts query: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut fts_scan = handle.dataset.scan();
+    fts_scan.prefilter(prefilter != 0);
+    if let Some(filter) = filter {
+        if let Err(err) = fts_scan.filter(filter) {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid fts filter: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    }
+    if let Err(err) = fts_scan.full_text_search(fts_query) {
+        set_last_error(
+            ErrorCode::HybridStreamCreate,
+            format!("hybrid fts search: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    fts_scan.with_row_id();
+    fts_scan.disable_scoring_autoprojection();
+    if let Err(err) = fts_scan.project(&[ROW_ID_COLUMN, SCORE_COLUMN]) {
+        set_last_error(
+            ErrorCode::HybridStreamCreate,
+            format!("hybrid fts project: {err}"),
+        );
+        return ptr::null_mut();
+    }
+    fts_scan.scan_in_order(false);
+
+    let mut fts_stream = match LanceStream::from_scanner(fts_scan) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid fts stream: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    let mut fts_rows = Vec::<(u64, f32)>::new();
+    loop {
+        match fts_stream.next() {
+            Ok(Some(batch)) => {
+                let idx_rowid = match batch.schema().index_of(ROW_ID_COLUMN) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        set_last_error(
+                            ErrorCode::HybridStreamCreate,
+                            "hybrid fts batch missing _rowid",
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                let idx_score = match batch.schema().index_of(SCORE_COLUMN) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        set_last_error(
+                            ErrorCode::HybridStreamCreate,
+                            "hybrid fts batch missing _score",
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                let rowids = batch.column(idx_rowid).as_any().downcast_ref::<arrow_array::UInt64Array>();
+                let scores = batch.column(idx_score).as_any().downcast_ref::<Float32Array>();
+                let (Some(rowids), Some(scores)) = (rowids, scores) else {
+                    set_last_error(
+                        ErrorCode::HybridStreamCreate,
+                        "hybrid fts batch has unexpected column types",
+                    );
+                    return ptr::null_mut();
+                };
+                for i in 0..batch.num_rows() {
+                    if rowids.is_null(i) || scores.is_null(i) {
+                        continue;
+                    }
+                    fts_rows.push((rowids.value(i), scores.value(i)));
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                set_last_error(
+                    ErrorCode::HybridStreamCreate,
+                    format!("hybrid fts next: {err}"),
+                );
+                return ptr::null_mut();
+            }
+        }
+    }
+
+    let vector_values = vector_rows.iter().map(|(_, d)| *d).collect::<Vec<_>>();
+    let fts_values = fts_rows.iter().map(|(_, s)| *s).collect::<Vec<_>>();
+    let (dist_min, dist_max) = normalize_range(&vector_values);
+    let (score_min, score_max) = normalize_range(&fts_values);
+
+    let alpha = alpha.clamp(0.0, 1.0);
+    let mut merged = std::collections::HashMap::<u64, (Option<f32>, Option<f32>, f32)>::new();
+    for (rowid, dist) in vector_rows {
+        let dist_norm = 1.0 - normalize_value(dist, dist_min, dist_max);
+        merged.insert(rowid, (Some(dist), None, alpha * dist_norm));
+    }
+    for (rowid, score) in fts_rows {
+        let score_norm = normalize_value(score, score_min, score_max);
+        merged
+            .entry(rowid)
+            .and_modify(|e| {
+                e.1 = Some(score);
+                e.2 += (1.0 - alpha) * score_norm;
+            })
+            .or_insert((None, Some(score), (1.0 - alpha) * score_norm));
+    }
+
+    let mut ranked: Vec<(u64, Option<f32>, Option<f32>, f32)> = merged
+        .into_iter()
+        .map(|(rowid, (dist, score, hybrid))| (rowid, dist, score, hybrid))
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.3.partial_cmp(&a.3)
+            .unwrap_or_else(|| if b.3.is_nan() && a.3.is_nan() { Ordering::Equal } else if b.3.is_nan() { Ordering::Less } else { Ordering::Greater })
+    });
+    ranked.truncate(k_usize);
+
+    let row_ids: Vec<u64> = ranked.iter().map(|(rowid, _, _, _)| *rowid).collect();
+    let projection_cols = {
+        let schema: Schema = handle.dataset.schema().into();
+        schema
+            .fields()
+            .iter()
+            .filter(|f| !is_default_excluded_field(f))
+            .map(|f| f.name().to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let projection = ProjectionRequest::from_columns(&projection_cols, handle.dataset.schema());
+    let rows = match runtime::block_on(handle.dataset.take_rows(&row_ids, projection)) {
+        Ok(Ok(batch)) => batch,
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid take_rows: {err}"),
+            );
+            return ptr::null_mut();
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            return ptr::null_mut();
+        }
+    };
+
+    let mut dist_builder = Float32Builder::with_capacity(rows.num_rows());
+    let mut score_builder = Float32Builder::with_capacity(rows.num_rows());
+    let mut hybrid_builder = Float32Builder::with_capacity(rows.num_rows());
+    for (_, dist, score, hybrid) in &ranked {
+        match dist {
+            Some(v) => dist_builder.append_value(*v),
+            None => dist_builder.append_null(),
+        }
+        match score {
+            Some(v) => score_builder.append_value(*v),
+            None => score_builder.append_null(),
+        }
+        if hybrid.is_finite() {
+            hybrid_builder.append_value(*hybrid);
+        } else {
+            hybrid_builder.append_null();
+        }
+    }
+
+    let mut cols: Vec<Arc<dyn Array>> = rows.columns().to_vec();
+    cols.push(Arc::new(dist_builder.finish()) as Arc<dyn Array>);
+    cols.push(Arc::new(score_builder.finish()) as Arc<dyn Array>);
+    cols.push(Arc::new(hybrid_builder.finish()) as Arc<dyn Array>);
+
+    let mut fields = rows.schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        DISTANCE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        SCORE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        HYBRID_SCORE_COLUMN,
+        DataType::Float32,
+        true,
+    )));
+
+    let out_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let rows = match RecordBatch::try_new(out_schema, cols) {
+        Ok(v) => v,
+        Err(err) => {
+            set_last_error(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid batch: {err}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+
+    clear_last_error();
+    Box::into_raw(Box::new(StreamHandle::Batches(vec![rows]))) as *mut c_void
 }
 
 #[no_mangle]
@@ -934,7 +1587,7 @@ pub unsafe extern "C" fn lance_stream_next(
         return -1;
     }
 
-    let stream = unsafe { &mut *(stream as *mut LanceStream) };
+    let stream = unsafe { &mut *(stream as *mut StreamHandle) };
 
     match stream.next() {
         Ok(Some(batch)) => {
@@ -960,7 +1613,7 @@ pub unsafe extern "C" fn lance_stream_next(
 pub unsafe extern "C" fn lance_close_stream(stream: *mut c_void) {
     if !stream.is_null() {
         unsafe {
-            let _ = Box::from_raw(stream as *mut LanceStream);
+            let _ = Box::from_raw(stream as *mut StreamHandle);
         }
     }
 }

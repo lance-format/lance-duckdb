@@ -10,7 +10,8 @@ project(${TARGET_NAME})
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
-                      src/lance_knn.cpp src/lance_replacement.cpp)
+                      src/lance_knn.cpp src/lance_fts.cpp
+                      src/lance_replacement.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

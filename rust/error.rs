@@ -18,6 +18,10 @@ pub enum ErrorCode {
     KnnSchema = 11,
     KnnStreamCreate = 12,
     ExplainPlan = 13,
+    FtsSchema = 14,
+    FtsStreamCreate = 15,
+    HybridSchema = 16,
+    HybridStreamCreate = 17,
 }
 
 struct LastError {
@@ -26,7 +30,7 @@ struct LastError {
 }
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<LastError>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<LastError>> = const { RefCell::new(None) };
 }
 
 fn sanitize_message(message: &str) -> CString {
