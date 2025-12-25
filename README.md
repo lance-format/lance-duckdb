@@ -32,61 +32,76 @@ SELECT *
   LIMIT 10;
 ```
 
-### Search (vector / FTS / hybrid)
-
-The extension exposes `lance_search(...)` as a unified entry point for:
-- Vector search (KNN / ANN)
-- Full-text search (FTS)
-- Hybrid search (vector + FTS)
-
-Note: DuckDB treats `column` as a keyword in some contexts. Prefer `text_column` / `vector_column`.
-
-#### Full-text search (FTS)
-
-```sql
--- Search a text column, returning BM25-like scores in `_score`
-SELECT id, text, _score
-FROM lance_search('path/to/dataset.lance', 'puppy', text_column = 'text', k = 10, prefilter = true)
-ORDER BY _score DESC;
-```
-
-#### Structured text queries
-
-```sql
--- Equivalent to the plain string form, but explicit about the target column
-SELECT id, text, _score
-FROM lance_search('path/to/dataset.lance', lance_match_query('crazily', 'text'), k = 100)
-ORDER BY _score DESC;
-```
-
-#### Vector search
+### Vector search
 
 ```sql
 -- Search a vector column, returning distances in `_distance` (smaller is closer)
 SELECT id, label, _distance
-FROM lance_search(
-  'path/to/dataset.lance',
-  [0.1, 0.2, 0.3, 0.4]::FLOAT[],
-  vector_column = 'vec',
-  k = 5,
-  prefilter = true
-)
+FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+                         k = 5, prefilter = true)
 ORDER BY _distance ASC;
 ```
 
-#### Hybrid search (vector + FTS)
+- Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
+- Positional arguments:
+  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+  - `vector_column` (VARCHAR): Vector column name.
+  - `query_vector` (FLOAT[] or DOUBLE[]): Query vector (must be non-empty; values are cast to float32).
+- Named parameters:
+  - `k` (BIGINT, default `10`): Number of results to return.
+  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
+  - `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage when available.
+  - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
+- Output:
+  - Dataset columns plus `_distance` (smaller is closer).
+
+### Full-text search (FTS)
+
+```sql
+-- Search a text column, returning BM25-like scores in `_score`
+SELECT id, text, _score
+FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10, prefilter = true)
+ORDER BY _score DESC;
+```
+
+- Signature: `lance_fts(uri, text_column, query, ...)`
+- Positional arguments:
+  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+  - `text_column` (VARCHAR): Text column name.
+  - `query` (VARCHAR): Query string.
+- Named parameters:
+  - `k` (BIGINT, default `10`): Number of results to return.
+  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
+- Output:
+  - Dataset columns plus `_score` (larger is better).
+
+### Hybrid search (vector + FTS)
 
 ```sql
 -- Combine vector and text scores, returning `_hybrid_score` in addition to `_distance` / `_score`
 SELECT id, _hybrid_score, _distance, _score
-FROM lance_search(
-  'path/to/dataset.lance',
-  lance_hybrid_query([0.1, 0.2, 0.3, 0.4]::FLOAT[], 'puppy', 'vec', 'text', 0.5, 4),
-  k = 10,
-  prefilter = false
-)
+FROM lance_hybrid_search('path/to/dataset.lance',
+                         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+                         'text', 'puppy',
+                         k = 10, prefilter = false,
+                         alpha = 0.5, oversample_factor = 4)
 ORDER BY _hybrid_score DESC;
 ```
+
+- Signature: `lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)`
+- Positional arguments:
+  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+  - `vector_column` (VARCHAR): Vector column name.
+  - `query_vector` (FLOAT[] or DOUBLE[]): Query vector (must be non-empty; values are cast to float32).
+  - `text_column` (VARCHAR): Text column name.
+  - `query` (VARCHAR): Query string.
+- Named parameters:
+  - `k` (BIGINT, default `10`): Number of results to return.
+  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
+  - `alpha` (FLOAT, default `0.5`): Vector/text mixing weight.
+  - `oversample_factor` (INTEGER, default `4`): Oversample factor for candidate generation (larger can improve recall at higher cost).
+- Output:
+  - Dataset columns plus `_hybrid_score` (larger is better), `_distance`, and `_score`.
 
 ## Install
 

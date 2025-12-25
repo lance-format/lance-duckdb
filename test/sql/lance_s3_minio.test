@@ -50,10 +50,10 @@ SELECT count(*) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}'
 5
 
 query I
-SELECT count(*) FROM lance_search(
+SELECT count(*) FROM lance_fts(
   's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}',
+  'text',
   'puppy',
-  text_column = 'text',
   k = 10
 );
 ----
@@ -61,18 +61,16 @@ SELECT count(*) FROM lance_search(
 
 query I
 SELECT id
-FROM lance_search(
+FROM lance_hybrid_search(
   's3://${LANCE_S3_BUCKET}/${LANCE_S3_SEARCH_DATASET_PREFIX}',
-  lance_hybrid_query(
-    [0.0, 0.0, 0.0, 0.0]::FLOAT[],
-    'puppy',
-    'vec',
-    'text',
-    0.5,
-    4
-  ),
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+  'text',
+  'puppy',
   k = 3,
-  prefilter = false
+  prefilter = false,
+  alpha = 0.5,
+  oversample_factor = 4
 )
 ORDER BY _hybrid_score DESC;
 ----
