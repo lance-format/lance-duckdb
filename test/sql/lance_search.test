@@ -1,8 +1,26 @@
-# name: test/sql/search.test
+# name: test/sql/lance_search.test
 # description: SQL surface tests for lance_search (vector / fts / hybrid)
 # group: [sql]
 
 require lance
+
+# Invalid dataset root
+statement error
+SELECT * FROM lance_search('dummy_path.lance', [1.0]::FLOAT[], 1)
+----
+IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
+
+# Empty query vector is rejected
+statement error
+SELECT * FROM lance_search('test/test_data.lance', []::FLOAT[], 1)
+----
+Invalid Input Error: lance_search requires a non-empty query vector
+
+# Non-positive k is rejected
+statement error
+SELECT * FROM lance_search('test/test_data.lance', [1.0]::FLOAT[], 0)
+----
+Invalid Input Error: lance_search requires k > 0
 
 # Sanity: dataset is readable
 query I
