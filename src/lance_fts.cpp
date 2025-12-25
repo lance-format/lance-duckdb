@@ -2,17 +2,18 @@
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
+
+#include "lance_common.hpp"
+#include "lance_ffi.hpp"
+#include "lance_filter_ir.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -20,193 +21,7 @@
 #include <cstring>
 #include <limits>
 
-extern "C" {
-void *lance_open_dataset(const char *path);
-void lance_close_dataset(void *dataset);
-
-void *lance_get_schema(void *dataset);
-void lance_free_schema(void *schema);
-int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
-
-void *lance_get_fts_schema(void *dataset, const char *text_column,
-                           const char *query, uint64_t k, uint8_t prefilter);
-void *lance_create_fts_stream(void *dataset, const char *text_column,
-                              const char *query, uint64_t k,
-                              const char *filter_sql, uint8_t prefilter);
-
-void *lance_get_hybrid_schema(void *dataset);
-void *lance_create_hybrid_stream(void *dataset, const char *vector_column,
-                                 const float *query_values, size_t query_len,
-                                 const char *text_column,
-                                 const char *text_query, uint64_t k,
-                                 const char *filter_sql, uint8_t prefilter,
-                                 float alpha, uint32_t oversample_factor);
-
-int32_t lance_stream_next(void *stream, void **out_batch);
-void lance_close_stream(void *stream);
-
-int32_t lance_last_error_code();
-const char *lance_last_error_message();
-void lance_free_string(const char *s);
-
-void lance_free_batch(void *batch);
-int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
-                             ArrowSchema *out_schema);
-}
-
 namespace duckdb {
-
-static string LanceConsumeLastError() {
-  auto code = lance_last_error_code();
-  string message;
-  if (auto *ptr = lance_last_error_message()) {
-    message = ptr;
-    lance_free_string(ptr);
-  }
-
-  if (code == 0 && message.empty()) {
-    return "";
-  }
-  if (message.empty()) {
-    return "code=" + to_string(code);
-  }
-  if (code == 0) {
-    return message;
-  }
-  return message + " (code=" + to_string(code) + ")";
-}
-
-static string LanceFormatErrorSuffix() {
-  auto err = LanceConsumeLastError();
-  if (err.empty()) {
-    return "";
-  }
-  return " (Lance error: " + err + ")";
-}
-
-static bool IsComputedSearchColumn(const string &name) {
-  return name == "_distance" || name == "_score" || name == "_hybrid_score";
-}
-
-static string EscapeLanceColumnName(const string &name) {
-  string result;
-  idx_t start = 0;
-  for (idx_t i = 0; i <= name.size(); i++) {
-    if (i == name.size() || name[i] == '.') {
-      auto segment = name.substr(start, i - start);
-      if (!result.empty()) {
-        result += ".";
-      }
-      result += "`";
-      result += StringUtil::Replace(segment, "`", "``");
-      result += "`";
-      start = i + 1;
-    }
-  }
-  return result;
-}
-
-static bool LanceFilterPushdownSupported(const TableFilter &filter) {
-  switch (filter.filter_type) {
-  case TableFilterType::CONSTANT_COMPARISON:
-  case TableFilterType::IS_NULL:
-  case TableFilterType::IS_NOT_NULL:
-  case TableFilterType::IN_FILTER:
-    return true;
-  case TableFilterType::CONJUNCTION_AND: {
-    auto &f = filter.Cast<ConjunctionAndFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  case TableFilterType::CONJUNCTION_OR: {
-    auto &f = filter.Cast<ConjunctionOrFilter>();
-    for (auto &child : f.child_filters) {
-      if (!LanceFilterPushdownSupported(*child)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  default:
-    return false;
-  }
-}
-
-static bool LanceSupportsPushdownLogicalType(const LogicalType &type) {
-  switch (type.id()) {
-  case LogicalTypeId::BOOLEAN:
-  case LogicalTypeId::TINYINT:
-  case LogicalTypeId::SMALLINT:
-  case LogicalTypeId::INTEGER:
-  case LogicalTypeId::BIGINT:
-  case LogicalTypeId::UTINYINT:
-  case LogicalTypeId::USMALLINT:
-  case LogicalTypeId::UINTEGER:
-  case LogicalTypeId::UBIGINT:
-  case LogicalTypeId::FLOAT:
-  case LogicalTypeId::DOUBLE:
-  case LogicalTypeId::VARCHAR:
-    return true;
-  default:
-    return false;
-  }
-}
-
-struct LanceFilterBuildResult {
-  string pushed_sql;
-  bool all_filters_pushed = true;
-  bool all_prefilterable_filters_pushed = true;
-};
-
-static LanceFilterBuildResult
-BuildLanceFilterSQL(const vector<string> &names,
-                    const vector<LogicalType> &types,
-                    const TableFunctionInitInput &input) {
-  LanceFilterBuildResult result;
-  if (!input.filters || input.filters->filters.empty()) {
-    return result;
-  }
-
-  vector<string> predicates;
-  predicates.reserve(input.filters->filters.size());
-
-  for (auto &it : input.filters->filters) {
-    auto scan_col_idx = it.first;
-    auto &filter = *it.second;
-    if (scan_col_idx >= input.column_ids.size()) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    auto col_id = input.column_ids[scan_col_idx];
-    if (col_id >= names.size() || col_id >= types.size()) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    if (IsComputedSearchColumn(names[col_id])) {
-      result.all_filters_pushed = false;
-      continue;
-    }
-
-    if (!LanceFilterPushdownSupported(filter) ||
-        !LanceSupportsPushdownLogicalType(types[col_id])) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    predicates.push_back(filter.ToString(EscapeLanceColumnName(names[col_id])));
-  }
-
-  if (!predicates.empty()) {
-    result.pushed_sql = StringUtil::Join(predicates, " AND ");
-  }
-  return result;
-}
 
 static vector<float> ParseQueryVector(const Value &value) {
   if (value.IsNull()) {
@@ -396,8 +211,9 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
   std::atomic<idx_t> record_batches{0};
   std::atomic<idx_t> record_batch_rows{0};
-  string lance_filter_sql;
+  string lance_filter_ir;
   bool filter_pushed_down = false;
+  std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
@@ -424,60 +240,39 @@ struct LanceSearchLocalState : public ArrowScanLocalState {
   }
 };
 
-static void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
-                               DataChunk &chunk, SelectionVector &sel) {
-  if (chunk.size() == 0) {
-    return;
-  }
-  unique_ptr<Expression> combined;
-  for (auto &it : filters.filters) {
-    auto scan_col_idx = it.first;
-    if (scan_col_idx >= chunk.ColumnCount()) {
-      continue;
-    }
-    BoundReferenceExpression col_expr(chunk.data[scan_col_idx].GetType(),
-                                      NumericCast<storage_t>(scan_col_idx));
-    auto expr = it.second->ToExpression(col_expr);
-    if (!combined) {
-      combined = std::move(expr);
-    } else {
-      auto conj = make_uniq<BoundConjunctionExpression>(
-          ExpressionType::CONJUNCTION_AND);
-      conj->children.push_back(std::move(combined));
-      conj->children.push_back(std::move(expr));
-      combined = std::move(conj);
-    }
-  }
-  if (!combined) {
-    return;
-  }
-  ExpressionExecutor executor(context, *combined);
-  auto selected = executor.SelectExpression(chunk, sel);
-  if (selected != chunk.size()) {
-    chunk.Slice(sel, selected);
-  }
-}
-
 static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
                                      const LanceSearchBindData &bind_data,
-                                     const LanceSearchGlobalState &global) {
+                                     LanceSearchGlobalState &global) {
   if (!local_state.stream) {
-    auto filter_ptr = global.lance_filter_sql.empty()
-                          ? nullptr
-                          : global.lance_filter_sql.c_str();
+    const uint8_t *filter_ir =
+        global.lance_filter_ir.empty()
+            ? nullptr
+            : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
+    auto filter_ir_len = global.lance_filter_ir.size();
 
-    if (bind_data.mode == LanceSearchMode::Fts) {
-      local_state.stream = lance_create_fts_stream(
-          bind_data.dataset, bind_data.text_column.c_str(),
-          bind_data.query.c_str(), bind_data.k, filter_ptr,
-          bind_data.prefilter ? 1 : 0);
-    } else {
-      local_state.stream = lance_create_hybrid_stream(
+    auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
+      if (bind_data.mode == LanceSearchMode::Fts) {
+        return lance_create_fts_stream_ir(
+            bind_data.dataset, bind_data.text_column.c_str(),
+            bind_data.query.c_str(), bind_data.k, ir, ir_len,
+            bind_data.prefilter ? 1 : 0);
+      }
+      return lance_create_hybrid_stream_ir(
           bind_data.dataset, bind_data.vector_column.c_str(),
           bind_data.vector_query.data(), bind_data.vector_query.size(),
           bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-          bind_data.k, filter_ptr, bind_data.prefilter ? 1 : 0, bind_data.alpha,
+          bind_data.k, ir, ir_len, bind_data.prefilter ? 1 : 0, bind_data.alpha,
           bind_data.oversample_factor);
+    };
+
+    local_state.stream = create_stream(filter_ir, filter_ir_len);
+    if (!local_state.stream && filter_ir && !bind_data.prefilter) {
+      // Best-effort: if filter pushdown failed, retry without it and rely on
+      // DuckDB-side filter execution for correctness.
+      global.filter_pushdown_fallbacks.fetch_add(1);
+      global.filter_pushed_down = false;
+      local_state.filter_pushed_down = false;
+      local_state.stream = create_stream(nullptr, 0);
     }
     if (!local_state.stream) {
       throw IOException("Failed to create Lance search stream" +
@@ -563,7 +358,7 @@ LanceSearchBindFts(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  result->dataset = lance_open_dataset(result->file_path.c_str());
+  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -656,7 +451,7 @@ LanceSearchBindStruct(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  result->dataset = lance_open_dataset(result->file_path.c_str());
+  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -771,16 +566,28 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  auto filter_build =
-      BuildLanceFilterSQL(bind_data.names, bind_data.types, input);
-  if (bind_data.prefilter && !filter_build.all_prefilterable_filters_pushed) {
+  auto table_filters = BuildLanceTableFilterIRParts(
+      bind_data.names, bind_data.types, input, true);
+  if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException(
         "lance_search requires filter pushdown for prefilterable columns when "
         "prefilter=true");
   }
-  global.lance_filter_sql = std::move(filter_build.pushed_sql);
+
+  bool has_table_filter_parts = !table_filters.parts.empty();
+  string filter_ir_msg;
+  if (!table_filters.parts.empty()) {
+    if (!TryEncodeLanceFilterIRMessage(table_filters.parts, filter_ir_msg)) {
+      filter_ir_msg.clear();
+    }
+    global.lance_filter_ir = std::move(filter_ir_msg);
+  }
+  if (bind_data.prefilter && has_table_filter_parts &&
+      global.lance_filter_ir.empty()) {
+    throw IOException("Failed to encode Lance filter IR");
+  }
   global.filter_pushed_down =
-      filter_build.all_filters_pushed && !global.lance_filter_sql.empty();
+      table_filters.all_filters_pushed && !global.lance_filter_ir.empty();
   return state;
 }
 

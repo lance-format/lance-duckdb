@@ -3,7 +3,7 @@ use std::ffi::{c_char, CString};
 use std::ptr;
 
 #[repr(i32)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum ErrorCode {
     InvalidArgument = 1,
     Utf8 = 2,
@@ -20,7 +20,6 @@ pub enum ErrorCode {
     ExplainPlan = 13,
     FtsSchema = 14,
     FtsStreamCreate = 15,
-    HybridSchema = 16,
     HybridStreamCreate = 17,
 }
 
