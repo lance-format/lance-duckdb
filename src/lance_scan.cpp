@@ -113,6 +113,7 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
 
   vector<string> scan_column_names;
   string lance_filter_ir;
+  bool filter_pushed_down = false;
 
   bool count_only = false;
   idx_t count_only_total_rows = 0;
@@ -136,6 +137,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
   void *stream = nullptr;
   LanceScanGlobalState *global_state = nullptr;
   idx_t fragment_pos = 0;
+  bool filter_pushed_down = false;
   SelectionVector filter_sel;
 
   ~LanceScanLocalState() override {
@@ -283,6 +285,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
     scan_state.lance_filter_ir = std::move(filter_ir_msg);
   }
+  scan_state.filter_pushed_down =
+      table_filters.all_filters_pushed && !scan_state.lance_filter_ir.empty();
 
   if (scan_state.scan_column_names.empty() &&
       scan_state.lance_filter_ir.empty()) {
@@ -324,6 +328,7 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   result->column_ids = input.column_ids;
   result->filters = input.filters.get();
   result->global_state = &scan_global;
+  result->filter_pushed_down = scan_global.filter_pushed_down;
   if (scan_global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, scan_global.scanned_types);
   }
@@ -364,6 +369,8 @@ static bool LanceScanOpenStream(ClientContext &context,
                                  : reinterpret_cast<const uint8_t *>(
                                        global_state.lance_filter_ir.data());
   auto filter_ir_len = global_state.lance_filter_ir.size();
+  local_state.filter_pushed_down =
+      global_state.filter_pushed_down && filter_ir && filter_ir_len > 0;
 
   auto stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
                                                 columns.data(), columns.size(),
@@ -372,6 +379,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
     global_state.filter_pushdown_fallbacks.fetch_add(1);
+    local_state.filter_pushed_down = false;
     stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
                                              columns.data(), columns.size(),
                                              nullptr, 0);
@@ -480,7 +488,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters) {
+      if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
                            local_state.all_columns, local_state.filter_sel);
       }
@@ -492,7 +500,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, start);
       local_state.chunk_offset += output_size;
-      if (local_state.filters) {
+      if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
                            local_state.filter_sel);
       }
