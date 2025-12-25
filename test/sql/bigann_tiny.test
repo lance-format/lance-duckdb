@@ -1,0 +1,323 @@
+# name: test/sql/bigann_tiny.test
+# description: Big-ANN style fixture coverage (exact + prefilter + index path)
+# group: [sql]
+
+require lance
+
+# Sanity: fixture is readable
+query I
+SELECT count(*) FROM 'test/bigann_tiny/base.lance'
+----
+2048
+
+query I
+SELECT count(*) FROM 'test/bigann_tiny/queries.lance'
+----
+32
+
+query I
+SELECT count(*) FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+----
+320
+
+query I
+SELECT count(*) FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+----
+320
+
+# Exact search (no index): ids match precomputed groundtruth for qid=0
+query I
+WITH got AS (
+  SELECT
+    CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
+    r.id AS id
+  FROM lance_vector_search(
+    'test/bigann_tiny/base.lance',
+    'vec',
+    [
+      0.32245764,
+      0.2814153,
+      0.08346437,
+      0.28065863,
+      0.2566661,
+      -0.47035545,
+      -0.9935358,
+      0.09578487,
+      0.000604047,
+      -0.37332273,
+      0.12592472,
+      -0.3458825,
+      -0.2536356,
+      -0.3673502,
+      -0.68120277,
+      0.41665298
+    ]::FLOAT[],
+    k = 10,
+    use_index = false
+  ) r
+),
+exp AS (
+  SELECT CAST(rank AS INTEGER) AS rank, id
+  FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+  WHERE qid = 0
+)
+SELECT count(*) FROM (
+  (SELECT * FROM got EXCEPT SELECT * FROM exp)
+  UNION ALL
+  (SELECT * FROM exp EXCEPT SELECT * FROM got)
+) diff;
+----
+0
+
+# Prefilter: exact search restricted to label=1 matches precomputed groundtruth
+query I
+WITH got AS (
+  SELECT
+    CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
+    r.id AS id
+  FROM lance_vector_search(
+    'test/bigann_tiny/base.lance',
+    'vec',
+    [
+      0.32245764,
+      0.2814153,
+      0.08346437,
+      0.28065863,
+      0.2566661,
+      -0.47035545,
+      -0.9935358,
+      0.09578487,
+      0.000604047,
+      -0.37332273,
+      0.12592472,
+      -0.3458825,
+      -0.2536356,
+      -0.3673502,
+      -0.68120277,
+      0.41665298
+    ]::FLOAT[],
+    k = 10,
+    prefilter = true,
+    use_index = false
+  ) r
+  WHERE r.label = 1
+),
+exp AS (
+  SELECT CAST(rank AS INTEGER) AS rank, id
+  FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+  WHERE qid = 0
+)
+SELECT count(*) FROM (
+  (SELECT * FROM got EXCEPT SELECT * FROM exp)
+  UNION ALL
+  (SELECT * FROM exp EXCEPT SELECT * FROM got)
+) diff;
+----
+0
+
+# Index path: returns k rows, and rank-0 id matches the exact groundtruth
+query I
+WITH got AS (
+  SELECT
+    CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
+    r.id AS id
+  FROM lance_vector_search(
+    'test/bigann_tiny/base.lance',
+    'vec',
+    [
+      0.32245764,
+      0.2814153,
+      0.08346437,
+      0.28065863,
+      0.2566661,
+      -0.47035545,
+      -0.9935358,
+      0.09578487,
+      0.000604047,
+      -0.37332273,
+      0.12592472,
+      -0.3458825,
+      -0.2536356,
+      -0.3673502,
+      -0.68120277,
+      0.41665298
+    ]::FLOAT[],
+    k = 10,
+    use_index = true
+  ) r
+)
+SELECT count(*) FROM got;
+----
+10
+
+query I
+WITH got AS (
+  SELECT r.id AS id
+  FROM lance_vector_search(
+    'test/bigann_tiny/base.lance',
+    'vec',
+    [
+      0.32245764,
+      0.2814153,
+      0.08346437,
+      0.28065863,
+      0.2566661,
+      -0.47035545,
+      -0.9935358,
+      0.09578487,
+      0.000604047,
+      -0.37332273,
+      0.12592472,
+      -0.3458825,
+      -0.2536356,
+      -0.3673502,
+      -0.68120277,
+      0.41665298
+    ]::FLOAT[],
+    k = 10,
+    use_index = true
+  ) r
+  ORDER BY r._distance, r.id
+  LIMIT 1
+),
+exp AS (
+  SELECT id
+  FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+  WHERE qid = 0
+)
+SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
+----
+1
+
+query I
+SELECT count(*)
+FROM lance_vector_search(
+  'test/bigann_tiny/base.lance',
+  'vec',
+  [
+    0.32245764,
+    0.2814153,
+    0.08346437,
+    0.28065863,
+    0.2566661,
+    -0.47035545,
+    -0.9935358,
+    0.09578487,
+    0.000604047,
+    -0.37332273,
+    0.12592472,
+    -0.3458825,
+    -0.2536356,
+    -0.3673502,
+    -0.68120277,
+    0.41665298
+  ]::FLOAT[],
+  k = 10,
+  prefilter = true,
+  use_index = true
+)
+WHERE label = 1;
+----
+10
+
+query I
+WITH got AS (
+  SELECT r.id AS id
+  FROM lance_vector_search(
+    'test/bigann_tiny/base.lance',
+    'vec',
+    [
+      0.32245764,
+      0.2814153,
+      0.08346437,
+      0.28065863,
+      0.2566661,
+      -0.47035545,
+      -0.9935358,
+      0.09578487,
+      0.000604047,
+      -0.37332273,
+      0.12592472,
+      -0.3458825,
+      -0.2536356,
+      -0.3673502,
+      -0.68120277,
+      0.41665298
+    ]::FLOAT[],
+    k = 10,
+    prefilter = true,
+    use_index = true
+  ) r
+  WHERE r.label = 1
+  ORDER BY r._distance, r.id
+  LIMIT 1
+),
+exp AS (
+  SELECT id
+  FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+  WHERE qid = 0
+)
+SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
+----
+1
+
+# Explain diagnostics include the use_index flag
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM lance_vector_search(
+  'test/bigann_tiny/base.lance',
+  'vec',
+  [
+    0.32245764,
+    0.2814153,
+    0.08346437,
+    0.28065863,
+    0.2566661,
+    -0.47035545,
+    -0.9935358,
+    0.09578487,
+    0.000604047,
+    -0.37332273,
+    0.12592472,
+    -0.3458825,
+    -0.2536356,
+    -0.3673502,
+    -0.68120277,
+    0.41665298
+  ]::FLOAT[],
+  k = 1,
+  use_index = true
+);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Use Index": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM lance_vector_search(
+  'test/bigann_tiny/base.lance',
+  'vec',
+  [
+    0.32245764,
+    0.2814153,
+    0.08346437,
+    0.28065863,
+    0.2566661,
+    -0.47035545,
+    -0.9935358,
+    0.09578487,
+    0.000604047,
+    -0.37332273,
+    0.12592472,
+    -0.3458825,
+    -0.2536356,
+    -0.3673502,
+    -0.68120277,
+    0.41665298
+  ]::FLOAT[],
+  k = 1,
+  use_index = false
+);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Use Index": "false"[\s\S]*
