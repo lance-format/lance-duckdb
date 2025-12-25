@@ -10,6 +10,14 @@ This repository contains a DuckDB extension for querying Lance format datasets (
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
 
+## Deliverable & Compatibility Policy
+
+This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). All APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
+
+- They are not intended to be directly consumed by end users.
+- There are no external downstream users that depend on them.
+- When planning/implementing/refactoring, prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
+
 ## Essential Commands
 
 ### Building
