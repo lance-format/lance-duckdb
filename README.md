@@ -34,10 +34,10 @@ SELECT *
 
 ### Search (vector / FTS / hybrid)
 
-The extension exposes `lance_search(...)` as a unified entry point for:
-- Vector search (KNN / ANN)
-- Full-text search (FTS)
-- Hybrid search (vector + FTS)
+The extension exposes three table functions:
+- `lance_vector_search(...)` for vector search (KNN / ANN)
+- `lance_fts(...)` for full-text search (FTS)
+- `lance_hybrid_search(...)` for hybrid search (vector + FTS)
 
 Note: DuckDB treats `column` as a keyword in some contexts. Prefer `text_column` / `vector_column`.
 
@@ -46,16 +46,7 @@ Note: DuckDB treats `column` as a keyword in some contexts. Prefer `text_column`
 ```sql
 -- Search a text column, returning BM25-like scores in `_score`
 SELECT id, text, _score
-FROM lance_search('path/to/dataset.lance', 'puppy', text_column = 'text', k = 10, prefilter = true)
-ORDER BY _score DESC;
-```
-
-#### Structured text queries
-
-```sql
--- Equivalent to the plain string form, but explicit about the target column
-SELECT id, text, _score
-FROM lance_search('path/to/dataset.lance', lance_match_query('crazily', 'text'), k = 100)
+FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10, prefilter = true)
 ORDER BY _score DESC;
 ```
 
@@ -64,13 +55,8 @@ ORDER BY _score DESC;
 ```sql
 -- Search a vector column, returning distances in `_distance` (smaller is closer)
 SELECT id, label, _distance
-FROM lance_search(
-  'path/to/dataset.lance',
-  [0.1, 0.2, 0.3, 0.4]::FLOAT[],
-  vector_column = 'vec',
-  k = 5,
-  prefilter = true
-)
+FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+                         k = 5, prefilter = true)
 ORDER BY _distance ASC;
 ```
 
@@ -79,12 +65,11 @@ ORDER BY _distance ASC;
 ```sql
 -- Combine vector and text scores, returning `_hybrid_score` in addition to `_distance` / `_score`
 SELECT id, _hybrid_score, _distance, _score
-FROM lance_search(
-  'path/to/dataset.lance',
-  lance_hybrid_query([0.1, 0.2, 0.3, 0.4]::FLOAT[], 'puppy', 'vec', 'text', 0.5, 4),
-  k = 10,
-  prefilter = false
-)
+FROM lance_hybrid_search('path/to/dataset.lance',
+                         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+                         'text', 'puppy',
+                         k = 10, prefilter = false,
+                         alpha = 0.5, oversample_factor = 4)
 ORDER BY _hybrid_score DESC;
 ```
 
