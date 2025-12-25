@@ -4,11 +4,19 @@ This file provides guidance to coding agents working in this repository, includi
 
 ## Project Overview
 
-This repository contains a DuckDB extension for querying Lance format datasets. The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
+This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
 ## Documentation Language
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
+
+## Deliverable & Compatibility Policy
+
+This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). All APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
+
+- They are not intended to be directly consumed by end users.
+- There are no external downstream users that depend on them.
+- When planning/implementing/refactoring, prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
 
 ## Essential Commands
 
@@ -67,33 +75,6 @@ cargo clippy --manifest-path Cargo.toml --all-targets
 
 ## Architecture & Key Design Decisions
 
-### Extension Architecture
-
-#### Source layout
-
-- Primary C++ extension sources are under `src/` (see `CMakeLists.txt` for `EXTENSION_SOURCES`).
-
-#### DuckDB layer (C++)
-
-- `src/lance_extension.cpp`
-  - Defines the `lance_init` entry point and the `LanceExtension` class.
-  - Registers the `lance_scan` table function and a replacement scan.
-
-- `src/lance_scan.cpp`
-  - Implements the `lance_scan(path)` table function.
-  - `bind`: opens the dataset via Rust FFI, exports schema via Arrow C Data Interface, and lets DuckDB derive output types.
-  - `init`: creates a streaming scanner via Rust FFI.
-  - `func`: pulls RecordBatches, exports each batch via Arrow C Data Interface, and converts Arrow -> DuckDB via `ArrowTableFunction::ArrowToDuckDB`.
-  - Currently disables projection and filter pushdown and serializes stream access via a global mutex.
-
-- `src/lance_replacement.cpp`
-  - Enables `SELECT * FROM '.../dataset.lance'` by rewriting it into `lance_scan('.../dataset.lance')`.
-
-#### Rust FFI layer
-
-- `rust/lib.rs`: C ABI for opening datasets, exporting schema and batches via Arrow C Data Interface, and streaming RecordBatches.
-- `rust/scanner.rs`: wraps Lance scanning as a `RecordBatch` stream.
-
 #### Naming Strategy
 
 The project uses different names to avoid conflicts:
@@ -102,16 +83,18 @@ The project uses different names to avoid conflicts:
 
 ## Test Data & Testing Conventions
 
-### Test Dataset
-
-Location: `test/test_data.lance`
-
 ### Test Format
 
 Uses DuckDB's `sqllogictest` format in `test/sql/`:
 - `statement ok/error`: Test statement execution
 - `query <types>`: Test queries with expected results (`I`=int, `T`=text, `R`=real)
 - `require lance`: Load the extension
+
+Key test files:
+- `test/sql/lance.test` (scan, pushdown, explain diagnostics, replacement scan)
+- `test/sql/knn.test` (KNN API validation)
+- `test/sql/search.test` (vector/FTS/hybrid search surface)
+- `test/sql/lance_s3_minio.test` (S3 scan/search via DuckDB secrets, gated by `LANCE_TEST_S3=1`)
 
 ## Common Issues
 
