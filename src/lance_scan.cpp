@@ -153,19 +153,7 @@ static bool LanceSupportsPushdownType(const FunctionData &bind_data,
   if (col_idx >= scan_bind.types.size()) {
     return false;
   }
-  auto &type = scan_bind.types[col_idx];
-  if (LanceFilterIRSupportsLogicalType(type)) {
-    return true;
-  }
-  // Even if a type is not supported by our Lance filter IR, we can still
-  // safely evaluate DuckDB table filters inside the scan (and potentially
-  // prune filter-only columns).
-  switch (type.id()) {
-  case LogicalTypeId::DATE:
-    return true;
-  default:
-    return false;
-  }
+  return LanceFilterIRSupportsLogicalType(scan_bind.types[col_idx]);
 }
 
 static void
