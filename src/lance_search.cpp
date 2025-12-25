@@ -76,7 +76,8 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
 static vector<float> ParseQueryVector(const Value &value,
                                       const string &function_name) {
   if (value.IsNull()) {
-    throw InvalidInputException(function_name + " requires a non-null query vector");
+    throw InvalidInputException(function_name +
+                                " requires a non-null query vector");
   }
   if (value.type().id() != LogicalTypeId::LIST) {
     throw InvalidInputException(function_name +
@@ -90,13 +91,13 @@ static vector<float> ParseQueryVector(const Value &value,
 
   auto cast_f32 = [&function_name](double v) {
     if (!std::isfinite(v)) {
-      throw InvalidInputException(
-          function_name + " query vector contains non-finite value");
+      throw InvalidInputException(function_name +
+                                  " query vector contains non-finite value");
     }
     auto max_v = static_cast<double>(std::numeric_limits<float>::max());
     if (v > max_v || v < -max_v) {
-      throw InvalidInputException(function_name +
-                                  " query vector value is out of float32 range");
+      throw InvalidInputException(
+          function_name + " query vector value is out of float32 range");
     }
     return static_cast<float>(v);
   };
@@ -105,7 +106,8 @@ static vector<float> ParseQueryVector(const Value &value,
   out.reserve(children.size());
   for (auto &child : children) {
     if (child.IsNull()) {
-      throw InvalidInputException(function_name + " query vector contains NULL");
+      throw InvalidInputException(function_name +
+                                  " query vector contains NULL");
     }
     switch (child.type().id()) {
     case LogicalTypeId::FLOAT:
@@ -131,8 +133,8 @@ static vector<float> ParseQueryVector(const Value &value,
         auto dbl = child.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
         out.push_back(cast_f32(dbl));
       } catch (Exception &) {
-        throw InvalidInputException(
-            function_name + " query vector elements must be numeric");
+        throw InvalidInputException(function_name +
+                                    " query vector elements must be numeric");
       }
     }
   }
@@ -340,9 +342,9 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
-    throw InvalidInputException(
-        "lance_vector_search requires filter pushdown for prefilterable columns when "
-        "prefilter=true");
+    throw InvalidInputException("lance_vector_search requires filter pushdown "
+                                "for prefilterable columns when "
+                                "prefilter=true");
   }
 
   bool has_table_filter_parts = !table_filters.parts.empty();
@@ -631,16 +633,16 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
   TableFunction search_f32("lance_vector_search",
                            {LogicalType::VARCHAR, LogicalType::VARCHAR,
                             LogicalType::LIST(LogicalType::FLOAT)},
-                           LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
-                           LanceKnnLocalInit);
+                           LanceKnnFunc, LanceSearchVectorBind,
+                           LanceKnnInitGlobal, LanceKnnLocalInit);
   configure(search_f32);
   loader.RegisterFunction(search_f32);
 
   TableFunction search_f64("lance_vector_search",
                            {LogicalType::VARCHAR, LogicalType::VARCHAR,
                             LogicalType::LIST(LogicalType::DOUBLE)},
-                           LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
-                           LanceKnnLocalInit);
+                           LanceKnnFunc, LanceSearchVectorBind,
+                           LanceKnnInitGlobal, LanceKnnLocalInit);
   configure(search_f64);
   loader.RegisterFunction(search_f64);
 }
@@ -792,11 +794,13 @@ static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
   return true;
 }
 
-static unique_ptr<FunctionData>
-LanceFtsBind(ClientContext &context, TableFunctionBindInput &input,
-             vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
+                                             TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types,
+                                             vector<string> &names) {
   if (input.inputs.size() < 3) {
-    throw InvalidInputException("lance_fts requires (path, text_column, query)");
+    throw InvalidInputException(
+        "lance_fts requires (path, text_column, query)");
   }
   if (input.inputs[0].IsNull()) {
     throw InvalidInputException("lance_fts requires a dataset root path");
@@ -872,8 +876,8 @@ static unique_ptr<FunctionData>
 LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
                 vector<LogicalType> &return_types, vector<string> &names) {
   if (input.inputs.size() < 5) {
-    throw InvalidInputException(
-        "lance_hybrid_search requires (path, vector_column, vector, text_column, text)");
+    throw InvalidInputException("lance_hybrid_search requires (path, "
+                                "vector_column, vector, text_column, text)");
   }
   if (input.inputs[0].IsNull()) {
     throw InvalidInputException(
@@ -892,14 +896,16 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         "lance_hybrid_search requires a non-null text_column");
   }
   if (input.inputs[4].IsNull()) {
-    throw InvalidInputException("lance_hybrid_search requires a non-null query");
+    throw InvalidInputException(
+        "lance_hybrid_search requires a non-null query");
   }
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
   result->file_path = input.inputs[0].GetValue<string>();
   result->vector_column = input.inputs[1].GetValue<string>();
-  result->vector_query = ParseQueryVector(input.inputs[2], "lance_hybrid_search");
+  result->vector_query =
+      ParseQueryVector(input.inputs[2], "lance_hybrid_search");
   result->text_column = input.inputs[3].GetValue<string>();
   result->text_query = input.inputs[4].GetValue<string>();
 
@@ -946,8 +952,8 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto *schema_handle = lance_get_hybrid_schema(result->dataset);
   if (!schema_handle) {
-    throw IOException("Failed to get Lance hybrid schema: " + result->file_path +
-                      LanceFormatErrorSuffix());
+    throw IOException("Failed to get Lance hybrid schema: " +
+                      result->file_path + LanceFormatErrorSuffix());
   }
 
   memset(&result->schema_root.arrow_schema, 0,
@@ -995,9 +1001,9 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"
                              : "lance_hybrid_search";
-    throw InvalidInputException(
-        string(function_name) +
-        " requires filter pushdown for prefilterable columns when prefilter=true");
+    throw InvalidInputException(string(function_name) +
+                                " requires filter pushdown for prefilterable "
+                                "columns when prefilter=true");
   }
 
   bool has_table_filter_parts = !table_filters.parts.empty();
@@ -1093,11 +1099,11 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
 }
 
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
-  TableFunction fts("lance_fts",
-                    {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                     LogicalType::VARCHAR},
-                    LanceSearchFunc, LanceFtsBind, LanceSearchInitGlobal,
-                    LanceSearchLocalInit);
+  TableFunction fts(
+      "lance_fts",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LanceSearchFunc, LanceFtsBind, LanceSearchInitGlobal,
+      LanceSearchLocalInit);
   fts.named_parameters["k"] = LogicalType::BIGINT;
   fts.named_parameters["prefilter"] = LogicalType::BOOLEAN;
   fts.projection_pushdown = true;
@@ -1117,23 +1123,21 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_prune = true;
   };
 
-  TableFunction hybrid_f32(
-      "lance_hybrid_search",
-      {LogicalType::VARCHAR, LogicalType::VARCHAR,
-       LogicalType::LIST(LogicalType::FLOAT), LogicalType::VARCHAR,
-       LogicalType::VARCHAR},
-      LanceSearchFunc, LanceHybridBind, LanceSearchInitGlobal,
-      LanceSearchLocalInit);
+  TableFunction hybrid_f32("lance_hybrid_search",
+                           {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                            LogicalType::LIST(LogicalType::FLOAT),
+                            LogicalType::VARCHAR, LogicalType::VARCHAR},
+                           LanceSearchFunc, LanceHybridBind,
+                           LanceSearchInitGlobal, LanceSearchLocalInit);
   configure(hybrid_f32);
   loader.RegisterFunction(hybrid_f32);
 
-  TableFunction hybrid_f64(
-      "lance_hybrid_search",
-      {LogicalType::VARCHAR, LogicalType::VARCHAR,
-       LogicalType::LIST(LogicalType::DOUBLE), LogicalType::VARCHAR,
-       LogicalType::VARCHAR},
-      LanceSearchFunc, LanceHybridBind, LanceSearchInitGlobal,
-      LanceSearchLocalInit);
+  TableFunction hybrid_f64("lance_hybrid_search",
+                           {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                            LogicalType::LIST(LogicalType::DOUBLE),
+                            LogicalType::VARCHAR, LogicalType::VARCHAR},
+                           LanceSearchFunc, LanceHybridBind,
+                           LanceSearchInitGlobal, LanceSearchLocalInit);
   configure(hybrid_f64);
   loader.RegisterFunction(hybrid_f64);
 }
