@@ -2,6 +2,7 @@
 
 #include "lance_common.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/date.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -37,6 +38,7 @@ bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
   case LogicalTypeId::FLOAT:
   case LogicalTypeId::DOUBLE:
   case LogicalTypeId::VARCHAR:
+  case LogicalTypeId::DATE:
     return true;
   default:
     return false;
@@ -66,6 +68,7 @@ enum class LanceFilterIRLiteralTag : uint8_t {
   F32 = 4,
   F64 = 5,
   STRING = 6,
+  DATE32 = 7,
 };
 
 enum class LanceFilterIRComparisonOp : uint8_t {
@@ -88,6 +91,10 @@ static void LanceFilterIRAppendU32(string &out, uint32_t v) {
   buf[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
   buf[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
   out.append(reinterpret_cast<const char *>(buf), sizeof(buf));
+}
+
+static void LanceFilterIRAppendI32(string &out, int32_t v) {
+  LanceFilterIRAppendU32(out, static_cast<uint32_t>(v));
 }
 
 static void LanceFilterIRAppendU64(string &out, uint64_t v) {
@@ -236,6 +243,16 @@ static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
     LanceFilterIRAppendU8(
         out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::STRING));
     return LanceFilterIRAppendLenPrefixedString(out_ir, v);
+  }
+  case LogicalTypeId::DATE: {
+    auto d = value.GetValue<date_t>();
+    if (!Date::IsFinite(d)) {
+      return false;
+    }
+    LanceFilterIRAppendU8(
+        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::DATE32));
+    LanceFilterIRAppendI32(out_ir, d.days);
+    return true;
   }
   default:
     return false;
@@ -512,7 +529,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     auto &c = cast.child->Cast<BoundConstantExpression>();
-    return TryEncodeLanceFilterIRLiteral(c.value, out_ir);
+    try {
+      auto casted = c.value.DefaultCastAs(cast.return_type);
+      return TryEncodeLanceFilterIRLiteral(casted, out_ir);
+    } catch (...) {
+      return false;
+    }
   }
   case ExpressionClass::BOUND_COMPARISON: {
     auto &cmp = expr.Cast<BoundComparisonExpression>();

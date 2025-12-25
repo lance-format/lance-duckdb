@@ -26,6 +26,7 @@ const LIT_U64: u8 = 3;
 const LIT_F32: u8 = 4;
 const LIT_F64: u8 = 5;
 const LIT_STRING: u8 = 6;
+const LIT_DATE32: u8 = 7;
 
 const OP_EQ: u8 = 0;
 const OP_NOT_EQ: u8 = 1;
@@ -92,6 +93,11 @@ impl<'a> Cursor<'a> {
     fn read_i64_le(&mut self) -> Result<i64> {
         let bytes = self.read_exact(8)?;
         Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_i32_le(&mut self) -> Result<i32> {
+        let bytes = self.read_exact(4)?;
+        Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_u64_le(&mut self) -> Result<u64> {
@@ -203,6 +209,7 @@ fn parse_literal(cursor: &mut Cursor<'_>) -> Result<Expr> {
         LIT_F32 => ScalarValue::Float32(Some(cursor.read_f32_le()?)),
         LIT_F64 => ScalarValue::Float64(Some(cursor.read_f64_le()?)),
         LIT_STRING => ScalarValue::Utf8(Some(cursor.read_len_prefixed_string()?)),
+        LIT_DATE32 => ScalarValue::Date32(Some(cursor.read_i32_le()?)),
         other => return Err(anyhow!("unknown literal tag: {other}")),
     };
     Ok(Expr::Literal(scalar, None))
