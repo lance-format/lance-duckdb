@@ -46,7 +46,6 @@ bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
 }
 
 static constexpr char LANCE_FILTER_IR_MAGIC[] = {'L', 'F', 'T', '1'};
-static constexpr uint8_t LANCE_FILTER_IR_VERSION = 1;
 
 enum class LanceFilterIRTag : uint8_t {
   COLUMN_REF = 1,
@@ -143,7 +142,6 @@ static bool LanceFilterIRAppendLenPrefixedString(string &out,
 static string LanceFilterIREncodeMessage(const string &root_node) {
   string out;
   out.append(LANCE_FILTER_IR_MAGIC, sizeof(LANCE_FILTER_IR_MAGIC));
-  LanceFilterIRAppendU8(out, LANCE_FILTER_IR_VERSION);
   out.append(root_node);
   return out;
 }

@@ -7,7 +7,6 @@ use datafusion_expr::{Expr, ScalarUDF};
 use datafusion_functions::core::getfield::GetFieldFunc;
 
 const MAGIC: &[u8; 4] = b"LFT1";
-const VERSION: u8 = 1;
 
 const TAG_COLUMN_REF: u8 = 1;
 const TAG_LITERAL: u8 = 2;
@@ -44,17 +43,14 @@ fn getfield_udf() -> Arc<ScalarUDF> {
 }
 
 pub fn parse_filter_ir(filter_ir: &[u8]) -> Result<Expr> {
-    if filter_ir.len() < MAGIC.len() + 1 {
+    if filter_ir.len() < MAGIC.len() {
         bail!("filter_ir is too short");
     }
     if &filter_ir[0..MAGIC.len()] != MAGIC {
         bail!("filter_ir magic mismatch");
     }
-    if filter_ir[MAGIC.len()] != VERSION {
-        bail!("unsupported filter_ir version: {}", filter_ir[MAGIC.len()]);
-    }
 
-    let mut cursor = Cursor::new(&filter_ir[MAGIC.len() + 1..]);
+    let mut cursor = Cursor::new(&filter_ir[MAGIC.len()..]);
     let expr = parse_node(&mut cursor)?;
     if cursor.remaining() != 0 {
         bail!("trailing bytes in filter_ir: {}", cursor.remaining());
