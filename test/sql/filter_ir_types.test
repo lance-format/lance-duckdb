@@ -1,0 +1,84 @@
+# name: test/sql/filter_ir_types.test
+# description: Filter IR supports timestamps/decimals/struct fields
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT
+    1::BIGINT AS id,
+    TIMESTAMP '2020-01-01 00:00:00' AS ts_us,
+    CAST(TIMESTAMP '2020-01-01 00:00:00' AS TIMESTAMP_NS) AS ts_ns,
+    CAST('9.99' AS DECIMAL(9,2)) AS d_small,
+    CAST('0.0000000000' AS DECIMAL(38,10)) AS d_big,
+    struct_pack(a := 1::INTEGER, b := 'x'::VARCHAR) AS s
+  UNION ALL
+  SELECT
+    2::BIGINT AS id,
+    TIMESTAMP '2020-01-03 00:00:00' AS ts_us,
+    CAST(TIMESTAMP '2020-01-03 00:00:00' AS TIMESTAMP_NS) AS ts_ns,
+    CAST('10.00' AS DECIMAL(9,2)) AS d_small,
+    CAST('1234567890123456789012345678.1234567890' AS DECIMAL(38,10)) AS d_big,
+    struct_pack(a := 2::INTEGER, b := 'y'::VARCHAR) AS s
+  UNION ALL
+  SELECT
+    3::BIGINT AS id,
+    TIMESTAMP '2020-01-05 00:00:00' AS ts_us,
+    CAST(TIMESTAMP '2020-01-05 00:00:00' AS TIMESTAMP_NS) AS ts_ns,
+    CAST('10.01' AS DECIMAL(9,2)) AS d_small,
+    CAST('-1.0000000000' AS DECIMAL(38,10)) AS d_big,
+    NULL::STRUCT(a INTEGER, b VARCHAR) AS s
+) TO 'test/.tmp/filter_ir_types.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_us >= TIMESTAMP '2020-01-02 00:00:00';
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_ns >= CAST(TIMESTAMP '2020-01-02 00:00:00' AS TIMESTAMP_NS);
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE d_small > CAST('10.00' AS DECIMAL(9,2));
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE d_big = CAST('1234567890123456789012345678.1234567890' AS DECIMAL(38,10));
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a = 2;
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a IS NULL;
+----
+1
+
+# Verify we emit a non-empty Filter IR for these supported types.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_us >= TIMESTAMP '2020-01-02 00:00:00';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE d_small > CAST('10.00' AS DECIMAL(9,2));
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a = 2;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# Boundary: infinite timestamps are rejected for pushdown encoding.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_us < 'infinity'::TIMESTAMP;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "0"[\s\S]*

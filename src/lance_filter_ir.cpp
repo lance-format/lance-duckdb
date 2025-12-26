@@ -2,7 +2,10 @@
 
 #include "lance_common.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/hugeint.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -10,6 +13,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -20,6 +24,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 
 namespace duckdb {
@@ -39,6 +44,13 @@ bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
   case LogicalTypeId::DOUBLE:
   case LogicalTypeId::VARCHAR:
   case LogicalTypeId::DATE:
+  case LogicalTypeId::TIMESTAMP:
+  case LogicalTypeId::TIMESTAMP_SEC:
+  case LogicalTypeId::TIMESTAMP_MS:
+  case LogicalTypeId::TIMESTAMP_NS:
+  case LogicalTypeId::TIMESTAMP_TZ:
+  case LogicalTypeId::DECIMAL:
+  case LogicalTypeId::STRUCT:
     return true;
   default:
     return false;
@@ -68,6 +80,15 @@ enum class LanceFilterIRLiteralTag : uint8_t {
   F64 = 5,
   STRING = 6,
   DATE32 = 7,
+  TIMESTAMP = 8,
+  DECIMAL128 = 9,
+};
+
+enum class LanceFilterIRTimestampUnit : uint8_t {
+  SECOND = 0,
+  MILLISECOND = 1,
+  MICROSECOND = 2,
+  NANOSECOND = 3,
 };
 
 enum class LanceFilterIRComparisonOp : uint8_t {
@@ -106,6 +127,11 @@ static void LanceFilterIRAppendU64(string &out, uint64_t v) {
 
 static void LanceFilterIRAppendI64(string &out, int64_t v) {
   LanceFilterIRAppendU64(out, static_cast<uint64_t>(v));
+}
+
+static void LanceFilterIRAppendI128(string &out, hugeint_t v) {
+  LanceFilterIRAppendU64(out, v.lower);
+  LanceFilterIRAppendU64(out, static_cast<uint64_t>(v.upper));
 }
 
 static void LanceFilterIRAppendF32(string &out, float v) {
@@ -161,11 +187,15 @@ static bool SplitLanceColumnPath(const string &name, vector<string> &segments) {
   return !segments.empty();
 }
 
-static bool TryEncodeLanceFilterIRColumnRef(const string &name,
+static bool TryEncodeLanceFilterIRColumnRef(const vector<string> &segments,
                                             string &out_ir) {
-  vector<string> segments;
-  if (!SplitLanceColumnPath(name, segments)) {
+  if (segments.empty()) {
     return false;
+  }
+  for (auto &segment : segments) {
+    if (segment.empty()) {
+      return false;
+    }
   }
 
   out_ir.clear();
@@ -181,6 +211,15 @@ static bool TryEncodeLanceFilterIRColumnRef(const string &name,
     }
   }
   return true;
+}
+
+static bool TryEncodeLanceFilterIRColumnRef(const string &name,
+                                            string &out_ir) {
+  vector<string> segments;
+  if (!SplitLanceColumnPath(name, segments)) {
+    return false;
+  }
+  return TryEncodeLanceFilterIRColumnRef(segments, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
@@ -250,6 +289,92 @@ static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
     LanceFilterIRAppendU8(
         out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::DATE32));
     LanceFilterIRAppendI32(out_ir, d.days);
+    return true;
+  }
+  case LogicalTypeId::TIMESTAMP:
+  case LogicalTypeId::TIMESTAMP_SEC:
+  case LogicalTypeId::TIMESTAMP_MS:
+  case LogicalTypeId::TIMESTAMP_NS:
+  case LogicalTypeId::TIMESTAMP_TZ: {
+    auto v = value.GetValue<int64_t>();
+    if (!Timestamp::IsFinite(timestamp_t(v))) {
+      return false;
+    }
+    LanceFilterIRAppendU8(
+        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::TIMESTAMP));
+    LanceFilterIRTimestampUnit unit;
+    switch (value.type().id()) {
+    case LogicalTypeId::TIMESTAMP_SEC:
+      unit = LanceFilterIRTimestampUnit::SECOND;
+      break;
+    case LogicalTypeId::TIMESTAMP_MS:
+      unit = LanceFilterIRTimestampUnit::MILLISECOND;
+      break;
+    case LogicalTypeId::TIMESTAMP_NS:
+      unit = LanceFilterIRTimestampUnit::NANOSECOND;
+      break;
+    case LogicalTypeId::TIMESTAMP:
+    case LogicalTypeId::TIMESTAMP_TZ:
+    default:
+      unit = LanceFilterIRTimestampUnit::MICROSECOND;
+      break;
+    }
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(unit));
+    LanceFilterIRAppendI64(out_ir, v);
+    return true;
+  }
+  case LogicalTypeId::DECIMAL: {
+    auto precision = DecimalType::GetWidth(value.type());
+    auto scale_u8 = DecimalType::GetScale(value.type());
+    if (scale_u8 > static_cast<uint8_t>(std::numeric_limits<int8_t>::max())) {
+      return false;
+    }
+    auto scale = static_cast<int8_t>(scale_u8);
+    auto str = value.ToString();
+    hugeint_t v(0);
+    {
+      idx_t pos = 0;
+      bool neg = false;
+      if (pos < str.size() && (str[pos] == '-' || str[pos] == '+')) {
+        neg = (str[pos] == '-');
+        pos++;
+      }
+
+      hugeint_t acc(0);
+      bool seen_dot = false;
+      uint8_t frac_digits = 0;
+      for (; pos < str.size(); pos++) {
+        auto c = str[pos];
+        if (c == '.') {
+          if (seen_dot) {
+            return false;
+          }
+          seen_dot = true;
+          continue;
+        }
+        if (c < '0' || c > '9') {
+          return false;
+        }
+        acc = acc * hugeint_t(10) + hugeint_t(static_cast<int64_t>(c - '0'));
+        if (seen_dot) {
+          if (frac_digits >= scale_u8) {
+            return false;
+          }
+          frac_digits++;
+        }
+      }
+      // Pad missing fractional digits (or scale an integer).
+      while (frac_digits < scale_u8) {
+        acc = acc * hugeint_t(10);
+        frac_digits++;
+      }
+      v = neg ? -acc : acc;
+    }
+    LanceFilterIRAppendU8(
+        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::DECIMAL128));
+    LanceFilterIRAppendU8(out_ir, precision);
+    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(scale));
+    LanceFilterIRAppendI128(out_ir, v);
     return true;
   }
   default:
@@ -471,38 +596,170 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
                                          bool exclude_computed_columns,
                                          const Expression &expr,
                                          string &out_ir) {
-  if (expr.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+  vector<string> segments;
+  LogicalType leaf_type;
+
+  std::function<bool(const Expression &, vector<string> &, LogicalType &)>
+      build_segments;
+
+  build_segments = [&](const Expression &node, vector<string> &out_segments,
+                       LogicalType &out_leaf_type) -> bool {
+    if (node.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+      auto &colref = node.Cast<BoundColumnRefExpression>();
+      if (colref.depth != 0) {
+        return false;
+      }
+      if (colref.binding.table_index != get.table_index) {
+        return false;
+      }
+      auto &column_ids = get.GetColumnIds();
+      if (colref.binding.column_index >= column_ids.size()) {
+        return false;
+      }
+      auto &col_index = column_ids[colref.binding.column_index];
+      if (col_index.IsVirtualColumn()) {
+        return false;
+      }
+      auto col_id = col_index.GetPrimaryIndex();
+      if (col_id >= names.size() || col_id >= types.size()) {
+        return false;
+      }
+
+      out_segments.clear();
+      out_segments.push_back(names[col_id]);
+      out_leaf_type = types[col_id];
+
+      vector<idx_t> child_path;
+      child_path.reserve(col_index.GetChildIndexes().size());
+
+      std::function<bool(const vector<ColumnIndex> &)> linearize_child_indexes;
+      linearize_child_indexes =
+          [&](const vector<ColumnIndex> &children) -> bool {
+        if (children.empty()) {
+          return true;
+        }
+        if (children.size() > 1) {
+          for (auto &child : children) {
+            if (!child.GetChildIndexes().empty()) {
+              return false;
+            }
+            child_path.push_back(child.GetPrimaryIndex());
+          }
+          return true;
+        }
+        auto &child = children[0];
+        child_path.push_back(child.GetPrimaryIndex());
+        return linearize_child_indexes(child.GetChildIndexes());
+      };
+
+      if (!linearize_child_indexes(col_index.GetChildIndexes())) {
+        return false;
+      }
+
+      for (auto child_idx : child_path) {
+        if (out_leaf_type.id() != LogicalTypeId::STRUCT) {
+          return false;
+        }
+        if (child_idx >= StructType::GetChildCount(out_leaf_type)) {
+          return false;
+        }
+        out_segments.push_back(
+            StructType::GetChildName(out_leaf_type, child_idx));
+        out_leaf_type = StructType::GetChildType(out_leaf_type, child_idx);
+      }
+      return true;
+    }
+
+    if (node.expression_class == ExpressionClass::BOUND_FUNCTION) {
+      auto &func = node.Cast<BoundFunctionExpression>();
+      if (func.function.name != "struct_extract" &&
+          func.function.name != "struct_extract_at") {
+        return false;
+      }
+      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
+        return false;
+      }
+
+      vector<string> base_segments;
+      LogicalType base_type;
+      if (!build_segments(*func.children[0], base_segments, base_type)) {
+        return false;
+      }
+      if (base_type.id() != LogicalTypeId::STRUCT) {
+        return false;
+      }
+
+      if (func.children[1]->expression_class !=
+          ExpressionClass::BOUND_CONSTANT) {
+        return false;
+      }
+      auto &c = func.children[1]->Cast<BoundConstantExpression>();
+      if (c.value.IsNull()) {
+        return false;
+      }
+
+      idx_t child_idx = 0;
+      string child_name;
+      if (func.function.name == "struct_extract") {
+        if (c.value.type().id() != LogicalTypeId::VARCHAR) {
+          return false;
+        }
+        child_name = c.value.GetValue<string>();
+        bool found = false;
+        for (idx_t i = 0; i < StructType::GetChildCount(base_type); i++) {
+          if (StructType::GetChildName(base_type, i) == child_name) {
+            child_idx = i;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          return false;
+        }
+      } else {
+        try {
+          auto one_based =
+              c.value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+          if (one_based <= 0) {
+            return false;
+          }
+          child_idx = static_cast<idx_t>(one_based - 1);
+        } catch (...) {
+          return false;
+        }
+        if (child_idx >= StructType::GetChildCount(base_type)) {
+          return false;
+        }
+        child_name = StructType::GetChildName(base_type, child_idx);
+        if (child_name.empty()) {
+          // Fallback: for unnamed structs, the name can be empty; encode a
+          // stable segment anyway by using the 1-based index.
+          child_name = to_string(child_idx + 1);
+        }
+      }
+
+      base_segments.push_back(child_name);
+      out_segments = std::move(base_segments);
+      out_leaf_type = StructType::GetChildType(base_type, child_idx);
+      return true;
+    }
+
+    return false;
+  };
+
+  if (!build_segments(expr, segments, leaf_type)) {
     return false;
   }
-  auto &colref = expr.Cast<BoundColumnRefExpression>();
-  if (colref.depth != 0) {
+  if (segments.empty()) {
     return false;
   }
-  if (colref.binding.table_index != get.table_index) {
+  if (exclude_computed_columns && IsComputedSearchColumn(segments[0])) {
     return false;
   }
-  auto &column_ids = get.GetColumnIds();
-  if (colref.binding.column_index >= column_ids.size()) {
+  if (!LanceFilterIRSupportsLogicalType(leaf_type)) {
     return false;
   }
-  auto &col_index = column_ids[colref.binding.column_index];
-  if (col_index.IsVirtualColumn()) {
-    return false;
-  }
-  if (!col_index.GetChildIndexes().empty()) {
-    return false;
-  }
-  auto col_id = col_index.GetPrimaryIndex();
-  if (col_id >= names.size() || col_id >= types.size()) {
-    return false;
-  }
-  if (exclude_computed_columns && IsComputedSearchColumn(names[col_id])) {
-    return false;
-  }
-  if (!LanceFilterIRSupportsLogicalType(types[col_id])) {
-    return false;
-  }
-  return TryEncodeLanceFilterIRColumnRef(names[col_id], out_ir);
+  return TryEncodeLanceFilterIRColumnRef(segments, out_ir);
 }
 
 bool TryBuildLanceExprFilterIR(const LogicalGet &get,
@@ -512,6 +769,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const Expression &expr, string &out_ir) {
   switch (expr.expression_class) {
   case ExpressionClass::BOUND_COLUMN_REF:
+  case ExpressionClass::BOUND_FUNCTION:
     return TryBuildLanceExprColumnRefIR(get, names, types,
                                         exclude_computed_columns, expr, out_ir);
   case ExpressionClass::BOUND_CONSTANT: {
