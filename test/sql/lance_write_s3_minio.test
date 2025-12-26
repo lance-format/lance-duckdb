@@ -5,10 +5,15 @@
 require-env LANCE_TEST_S3 1
 
 test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
+
 test-env LANCE_S3_REGION us-east-1
+
 test-env LANCE_S3_BUCKET lance-test
+
 test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+
 test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+
 test-env LANCE_S3_WRITE_DATASET_PREFIX write_test_data.lance
 
 require lance
@@ -48,4 +53,3 @@ query I
 SELECT sum(id) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_WRITE_DATASET_PREFIX}';
 ----
 3
-
