@@ -42,12 +42,10 @@
 
 namespace duckdb {
 
-struct LanceDirectoryTableList {
-  explicit LanceDirectoryTableList(vector<string> init_tables)
-      : tables(std::move(init_tables)) {}
-
-  mutex lock;
-  vector<string> tables;
+struct LanceDirectoryNamespaceConfig {
+  string root;
+  vector<string> option_keys;
+  vector<string> option_values;
 };
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -77,33 +75,24 @@ static string GetLanceNamespaceDelimiter(const AttachInfo &info) {
   return "";
 }
 
-static void PopulateLanceTableColumns(ClientContext &context,
-                                      const string &dataset_path,
-                                      ColumnList &out_columns) {
-  auto *dataset = LanceOpenDataset(context, dataset_path);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + dataset_path +
-                      LanceFormatErrorSuffix());
-  }
-
+static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
+                                                 void *dataset,
+                                                 ColumnList &out_columns) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to get schema from Lance dataset: " +
-                      dataset_path + LanceFormatErrorSuffix());
+    throw IOException("Failed to get schema from Lance dataset" +
+                      LanceFormatErrorSuffix());
   }
 
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
     lance_free_schema(schema_handle);
-    lance_close_dataset(dataset);
     throw IOException(
         "Failed to export Lance schema to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  lance_close_dataset(dataset);
 
   auto &config = DBConfig::GetConfig(context);
   ArrowTableSchema arrow_table;
@@ -121,89 +110,184 @@ static void PopulateLanceTableColumns(ClientContext &context,
   }
 }
 
+static string JoinNamespacePath(const string &root, const string &child) {
+  if (root.empty()) {
+    return child;
+  }
+  if (root.back() == '/' || root.back() == '\\') {
+    return root + child;
+  }
+  return root + "/" + child;
+}
+
+static string GetDatasetDirName(const string &table_name);
+static bool IsSafeDatasetTableName(const string &name);
+
+static vector<string>
+ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  key_ptrs.reserve(ns.option_keys.size());
+  value_ptrs.reserve(ns.option_values.size());
+  for (idx_t i = 0; i < ns.option_keys.size(); i++) {
+    key_ptrs.push_back(ns.option_keys[i].c_str());
+    value_ptrs.push_back(ns.option_values[i].c_str());
+  }
+
+  auto *ptr = lance_dir_namespace_list_tables(
+      ns.root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size());
+  if (!ptr) {
+    throw IOException("Failed to list tables from Lance directory namespace: " +
+                      ns.root + LanceFormatErrorSuffix());
+  }
+  string joined = ptr;
+  lance_free_string(ptr);
+
+  vector<string> out;
+  for (auto &p : StringUtil::Split(joined, '\n')) {
+    if (!p.empty()) {
+      out.push_back(std::move(p));
+    }
+  }
+  return out;
+}
+
+static vector<string> ListRestNamespaceTables(const string &endpoint,
+                                              const string &namespace_id,
+                                              const string &bearer_token,
+                                              const string &api_key,
+                                              const string &delimiter) {
+  const char *bearer_ptr =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+  const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+
+  auto *ptr =
+      lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                  bearer_ptr, api_key_ptr, delimiter_ptr);
+  if (!ptr) {
+    throw IOException("Failed to list tables from Lance namespace: " +
+                      endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
+  }
+  string joined = ptr;
+  lance_free_string(ptr);
+
+  vector<string> out;
+  for (auto &p : StringUtil::Split(joined, '\n')) {
+    if (!p.empty()) {
+      out.push_back(std::move(p));
+    }
+  }
+  return out;
+}
+
+static bool
+DirectoryNamespaceTableExists(const LanceDirectoryNamespaceConfig &ns,
+                              const string &table_name) {
+  auto tables = ListDirectoryNamespaceTables(ns);
+  for (auto &t : tables) {
+    if (StringUtil::CIEquals(t, table_name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
 public:
   LanceDirectoryDefaultGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
-                                 string namespace_root,
-                                 shared_ptr<LanceDirectoryTableList> table_list)
-      : DefaultGenerator(catalog), schema(schema),
-        namespace_root(std::move(namespace_root)),
-        table_list(std::move(table_list)) {}
+                                 shared_ptr<LanceDirectoryNamespaceConfig> ns)
+      : DefaultGenerator(catalog), schema(schema), ns(std::move(ns)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
-    auto &fs = FileSystem::GetFileSystem(context);
-    auto dataset_dir = entry_name + ".lance";
-    auto dataset_path = fs.JoinPath(namespace_root, dataset_dir);
-
-    bool is_known = false;
-    if (table_list) {
-      lock_guard<mutex> guard(table_list->lock);
-      for (auto &t : table_list->tables) {
-        if (StringUtil::CIEquals(t, entry_name)) {
-          is_known = true;
-          break;
-        }
-      }
+    if (!ns) {
+      throw InternalException("Lance directory namespace config is missing");
+    }
+    if (!IsSafeDatasetTableName(entry_name)) {
+      throw InvalidInputException(
+          "Unsafe Lance dataset name for directory namespace: " + entry_name);
     }
 
-    if (!is_known &&
-        !(fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path))) {
-      return nullptr;
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    key_ptrs.reserve(ns->option_keys.size());
+    value_ptrs.reserve(ns->option_values.size());
+    for (idx_t i = 0; i < ns->option_keys.size(); i++) {
+      key_ptrs.push_back(ns->option_keys[i].c_str());
+      value_ptrs.push_back(ns->option_values[i].c_str());
     }
-    // A Lance dataset directory is expected to have a `_versions` directory.
-    // This avoids eagerly opening partially-created directories (e.g. leftovers
-    // from previous failed runs).
-    if (!fs.DirectoryExists(fs.JoinPath(dataset_path, "_versions"))) {
+
+    const char *uri_ptr = nullptr;
+    auto *dataset = lance_open_dataset_in_dir_namespace(
+        ns->root.c_str(), entry_name.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        ns->option_keys.size(), &uri_ptr);
+    string dataset_uri;
+    if (uri_ptr) {
+      dataset_uri = uri_ptr;
+      lance_free_string(uri_ptr);
+    }
+    if (!dataset) {
       return nullptr;
     }
 
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    PopulateLanceTableColumns(context, dataset_path, info.columns);
-    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
-                                                         dataset_path);
+    try {
+      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+    } catch (...) {
+      lance_close_dataset(dataset);
+      throw;
+    }
+    lance_close_dataset(dataset);
+
+    if (dataset_uri.empty()) {
+      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+    }
+    return make_uniq_base<CatalogEntry, LanceTableEntry>(
+        catalog, schema, info, std::move(dataset_uri));
   }
 
   vector<string> GetDefaultEntries() override {
-    if (!table_list) {
+    if (!ns) {
       return {};
     }
-    lock_guard<mutex> guard(table_list->lock);
-    return table_list->tables;
+    return ListDirectoryNamespaceTables(*ns);
   }
 
 private:
   SchemaCatalogEntry &schema;
-  string namespace_root;
-  shared_ptr<LanceDirectoryTableList> table_list;
+  shared_ptr<LanceDirectoryNamespaceConfig> ns;
 };
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
 public:
   LanceRestNamespaceDefaultGenerator(Catalog &catalog,
                                      SchemaCatalogEntry &schema,
-                                     string endpoint, string delimiter,
-                                     vector<string> discovered_tables)
+                                     string endpoint, string namespace_id,
+                                     string bearer_token, string api_key,
+                                     string delimiter)
       : DefaultGenerator(catalog), schema(schema),
-        endpoint(std::move(endpoint)), delimiter(std::move(delimiter)),
-        discovered_tables(std::move(discovered_tables)) {}
+        endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
+        bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
+        delimiter(std::move(delimiter)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
-    bool is_known = false;
-    for (auto &t : discovered_tables) {
-      if (StringUtil::CIEquals(t, entry_name)) {
-        is_known = true;
-        break;
-      }
-    }
-    if (!is_known) {
+    string table_uri;
+    auto *dataset =
+        LanceOpenDatasetInNamespace(context, endpoint, entry_name, bearer_token,
+                                    api_key, delimiter, table_uri);
+    if (!dataset) {
       return nullptr;
     }
+    lance_close_dataset(dataset);
 
     auto view = make_uniq<CreateViewInfo>();
     view->schema = DEFAULT_SCHEMA;
@@ -219,13 +303,18 @@ public:
                                                           *view_info);
   }
 
-  vector<string> GetDefaultEntries() override { return discovered_tables; }
+  vector<string> GetDefaultEntries() override {
+    return ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
+                                   api_key, delimiter);
+  }
 
 private:
   SchemaCatalogEntry &schema;
   string endpoint;
+  string namespace_id;
+  string bearer_token;
+  string api_key;
   string delimiter;
-  vector<string> discovered_tables;
 };
 
 static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
@@ -254,7 +343,9 @@ static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
   switch (on_conflict) {
   case OnCreateConflict::ERROR_ON_CONFLICT:
   case OnCreateConflict::IGNORE_ON_CONFLICT:
+    return "create";
   case OnCreateConflict::REPLACE_ON_CONFLICT:
+    return "overwrite";
   case OnCreateConflict::ALTER_ON_CONFLICT:
     break;
   default:
@@ -266,12 +357,10 @@ static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
 class LanceSchemaEntry final : public DuckSchemaEntry {
 public:
   LanceSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
-                   string directory_namespace_root, bool is_rest_namespace,
-                   shared_ptr<LanceDirectoryTableList> directory_table_list)
-      : DuckSchemaEntry(catalog, info),
-        directory_namespace_root(std::move(directory_namespace_root)),
-        is_rest_namespace(is_rest_namespace),
-        directory_table_list(std::move(directory_table_list)) {}
+                   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
+                   bool is_rest_namespace)
+      : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
+        is_rest_namespace(is_rest_namespace) {}
 
   void DropEntry(ClientContext &context, DropInfo &info) override {
     if (info.type != CatalogType::TABLE_ENTRY) {
@@ -300,20 +389,15 @@ public:
                                   info.name);
     }
 
-    auto root = LanceNormalizeS3Scheme(directory_namespace_root);
-    if (root.empty()) {
+    if (!directory_ns || directory_ns->root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
     }
+    auto root = directory_ns->root;
 
     vector<string> option_keys;
     vector<string> option_values;
-    if (StringUtil::StartsWith(root, "s3://") ||
-        StringUtil::StartsWith(root, "s3a://") ||
-        StringUtil::StartsWith(root, "s3n://")) {
-      root = LanceNormalizeS3Scheme(root);
-      LanceFillS3StorageOptionsFromSecrets(context, root, option_keys,
-                                           option_values);
-    }
+    option_keys = directory_ns->option_keys;
+    option_values = directory_ns->option_values;
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -332,16 +416,6 @@ public:
       throw IOException("Failed to drop Lance dataset: " + root + "/" +
                         GetDatasetDirName(info.name) +
                         LanceFormatErrorSuffix());
-    }
-
-    if (directory_table_list) {
-      lock_guard<mutex> guard(directory_table_list->lock);
-      auto &tables = directory_table_list->tables;
-      tables.erase(remove_if(tables.begin(), tables.end(),
-                             [&](const string &t) {
-                               return StringUtil::CIEquals(t, info.name);
-                             }),
-                   tables.end());
     }
 
     // Drop the DuckDB catalog entry after the dataset has been deleted
@@ -381,14 +455,20 @@ public:
       throw NotImplementedException(
           "Lance CREATE TABLE does not support constraints");
     }
+    if (!IsSafeDatasetTableName(create_info.table)) {
+      throw InvalidInputException(
+          "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
+    }
+    if (!directory_ns || directory_ns->root.empty()) {
+      throw InternalException("Lance directory namespace root is empty");
+    }
 
     auto &context = transaction.GetContext();
-    auto &fs = FileSystem::GetFileSystem(context);
-    auto dataset_path = fs.JoinPath(directory_namespace_root,
-                                    GetDatasetDirName(create_info.table));
+    auto dataset_path = JoinNamespacePath(directory_ns->root,
+                                          GetDatasetDirName(create_info.table));
 
     auto exists =
-        fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path);
+        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {
       return nullptr;
@@ -414,8 +494,24 @@ public:
                                   props);
 
     auto mode = CreateTableModeFromConflict(create_info.on_conflict);
+
+    vector<string> option_keys;
+    vector<string> option_values;
+    option_keys = directory_ns->option_keys;
+    option_values = directory_ns->option_values;
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    key_ptrs.reserve(option_keys.size());
+    value_ptrs.reserve(option_values.size());
+    for (idx_t i = 0; i < option_keys.size(); i++) {
+      key_ptrs.push_back(option_keys[i].c_str());
+      value_ptrs.push_back(option_values[i].c_str());
+    }
+
     auto *writer = lance_open_writer_with_storage_options(
-        dataset_path.c_str(), mode.c_str(), nullptr, nullptr, 0,
+        dataset_path.c_str(), mode.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         DEFAULT_MAX_ROWS_PER_FILE, DEFAULT_MAX_ROWS_PER_GROUP,
         DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
     if (!writer) {
@@ -433,20 +529,17 @@ public:
   }
 
 private:
-  string directory_namespace_root;
+  shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   bool is_rest_namespace;
-  shared_ptr<LanceDirectoryTableList> directory_table_list;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
-  LanceDuckCatalog(AttachedDatabase &db, string directory_namespace_root,
-                   bool is_rest_namespace,
-                   shared_ptr<LanceDirectoryTableList> directory_table_list)
-      : DuckCatalog(db),
-        directory_namespace_root(std::move(directory_namespace_root)),
-        is_rest_namespace(is_rest_namespace),
-        directory_table_list(std::move(directory_table_list)) {}
+  LanceDuckCatalog(AttachedDatabase &db,
+                   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
+                   bool is_rest_namespace)
+      : DuckCatalog(db), directory_ns(std::move(directory_ns)),
+        is_rest_namespace(is_rest_namespace) {}
 
   PhysicalOperator &PlanInsert(ClientContext &context,
                                PhysicalPlanGenerator &planner,
@@ -471,13 +564,19 @@ public:
       throw NotImplementedException(
           "CREATE TABLE is not supported for Lance REST namespaces");
     }
+    if (!IsSafeDatasetTableName(create_info.table)) {
+      throw InvalidInputException(
+          "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
+    }
+    if (!directory_ns || directory_ns->root.empty()) {
+      throw InternalException("Lance directory namespace root is empty");
+    }
 
-    auto &fs = FileSystem::GetFileSystem(context);
-    auto dataset_path = fs.JoinPath(directory_namespace_root,
-                                    GetDatasetDirName(create_info.table));
+    auto dataset_path = JoinNamespacePath(directory_ns->root,
+                                          GetDatasetDirName(create_info.table));
 
     auto exists =
-        fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path);
+        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
 
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {
@@ -573,9 +672,8 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
     LogicalDependencyList dependencies;
-    auto entry =
-        make_uniq<LanceSchemaEntry>(*this, info, directory_namespace_root,
-                                    is_rest_namespace, directory_table_list);
+    auto entry = make_uniq<LanceSchemaEntry>(*this, info, directory_ns,
+                                             is_rest_namespace);
     if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
                              dependencies)) {
       throw InternalException("Failed to replace Lance schema entry");
@@ -583,9 +681,8 @@ public:
   }
 
 private:
-  string directory_namespace_root;
+  shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   bool is_rest_namespace;
-  shared_ptr<LanceDirectoryTableList> directory_table_list;
 };
 
 static unique_ptr<Catalog>
@@ -597,35 +694,50 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto delimiter = GetLanceNamespaceDelimiter(info);
 
   unique_ptr<DefaultGenerator> generator;
-  vector<string> discovered_tables;
-  shared_ptr<LanceDirectoryTableList> directory_table_list;
+  shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
 
   auto is_rest_namespace = !endpoint.empty();
-  string directory_namespace_root;
+  string namespace_id;
+  string bearer_token;
+  string api_key;
 
   if (!is_rest_namespace) {
-    directory_namespace_root =
-        FileSystem::GetFileSystem(context).ExpandPath(attach_path);
+    auto root = FileSystem::GetFileSystem(context).ExpandPath(attach_path);
+    root = LanceNormalizeS3Scheme(root);
+    vector<string> option_keys;
+    vector<string> option_values;
+    if (StringUtil::StartsWith(root, "s3://") ||
+        StringUtil::StartsWith(root, "s3a://") ||
+        StringUtil::StartsWith(root, "s3n://")) {
+      root = LanceNormalizeS3Scheme(root);
+      LanceFillS3StorageOptionsFromSecrets(context, root, option_keys,
+                                           option_values);
+    }
+
     string list_error;
-    if (!TryLanceDirNamespaceListTables(context, directory_namespace_root,
-                                        discovered_tables, list_error)) {
+    vector<string> discovered_tables;
+    // Validate the namespace during ATTACH.
+    if (!TryLanceDirNamespaceListTables(context, root, discovered_tables,
+                                        list_error)) {
       throw IOException(
           "Failed to list tables from Lance directory namespace: " +
           list_error);
     }
-    directory_table_list =
-        make_shared_ptr<LanceDirectoryTableList>(std::move(discovered_tables));
+    directory_ns = make_shared_ptr<LanceDirectoryNamespaceConfig>();
+    directory_ns->root = std::move(root);
+    directory_ns->option_keys = std::move(option_keys);
+    directory_ns->option_values = std::move(option_values);
   } else {
-    const auto namespace_id = attach_path;
+    namespace_id = attach_path;
     if (namespace_id.empty()) {
       throw InvalidInputException(
           "ATTACH TYPE LANCE with ENDPOINT requires a non-empty namespace id");
     }
-    string bearer_token;
-    string api_key;
     ResolveLanceNamespaceAuth(context, endpoint, info.options, bearer_token,
                               api_key);
     string list_error;
+    vector<string> discovered_tables;
+    // Validate the namespace during ATTACH.
     if (!TryLanceNamespaceListTables(context, endpoint, namespace_id,
                                      bearer_token, api_key, delimiter,
                                      discovered_tables, list_error)) {
@@ -638,8 +750,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   // materializes per-table entries mapping to `lance_scan` / internal namespace
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
-  auto catalog = make_uniq<LanceDuckCatalog>(
-      db, directory_namespace_root, is_rest_namespace, directory_table_list);
+  auto catalog =
+      make_uniq<LanceDuckCatalog>(db, directory_ns, is_rest_namespace);
   catalog->Initialize(false);
 
   auto system_transaction =
@@ -652,13 +764,12 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
       is_rest_namespace ? CatalogType::VIEW_ENTRY : CatalogType::TABLE_ENTRY);
 
   if (!is_rest_namespace) {
-    generator = make_uniq<LanceDirectoryDefaultGenerator>(
-        *catalog, schema, std::move(directory_namespace_root),
-        directory_table_list);
+    generator = make_uniq<LanceDirectoryDefaultGenerator>(*catalog, schema,
+                                                          directory_ns);
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
-        *catalog, schema, std::move(endpoint), std::move(delimiter),
-        std::move(discovered_tables));
+        *catalog, schema, std::move(endpoint), std::move(namespace_id),
+        std::move(bearer_token), std::move(api_key), std::move(delimiter));
   }
   catalog_set.SetDefaultGenerator(std::move(generator));
 

@@ -1,0 +1,35 @@
+# name: test/sql/attach_namespace_dynamic_discovery.test
+# description: Dynamic table discovery in attached LANCE directory namespace
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s)
+TO 'test/.tmp/nsroot_dynamic/dynamic_before_attach.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp/nsroot_dynamic' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM ns.main.dynamic_before_attach;
+----
+1
+
+statement ok
+COPY (SELECT 1::BIGINT AS id UNION ALL SELECT 2::BIGINT AS id)
+TO 'test/.tmp/nsroot_dynamic/dynamic_after_attach.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM ns.main.dynamic_after_attach;
+----
+2
+
+query T
+SHOW TABLES FROM ns.main
+----
+dynamic_after_attach
+dynamic_before_attach
+
+statement ok
+DETACH ns;
