@@ -1,0 +1,49 @@
+# name: test/sql/drop_table.test
+# description: DROP TABLE deletes Lance datasets in attached directory namespaces
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/nsroot/drop_table_basic.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id
+) TO 'test/.tmp/unsafe.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp/nsroot' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM ns.main.drop_table_basic;
+----
+2
+
+statement ok
+DROP TABLE ns.main.drop_table_basic;
+
+statement error
+SELECT count(*) FROM 'test/.tmp/nsroot/drop_table_basic.lance';
+----
+IO Error: Failed to open Lance dataset: test/.tmp/nsroot/drop_table_basic.lance (Lance error: dataset open 'test/.tmp/nsroot/drop_table_basic.lance':
+
+statement ok
+DROP TABLE IF EXISTS ns.main.drop_table_basic;
+
+statement error
+DROP TABLE ns.main."../unsafe";
+----
+Invalid Input Error: Unsafe Lance dataset name for DROP TABLE:
+
+query I
+SELECT count(*) FROM 'test/.tmp/unsafe.lance';
+----
+1
+
+statement ok
+DETACH ns;
