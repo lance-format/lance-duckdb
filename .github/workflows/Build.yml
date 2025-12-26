@@ -146,8 +146,8 @@ jobs:
           chmod +x mc
           ./mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
           ./mc mb -p local/lance-test || true
-          ./mc mirror --overwrite test/test_data.lance local/lance-test/test_data.lance
-          ./mc mirror --overwrite test/search_test_data.lance local/lance-test/search_test_data.lance
+          ./mc mirror --overwrite test/data/test_data.lance local/lance-test/test_data.lance
+          ./mc mirror --overwrite test/data/search_test_data.lance local/lance-test/search_test_data.lance
 
       - name: Run S3 tests
         env:
