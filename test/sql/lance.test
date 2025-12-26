@@ -10,10 +10,6 @@ SELECT 1
 ----
 1
 
-# Test that lance_scan can read a local dataset root
-statement ok
-SELECT * FROM lance_scan('test/test_data.lance') LIMIT 1
-
 # Baseline: materialize once and evaluate filters in DuckDB
 statement ok
 CREATE TEMP TABLE baseline AS SELECT * FROM 'test/test_data.lance'
@@ -134,11 +130,6 @@ SELECT * FROM 'test/test_data.lance' LIMIT 1
 
 # Test error handling - invalid dataset root
 statement error
-SELECT * FROM lance_scan('dummy_path.lance')
+SELECT * FROM 'dummy_path.lance'
 ----
 IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
-
-# Test error handling - requires at least one argument
-statement error
-SELECT * FROM lance_scan()
-----

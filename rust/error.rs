@@ -21,6 +21,9 @@ pub enum ErrorCode {
     FtsSchema = 14,
     FtsStreamCreate = 15,
     HybridStreamCreate = 17,
+    DatasetWriteOpen = 18,
+    DatasetWriteBatch = 19,
+    DatasetWriteFinish = 20,
 }
 
 struct LastError {

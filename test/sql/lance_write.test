@@ -1,0 +1,48 @@
+# name: test/sql/lance_write.test
+# description: COPY TO (FORMAT lance) writes datasets
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_basic.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_basic.lance';
+----
+2
+
+query I
+SELECT sum(id) FROM 'test/.tmp/lance_write_basic.lance';
+----
+3
+
+statement ok
+COPY (
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_basic.lance' (FORMAT lance, mode 'append');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_basic.lance';
+----
+3
+
+query I
+SELECT sum(id) FROM 'test/.tmp/lance_write_basic.lance';
+----
+6
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
+  LIMIT 0
+) TO 'test/.tmp/lance_write_empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_empty.lance';
+----
+0
