@@ -7,7 +7,7 @@ Lance is a modern columnar data format optimized for ML/AI workloads, with nativ
 
 ## Usage
 
-### Query a `*.lance` path
+### Query a Lance dataset
 
 ```sql
 -- local file
@@ -20,9 +20,7 @@ SELECT *
   LIMIT 10;
 ```
 
-### S3 authentication via DuckDB Secrets
-
-For `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
+To read `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
 
 ```sql
 CREATE SECRET (TYPE S3, provider credential_chain);
@@ -30,6 +28,44 @@ CREATE SECRET (TYPE S3, provider credential_chain);
 SELECT *
   FROM 's3://bucket/path/to/dataset.lance'
   LIMIT 10;
+```
+
+### Write a Lance dataset
+
+Use DuckDB's `COPY ... TO ...` to materialize query results as a Lance dataset.
+
+```sql
+-- Create/overwrite a Lance dataset from a query
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'path/to/out.lance' (FORMAT lance, mode 'overwrite');
+
+-- Read it back via the replacement scan
+SELECT count(*) FROM 'path/to/out.lance';
+
+-- Append more rows to an existing dataset
+COPY (
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'path/to/out.lance' (FORMAT lance, mode 'append');
+
+-- Optionally create an empty dataset (schema only)
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
+  LIMIT 0
+) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+```
+
+To write to `s3://...` paths, load DuckDB's `httpfs` extension and configure an S3 secret:
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+CREATE SECRET (TYPE S3, provider credential_chain);
+
+COPY (SELECT 1 AS id) TO 's3://bucket/path/to/out.lance' (FORMAT lance, mode 'overwrite');
 ```
 
 ### Vector search
