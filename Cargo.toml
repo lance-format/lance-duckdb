@@ -13,6 +13,9 @@ lto = "thin"
 strip = true
 panic = "abort"
 
+[profile.dev]
+panic = "abort"
+
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
