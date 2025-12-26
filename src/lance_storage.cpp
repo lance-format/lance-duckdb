@@ -24,6 +24,7 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -37,7 +38,17 @@
 
 #include <cstring>
 
+#include <algorithm>
+
 namespace duckdb {
+
+struct LanceDirectoryTableList {
+  explicit LanceDirectoryTableList(vector<string> init_tables)
+      : tables(std::move(init_tables)) {}
+
+  mutex lock;
+  vector<string> tables;
+};
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
   for (auto &kv : info.options) {
@@ -114,10 +125,10 @@ class LanceDirectoryDefaultGenerator : public DefaultGenerator {
 public:
   LanceDirectoryDefaultGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
                                  string namespace_root,
-                                 vector<string> discovered_tables)
+                                 shared_ptr<LanceDirectoryTableList> table_list)
       : DefaultGenerator(catalog), schema(schema),
         namespace_root(std::move(namespace_root)),
-        discovered_tables(std::move(discovered_tables)) {}
+        table_list(std::move(table_list)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
@@ -125,7 +136,20 @@ public:
     auto &fs = FileSystem::GetFileSystem(context);
     auto dataset_dir = entry_name + ".lance";
     auto dataset_path = fs.JoinPath(namespace_root, dataset_dir);
-    if (!fs.DirectoryExists(dataset_path)) {
+
+    bool is_known = false;
+    if (table_list) {
+      lock_guard<mutex> guard(table_list->lock);
+      for (auto &t : table_list->tables) {
+        if (StringUtil::CIEquals(t, entry_name)) {
+          is_known = true;
+          break;
+        }
+      }
+    }
+
+    if (!is_known &&
+        !(fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path))) {
       return nullptr;
     }
     // A Lance dataset directory is expected to have a `_versions` directory.
@@ -143,12 +167,18 @@ public:
                                                          dataset_path);
   }
 
-  vector<string> GetDefaultEntries() override { return discovered_tables; }
+  vector<string> GetDefaultEntries() override {
+    if (!table_list) {
+      return {};
+    }
+    lock_guard<mutex> guard(table_list->lock);
+    return table_list->tables;
+  }
 
 private:
   SchemaCatalogEntry &schema;
   string namespace_root;
-  vector<string> discovered_tables;
+  shared_ptr<LanceDirectoryTableList> table_list;
 };
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -181,7 +211,7 @@ public:
     view->sql = StringUtil::Format(
         "SELECT * FROM __lance_namespace_scan(%s, %s, %s)", SQLString(endpoint),
         SQLString(entry_name), SQLString(delimiter));
-    view->internal = true;
+    view->internal = false;
     view->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
     auto view_info = CreateViewInfo::FromSelect(context, std::move(view));
@@ -207,6 +237,19 @@ static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
 }
 
+static bool IsSafeDatasetTableName(const string &name) {
+  if (name.empty()) {
+    return false;
+  }
+  if (name == "." || name == "..") {
+    return false;
+  }
+  if (name.find('/') != string::npos || name.find('\\') != string::npos) {
+    return false;
+  }
+  return true;
+}
+
 static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
   switch (on_conflict) {
   case OnCreateConflict::ERROR_ON_CONFLICT:
@@ -223,10 +266,105 @@ static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
 class LanceSchemaEntry final : public DuckSchemaEntry {
 public:
   LanceSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
-                   string directory_namespace_root, bool is_rest_namespace)
+                   string directory_namespace_root, bool is_rest_namespace,
+                   shared_ptr<LanceDirectoryTableList> directory_table_list)
       : DuckSchemaEntry(catalog, info),
         directory_namespace_root(std::move(directory_namespace_root)),
-        is_rest_namespace(is_rest_namespace) {}
+        is_rest_namespace(is_rest_namespace),
+        directory_table_list(std::move(directory_table_list)) {}
+
+  void DropEntry(ClientContext &context, DropInfo &info) override {
+    if (info.type != CatalogType::TABLE_ENTRY) {
+      DuckSchemaEntry::DropEntry(context, info);
+      return;
+    }
+    if (is_rest_namespace) {
+      throw NotImplementedException(
+          "DROP TABLE is not supported for Lance REST namespaces");
+    }
+
+    // DuckDB stores TABLE and VIEW entries in the same catalog set (see
+    // DuckSchemaEntry::GetCatalogSet), so we need to resolve the existing entry
+    // type explicitly before attempting to drop anything.
+    auto transaction = GetCatalogTransaction(context);
+    auto &set = GetCatalogSet(info.type);
+    auto existing_entry = set.GetEntry(transaction, info.name);
+    if (!existing_entry) {
+      throw InternalException(
+          "Failed to drop entry \"%s\" - entry could not be found", info.name);
+    }
+    auto existing_type = existing_entry->type;
+
+    if (!IsSafeDatasetTableName(info.name)) {
+      throw InvalidInputException("Unsafe Lance dataset name for DROP TABLE: " +
+                                  info.name);
+    }
+
+    auto root = LanceNormalizeS3Scheme(directory_namespace_root);
+    if (root.empty()) {
+      throw InternalException("Lance directory namespace root is empty");
+    }
+
+    vector<string> option_keys;
+    vector<string> option_values;
+    if (StringUtil::StartsWith(root, "s3://") ||
+        StringUtil::StartsWith(root, "s3a://") ||
+        StringUtil::StartsWith(root, "s3n://")) {
+      root = LanceNormalizeS3Scheme(root);
+      LanceFillS3StorageOptionsFromSecrets(context, root, option_keys,
+                                           option_values);
+    }
+
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    key_ptrs.reserve(option_keys.size());
+    value_ptrs.reserve(option_values.size());
+    for (idx_t i = 0; i < option_keys.size(); i++) {
+      key_ptrs.push_back(option_keys[i].c_str());
+      value_ptrs.push_back(option_values[i].c_str());
+    }
+
+    auto rc = lance_dir_namespace_drop_table(
+        root.c_str(), info.name.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
+    if (rc != 0) {
+      throw IOException("Failed to drop Lance dataset: " + root + "/" +
+                        GetDatasetDirName(info.name) +
+                        LanceFormatErrorSuffix());
+    }
+
+    if (directory_table_list) {
+      lock_guard<mutex> guard(directory_table_list->lock);
+      auto &tables = directory_table_list->tables;
+      tables.erase(remove_if(tables.begin(), tables.end(),
+                             [&](const string &t) {
+                               return StringUtil::CIEquals(t, info.name);
+                             }),
+                   tables.end());
+    }
+
+    // Drop the DuckDB catalog entry after the dataset has been deleted
+    // successfully.
+    //
+    // Note: TABLE_ENTRY and VIEW_ENTRY share the same underlying catalog set.
+    // DuckDB's transactional DROP path assumes TABLE_ENTRY is always a
+    // DuckTableEntry (and will fail for extension-backed TableCatalogEntry
+    // implementations). To avoid that, perform the catalog drop using a system
+    // (non-transactional) CatalogTransaction.
+    if (existing_type != CatalogType::TABLE_ENTRY &&
+        existing_type != CatalogType::VIEW_ENTRY) {
+      throw InternalException(
+          "Unexpected catalog entry type for DROP TABLE: %s",
+          CatalogTypeToString(existing_type));
+    }
+    auto system_transaction =
+        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
+    if (!set.DropEntry(system_transaction, info.name, info.cascade, true)) {
+      throw InternalException(
+          "Could not drop element because of an internal error");
+    }
+  }
 
   optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction,
                                          BoundCreateTableInfo &info) override {
@@ -297,15 +435,18 @@ public:
 private:
   string directory_namespace_root;
   bool is_rest_namespace;
+  shared_ptr<LanceDirectoryTableList> directory_table_list;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
   LanceDuckCatalog(AttachedDatabase &db, string directory_namespace_root,
-                   bool is_rest_namespace)
+                   bool is_rest_namespace,
+                   shared_ptr<LanceDirectoryTableList> directory_table_list)
       : DuckCatalog(db),
         directory_namespace_root(std::move(directory_namespace_root)),
-        is_rest_namespace(is_rest_namespace) {}
+        is_rest_namespace(is_rest_namespace),
+        directory_table_list(std::move(directory_table_list)) {}
 
   PhysicalOperator &PlanInsert(ClientContext &context,
                                PhysicalPlanGenerator &planner,
@@ -432,8 +573,9 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
     LogicalDependencyList dependencies;
-    auto entry = make_uniq<LanceSchemaEntry>(
-        *this, info, directory_namespace_root, is_rest_namespace);
+    auto entry =
+        make_uniq<LanceSchemaEntry>(*this, info, directory_namespace_root,
+                                    is_rest_namespace, directory_table_list);
     if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
                              dependencies)) {
       throw InternalException("Failed to replace Lance schema entry");
@@ -443,6 +585,7 @@ public:
 private:
   string directory_namespace_root;
   bool is_rest_namespace;
+  shared_ptr<LanceDirectoryTableList> directory_table_list;
 };
 
 static unique_ptr<Catalog>
@@ -455,6 +598,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
 
   unique_ptr<DefaultGenerator> generator;
   vector<string> discovered_tables;
+  shared_ptr<LanceDirectoryTableList> directory_table_list;
 
   auto is_rest_namespace = !endpoint.empty();
   string directory_namespace_root;
@@ -469,6 +613,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
           "Failed to list tables from Lance directory namespace: " +
           list_error);
     }
+    directory_table_list =
+        make_shared_ptr<LanceDirectoryTableList>(std::move(discovered_tables));
   } else {
     const auto namespace_id = attach_path;
     if (namespace_id.empty()) {
@@ -492,8 +638,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   // materializes per-table entries mapping to `lance_scan` / internal namespace
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
-  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_namespace_root,
-                                             is_rest_namespace);
+  auto catalog = make_uniq<LanceDuckCatalog>(
+      db, directory_namespace_root, is_rest_namespace, directory_table_list);
   catalog->Initialize(false);
 
   auto system_transaction =
@@ -508,7 +654,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   if (!is_rest_namespace) {
     generator = make_uniq<LanceDirectoryDefaultGenerator>(
         *catalog, schema, std::move(directory_namespace_root),
-        std::move(discovered_tables));
+        directory_table_list);
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, std::move(endpoint), std::move(delimiter),

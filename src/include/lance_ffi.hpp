@@ -15,6 +15,10 @@ const char *lance_dir_namespace_list_tables(const char *root,
                                             const char **option_keys,
                                             const char **option_values,
                                             size_t options_len);
+int32_t lance_dir_namespace_drop_table(const char *root, const char *table_name,
+                                       const char **option_keys,
+                                       const char **option_values,
+                                       size_t options_len);
 void *lance_open_dataset_in_dir_namespace(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, const char **out_table_uri);

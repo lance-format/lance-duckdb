@@ -3681,6 +3681,7 @@ dependencies = [
  "datafusion-functions",
  "futures",
  "lance",
+ "lance-core",
  "lance-index",
  "lance-namespace",
  "lance-namespace-impls",
