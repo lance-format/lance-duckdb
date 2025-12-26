@@ -32,6 +32,44 @@ SELECT *
   LIMIT 10;
 ```
 
+### Write a Lance dataset
+
+Use DuckDB's `COPY ... TO ...` to materialize query results as a Lance dataset.
+
+```sql
+-- Create/overwrite a Lance dataset from a query
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'path/to/out.lance' (FORMAT lance, mode 'overwrite');
+
+-- Read it back via the replacement scan
+SELECT count(*) FROM 'path/to/out.lance';
+
+-- Append more rows to an existing dataset
+COPY (
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'path/to/out.lance' (FORMAT lance, mode 'append');
+
+-- Optionally create an empty dataset (schema only)
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
+  LIMIT 0
+) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+```
+
+To write to `s3://...` paths, load DuckDB's `httpfs` extension and configure an S3 secret:
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+CREATE SECRET (TYPE S3, provider credential_chain);
+
+COPY (SELECT 1 AS id) TO 's3://bucket/path/to/out.lance' (FORMAT lance, mode 'overwrite');
+```
+
 ### Vector search
 
 ```sql
