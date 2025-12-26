@@ -18,16 +18,25 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/transaction/transaction.hpp"
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
+#include "lance_insert.hpp"
+#include "lance_table_entry.hpp"
+
+#include <cstring>
 
 #include <algorithm>
 
@@ -68,6 +77,50 @@ static string GetLanceNamespaceDelimiter(const AttachInfo &info) {
   return "";
 }
 
+static void PopulateLanceTableColumns(ClientContext &context,
+                                      const string &dataset_path,
+                                      ColumnList &out_columns) {
+  auto *dataset = LanceOpenDataset(context, dataset_path);
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + dataset_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to get schema from Lance dataset: " +
+                      dataset_path + LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    lance_close_dataset(dataset);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+  lance_close_dataset(dataset);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableSchema arrow_table;
+  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+                                               schema_root.arrow_schema);
+  const auto names = arrow_table.GetNames();
+  const auto types = arrow_table.GetTypes();
+  if (names.size() != types.size()) {
+    throw InternalException(
+        "Arrow table schema returned mismatched names/types sizes");
+  }
+
+  for (idx_t i = 0; i < names.size(); i++) {
+    out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
+  }
+}
+
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
 public:
   LanceDirectoryDefaultGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
@@ -99,18 +152,19 @@ public:
         !(fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path))) {
       return nullptr;
     }
+    // A Lance dataset directory is expected to have a `_versions` directory.
+    // This avoids eagerly opening partially-created directories (e.g. leftovers
+    // from previous failed runs).
+    if (!fs.DirectoryExists(fs.JoinPath(dataset_path, "_versions"))) {
+      return nullptr;
+    }
 
-    auto view = make_uniq<CreateViewInfo>();
-    view->schema = DEFAULT_SCHEMA;
-    view->view_name = entry_name;
-    view->sql = StringUtil::Format("SELECT * FROM lance_scan(%s)",
-                                   SQLString(dataset_path));
-    view->internal = false;
-    view->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-
-    auto view_info = CreateViewInfo::FromSelect(context, std::move(view));
-    return make_uniq_base<CatalogEntry, ViewCatalogEntry>(catalog, schema,
-                                                          *view_info);
+    CreateTableInfo info(schema, entry_name);
+    info.internal = true;
+    info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+    PopulateLanceTableColumns(context, dataset_path, info.columns);
+    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
+                                                         dataset_path);
   }
 
   vector<string> GetDefaultEntries() override {
@@ -229,6 +283,18 @@ public:
           "DROP TABLE is not supported for Lance REST namespaces");
     }
 
+    // DuckDB stores TABLE and VIEW entries in the same catalog set (see
+    // DuckSchemaEntry::GetCatalogSet), so we need to resolve the existing entry
+    // type explicitly before attempting to drop anything.
+    auto transaction = GetCatalogTransaction(context);
+    auto &set = GetCatalogSet(info.type);
+    auto existing_entry = set.GetEntry(transaction, info.name);
+    if (!existing_entry) {
+      throw InternalException("Failed to drop entry \"%s\" - entry could not be found",
+                              info.name);
+    }
+    auto existing_type = existing_entry->type;
+
     if (!IsSafeDatasetTableName(info.name)) {
       throw InvalidInputException("Unsafe Lance dataset name for DROP TABLE: " +
                                   info.name);
@@ -238,14 +304,6 @@ public:
     if (root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
     }
-
-    // Prefer dropping the view first to preserve normal DROP semantics for
-    // dependent objects (unless CASCADE is used).
-    DropInfo view_drop(info);
-    view_drop.type = CatalogType::VIEW_ENTRY;
-    view_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
-    view_drop.allow_drop_internal = true;
-    DuckSchemaEntry::DropEntry(context, view_drop);
 
     vector<string> option_keys;
     vector<string> option_values;
@@ -284,6 +342,26 @@ public:
                                return StringUtil::CIEquals(t, info.name);
                              }),
                    tables.end());
+    }
+
+    // Drop the DuckDB catalog entry after the dataset has been deleted
+    // successfully.
+    //
+    // Note: TABLE_ENTRY and VIEW_ENTRY share the same underlying catalog set.
+    // DuckDB's transactional DROP path assumes TABLE_ENTRY is always a
+    // DuckTableEntry (and will fail for extension-backed TableCatalogEntry
+    // implementations). To avoid that, perform the catalog drop using a system
+    // (non-transactional) CatalogTransaction.
+    if (existing_type != CatalogType::TABLE_ENTRY &&
+        existing_type != CatalogType::VIEW_ENTRY) {
+      throw InternalException("Unexpected catalog entry type for DROP TABLE: %s",
+                              CatalogTypeToString(existing_type));
+    }
+    auto system_transaction =
+        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
+    if (!set.DropEntry(system_transaction, info.name, info.cascade, true)) {
+      throw InternalException(
+          "Could not drop element because of an internal error");
     }
   }
 
@@ -368,6 +446,16 @@ public:
         directory_namespace_root(std::move(directory_namespace_root)),
         is_rest_namespace(is_rest_namespace),
         directory_table_list(std::move(directory_table_list)) {}
+
+  PhysicalOperator &PlanInsert(ClientContext &context,
+                               PhysicalPlanGenerator &planner,
+                               LogicalInsert &op,
+                               optional_ptr<PhysicalOperator> plan) override {
+    if (dynamic_cast<LanceTableEntry *>(&op.table)) {
+      return PlanLanceInsertAppend(context, planner, op, plan);
+    }
+    return DuckCatalog::PlanInsert(context, planner, op, plan);
+  }
 
   PhysicalOperator &PlanCreateTableAs(ClientContext &context,
                                       PhysicalPlanGenerator &planner,
@@ -546,7 +634,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
-  // materializes per-table views mapping to `lance_scan` / internal namespace
+  // materializes per-table entries mapping to `lance_scan` / internal namespace
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
   auto catalog = make_uniq<LanceDuckCatalog>(
@@ -559,7 +647,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
 
   auto &duck_schema = schema.Cast<DuckSchemaEntry>();
-  auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::VIEW_ENTRY);
+  auto &catalog_set = duck_schema.GetCatalogSet(
+      is_rest_namespace ? CatalogType::VIEW_ENTRY : CatalogType::TABLE_ENTRY);
 
   if (!is_rest_namespace) {
     generator = make_uniq<LanceDirectoryDefaultGenerator>(
@@ -576,10 +665,96 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   return std::move(catalog);
 }
 
+struct LancePendingAppend {
+  string path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  void *transaction = nullptr;
+};
+
+class LanceTransactionManager final : public DuckTransactionManager {
+public:
+  explicit LanceTransactionManager(AttachedDatabase &db)
+      : DuckTransactionManager(db) {}
+
+  void RegisterPendingAppend(Transaction &transaction_p,
+                             LancePendingAppend pending) {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    lock_guard<mutex> guard(pending_lock);
+    pending_appends[transaction.transaction_id].push_back(std::move(pending));
+  }
+
+  ErrorData CommitTransaction(ClientContext &context,
+                              Transaction &transaction_p) override {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    vector<LancePendingAppend> appends;
+    {
+      lock_guard<mutex> guard(pending_lock);
+      auto it = pending_appends.find(transaction.transaction_id);
+      if (it != pending_appends.end()) {
+        appends = std::move(it->second);
+        pending_appends.erase(it);
+      }
+    }
+
+    for (idx_t i = 0; i < appends.size(); i++) {
+      auto &pending = appends[i];
+      vector<const char *> key_ptrs;
+      vector<const char *> value_ptrs;
+      key_ptrs.reserve(pending.option_keys.size());
+      value_ptrs.reserve(pending.option_values.size());
+      for (idx_t j = 0; j < pending.option_keys.size(); j++) {
+        key_ptrs.push_back(pending.option_keys[j].c_str());
+        value_ptrs.push_back(pending.option_values[j].c_str());
+      }
+
+      auto rc = lance_commit_transaction_with_storage_options(
+          pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(),
+          pending.option_keys.size(), pending.transaction);
+      if (rc != 0) {
+        // Best-effort cleanup of any remaining pending transactions.
+        // Note: the transaction pointer is consumed by the commit call, even on
+        // error.
+        for (idx_t k = i + 1; k < appends.size(); k++) {
+          lance_free_transaction(appends[k].transaction);
+        }
+        DuckTransactionManager::RollbackTransaction(transaction_p);
+        return ErrorData(ExceptionType::TRANSACTION,
+                         "Failed to commit Lance append transaction for '" +
+                             pending.path + "'" + LanceFormatErrorSuffix());
+      }
+    }
+
+    return DuckTransactionManager::CommitTransaction(context, transaction_p);
+  }
+
+  void RollbackTransaction(Transaction &transaction_p) override {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    vector<LancePendingAppend> appends;
+    {
+      lock_guard<mutex> guard(pending_lock);
+      auto it = pending_appends.find(transaction.transaction_id);
+      if (it != pending_appends.end()) {
+        appends = std::move(it->second);
+        pending_appends.erase(it);
+      }
+    }
+    for (auto &pending : appends) {
+      lance_free_transaction(pending.transaction);
+    }
+    DuckTransactionManager::RollbackTransaction(transaction_p);
+  }
+
+private:
+  mutex pending_lock;
+  unordered_map<transaction_t, vector<LancePendingAppend>> pending_appends;
+};
+
 static unique_ptr<TransactionManager>
 LanceStorageTransactionManager(optional_ptr<StorageExtensionInfo>,
                                AttachedDatabase &db, Catalog &) {
-  return make_uniq<DuckTransactionManager>(db);
+  return make_uniq<LanceTransactionManager>(db);
 }
 
 void RegisterLanceStorage(DBConfig &config) {
@@ -587,6 +762,25 @@ void RegisterLanceStorage(DBConfig &config) {
   ext->attach = LanceStorageAttach;
   ext->create_transaction_manager = LanceStorageTransactionManager;
   config.storage_extensions["lance"] = std::move(ext);
+}
+
+void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
+                                string dataset_uri, vector<string> option_keys,
+                                vector<string> option_values,
+                                void *lance_transaction) {
+  auto &txn = Transaction::Get(context, catalog);
+  auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
+  if (!tm) {
+    lance_free_transaction(lance_transaction);
+    throw InternalException(
+        "RegisterLancePendingAppend requires LanceTransactionManager");
+  }
+  LancePendingAppend pending;
+  pending.path = std::move(dataset_uri);
+  pending.option_keys = std::move(option_keys);
+  pending.option_values = std::move(option_values);
+  pending.transaction = lance_transaction;
+  tm->RegisterPendingAppend(txn, std::move(pending));
 }
 
 } // namespace duckdb

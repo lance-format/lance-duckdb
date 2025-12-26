@@ -1,0 +1,73 @@
+# name: test/sql/lance_insert.test
+# description: INSERT INTO appends to Lance datasets
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/lance_insert_append.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM ns.main.lance_insert_append;
+----
+2
+
+statement ok
+INSERT INTO ns.main.lance_insert_append VALUES (3::BIGINT, 'c'::VARCHAR);
+
+query I
+SELECT count(*) FROM ns.main.lance_insert_append;
+----
+3
+
+query I
+SELECT sum(id) FROM ns.main.lance_insert_append;
+----
+6
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO ns.main.lance_insert_append SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ns.main.lance_insert_append;
+----
+3
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO ns.main.lance_insert_append SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM ns.main.lance_insert_append;
+----
+4
+
+query I
+SELECT sum(id) FROM ns.main.lance_insert_append;
+----
+10
+
+statement ok
+DETACH ns;
+

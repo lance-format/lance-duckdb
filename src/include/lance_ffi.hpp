@@ -57,9 +57,20 @@ void *lance_open_writer_with_storage_options(
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     const ArrowSchema *schema);
+void *lance_open_uncommitted_writer_with_storage_options(
+    const char *path, const char *mode, const char **option_keys,
+    const char **option_values, size_t options_len, uint64_t max_rows_per_file,
+    uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
+    const ArrowSchema *schema);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_finish(void *writer);
+int32_t lance_writer_finish_uncommitted(void *writer, void **out_transaction);
 void lance_close_writer(void *writer);
+
+int32_t lance_commit_transaction_with_storage_options(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *transaction);
+void lance_free_transaction(void *transaction);
 
 const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
                                           size_t columns_len,
