@@ -7,6 +7,7 @@ build/
 configure/
 duckdb_unittest_tempdir/
 /test/bin
+/test/**/__manifest/
 
 # Python
 __pycache__/

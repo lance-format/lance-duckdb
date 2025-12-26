@@ -8,6 +8,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
@@ -206,6 +207,80 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset: " +
                       result->file_path + LanceFormatErrorSuffix());
+  }
+
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
+      0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+  names = result->names;
+  return_types = result->types;
+  return std::move(result);
+}
+
+static unique_ptr<FunctionData>
+LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
+                       vector<LogicalType> &return_types,
+                       vector<string> &names) {
+  if (input.inputs.size() < 2 || input.inputs[0].IsNull() ||
+      input.inputs[1].IsNull()) {
+    throw InvalidInputException(
+        "Lance namespace scan requires (endpoint, table_id[, delimiter])");
+  }
+
+  auto endpoint =
+      input.inputs[0].DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  auto table_id =
+      input.inputs[1].DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  string delimiter;
+  if (input.inputs.size() >= 3 && !input.inputs[2].IsNull()) {
+    delimiter =
+        input.inputs[2].DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  }
+
+  auto result = make_uniq<LanceScanBindData>();
+  result->file_path = endpoint + "/" + table_id;
+
+  auto verbose_it = input.named_parameters.find("explain_verbose");
+  if (verbose_it != input.named_parameters.end() &&
+      !verbose_it->second.IsNull()) {
+    result->explain_verbose =
+        verbose_it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  }
+
+  string bearer_token;
+  string api_key;
+  ResolveLanceNamespaceAuth(context, endpoint, input.named_parameters,
+                            bearer_token, api_key);
+
+  string table_uri;
+  result->dataset = LanceOpenDatasetInNamespace(
+      context, endpoint, table_id, bearer_token, api_key, delimiter, table_uri);
+  if (!table_uri.empty()) {
+    result->file_path = table_uri;
+  }
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset via namespace: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_schema(result->dataset);
+  if (!schema_handle) {
+    throw IOException(
+        "Failed to get schema from Lance dataset via namespace: " +
+        result->file_path + LanceFormatErrorSuffix());
   }
 
   memset(&result->schema_root.arrow_schema, 0,
@@ -611,6 +686,30 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.to_string = LanceScanToString;
   lance_scan.dynamic_to_string = LanceScanDynamicToString;
   loader.RegisterFunction(lance_scan);
+
+  TableFunction internal_namespace_scan(
+      "__lance_namespace_scan",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LanceScanFunc, LanceNamespaceScanBind, LanceScanInitGlobal,
+      LanceScanLocalInit);
+  internal_namespace_scan.named_parameters["explain_verbose"] =
+      LogicalType::BOOLEAN;
+  internal_namespace_scan.named_parameters["token"] = LogicalType::VARCHAR;
+  internal_namespace_scan.named_parameters["bearer_token"] =
+      LogicalType::VARCHAR;
+  internal_namespace_scan.named_parameters["api_key"] = LogicalType::VARCHAR;
+  internal_namespace_scan.projection_pushdown = true;
+  internal_namespace_scan.filter_pushdown = true;
+  internal_namespace_scan.filter_prune = true;
+  internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
+  internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
+  internal_namespace_scan.to_string = LanceScanToString;
+  internal_namespace_scan.dynamic_to_string = LanceScanDynamicToString;
+
+  CreateTableFunctionInfo internal_info(std::move(internal_namespace_scan));
+  internal_info.internal = true;
+  internal_info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+  loader.RegisterFunction(std::move(internal_info));
 }
 
 } // namespace duckdb

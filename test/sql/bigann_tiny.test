@@ -6,22 +6,22 @@ require lance
 
 # Sanity: fixture is readable
 query I
-SELECT count(*) FROM 'test/bigann_tiny/base.lance'
+SELECT count(*) FROM 'test/data/bigann_tiny/base.lance'
 ----
 2048
 
 query I
-SELECT count(*) FROM 'test/bigann_tiny/queries.lance'
+SELECT count(*) FROM 'test/data/bigann_tiny/queries.lance'
 ----
 32
 
 query I
-SELECT count(*) FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+SELECT count(*) FROM 'test/data/bigann_tiny/groundtruth_all_top10.lance'
 ----
 320
 
 query I
-SELECT count(*) FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+SELECT count(*) FROM 'test/data/bigann_tiny/groundtruth_label1_top10.lance'
 ----
 320
 
@@ -32,7 +32,7 @@ WITH got AS (
     CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
     r.id AS id
   FROM lance_vector_search(
-    'test/bigann_tiny/base.lance',
+    'test/data/bigann_tiny/base.lance',
     'vec',
     [
       0.32245764,
@@ -58,7 +58,7 @@ WITH got AS (
 ),
 exp AS (
   SELECT CAST(rank AS INTEGER) AS rank, id
-  FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+  FROM 'test/data/bigann_tiny/groundtruth_all_top10.lance'
   WHERE qid = 0
 )
 SELECT count(*) FROM (
@@ -76,7 +76,7 @@ WITH got AS (
     CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
     r.id AS id
   FROM lance_vector_search(
-    'test/bigann_tiny/base.lance',
+    'test/data/bigann_tiny/base.lance',
     'vec',
     [
       0.32245764,
@@ -104,7 +104,7 @@ WITH got AS (
 ),
 exp AS (
   SELECT CAST(rank AS INTEGER) AS rank, id
-  FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+  FROM 'test/data/bigann_tiny/groundtruth_label1_top10.lance'
   WHERE qid = 0
 )
 SELECT count(*) FROM (
@@ -122,7 +122,7 @@ WITH got AS (
     CAST(row_number() OVER (ORDER BY r._distance, r.id) - 1 AS INTEGER) AS rank,
     r.id AS id
   FROM lance_vector_search(
-    'test/bigann_tiny/base.lance',
+    'test/data/bigann_tiny/base.lance',
     'vec',
     [
       0.32245764,
@@ -154,7 +154,7 @@ query I
 WITH got AS (
   SELECT r.id AS id
   FROM lance_vector_search(
-    'test/bigann_tiny/base.lance',
+    'test/data/bigann_tiny/base.lance',
     'vec',
     [
       0.32245764,
@@ -182,7 +182,7 @@ WITH got AS (
 ),
 exp AS (
   SELECT id
-  FROM 'test/bigann_tiny/groundtruth_all_top10.lance'
+  FROM 'test/data/bigann_tiny/groundtruth_all_top10.lance'
   WHERE qid = 0
 )
 SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
@@ -192,7 +192,7 @@ SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
 query I
 SELECT count(*)
 FROM lance_vector_search(
-  'test/bigann_tiny/base.lance',
+  'test/data/bigann_tiny/base.lance',
   'vec',
   [
     0.32245764,
@@ -224,7 +224,7 @@ query I
 WITH got AS (
   SELECT r.id AS id
   FROM lance_vector_search(
-    'test/bigann_tiny/base.lance',
+    'test/data/bigann_tiny/base.lance',
     'vec',
     [
       0.32245764,
@@ -254,7 +254,7 @@ WITH got AS (
 ),
 exp AS (
   SELECT id
-  FROM 'test/bigann_tiny/groundtruth_label1_top10.lance'
+  FROM 'test/data/bigann_tiny/groundtruth_label1_top10.lance'
   WHERE qid = 0
 )
 SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
@@ -266,7 +266,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_vector_search(
-  'test/bigann_tiny/base.lance',
+  'test/data/bigann_tiny/base.lance',
   'vec',
   [
     0.32245764,
@@ -296,7 +296,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_vector_search(
-  'test/bigann_tiny/base.lance',
+  'test/data/bigann_tiny/base.lance',
   'vec',
   [
     0.32245764,

@@ -10,58 +10,62 @@ SELECT 1
 ----
 1
 
+# Test that lance_scan can read a local dataset root
+statement ok
+SELECT * FROM lance_scan('test/data/test_data.lance') LIMIT 1
+
 # Baseline: materialize once and evaluate filters in DuckDB
 statement ok
-CREATE TEMP TABLE baseline AS SELECT * FROM 'test/test_data.lance'
+CREATE TEMP TABLE baseline AS SELECT * FROM 'test/data/test_data.lance'
 
 # Test parallel scan + filter pushdown correctness
 statement ok
 PRAGMA threads=4
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30
 ----
 3
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE name IN ('Alice', 'Eve')
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE name IN ('Alice', 'Eve')
 ----
 2
 
 query I
-SELECT count(*) FROM 'test/test_data.lance'
+SELECT count(*) FROM 'test/data/test_data.lance'
 ----
 5
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 AND score < 90
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30 AND score < 90
 ----
 2
 
 # Test complex filter forms
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30 OR score < 90
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30 OR score < 90
 ----
 4
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE NOT (age > 30)
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE NOT (age > 30)
 ----
 2
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE age BETWEEN 26 AND 40
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE age BETWEEN 26 AND 40
 ----
 3
 
 query I
-SELECT count(*) FROM 'test/test_data.lance' WHERE name NOT IN ('Alice', 'Eve')
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE name NOT IN ('Alice', 'Eve')
 ----
 3
 
 # Projection + filter correctness (also exercises projection pushdown path)
 query T
-SELECT name FROM 'test/test_data.lance' WHERE age > 30 ORDER BY name
+SELECT name FROM 'test/data/test_data.lance' WHERE age > 30 ORDER BY name
 ----
 Charlie
 David
@@ -85,22 +89,22 @@ SELECT count(*) FROM baseline WHERE age > 30 AND score < 90
 
 # Explain output includes Lance-specific diagnostics (bind-time and runtime)
 query II
-EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
 ----
-physical_plan	<REGEX>:[\s\S]*"Lance Path": "test/test_data\.lance"[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Path": "test/data/test_data\.lance"[\s\S]*
 
 query II
-EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Plan \(Bind\)"[\s\S]*
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Rows Out"[\s\S]*
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/test_data.lance' WHERE age > 30;
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/data/test_data.lance' WHERE age > 30;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Plan"[\s\S]*
 
@@ -126,7 +130,7 @@ SELECT count(*) FROM baseline WHERE name NOT IN ('Alice', 'Eve')
 
 # Test replacement scan for SELECT * FROM '.../dataset.lance'
 statement ok
-SELECT * FROM 'test/test_data.lance' LIMIT 1
+SELECT * FROM 'test/data/test_data.lance' LIMIT 1
 
 # Test error handling - invalid dataset root
 statement error

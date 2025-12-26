@@ -5,28 +5,28 @@
 require lance
 
 statement ok
-CREATE OR REPLACE VIEW customer AS SELECT * FROM 'test/tpch_sf0_01/customer.lance';
+CREATE OR REPLACE VIEW customer AS SELECT * FROM 'test/data/tpch_sf0_01/customer.lance';
 
 statement ok
-CREATE OR REPLACE VIEW lineitem AS SELECT * FROM 'test/tpch_sf0_01/lineitem.lance';
+CREATE OR REPLACE VIEW lineitem AS SELECT * FROM 'test/data/tpch_sf0_01/lineitem.lance';
 
 statement ok
-CREATE OR REPLACE VIEW nation AS SELECT * FROM 'test/tpch_sf0_01/nation.lance';
+CREATE OR REPLACE VIEW nation AS SELECT * FROM 'test/data/tpch_sf0_01/nation.lance';
 
 statement ok
-CREATE OR REPLACE VIEW orders AS SELECT * FROM 'test/tpch_sf0_01/orders.lance';
+CREATE OR REPLACE VIEW orders AS SELECT * FROM 'test/data/tpch_sf0_01/orders.lance';
 
 statement ok
-CREATE OR REPLACE VIEW part AS SELECT * FROM 'test/tpch_sf0_01/part.lance';
+CREATE OR REPLACE VIEW part AS SELECT * FROM 'test/data/tpch_sf0_01/part.lance';
 
 statement ok
-CREATE OR REPLACE VIEW partsupp AS SELECT * FROM 'test/tpch_sf0_01/partsupp.lance';
+CREATE OR REPLACE VIEW partsupp AS SELECT * FROM 'test/data/tpch_sf0_01/partsupp.lance';
 
 statement ok
-CREATE OR REPLACE VIEW region AS SELECT * FROM 'test/tpch_sf0_01/region.lance';
+CREATE OR REPLACE VIEW region AS SELECT * FROM 'test/data/tpch_sf0_01/region.lance';
 
 statement ok
-CREATE OR REPLACE VIEW supplier AS SELECT * FROM 'test/tpch_sf0_01/supplier.lance';
+CREATE OR REPLACE VIEW supplier AS SELECT * FROM 'test/data/tpch_sf0_01/supplier.lance';
 
 # Q1
 query TTRRRRRRRI
@@ -1655,4 +1655,3 @@ ORDER BY
 29	11	88722.85
 30	17	122189.33
 31	8	66313.16
-

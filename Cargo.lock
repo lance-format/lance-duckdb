@@ -2065,7 +2065,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3094,7 +3094,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3588,6 +3588,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-namespace-impls"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf12e121a4b69dc511a22cba8206639b134879ba89d5f945c2ffa8c208aa61cc"
+dependencies = [
+ "arrow",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "futures",
+ "lance",
+ "lance-core",
+ "lance-index",
+ "lance-io",
+ "lance-namespace",
+ "log",
+ "object_store",
+ "rand 0.9.2",
+ "reqwest",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "lance-namespace-reqwest-client"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3655,6 +3682,8 @@ dependencies = [
  "futures",
  "lance",
  "lance-index",
+ "lance-namespace",
+ "lance-namespace-impls",
  "tokio",
 ]
 
@@ -6115,6 +6144,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.0",
