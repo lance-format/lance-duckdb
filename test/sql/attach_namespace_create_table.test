@@ -1,0 +1,56 @@
+# name: test/sql/attach_namespace_create_table.test
+# description: CREATE TABLE in attached LANCE directory namespace
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.attach_create_table_empty (id BIGINT, s VARCHAR);
+
+query I
+SELECT count(*) FROM ns.main.attach_create_table_empty
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas AS
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+query I
+SELECT count(*) FROM ns.main.attach_create_table_ctas
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/attach_create_table_ctas.lance'
+----
+2
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas AS
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s;
+
+query I
+SELECT sum(id) FROM ns.main.attach_create_table_ctas
+----
+3
+
+statement ok
+CREATE TABLE IF NOT EXISTS ns.main.attach_create_table_ctas AS
+  SELECT 100::BIGINT AS id, 'x'::VARCHAR AS s;
+
+query I
+SELECT sum(id) FROM ns.main.attach_create_table_ctas
+----
+3
+
+statement ok
+DETACH ns;
