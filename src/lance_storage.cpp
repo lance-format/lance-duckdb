@@ -290,8 +290,8 @@ public:
     auto &set = GetCatalogSet(info.type);
     auto existing_entry = set.GetEntry(transaction, info.name);
     if (!existing_entry) {
-      throw InternalException("Failed to drop entry \"%s\" - entry could not be found",
-                              info.name);
+      throw InternalException(
+          "Failed to drop entry \"%s\" - entry could not be found", info.name);
     }
     auto existing_type = existing_entry->type;
 
@@ -354,8 +354,9 @@ public:
     // (non-transactional) CatalogTransaction.
     if (existing_type != CatalogType::TABLE_ENTRY &&
         existing_type != CatalogType::VIEW_ENTRY) {
-      throw InternalException("Unexpected catalog entry type for DROP TABLE: %s",
-                              CatalogTypeToString(existing_type));
+      throw InternalException(
+          "Unexpected catalog entry type for DROP TABLE: %s",
+          CatalogTypeToString(existing_type));
     }
     auto system_transaction =
         CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
