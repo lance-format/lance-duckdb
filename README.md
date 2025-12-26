@@ -7,7 +7,7 @@ Lance is a modern columnar data format optimized for ML/AI workloads, with nativ
 
 ## Usage
 
-### Query a `*.lance` path
+### Query a Lance dataset
 
 ```sql
 -- local file
@@ -20,9 +20,7 @@ SELECT *
   LIMIT 10;
 ```
 
-### S3 authentication via DuckDB Secrets
-
-For `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
+To read `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
 
 ```sql
 CREATE SECRET (TYPE S3, provider credential_chain);
