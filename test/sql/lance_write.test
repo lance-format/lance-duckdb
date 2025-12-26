@@ -5,6 +5,9 @@
 require lance
 
 statement ok
+PRAGMA threads=4;
+
+statement ok
 COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
@@ -46,3 +49,14 @@ query I
 SELECT count(*) FROM 'test/.tmp/lance_write_empty.lance';
 ----
 0
+
+statement ok
+COPY (
+  SELECT i::BIGINT AS id, 'x'::VARCHAR AS s
+  FROM range(0, 10000) tbl(i)
+) TO 'test/.tmp/lance_write_parallel.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_parallel.lance';
+----
+10000
