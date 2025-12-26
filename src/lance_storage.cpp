@@ -308,7 +308,8 @@ public:
         is_rest_namespace(is_rest_namespace) {}
 
   PhysicalOperator &PlanInsert(ClientContext &context,
-                               PhysicalPlanGenerator &planner, LogicalInsert &op,
+                               PhysicalPlanGenerator &planner,
+                               LogicalInsert &op,
                                optional_ptr<PhysicalOperator> plan) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
       return PlanLanceInsertAppend(context, planner, op, plan);
@@ -501,9 +502,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
 
   auto &duck_schema = schema.Cast<DuckSchemaEntry>();
-  auto &catalog_set =
-      duck_schema.GetCatalogSet(is_rest_namespace ? CatalogType::VIEW_ENTRY
-                                                  : CatalogType::TABLE_ENTRY);
+  auto &catalog_set = duck_schema.GetCatalogSet(
+      is_rest_namespace ? CatalogType::VIEW_ENTRY : CatalogType::TABLE_ENTRY);
 
   if (!is_rest_namespace) {
     generator = make_uniq<LanceDirectoryDefaultGenerator>(
