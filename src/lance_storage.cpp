@@ -187,26 +187,10 @@ static bool IsSafeDatasetTableName(const string &name) {
   if (name.empty()) {
     return false;
   }
-  if (name.find('\\') != string::npos) {
+  if (name == "." || name == "..") {
     return false;
   }
-
-  idx_t start = 0;
-  while (start <= name.size()) {
-    auto end = name.find('/', start);
-    if (end == string::npos) {
-      end = name.size();
-    }
-    auto part = name.substr(start, end - start);
-    if (part.empty() || part == "." || part == "..") {
-      return false;
-    }
-    if (end == name.size()) {
-      break;
-    }
-    start = end + 1;
-  }
-  if (name.find("..") != string::npos) {
+  if (name.find('/') != string::npos || name.find('\\') != string::npos) {
     return false;
   }
   return true;
@@ -250,25 +234,9 @@ public:
                                   info.name);
     }
 
-    auto &fs = FileSystem::GetFileSystem(context);
     auto root = LanceNormalizeS3Scheme(directory_namespace_root);
     if (root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
-    }
-    auto dataset_path = fs.JoinPath(root, GetDatasetDirName(info.name));
-    dataset_path = LanceNormalizeS3Scheme(dataset_path);
-
-    auto &views = GetCatalogSet(CatalogType::VIEW_ENTRY);
-    auto view_entry = views.GetEntry(context, info.name);
-    const bool view_exists = view_entry != nullptr;
-
-    const bool dir_exists = fs.DirectoryExists(dataset_path);
-    const bool file_exists = fs.FileExists(dataset_path);
-    const bool dataset_exists = dir_exists || file_exists;
-
-    if (!view_exists && !dataset_exists) {
-      DuckSchemaEntry::DropEntry(context, info);
-      return;
     }
 
     // Prefer dropping the view first to preserve normal DROP semantics for
@@ -279,10 +247,33 @@ public:
     view_drop.allow_drop_internal = true;
     DuckSchemaEntry::DropEntry(context, view_drop);
 
-    if (dir_exists) {
-      fs.RemoveDirectory(dataset_path);
-    } else if (file_exists) {
-      fs.RemoveFile(dataset_path);
+    vector<string> option_keys;
+    vector<string> option_values;
+    if (StringUtil::StartsWith(root, "s3://") ||
+        StringUtil::StartsWith(root, "s3a://") ||
+        StringUtil::StartsWith(root, "s3n://")) {
+      root = LanceNormalizeS3Scheme(root);
+      LanceFillS3StorageOptionsFromSecrets(context, root, option_keys,
+                                           option_values);
+    }
+
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    key_ptrs.reserve(option_keys.size());
+    value_ptrs.reserve(option_values.size());
+    for (idx_t i = 0; i < option_keys.size(); i++) {
+      key_ptrs.push_back(option_keys[i].c_str());
+      value_ptrs.push_back(option_values[i].c_str());
+    }
+
+    auto rc = lance_dir_namespace_drop_table(
+        root.c_str(), info.name.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
+    if (rc != 0) {
+      throw IOException("Failed to drop Lance dataset: " + root + "/" +
+                        GetDatasetDirName(info.name) +
+                        LanceFormatErrorSuffix());
     }
 
     if (directory_table_list) {

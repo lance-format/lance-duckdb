@@ -4,8 +4,9 @@ use std::ptr;
 use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
+use lance_core::Error as LanceError;
 use lance_namespace::LanceNamespace;
-use lance_namespace::models::ListTablesRequest;
+use lance_namespace::models::{DropTableRequest, ListTablesRequest};
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -69,7 +70,7 @@ fn dir_namespace_list_tables_inner(
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
 
     let tables = runtime::block_on(async move {
-        let mut builder = DirectoryNamespaceBuilder::new(root);
+        let mut builder = DirectoryNamespaceBuilder::new(root).manifest_enabled(false);
         if !storage_options.is_empty() {
             builder = builder.storage_options(storage_options);
         }
@@ -173,6 +174,64 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
         Err(err) => {
             set_last_error(err.code, err.message);
             ptr::null_mut()
+        }
+    }
+}
+
+fn dir_namespace_drop_table_inner(
+    root: *const c_char,
+    table_name: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+) -> FfiResult<()> {
+    let root = unsafe { cstr_to_str(root, "root")? };
+    let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
+    let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
+
+    runtime::block_on(async move {
+        let mut builder = DirectoryNamespaceBuilder::new(root).manifest_enabled(false);
+        if !storage_options.is_empty() {
+            builder = builder.storage_options(storage_options);
+        }
+        let namespace = builder.build().await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::DirNamespaceDropTable,
+                format!("dir namespace build '{root}': {err}"),
+            )
+        })?;
+
+        let mut req = DropTableRequest::new();
+        req.id = Some(vec![table_name.to_string()]);
+
+        match namespace.drop_table(req).await {
+            Ok(_) => Ok(()),
+            Err(LanceError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(FfiError::new(
+                ErrorCode::DirNamespaceDropTable,
+                format!("dir namespace drop_table '{root}/{table_name}': {err}"),
+            )),
+        }
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dir_namespace_drop_table(
+    root: *const c_char,
+    table_name: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+) -> i32 {
+    match dir_namespace_drop_table_inner(root, table_name, option_keys, option_values, options_len) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
         }
     }
 }

@@ -27,6 +27,7 @@ pub enum ErrorCode {
     NamespaceListTables = 21,
     NamespaceDescribeTable = 22,
     DirNamespaceListTables = 23,
+    DirNamespaceDropTable = 24,
 }
 
 struct LastError {
