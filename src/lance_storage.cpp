@@ -1,21 +1,32 @@
 #include "duckdb/storage/storage_extension.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
+#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
+#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
 #include "lance_common.hpp"
+#include "lance_ffi.hpp"
 
 namespace duckdb {
 
@@ -61,6 +72,9 @@ public:
     auto &fs = FileSystem::GetFileSystem(context);
     auto dataset_dir = entry_name + ".lance";
     auto dataset_path = fs.JoinPath(namespace_root, dataset_dir);
+    if (!fs.DirectoryExists(dataset_path)) {
+      return nullptr;
+    }
 
     auto view = make_uniq<CreateViewInfo>();
     view->schema = DEFAULT_SCHEMA;
@@ -96,6 +110,17 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
+    bool is_known = false;
+    for (auto &t : discovered_tables) {
+      if (StringUtil::CIEquals(t, entry_name)) {
+        is_known = true;
+        break;
+      }
+    }
+    if (!is_known) {
+      return nullptr;
+    }
+
     auto view = make_uniq<CreateViewInfo>();
     view->schema = DEFAULT_SCHEMA;
     view->view_name = entry_name;
@@ -119,6 +144,243 @@ private:
   vector<string> discovered_tables;
 };
 
+static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
+static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
+static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
+    90ULL * 1024ULL * 1024ULL * 1024ULL;
+
+static string GetDatasetDirName(const string &table_name) {
+  return table_name + ".lance";
+}
+
+static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
+  switch (on_conflict) {
+  case OnCreateConflict::ERROR_ON_CONFLICT:
+  case OnCreateConflict::IGNORE_ON_CONFLICT:
+  case OnCreateConflict::REPLACE_ON_CONFLICT:
+  case OnCreateConflict::ALTER_ON_CONFLICT:
+    break;
+  default:
+    break;
+  }
+  return "overwrite";
+}
+
+class LanceSchemaEntry final : public DuckSchemaEntry {
+public:
+  LanceSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
+                   string directory_namespace_root, bool is_rest_namespace)
+      : DuckSchemaEntry(catalog, info),
+        directory_namespace_root(std::move(directory_namespace_root)),
+        is_rest_namespace(is_rest_namespace) {}
+
+  optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction,
+                                         BoundCreateTableInfo &info) override {
+    auto &create_info = info.Base();
+    if (create_info.temporary) {
+      throw NotImplementedException(
+          "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
+    }
+    if (is_rest_namespace) {
+      throw NotImplementedException(
+          "CREATE TABLE is not supported for Lance REST namespaces");
+    }
+    if (!info.constraints.empty() || !create_info.constraints.empty()) {
+      throw NotImplementedException(
+          "Lance CREATE TABLE does not support constraints");
+    }
+
+    auto &context = transaction.GetContext();
+    auto &fs = FileSystem::GetFileSystem(context);
+    auto dataset_path = fs.JoinPath(directory_namespace_root,
+                                    GetDatasetDirName(create_info.table));
+
+    auto exists =
+        fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path);
+    if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+        exists) {
+      return nullptr;
+    }
+    if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
+        exists) {
+      throw IOException("Lance dataset already exists: " + dataset_path);
+    }
+
+    vector<string> names;
+    vector<LogicalType> types;
+    names.reserve(create_info.columns.LogicalColumnCount());
+    types.reserve(create_info.columns.LogicalColumnCount());
+    for (auto &col : create_info.columns.Logical()) {
+      names.push_back(col.Name());
+      types.push_back(col.Type());
+    }
+
+    ArrowSchemaWrapper schema_root;
+    memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+    auto props = context.GetClientProperties();
+    ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
+                                  props);
+
+    auto mode = CreateTableModeFromConflict(create_info.on_conflict);
+    auto *writer = lance_open_writer_with_storage_options(
+        dataset_path.c_str(), mode.c_str(), nullptr, nullptr, 0,
+        DEFAULT_MAX_ROWS_PER_FILE, DEFAULT_MAX_ROWS_PER_GROUP,
+        DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+    if (!writer) {
+      throw IOException("Failed to open Lance writer: " + dataset_path +
+                        LanceFormatErrorSuffix());
+    }
+    auto rc = lance_writer_finish(writer);
+    lance_close_writer(writer);
+    if (rc != 0) {
+      throw IOException("Failed to finalize Lance dataset write" +
+                        LanceFormatErrorSuffix());
+    }
+
+    return nullptr;
+  }
+
+private:
+  string directory_namespace_root;
+  bool is_rest_namespace;
+};
+
+class LanceDuckCatalog final : public DuckCatalog {
+public:
+  LanceDuckCatalog(AttachedDatabase &db, string directory_namespace_root,
+                   bool is_rest_namespace)
+      : DuckCatalog(db),
+        directory_namespace_root(std::move(directory_namespace_root)),
+        is_rest_namespace(is_rest_namespace) {}
+
+  PhysicalOperator &PlanCreateTableAs(ClientContext &context,
+                                      PhysicalPlanGenerator &planner,
+                                      LogicalCreateTable &op,
+                                      PhysicalOperator &plan) override {
+    auto &create_info = op.info->Base();
+    if (create_info.temporary) {
+      throw NotImplementedException(
+          "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
+    }
+    if (is_rest_namespace) {
+      throw NotImplementedException(
+          "CREATE TABLE is not supported for Lance REST namespaces");
+    }
+
+    auto &fs = FileSystem::GetFileSystem(context);
+    auto dataset_path = fs.JoinPath(directory_namespace_root,
+                                    GetDatasetDirName(create_info.table));
+
+    auto exists =
+        fs.DirectoryExists(dataset_path) || fs.FileExists(dataset_path);
+
+    if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+        exists) {
+      return planner.Make<PhysicalEmptyResult>(op.types,
+                                               op.estimated_cardinality);
+    }
+    if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
+        exists) {
+      throw IOException("Lance dataset already exists: " + dataset_path);
+    }
+
+    auto mode = CreateTableModeFromConflict(create_info.on_conflict);
+
+    CopyInfo copy_info;
+    copy_info.is_from = false;
+    copy_info.format = "lance";
+    copy_info.file_path = dataset_path;
+    copy_info.options["mode"] = {Value(mode)};
+
+    auto &system_catalog = Catalog::GetSystemCatalog(context);
+    auto entry = system_catalog.GetEntry(
+        context, CatalogType::COPY_FUNCTION_ENTRY, DEFAULT_SCHEMA, "lance",
+        OnEntryNotFound::THROW_EXCEPTION);
+    auto &copy_function = entry->Cast<CopyFunctionCatalogEntry>().function;
+
+    if (!copy_function.copy_to_bind) {
+      throw NotImplementedException(
+          "COPY TO is not supported for FORMAT \"lance\"");
+    }
+
+    auto names = create_info.columns.GetColumnNames();
+    auto types = create_info.columns.GetColumnTypes();
+    CopyFunctionBindInput bind_input(copy_info);
+    auto bind_data =
+        copy_function.copy_to_bind(context, bind_input, names, types);
+
+    bool preserve_insertion_order =
+        PhysicalPlanGenerator::PreserveInsertionOrder(context, plan);
+    bool supports_batch_index =
+        PhysicalPlanGenerator::UseBatchIndex(context, plan);
+    auto execution_mode = CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+    if (copy_function.execution_mode) {
+      execution_mode = copy_function.execution_mode(preserve_insertion_order,
+                                                    supports_batch_index);
+    }
+
+    if (execution_mode == CopyFunctionExecutionMode::BATCH_COPY_TO_FILE) {
+      auto &copy = planner.Make<PhysicalBatchCopyToFile>(
+          op.types, copy_function, std::move(bind_data),
+          op.estimated_cardinality);
+      auto &cast_copy = copy.Cast<PhysicalBatchCopyToFile>();
+      cast_copy.file_path = dataset_path;
+      cast_copy.use_tmp_file = false;
+      cast_copy.return_type = CopyFunctionReturnType::CHANGED_ROWS;
+      cast_copy.write_empty_file = true;
+      cast_copy.children.push_back(plan);
+      return copy;
+    }
+
+    auto &copy = planner.Make<PhysicalCopyToFile>(op.types, copy_function,
+                                                  std::move(bind_data),
+                                                  op.estimated_cardinality);
+    auto &cast_copy = copy.Cast<PhysicalCopyToFile>();
+    cast_copy.file_path = dataset_path;
+    cast_copy.use_tmp_file = false;
+    cast_copy.filename_pattern = FilenamePattern();
+    cast_copy.file_extension = "";
+    cast_copy.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
+    cast_copy.return_type = CopyFunctionReturnType::CHANGED_ROWS;
+    cast_copy.per_thread_output = false;
+    cast_copy.file_size_bytes = optional_idx();
+    cast_copy.rotate = false;
+    cast_copy.write_empty_file = true;
+    cast_copy.partition_output = false;
+    cast_copy.write_partition_columns = false;
+    cast_copy.hive_file_pattern = false;
+    cast_copy.partition_columns.clear();
+    cast_copy.names = names;
+    cast_copy.expected_types = types;
+    cast_copy.parallel =
+        execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+    cast_copy.children.push_back(plan);
+    return copy;
+  }
+
+  void ReplaceDefaultSchemaWithLanceSchema(CatalogTransaction transaction) {
+    auto &schemas = GetSchemaCatalogSet();
+    (void)schemas.DropEntry(transaction, DEFAULT_SCHEMA, true, true);
+
+    CreateSchemaInfo info;
+    info.schema = DEFAULT_SCHEMA;
+    info.internal = true;
+    info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+
+    LogicalDependencyList dependencies;
+    auto entry = make_uniq<LanceSchemaEntry>(
+        *this, info, directory_namespace_root, is_rest_namespace);
+    if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
+                             dependencies)) {
+      throw InternalException("Failed to replace Lance schema entry");
+    }
+  }
+
+private:
+  string directory_namespace_root;
+  bool is_rest_namespace;
+};
+
 static unique_ptr<Catalog>
 LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                    AttachedDatabase &db, const string &name, AttachInfo &info,
@@ -127,33 +389,22 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto endpoint = GetLanceNamespaceEndpoint(info);
   auto delimiter = GetLanceNamespaceDelimiter(info);
 
-  // Back the attached catalog by an in-memory DuckCatalog that lazily
-  // materializes per-table views mapping to `lance_scan` / internal namespace
-  // scan.
-  info.path = ":memory:";
-  auto catalog = make_uniq<DuckCatalog>(db);
-  catalog->Initialize(false);
-
   unique_ptr<DefaultGenerator> generator;
   vector<string> discovered_tables;
 
-  auto system_transaction =
-      CatalogTransaction::GetSystemTransaction(db.GetDatabase());
-  auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
+  auto is_rest_namespace = !endpoint.empty();
+  string directory_namespace_root;
 
-  if (endpoint.empty()) {
-    auto namespace_root =
+  if (!is_rest_namespace) {
+    directory_namespace_root =
         FileSystem::GetFileSystem(context).ExpandPath(attach_path);
     string list_error;
-    if (!TryLanceDirNamespaceListTables(context, namespace_root,
+    if (!TryLanceDirNamespaceListTables(context, directory_namespace_root,
                                         discovered_tables, list_error)) {
       throw IOException(
           "Failed to list tables from Lance directory namespace: " +
           list_error);
     }
-    generator = make_uniq<LanceDirectoryDefaultGenerator>(
-        *catalog, schema, std::move(namespace_root),
-        std::move(discovered_tables));
   } else {
     const auto namespace_id = attach_path;
     if (namespace_id.empty()) {
@@ -171,13 +422,33 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
       throw IOException("Failed to list tables from Lance namespace: " +
                         list_error);
     }
+  }
+
+  // Back the attached catalog by an in-memory DuckCatalog that lazily
+  // materializes per-table views mapping to `lance_scan` / internal namespace
+  // scan, and supports CREATE TABLE for directory namespaces.
+  info.path = ":memory:";
+  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_namespace_root,
+                                             is_rest_namespace);
+  catalog->Initialize(false);
+
+  auto system_transaction =
+      CatalogTransaction::GetSystemTransaction(db.GetDatabase());
+  catalog->ReplaceDefaultSchemaWithLanceSchema(system_transaction);
+  auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
+
+  auto &duck_schema = schema.Cast<DuckSchemaEntry>();
+  auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::VIEW_ENTRY);
+
+  if (!is_rest_namespace) {
+    generator = make_uniq<LanceDirectoryDefaultGenerator>(
+        *catalog, schema, std::move(directory_namespace_root),
+        std::move(discovered_tables));
+  } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, std::move(endpoint), std::move(delimiter),
         std::move(discovered_tables));
   }
-
-  auto &duck_schema = schema.Cast<DuckSchemaEntry>();
-  auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::VIEW_ENTRY);
   catalog_set.SetDefaultGenerator(std::move(generator));
 
   (void)name;

@@ -68,6 +68,26 @@ CREATE SECRET (TYPE S3, provider credential_chain);
 COPY (SELECT 1 AS id) TO 's3://bucket/path/to/out.lance' (FORMAT lance, mode 'overwrite');
 ```
 
+### Create a Lance dataset via `CREATE TABLE` (directory namespace)
+
+When you `ATTACH` a directory as a Lance namespace, you can create new datasets using `CREATE TABLE` (schema-only)
+or `CREATE TABLE AS SELECT` (CTAS). The dataset is written to `<namespace_root>/<table_name>.lance`.
+
+```sql
+ATTACH 'path/to/dir' AS lance_ns (TYPE LANCE);
+
+-- Schema-only (creates an empty dataset)
+CREATE TABLE lance_ns.main.my_empty (id BIGINT, s VARCHAR);
+
+-- CTAS (writes query results)
+CREATE TABLE lance_ns.main.my_dataset AS
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+SELECT count(*) FROM lance_ns.main.my_dataset;
+```
+
 ### Vector search
 
 ```sql
