@@ -27,6 +27,8 @@ pub enum ErrorCode {
     NamespaceListTables = 21,
     NamespaceDescribeTable = 22,
     DirNamespaceListTables = 23,
+    DatasetWriteFinishUncommitted = 24,
+    DatasetCommitTransaction = 25,
 }
 
 struct LastError {

@@ -13,6 +13,7 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_table_entry.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -314,6 +315,10 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   if (!input.projection_ids.empty()) {
     scan_state.scanned_types.reserve(input.column_ids.size());
     for (auto col_id : input.column_ids) {
+      if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
+          col_id == COLUMN_IDENTIFIER_EMPTY) {
+        continue;
+      }
       if (col_id >= bind_data.types.size()) {
         throw IOException("Invalid column id in projection");
       }
@@ -323,6 +328,10 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
   scan_state.scan_column_names.reserve(input.column_ids.size());
   for (auto col_id : input.column_ids) {
+    if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
+        col_id == COLUMN_IDENTIFIER_EMPTY) {
+      continue;
+    }
     if (col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
     }
@@ -671,6 +680,64 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   }
 
   return result;
+}
+
+static TableFunction LanceTableScanFunction() {
+  TableFunction function("__lance_table_scan", {}, LanceScanFunc);
+  function.projection_pushdown = true;
+  function.filter_pushdown = true;
+  function.filter_prune = true;
+  function.supports_pushdown_type = LanceSupportsPushdownType;
+  function.pushdown_complex_filter = LancePushdownComplexFilter;
+  function.to_string = LanceScanToString;
+  function.dynamic_to_string = LanceScanDynamicToString;
+  function.init_global = LanceScanInitGlobal;
+  function.init_local = LanceScanLocalInit;
+  return function;
+}
+
+LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
+                                 CreateTableInfo &info, string dataset_uri)
+    : TableCatalogEntry(catalog, schema, info),
+      dataset_uri(std::move(dataset_uri)) {}
+
+TableFunction
+LanceTableEntry::GetScanFunction(ClientContext &context,
+                                 unique_ptr<FunctionData> &bind_data) {
+  auto result = make_uniq<LanceScanBindData>();
+  result->file_path = dataset_uri;
+
+  result->dataset = LanceOpenDataset(context, result->file_path);
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_schema(result->dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get schema from Lance dataset: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
+      0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+
+  bind_data = std::move(result);
+  return LanceTableScanFunction();
 }
 
 void RegisterLanceScan(ExtensionLoader &loader) {
