@@ -26,6 +26,13 @@ const LIT_F32: u8 = 4;
 const LIT_F64: u8 = 5;
 const LIT_STRING: u8 = 6;
 const LIT_DATE32: u8 = 7;
+const LIT_TIMESTAMP: u8 = 8;
+const LIT_DECIMAL128: u8 = 9;
+
+const TS_UNIT_SECOND: u8 = 0;
+const TS_UNIT_MILLISECOND: u8 = 1;
+const TS_UNIT_MICROSECOND: u8 = 2;
+const TS_UNIT_NANOSECOND: u8 = 3;
 
 const OP_EQ: u8 = 0;
 const OP_NOT_EQ: u8 = 1;
@@ -99,6 +106,11 @@ impl<'a> Cursor<'a> {
     fn read_u64_le(&mut self) -> Result<u64> {
         let bytes = self.read_exact(8)?;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_i128_le(&mut self) -> Result<i128> {
+        let bytes = self.read_exact(16)?;
+        Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_f32_le(&mut self) -> Result<f32> {
@@ -206,6 +218,23 @@ fn parse_literal(cursor: &mut Cursor<'_>) -> Result<Expr> {
         LIT_F64 => ScalarValue::Float64(Some(cursor.read_f64_le()?)),
         LIT_STRING => ScalarValue::Utf8(Some(cursor.read_len_prefixed_string()?)),
         LIT_DATE32 => ScalarValue::Date32(Some(cursor.read_i32_le()?)),
+        LIT_TIMESTAMP => {
+            let unit = cursor.read_u8()?;
+            let v = cursor.read_i64_le()?;
+            match unit {
+                TS_UNIT_SECOND => ScalarValue::TimestampSecond(Some(v), None),
+                TS_UNIT_MILLISECOND => ScalarValue::TimestampMillisecond(Some(v), None),
+                TS_UNIT_MICROSECOND => ScalarValue::TimestampMicrosecond(Some(v), None),
+                TS_UNIT_NANOSECOND => ScalarValue::TimestampNanosecond(Some(v), None),
+                other => return Err(anyhow!("unknown timestamp unit: {other}")),
+            }
+        }
+        LIT_DECIMAL128 => {
+            let precision = cursor.read_u8()?;
+            let scale = cursor.read_u8()? as i8;
+            let v = cursor.read_i128_le()?;
+            ScalarValue::Decimal128(Some(v), precision, scale)
+        }
         other => return Err(anyhow!("unknown literal tag: {other}")),
     };
     Ok(Expr::Literal(scalar, None))
