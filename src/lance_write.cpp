@@ -9,7 +9,6 @@
 #include "lance_ffi.hpp"
 
 #include <cstdint>
-#include <mutex>
 
 namespace duckdb {
 
@@ -52,7 +51,6 @@ struct LanceWriteGlobalState : public GlobalFunctionData {
 
   void *writer = nullptr;
   ArrowSchemaWrapper schema_root;
-  std::mutex write_mutex;
 
   ~LanceWriteGlobalState() override {
     if (writer) {
@@ -174,7 +172,6 @@ static void LanceWriteSink(ExecutionContext &context, FunctionData &,
   }
 
   auto &gstate = gstate_p.Cast<LanceWriteGlobalState>();
-  std::lock_guard<std::mutex> guard(gstate.write_mutex);
 
   auto props = context.client.GetClientProperties();
   unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
@@ -197,19 +194,23 @@ static void LanceWriteSink(ExecutionContext &context, FunctionData &,
 static void LanceWriteFinalize(ClientContext &, FunctionData &,
                                GlobalFunctionData &gstate_p) {
   auto &gstate = gstate_p.Cast<LanceWriteGlobalState>();
-  std::lock_guard<std::mutex> guard(gstate.write_mutex);
   if (!gstate.writer) {
     return;
   }
-  if (lance_writer_finish(gstate.writer) != 0) {
+  auto rc = lance_writer_finish(gstate.writer);
+  lance_close_writer(gstate.writer);
+  gstate.writer = nullptr;
+  if (rc != 0) {
     throw IOException("Failed to finalize Lance dataset write" +
                       LanceFormatErrorSuffix());
   }
-  lance_close_writer(gstate.writer);
-  gstate.writer = nullptr;
 }
 
-static CopyFunctionExecutionMode LanceWriteExecutionMode(bool, bool) {
+static CopyFunctionExecutionMode
+LanceWriteExecutionMode(bool preserve_insertion_order, bool) {
+  if (!preserve_insertion_order) {
+    return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+  }
   return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
 }
 

@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Mutex;
+use std::sync::RwLock;
 use std::thread::JoinHandle;
 
 use arrow_array::{make_array, RecordBatch, RecordBatchReader, StructArray};
@@ -59,15 +62,21 @@ impl RecordBatchReader for ReceiverRecordBatchReader {
 struct WriterHandle {
     schema: SchemaRef,
     data_type: DataType,
-    sender: Option<SyncSender<RecordBatch>>,
-    join: Option<JoinHandle<Result<(), String>>>,
-    batches_sent: u64,
+    sender: RwLock<Option<SyncSender<RecordBatch>>>,
+    join: Mutex<Option<JoinHandle<Result<(), String>>>>,
+    batches_sent: AtomicU64,
 }
 
 impl Drop for WriterHandle {
     fn drop(&mut self) {
-        let _ = self.sender.take();
-        if let Some(join) = self.join.take() {
+        let sender = self
+            .sender
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+        let mut guard = self.join.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(join) = guard.take() {
             let _ = join.join();
         }
     }
@@ -230,9 +239,9 @@ fn open_writer_inner(
     Ok(WriterHandle {
         schema,
         data_type,
-        sender: Some(sender),
-        join: Some(join),
-        batches_sent: 0,
+        sender: RwLock::new(Some(sender)),
+        join: Mutex::new(Some(join)),
+        batches_sent: AtomicU64::new(0),
     })
 }
 
@@ -264,13 +273,22 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
         ));
     }
 
-    let handle = unsafe { &mut *(writer as *mut WriterHandle) };
-    let sender = handle.sender.as_ref().ok_or_else(|| {
-        FfiError::new(
-            ErrorCode::DatasetWriteBatch,
-            "writer is already finished",
-        )
-    })?;
+    let handle = unsafe { &*(writer as *const WriterHandle) };
+    let sender = {
+        let guard = handle
+            .sender
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::DatasetWriteBatch,
+                    "writer is already finished",
+                )
+            })?
+            .clone()
+    };
 
     let raw_array = unsafe { ptr::read(array as *mut RawArrowArray) };
     unsafe {
@@ -301,7 +319,7 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
         )
     })?;
 
-    handle.batches_sent = handle.batches_sent.saturating_add(1);
+    handle.batches_sent.fetch_add(1, Ordering::Relaxed);
 
     Ok(())
 }
@@ -327,9 +345,18 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
             "writer is null",
         ));
     }
-    let handle = unsafe { &mut *(writer as *mut WriterHandle) };
-    if handle.batches_sent == 0 {
-        if let Some(sender) = handle.sender.as_ref() {
+
+    let handle = unsafe { &*(writer as *const WriterHandle) };
+
+    if handle.batches_sent.load(Ordering::Acquire) == 0 {
+        let sender = {
+            let guard = handle
+                .sender
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        if let Some(sender) = sender {
             let empty = RecordBatch::new_empty(handle.schema.clone());
             sender.send(empty).map_err(|_| {
                 FfiError::new(
@@ -340,15 +367,22 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
         }
     }
 
-    let sender = handle.sender.take();
+    let sender = handle
+        .sender
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
     drop(sender);
 
-    let join = handle.join.take().ok_or_else(|| {
-        FfiError::new(
-            ErrorCode::DatasetWriteFinish,
-            "writer is already finished",
-        )
-    })?;
+    let join = {
+        let mut guard = handle.join.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take().ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::DatasetWriteFinish,
+                "writer is already finished",
+            )
+        })?
+    };
 
     match join.join() {
         Ok(Ok(())) => Ok(()),
