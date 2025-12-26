@@ -128,6 +128,12 @@ public:
     if (!fs.DirectoryExists(dataset_path)) {
       return nullptr;
     }
+    // A Lance dataset directory is expected to have a `_versions` directory.
+    // This avoids eagerly opening partially-created directories (e.g. leftovers
+    // from previous failed runs).
+    if (!fs.DirectoryExists(fs.JoinPath(dataset_path, "_versions"))) {
+      return nullptr;
+    }
 
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
