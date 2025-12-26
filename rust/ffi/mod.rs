@@ -1,6 +1,8 @@
 mod arrow_export;
 mod dataset;
+mod dir_namespace;
 mod knn;
+mod namespace;
 mod projection;
 mod scan;
 mod search;

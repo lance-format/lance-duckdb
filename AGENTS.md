@@ -58,10 +58,10 @@ GEN=ninja make test_debug     # Test with debug build
 GEN=ninja make test_release   # Test with release build
 
 # Run DuckDB with extension for manual testing
-./build/release/duckdb -c "SELECT * FROM 'test/test_data.lance' LIMIT 1;"
+./build/release/duckdb -c "SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
 
 # Or load the loadable extension from a standalone DuckDB binary
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM 'test/test_data.lance' LIMIT 1;"
+duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
 ```
 
 ### Development Iteration

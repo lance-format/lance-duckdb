@@ -12,32 +12,32 @@ IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset o
 
 # Empty query vector is rejected
 statement error
-SELECT * FROM lance_vector_search('test/test_data.lance', 'vec', []::FLOAT[])
+SELECT * FROM lance_vector_search('test/data/test_data.lance', 'vec', []::FLOAT[])
 ----
 Invalid Input Error: lance_vector_search requires a non-empty query vector
 
 # Non-positive k is rejected
 statement error
-SELECT * FROM lance_vector_search('test/test_data.lance', 'vec', [1.0]::FLOAT[], k = 0)
+SELECT * FROM lance_vector_search('test/data/test_data.lance', 'vec', [1.0]::FLOAT[], k = 0)
 ----
 Invalid Input Error: lance_vector_search requires k > 0
 
 # Sanity: dataset is readable
 query I
-SELECT count(*) FROM 'test/search_test_data.lance'
+SELECT count(*) FROM 'test/data/search_test_data.lance'
 ----
 5
 
 # Basic FTS search with explicit column
 query I
-SELECT count(*) FROM lance_fts('test/search_test_data.lance', 'text', 'puppy', k = 10)
+SELECT count(*) FROM lance_fts('test/data/search_test_data.lance', 'text', 'puppy', k = 10)
 ----
 2
 
 # FTS + prefilter: ensure filters are applied before top-k
 query I
 SELECT id
-FROM lance_fts('test/search_test_data.lance', 'text', 'puppy', k = 10, prefilter = true)
+FROM lance_fts('test/data/search_test_data.lance', 'text', 'puppy', k = 10, prefilter = true)
 WHERE label >= 3
 ORDER BY id
 ----
@@ -47,7 +47,7 @@ ORDER BY id
 query I
 SELECT id
 FROM lance_vector_search(
-  'test/search_test_data.lance',
+  'test/data/search_test_data.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[],
   k = 3,
@@ -63,7 +63,7 @@ ORDER BY _distance
 query I
 SELECT id
 FROM lance_vector_search(
-  'test/search_test_data.lance',
+  'test/data/search_test_data.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[],
   k = 10,
@@ -80,7 +80,7 @@ ORDER BY _distance
 query I
 SELECT id
 FROM lance_hybrid_search(
-  'test/search_test_data.lance',
+  'test/data/search_test_data.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[],
   'text',
@@ -100,7 +100,7 @@ ORDER BY _hybrid_score DESC
 query I
 SELECT id
 FROM lance_hybrid_search(
-  'test/search_test_data.lance',
+  'test/data/search_test_data.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[],
   'text',

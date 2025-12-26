@@ -34,7 +34,7 @@ import numpy as np
 import pyarrow as pa
 import lance
 
-OUT_DIR = Path("test/bigann_tiny")
+OUT_DIR = Path("test/data/bigann_tiny")
 BASE_PATH = OUT_DIR / "base.lance"
 QUERIES_PATH = OUT_DIR / "queries.lance"
 TRUTH_ALL_PATH = OUT_DIR / "groundtruth_all_top10.lance"

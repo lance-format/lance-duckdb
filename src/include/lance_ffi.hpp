@@ -11,6 +11,21 @@ void *lance_open_dataset_with_storage_options(const char *path,
                                               const char **option_keys,
                                               const char **option_values,
                                               size_t options_len);
+const char *lance_dir_namespace_list_tables(const char *root,
+                                            const char **option_keys,
+                                            const char **option_values,
+                                            size_t options_len);
+void *lance_open_dataset_in_dir_namespace(
+    const char *root, const char *table_name, const char **option_keys,
+    const char **option_values, size_t options_len, const char **out_table_uri);
+const char *lance_namespace_list_tables(const char *endpoint,
+                                        const char *namespace_id,
+                                        const char *bearer_token,
+                                        const char *api_key,
+                                        const char *delimiter);
+void *lance_open_dataset_in_namespace(
+    const char *endpoint, const char *table_id, const char *bearer_token,
+    const char *api_key, const char *delimiter, const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
 void *lance_get_schema(void *dataset);

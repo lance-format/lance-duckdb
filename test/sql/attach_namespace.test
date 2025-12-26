@@ -1,0 +1,23 @@
+# name: test/sql/attach_namespace.test
+# description: Test ATTACH TYPE LANCE namespace mapping
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/data' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM ns.main.test_data
+----
+5
+
+query T
+SELECT name FROM ns.main.test_data WHERE age > 30 ORDER BY name
+----
+Charlie
+David
+Eve
+
+statement ok
+DETACH ns;

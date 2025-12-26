@@ -1,0 +1,27 @@
+# name: test/sql/lance_namespace_rest.test
+# description: End-to-end Lance REST namespace attach (requires external service)
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+test-env LANCE_NAMESPACE_ID default
+test-env LANCE_NAMESPACE_TABLE default.table
+
+require lance
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+query I
+SHOW TABLES FROM ns.main
+----
+${LANCE_NAMESPACE_TABLE}
+
+query I
+SELECT count(*) FROM ns.main."${LANCE_NAMESPACE_TABLE}"
+----
+<REGEX>:[0-9]+
+
+statement ok
+DETACH ns;

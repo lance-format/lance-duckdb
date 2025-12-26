@@ -24,6 +24,9 @@ pub enum ErrorCode {
     DatasetWriteOpen = 18,
     DatasetWriteBatch = 19,
     DatasetWriteFinish = 20,
+    NamespaceListTables = 21,
+    NamespaceDescribeTable = 22,
+    DirNamespaceListTables = 23,
 }
 
 struct LastError {
