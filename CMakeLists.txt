@@ -12,7 +12,8 @@ include_directories(src/include)
 set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_search.cpp src/lance_common.cpp
                       src/lance_filter_ir.cpp
-                      src/lance_replacement.cpp)
+                      src/lance_replacement.cpp
+                      src/lance_write.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -120,6 +121,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)

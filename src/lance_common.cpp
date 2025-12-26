@@ -42,7 +42,7 @@ bool IsComputedSearchColumn(const string &name) {
   return name == "_distance" || name == "_score" || name == "_hybrid_score";
 }
 
-static string NormalizeS3Scheme(const string &path) {
+string LanceNormalizeS3Scheme(const string &path) {
   if (StringUtil::StartsWith(path, "s3a://")) {
     return "s3://" + path.substr(6);
   }
@@ -68,10 +68,10 @@ static void AddIfNotEmpty(vector<string> &keys, vector<string> &values,
   values.push_back(value);
 }
 
-static void FillS3StorageOptionsFromSecrets(ClientContext &context,
-                                            const string &path,
-                                            vector<string> &out_keys,
-                                            vector<string> &out_values) {
+void LanceFillS3StorageOptionsFromSecrets(ClientContext &context,
+                                          const string &path,
+                                          vector<string> &out_keys,
+                                          vector<string> &out_values) {
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
   auto secret_match = secret_manager.LookupSecret(transaction, path, "s3");
@@ -131,9 +131,9 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   if (StringUtil::StartsWith(open_path, "s3://") ||
       StringUtil::StartsWith(open_path, "s3a://") ||
       StringUtil::StartsWith(open_path, "s3n://")) {
-    open_path = NormalizeS3Scheme(open_path);
-    FillS3StorageOptionsFromSecrets(context, open_path, option_keys,
-                                    option_values);
+    open_path = LanceNormalizeS3Scheme(open_path);
+    LanceFillS3StorageOptionsFromSecrets(context, open_path, option_keys,
+                                         option_values);
   }
 
   if (option_keys.empty()) {

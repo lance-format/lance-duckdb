@@ -33,6 +33,15 @@ void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const uint8_t *filter_ir,
                                       size_t filter_ir_len);
 
+void *lance_open_writer_with_storage_options(
+    const char *path, const char *mode, const char **option_keys,
+    const char **option_values, size_t options_len, uint64_t max_rows_per_file,
+    uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
+    const ArrowSchema *schema);
+int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
+int32_t lance_writer_finish(void *writer);
+void lance_close_writer(void *writer);
+
 const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
                                           size_t columns_len,
                                           const uint8_t *filter_ir,
