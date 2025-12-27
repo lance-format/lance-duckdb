@@ -3,9 +3,9 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
 
+use datafusion_sql::unparser::expr_to_sql;
 use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
-use datafusion_sql::unparser::expr_to_sql;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -274,7 +274,9 @@ fn dataset_delete_inner(
     };
     let predicate = match filter {
         Some(expr) => expr_to_sql(&expr)
-            .map_err(|err| FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}")))?
+            .map_err(|err| {
+                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
+            })?
             .to_string(),
         None => "true".to_string(),
     };
@@ -315,9 +317,8 @@ fn dataset_delete_inner(
     };
 
     let deleted_rows = before_rows.saturating_sub(after_rows);
-    let deleted_rows_i64 = i64::try_from(deleted_rows).map_err(|_| {
-        FfiError::new(ErrorCode::DatasetDelete, "deleted row count overflow")
-    })?;
+    let deleted_rows_i64 = i64::try_from(deleted_rows)
+        .map_err(|_| FfiError::new(ErrorCode::DatasetDelete, "deleted row count overflow"))?;
 
     unsafe {
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);

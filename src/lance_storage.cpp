@@ -28,6 +28,7 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -37,6 +38,7 @@
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_update.hpp"
 
 #include <cstring>
 
@@ -544,6 +546,17 @@ public:
                    bool is_rest_namespace)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
         is_rest_namespace(is_rest_namespace) {}
+
+  using DuckCatalog::PlanUpdate;
+
+  PhysicalOperator &PlanUpdate(ClientContext &context,
+                               PhysicalPlanGenerator &planner,
+                               LogicalUpdate &op) override {
+    if (dynamic_cast<LanceTableEntry *>(&op.table)) {
+      return PlanLanceUpdateOverwrite(context, planner, op);
+    }
+    return Catalog::PlanUpdate(context, planner, op);
+  }
 
   PhysicalOperator &PlanInsert(ClientContext &context,
                                PhysicalPlanGenerator &planner,
