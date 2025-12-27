@@ -19,12 +19,29 @@ void LanceFillS3StorageOptionsFromSecrets(ClientContext &context,
                                           const string &path,
                                           vector<string> &out_keys,
                                           vector<string> &out_values);
+void ResolveLanceStorageOptions(ClientContext &context, const string &path,
+                                string &out_open_path,
+                                vector<string> &out_option_keys,
+                                vector<string> &out_option_values);
+void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
+                                     const vector<string> &option_values,
+                                     vector<const char *> &out_key_ptrs,
+                                     vector<const char *> &out_value_ptrs);
+
+static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
+static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
+static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
+    90ULL * 1024ULL * 1024ULL * 1024ULL;
+
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const named_parameter_map_t &options,
                                string &out_bearer_token, string &out_api_key);
+void ResolveLanceNamespaceAuthOverrides(
+    const unordered_map<string, Value> &options, string &out_bearer_token,
+    string &out_api_key);
 
 bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,

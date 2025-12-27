@@ -15,11 +15,6 @@
 
 namespace duckdb {
 
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
-    90ULL * 1024ULL * 1024ULL * 1024ULL;
-
 struct LanceInsertGlobalState : public GlobalSinkState {
   explicit LanceInsertGlobalState(string dataset_uri_p,
                                   vector<string> column_names_p,
@@ -102,31 +97,21 @@ public:
                                     gstate.column_types, gstate.column_names,
                                     props);
 
-      gstate.open_path = gstate.dataset_uri;
-      if (StringUtil::StartsWith(gstate.open_path, "s3://") ||
-          StringUtil::StartsWith(gstate.open_path, "s3a://") ||
-          StringUtil::StartsWith(gstate.open_path, "s3n://")) {
-        gstate.open_path = LanceNormalizeS3Scheme(gstate.open_path);
-        LanceFillS3StorageOptionsFromSecrets(context.client, gstate.open_path,
-                                             gstate.option_keys,
-                                             gstate.option_values);
-      }
+      ResolveLanceStorageOptions(context.client, gstate.dataset_uri,
+                                 gstate.open_path, gstate.option_keys,
+                                 gstate.option_values);
 
       vector<const char *> key_ptrs;
       vector<const char *> value_ptrs;
-      key_ptrs.reserve(gstate.option_keys.size());
-      value_ptrs.reserve(gstate.option_values.size());
-      for (idx_t i = 0; i < gstate.option_keys.size(); i++) {
-        key_ptrs.push_back(gstate.option_keys[i].c_str());
-        value_ptrs.push_back(gstate.option_values[i].c_str());
-      }
+      BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
+                                      key_ptrs, value_ptrs);
 
       gstate.writer = lance_open_uncommitted_writer_with_storage_options(
           gstate.open_path.c_str(), "append",
           key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          gstate.option_keys.size(), DEFAULT_MAX_ROWS_PER_FILE,
-          DEFAULT_MAX_ROWS_PER_GROUP, DEFAULT_MAX_BYTES_PER_FILE,
+          gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+          LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
           &gstate.schema_root.arrow_schema);
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +

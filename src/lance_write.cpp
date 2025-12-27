@@ -12,16 +12,11 @@
 
 namespace duckdb {
 
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
-    90ULL * 1024ULL * 1024ULL * 1024ULL;
-
 struct LanceWriteBindData : public FunctionData {
   string mode = "create";
-  uint64_t max_rows_per_file = DEFAULT_MAX_ROWS_PER_FILE;
-  uint64_t max_rows_per_group = DEFAULT_MAX_ROWS_PER_GROUP;
-  uint64_t max_bytes_per_file = DEFAULT_MAX_BYTES_PER_FILE;
+  uint64_t max_rows_per_file = LANCE_DEFAULT_MAX_ROWS_PER_FILE;
+  uint64_t max_rows_per_group = LANCE_DEFAULT_MAX_ROWS_PER_GROUP;
+  uint64_t max_bytes_per_file = LANCE_DEFAULT_MAX_BYTES_PER_FILE;
 
   vector<string> names;
   vector<LogicalType> types;
@@ -124,26 +119,16 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
   ArrowConverter::ToArrowSchema(&state->schema_root.arrow_schema,
                                 bind_data.types, bind_data.names, props);
 
-  auto open_path = file_path;
   vector<string> option_keys;
   vector<string> option_values;
-
-  if (StringUtil::StartsWith(open_path, "s3://") ||
-      StringUtil::StartsWith(open_path, "s3a://") ||
-      StringUtil::StartsWith(open_path, "s3n://")) {
-    open_path = LanceNormalizeS3Scheme(open_path);
-    LanceFillS3StorageOptionsFromSecrets(context, open_path, option_keys,
-                                         option_values);
-  }
+  string open_path;
+  ResolveLanceStorageOptions(context, file_path, open_path, option_keys,
+                             option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
-  key_ptrs.reserve(option_keys.size());
-  value_ptrs.reserve(option_values.size());
-  for (idx_t i = 0; i < option_keys.size(); i++) {
-    key_ptrs.push_back(option_keys[i].c_str());
-    value_ptrs.push_back(option_values[i].c_str());
-  }
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
 
   state->writer = lance_open_writer_with_storage_options(
       open_path.c_str(), bind_data.mode.c_str(),

@@ -171,7 +171,7 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                string &out_bearer_token, string &out_api_key) {
   FillLanceNamespaceAuthFromSecrets(context, endpoint, out_bearer_token,
                                     out_api_key);
-  (void)options;
+  ResolveLanceNamespaceAuthOverrides(options, out_bearer_token, out_api_key);
 }
 
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
@@ -193,20 +193,54 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
   }
 }
 
-static void ResolveStorageOptions(ClientContext &context, const string &path,
-                                  string &out_open_path,
-                                  vector<string> &out_keys,
-                                  vector<string> &out_values) {
+void ResolveLanceNamespaceAuthOverrides(
+    const unordered_map<string, Value> &options, string &out_bearer_token,
+    string &out_api_key) {
+  for (auto &kv : options) {
+    if (StringUtil::CIEquals(kv.first, "token")) {
+      ApplyAuthOverrideValue(kv.second, out_bearer_token);
+      continue;
+    }
+    if (StringUtil::CIEquals(kv.first, "bearer_token")) {
+      ApplyAuthOverrideValue(kv.second, out_bearer_token);
+      continue;
+    }
+    if (StringUtil::CIEquals(kv.first, "api_key")) {
+      ApplyAuthOverrideValue(kv.second, out_api_key);
+      continue;
+    }
+  }
+}
+
+void ResolveLanceStorageOptions(ClientContext &context, const string &path,
+                                string &out_open_path, vector<string> &out_keys,
+                                vector<string> &out_values) {
   out_open_path = path;
   out_keys.clear();
   out_values.clear();
 
-  if (StringUtil::StartsWith(out_open_path, "s3://") ||
-      StringUtil::StartsWith(out_open_path, "s3a://") ||
-      StringUtil::StartsWith(out_open_path, "s3n://")) {
-    out_open_path = LanceNormalizeS3Scheme(out_open_path);
+  out_open_path = LanceNormalizeS3Scheme(out_open_path);
+  if (StringUtil::StartsWith(out_open_path, "s3://")) {
     LanceFillS3StorageOptionsFromSecrets(context, out_open_path, out_keys,
                                          out_values);
+  }
+}
+
+void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
+                                     const vector<string> &option_values,
+                                     vector<const char *> &out_key_ptrs,
+                                     vector<const char *> &out_value_ptrs) {
+  if (option_keys.size() != option_values.size()) {
+    throw InternalException(
+        "Storage option keys/values size mismatch for Lance");
+  }
+  out_key_ptrs.clear();
+  out_value_ptrs.clear();
+  out_key_ptrs.reserve(option_keys.size());
+  out_value_ptrs.reserve(option_values.size());
+  for (idx_t i = 0; i < option_keys.size(); i++) {
+    out_key_ptrs.push_back(option_keys[i].c_str());
+    out_value_ptrs.push_back(option_values[i].c_str());
   }
 }
 
@@ -255,16 +289,13 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   string open_root;
   vector<string> option_keys;
   vector<string> option_values;
-  ResolveStorageOptions(context, root, open_root, option_keys, option_values);
+  ResolveLanceStorageOptions(context, root, open_root, option_keys,
+                             option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
-  key_ptrs.reserve(option_keys.size());
-  value_ptrs.reserve(option_values.size());
-  for (idx_t i = 0; i < option_keys.size(); i++) {
-    key_ptrs.push_back(option_keys[i].c_str());
-    value_ptrs.push_back(option_values[i].c_str());
-  }
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
 
   auto *ptr = lance_dir_namespace_list_tables(
       open_root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
@@ -316,7 +347,8 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
-  ResolveStorageOptions(context, path, open_path, option_keys, option_values);
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
 
   if (option_keys.empty()) {
     return lance_open_dataset(open_path.c_str());
@@ -324,38 +356,25 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
-  key_ptrs.reserve(option_keys.size());
-  value_ptrs.reserve(option_values.size());
-  for (idx_t i = 0; i < option_keys.size(); i++) {
-    key_ptrs.push_back(option_keys[i].c_str());
-    value_ptrs.push_back(option_values[i].c_str());
-  }
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
   return lance_open_dataset_with_storage_options(
       open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
       option_keys.size());
 }
-
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
-    90ULL * 1024ULL * 1024ULL * 1024ULL;
 
 int64_t LanceTruncateDataset(ClientContext &context,
                              const string &dataset_uri) {
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
-  ResolveStorageOptions(context, dataset_uri, open_path, option_keys,
-                        option_values);
+  ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
+                             option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
-  key_ptrs.reserve(option_keys.size());
-  value_ptrs.reserve(option_values.size());
-  for (idx_t i = 0; i < option_keys.size(); i++) {
-    key_ptrs.push_back(option_keys[i].c_str());
-    value_ptrs.push_back(option_values[i].c_str());
-  }
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
 
   void *dataset = nullptr;
   if (option_keys.empty()) {
@@ -401,8 +420,8 @@ int64_t LanceTruncateDataset(ClientContext &context,
       open_path.c_str(), "overwrite",
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      DEFAULT_MAX_ROWS_PER_FILE, DEFAULT_MAX_ROWS_PER_GROUP,
-      DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+      LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
   if (!writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());

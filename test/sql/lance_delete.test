@@ -112,5 +112,20 @@ SELECT count(*) FROM del_ns.main.lance_delete_basic;
 ----
 2
 
+query I
+DELETE FROM del_ns.main.lance_delete_basic;
+----
+2
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_basic;
+----
+0
+
+query T
+SELECT ((SELECT c FROM v_basic) + 2) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*'));
+----
+true
+
 statement ok
 DETACH del_ns;

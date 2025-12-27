@@ -131,12 +131,8 @@ static vector<string>
 ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
-  key_ptrs.reserve(ns.option_keys.size());
-  value_ptrs.reserve(ns.option_values.size());
-  for (idx_t i = 0; i < ns.option_keys.size(); i++) {
-    key_ptrs.push_back(ns.option_keys[i].c_str());
-    value_ptrs.push_back(ns.option_values[i].c_str());
-  }
+  BuildStorageOptionPointerArrays(ns.option_keys, ns.option_values, key_ptrs,
+                                  value_ptrs);
 
   auto *ptr = lance_dir_namespace_list_tables(
       ns.root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
@@ -217,12 +213,8 @@ public:
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
-    key_ptrs.reserve(ns->option_keys.size());
-    value_ptrs.reserve(ns->option_values.size());
-    for (idx_t i = 0; i < ns->option_keys.size(); i++) {
-      key_ptrs.push_back(ns->option_keys[i].c_str());
-      value_ptrs.push_back(ns->option_values[i].c_str());
-    }
+    BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
+                                    key_ptrs, value_ptrs);
 
     const char *uri_ptr = nullptr;
     auto *dataset = lance_open_dataset_in_dir_namespace(
@@ -271,15 +263,16 @@ private:
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
 public:
-  LanceRestNamespaceDefaultGenerator(Catalog &catalog,
-                                     SchemaCatalogEntry &schema,
-                                     string endpoint, string namespace_id,
-                                     string bearer_token, string api_key,
-                                     string delimiter)
+  LanceRestNamespaceDefaultGenerator(
+      Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
+      string namespace_id, string bearer_token, string api_key,
+      string delimiter, string bearer_token_override, string api_key_override)
       : DefaultGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
         bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
-        delimiter(std::move(delimiter)) {}
+        delimiter(std::move(delimiter)),
+        bearer_token_override(std::move(bearer_token_override)),
+        api_key_override(std::move(api_key_override)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
@@ -296,9 +289,18 @@ public:
     auto view = make_uniq<CreateViewInfo>();
     view->schema = DEFAULT_SCHEMA;
     view->view_name = entry_name;
-    view->sql = StringUtil::Format(
-        "SELECT * FROM __lance_namespace_scan(%s, %s, %s)", SQLString(endpoint),
+    auto view_sql = StringUtil::Format(
+        "SELECT * FROM __lance_namespace_scan(%s, %s, %s", SQLString(endpoint),
         SQLString(entry_name), SQLString(delimiter));
+    if (!bearer_token_override.empty()) {
+      view_sql += StringUtil::Format(", bearer_token=%s",
+                                     SQLString(bearer_token_override));
+    }
+    if (!api_key_override.empty()) {
+      view_sql +=
+          StringUtil::Format(", api_key=%s", SQLString(api_key_override));
+    }
+    view->sql = view_sql + ")";
     view->internal = false;
     view->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
@@ -319,12 +321,9 @@ private:
   string bearer_token;
   string api_key;
   string delimiter;
+  string bearer_token_override;
+  string api_key_override;
 };
-
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
-    90ULL * 1024ULL * 1024ULL * 1024ULL;
 
 static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
@@ -405,12 +404,8 @@ public:
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
-    key_ptrs.reserve(option_keys.size());
-    value_ptrs.reserve(option_values.size());
-    for (idx_t i = 0; i < option_keys.size(); i++) {
-      key_ptrs.push_back(option_keys[i].c_str());
-      value_ptrs.push_back(option_values[i].c_str());
-    }
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
 
     auto rc = lance_dir_namespace_drop_table(
         root.c_str(), info.name.c_str(),
@@ -505,19 +500,15 @@ public:
     option_values = directory_ns->option_values;
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
-    key_ptrs.reserve(option_keys.size());
-    value_ptrs.reserve(option_values.size());
-    for (idx_t i = 0; i < option_keys.size(); i++) {
-      key_ptrs.push_back(option_keys[i].c_str());
-      value_ptrs.push_back(option_values[i].c_str());
-    }
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
 
     auto *writer = lance_open_writer_with_storage_options(
         dataset_path.c_str(), mode.c_str(),
         key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        DEFAULT_MAX_ROWS_PER_FILE, DEFAULT_MAX_ROWS_PER_GROUP,
-        DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+        LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
                         LanceFormatErrorSuffix());
@@ -716,57 +707,6 @@ private:
   bool is_rest_namespace;
 };
 
-class PhysicalLanceTruncate final : public PhysicalOperator {
-public:
-  static constexpr const PhysicalOperatorType TYPE =
-      PhysicalOperatorType::EXTENSION;
-
-  PhysicalLanceTruncate(PhysicalPlan &physical_plan,
-                        vector<LogicalType> types_p, LanceTableEntry &table_p,
-                        idx_t estimated_cardinality)
-      : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
-                         std::move(types_p), estimated_cardinality),
-        table(table_p) {}
-
-  bool IsSource() const override { return true; }
-
-  class LanceTruncateSourceState final : public GlobalSourceState {
-  public:
-    bool emitted = false;
-  };
-
-  unique_ptr<GlobalSourceState>
-  GetGlobalSourceState(ClientContext &) const override {
-    return make_uniq<LanceTruncateSourceState>();
-  }
-
-  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
-                           OperatorSourceInput &input) const override {
-    auto &state = input.global_state.Cast<LanceTruncateSourceState>();
-    if (state.emitted) {
-      return SourceResultType::FINISHED;
-    }
-    state.emitted = true;
-
-    auto row_count = LanceTruncateDataset(context.client, table.DatasetUri());
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0, Value::BIGINT(row_count));
-    return SourceResultType::FINISHED;
-  }
-
-  string GetName() const override { return "LanceTruncate"; }
-
-private:
-  LanceTableEntry &table;
-};
-
-static bool IsUnconditionalDelete(const LogicalDelete &op) {
-  if (op.children.size() != 1) {
-    return false;
-  }
-  return op.children[0]->type == LogicalOperatorType::LOGICAL_GET;
-}
-
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
                                                PhysicalPlanGenerator &planner,
                                                LogicalDelete &op,
@@ -775,20 +715,8 @@ PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
   if (!lance_table) {
     return DuckCatalog::PlanDelete(context, planner, op, plan);
   }
-  if (op.return_chunk) {
-    throw NotImplementedException(
-        "Lance DELETE/TRUNCATE does not support RETURNING yet");
-  }
-  if (!IsUnconditionalDelete(op)) {
-    throw NotImplementedException(
-        "Lance DELETE only supports deleting all rows (use TRUNCATE TABLE)");
-  }
-
-  auto &truncate = planner.Make<PhysicalLanceTruncate>(
-      op.types, *lance_table, op.estimated_cardinality);
-  (void)context;
   (void)plan;
-  return truncate;
+  return PlanLanceDelete(context, planner, op);
 }
 
 static unique_ptr<Catalog>
@@ -806,31 +734,28 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   string namespace_id;
   string bearer_token;
   string api_key;
+  string bearer_token_override;
+  string api_key_override;
 
   if (!is_rest_namespace) {
     auto root = FileSystem::GetFileSystem(context).ExpandPath(attach_path);
-    root = LanceNormalizeS3Scheme(root);
     vector<string> option_keys;
     vector<string> option_values;
-    if (StringUtil::StartsWith(root, "s3://") ||
-        StringUtil::StartsWith(root, "s3a://") ||
-        StringUtil::StartsWith(root, "s3n://")) {
-      root = LanceNormalizeS3Scheme(root);
-      LanceFillS3StorageOptionsFromSecrets(context, root, option_keys,
-                                           option_values);
-    }
+    string open_root;
+    ResolveLanceStorageOptions(context, root, open_root, option_keys,
+                               option_values);
 
     string list_error;
     vector<string> discovered_tables;
     // Validate the namespace during ATTACH.
-    if (!TryLanceDirNamespaceListTables(context, root, discovered_tables,
+    if (!TryLanceDirNamespaceListTables(context, open_root, discovered_tables,
                                         list_error)) {
       throw IOException(
           "Failed to list tables from Lance directory namespace: " +
           list_error);
     }
     directory_ns = make_shared_ptr<LanceDirectoryNamespaceConfig>();
-    directory_ns->root = std::move(root);
+    directory_ns->root = std::move(open_root);
     directory_ns->option_keys = std::move(option_keys);
     directory_ns->option_values = std::move(option_values);
   } else {
@@ -841,6 +766,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     }
     ResolveLanceNamespaceAuth(context, endpoint, info.options, bearer_token,
                               api_key);
+    ResolveLanceNamespaceAuthOverrides(info.options, bearer_token_override,
+                                       api_key_override);
     string list_error;
     vector<string> discovered_tables;
     // Validate the namespace during ATTACH.
@@ -875,7 +802,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, std::move(endpoint), std::move(namespace_id),
-        std::move(bearer_token), std::move(api_key), std::move(delimiter));
+        std::move(bearer_token), std::move(api_key), std::move(delimiter),
+        std::move(bearer_token_override), std::move(api_key_override));
   }
   catalog_set.SetDefaultGenerator(std::move(generator));
 
@@ -919,12 +847,8 @@ public:
       auto &pending = appends[i];
       vector<const char *> key_ptrs;
       vector<const char *> value_ptrs;
-      key_ptrs.reserve(pending.option_keys.size());
-      value_ptrs.reserve(pending.option_values.size());
-      for (idx_t j = 0; j < pending.option_keys.size(); j++) {
-        key_ptrs.push_back(pending.option_keys[j].c_str());
-        value_ptrs.push_back(pending.option_values[j].c_str());
-      }
+      BuildStorageOptionPointerArrays(
+          pending.option_keys, pending.option_values, key_ptrs, value_ptrs);
 
       auto rc = lance_commit_transaction_with_storage_options(
           pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
