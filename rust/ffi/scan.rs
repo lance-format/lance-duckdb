@@ -90,12 +90,109 @@ fn create_fragment_stream_ir_inner(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lance_create_dataset_stream_ir(
+    dataset: *mut c_void,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
+) -> *mut c_void {
+    match create_dataset_stream_ir_inner(
+        dataset,
+        columns,
+        columns_len,
+        filter_ir,
+        filter_ir_len,
+        limit,
+        offset,
+    ) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn create_dataset_stream_ir_inner(
+    dataset: *mut c_void,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
+) -> FfiResult<StreamHandle> {
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    if offset < 0 {
+        return Err(FfiError::new(
+            ErrorCode::DatasetScan,
+            "offset must be non-negative".to_string(),
+        ));
+    }
+    if limit < -1 {
+        return Err(FfiError::new(
+            ErrorCode::DatasetScan,
+            "limit must be >= -1".to_string(),
+        ));
+    }
+
+    let mut scan = handle.dataset.scan();
+
+    let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    if !projection.is_empty() {
+        scan.project(&projection).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetScan,
+                format!("dataset scan project: {err}"),
+            )
+        })?;
+    }
+
+    let filter = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::DatasetScan,
+            "dataset scan filter_ir",
+        )?
+    };
+    if let Some(filter) = filter {
+        scan.filter_expr(filter);
+    }
+
+    if limit != -1 || offset != 0 {
+        let limit_opt = if limit == -1 { None } else { Some(limit) };
+        let offset_opt = if offset == 0 { None } else { Some(offset) };
+        scan.limit(limit_opt, offset_opt).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetScan,
+                format!("dataset scan limit: {err}"),
+            )
+        })?;
+    }
+
+    scan.scan_in_order(false);
+    let stream = LanceStream::from_scanner(scan)
+        .map_err(|err| FfiError::new(ErrorCode::StreamCreate, format!("stream create: {err}")))?;
+    Ok(StreamHandle::Lance(stream))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lance_explain_dataset_scan_ir(
     dataset: *mut c_void,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
     verbose: u8,
 ) -> *const c_char {
     match explain_dataset_scan_ir_inner(
@@ -104,6 +201,8 @@ pub unsafe extern "C" fn lance_explain_dataset_scan_ir(
         columns_len,
         filter_ir,
         filter_ir_len,
+        limit,
+        offset,
         verbose,
     ) {
         Ok(plan) => {
@@ -123,6 +222,8 @@ fn explain_dataset_scan_ir_inner(
     columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
     verbose: u8,
 ) -> FfiResult<String> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
@@ -148,6 +249,26 @@ fn explain_dataset_scan_ir_inner(
     };
     if let Some(filter) = filter {
         scan.filter_expr(filter);
+    }
+
+    if offset < 0 {
+        return Err(FfiError::new(
+            ErrorCode::ExplainPlan,
+            "offset must be non-negative".to_string(),
+        ));
+    }
+    if limit < -1 {
+        return Err(FfiError::new(
+            ErrorCode::ExplainPlan,
+            "limit must be >= -1".to_string(),
+        ));
+    }
+    if limit != -1 || offset != 0 {
+        let limit_opt = if limit == -1 { None } else { Some(limit) };
+        let offset_opt = if offset == 0 { None } else { Some(offset) };
+        scan.limit(limit_opt, offset_opt).map_err(|err| {
+            FfiError::new(ErrorCode::ExplainPlan, format!("dataset scan limit: {err}"))
+        })?;
     }
 
     scan.scan_in_order(false);
