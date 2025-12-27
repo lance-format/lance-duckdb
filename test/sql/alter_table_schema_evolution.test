@@ -1,0 +1,160 @@
+# name: test/sql/alter_table_schema_evolution.test
+# description: ALTER TABLE schema evolution for attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/alter_table_schema_evolution_seed.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.alter_table_schema_evolution AS
+  SELECT 1::BIGINT AS id, 10::INTEGER AS age, 0.5::DOUBLE AS score
+  UNION ALL SELECT 2::BIGINT, 20::INTEGER, 1.5::DOUBLE
+  UNION ALL SELECT 3::BIGINT, 30::INTEGER, 2.5::DOUBLE;
+
+query I
+SELECT count(*) FROM ns.main.alter_table_schema_evolution
+----
+3
+
+statement ok
+COMMENT ON TABLE ns.main.alter_table_schema_evolution IS 'table comment';
+
+query T
+SELECT Value FROM lance_table_metadata('ns.main.alter_table_schema_evolution') WHERE Key='comment'
+----
+table comment
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution
+  ADD COLUMN age_plus_one BIGINT DEFAULT (age + 1);
+
+query I
+SELECT sum(age_plus_one) FROM ns.main.alter_table_schema_evolution
+----
+63
+
+query I
+SELECT Count FROM lance_set_config('ns.main.alter_table_schema_evolution', 'lance.add_columns.batch_size', '1')
+----
+1
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ADD COLUMN const_col INTEGER DEFAULT 42;
+
+query I
+SELECT sum(const_col) FROM ns.main.alter_table_schema_evolution
+----
+126
+
+query T
+SELECT Value FROM lance_config('ns.main.alter_table_schema_evolution') WHERE Key='lance.add_columns.batch_size'
+----
+1
+
+query I
+SELECT Count FROM lance_unset_config('ns.main.alter_table_schema_evolution', 'lance.add_columns.batch_size')
+----
+1
+
+query I
+SELECT count(*) FROM lance_config('ns.main.alter_table_schema_evolution') WHERE Key='lance.add_columns.batch_size'
+----
+0
+
+query I
+SELECT Count FROM lance_set_schema_metadata('ns.main.alter_table_schema_evolution', 'schema_key', 'schema_value')
+----
+1
+
+query T
+SELECT Value FROM lance_schema_metadata('ns.main.alter_table_schema_evolution') WHERE Key='schema_key'
+----
+schema_value
+
+query I
+SELECT Count FROM lance_unset_schema_metadata('ns.main.alter_table_schema_evolution', 'schema_key')
+----
+1
+
+query I
+SELECT count(*) FROM lance_schema_metadata('ns.main.alter_table_schema_evolution') WHERE Key='schema_key'
+----
+0
+
+statement ok
+COMMENT ON COLUMN ns.main.alter_table_schema_evolution.age_plus_one IS 'col comment';
+
+query T
+SELECT Value FROM lance_column_metadata('ns.main.alter_table_schema_evolution', 'age_plus_one') WHERE Key='comment'
+----
+col comment
+
+query I
+SELECT Count FROM lance_create_scalar_index('ns.main.alter_table_schema_evolution', 'age', 'age_idx')
+----
+1
+
+query I
+SELECT count(*) FROM lance_indices('ns.main.alter_table_schema_evolution')
+----
+1
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution RENAME COLUMN score TO score2;
+
+query I
+SELECT count(*) FROM lance_indices('ns.main.alter_table_schema_evolution')
+----
+1
+
+statement error
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col SET NOT NULL;
+----
+IO Error: Failed to set NOT NULL in Lance dataset:
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col DROP NOT NULL;
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
+
+query I
+SELECT count(*) FROM lance_indices('ns.main.alter_table_schema_evolution')
+----
+0
+
+query I
+SELECT sum(age) FROM ns.main.alter_table_schema_evolution
+----
+60
+
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution DROP COLUMN score2;
+
+statement error
+SELECT score2 FROM ns.main.alter_table_schema_evolution LIMIT 1;
+----
+Binder Error:
+
+query I
+SELECT Count FROM lance_compact_files('ns.main.alter_table_schema_evolution')
+----
+1
+
+query I
+SELECT Count FROM lance_cleanup_old_versions('ns.main.alter_table_schema_evolution', 0, false)
+----
+1
+
+statement error
+SELECT score2 FROM ns.main.alter_table_schema_evolution LIMIT 1;
+----
+Binder Error:
+
+statement ok
+DETACH ns;

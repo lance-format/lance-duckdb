@@ -47,6 +47,45 @@ int64_t lance_dataset_count_rows(void *dataset);
 int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
                              size_t filter_ir_len, int64_t *out_deleted_rows);
 
+int32_t lance_dataset_add_columns(void *dataset,
+                                  const ArrowSchema *new_columns_schema,
+                                  const char **expressions,
+                                  size_t expressions_len, uint32_t batch_size);
+int32_t lance_dataset_drop_columns(void *dataset, const char **columns,
+                                   size_t columns_len);
+int32_t lance_dataset_alter_columns_rename(void *dataset, const char *path,
+                                           const char *new_name);
+int32_t lance_dataset_alter_columns_set_nullable(void *dataset,
+                                                 const char *path,
+                                                 uint8_t nullable);
+int32_t lance_dataset_alter_columns_cast(void *dataset, const char *path,
+                                         const ArrowSchema *new_type_schema);
+
+int32_t lance_dataset_update_table_metadata(void *dataset, const char *key,
+                                            const char *value);
+int32_t lance_dataset_update_config(void *dataset, const char *key,
+                                    const char *value);
+int32_t lance_dataset_update_schema_metadata(void *dataset, const char *key,
+                                             const char *value);
+int32_t lance_dataset_update_field_metadata(void *dataset,
+                                            const char *field_path,
+                                            const char *key, const char *value);
+
+int32_t lance_dataset_compact_files(void *dataset);
+int32_t lance_dataset_cleanup_old_versions(void *dataset,
+                                           int64_t older_than_seconds,
+                                           uint8_t delete_unverified);
+
+const char *lance_dataset_list_config(void *dataset);
+const char *lance_dataset_list_table_metadata(void *dataset);
+const char *lance_dataset_list_schema_metadata(void *dataset);
+const char *lance_dataset_list_field_metadata(void *dataset,
+                                              const char *field_path);
+const char *lance_dataset_list_indices(void *dataset);
+int32_t lance_dataset_create_scalar_index(void *dataset, const char *column,
+                                          const char *index_name,
+                                          uint8_t replace);
+
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);
 void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,

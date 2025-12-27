@@ -8,13 +8,16 @@ pub enum ErrorCode {
     InvalidArgument = 1,
     Utf8 = 2,
     Runtime = 3,
+
     DatasetOpen = 4,
     DatasetCountRows = 5,
     FragmentScan = 6,
+
     StreamCreate = 7,
     StreamNext = 8,
     SchemaExport = 9,
     BatchExport = 10,
+
     KnnSchema = 11,
     KnnStreamCreate = 12,
     ExplainPlan = 13,
@@ -22,23 +25,40 @@ pub enum ErrorCode {
     FtsStreamCreate = 15,
     DatasetScan = 16,
     HybridStreamCreate = 17,
+
     DatasetWriteOpen = 18,
     DatasetWriteBatch = 19,
     DatasetWriteFinish = 20,
+
     NamespaceListTables = 21,
     NamespaceDescribeTable = 22,
     DirNamespaceListTables = 23,
     DatasetWriteFinishUncommitted = 24,
     DatasetCommitTransaction = 25,
     DirNamespaceDropTable = 26,
+
     DatasetDelete = 27,
     DatasetUpdateOverwrite = 28,
+
     DatasetCreateIndex = 29,
     DatasetDropIndex = 30,
     DatasetDescribeIndices = 31,
     DatasetOptimizeIndices = 32,
     IndexSchema = 33,
     IndexStreamCreate = 34,
+
+    DatasetAddColumns = 35,
+    DatasetDropColumns = 36,
+    DatasetAlterColumns = 37,
+    DatasetUpdateMetadata = 38,
+    DatasetUpdateConfig = 39,
+    DatasetUpdateSchemaMetadata = 40,
+    DatasetUpdateFieldMetadata = 41,
+    DatasetCompactFiles = 42,
+    DatasetCleanupOldVersions = 43,
+    DatasetListKeyValues = 44,
+    DatasetListIndices = 45,
+    DatasetCreateScalarIndex = 46,
 }
 
 struct LastError {

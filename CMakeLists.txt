@@ -13,6 +13,7 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_search.cpp src/lance_common.cpp
                       src/lance_filter_ir.cpp
                       src/lance_storage.cpp
+                      src/lance_metadata.cpp
                       src/lance_replacement.cpp
                       src/lance_insert.cpp
                       src/lance_delete.cpp
