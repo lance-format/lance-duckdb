@@ -14,6 +14,33 @@ SELECT 1
 statement ok
 SELECT * FROM lance_scan('test/data/test_data.lance') LIMIT 1
 
+# LIMIT/OFFSET pushdown correctness
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' LIMIT 2);
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1);
+----
+2
+
+# Explain output includes LIMIT/OFFSET diagnostics
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit": "2"[\s\S]*"Lance Offset": "1"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
 # Baseline: materialize once and evaluate filters in DuckDB
 statement ok
 CREATE TEMP TABLE baseline AS SELECT * FROM 'test/data/test_data.lance'

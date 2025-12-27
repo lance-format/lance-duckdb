@@ -53,6 +53,11 @@ void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const char **columns, size_t columns_len,
                                       const uint8_t *filter_ir,
                                       size_t filter_ir_len);
+void *lance_create_dataset_stream_ir(void *dataset, const char **columns,
+                                     size_t columns_len,
+                                     const uint8_t *filter_ir,
+                                     size_t filter_ir_len, int64_t limit,
+                                     int64_t offset);
 
 void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
@@ -84,8 +89,8 @@ int32_t lance_overwrite_update_transaction_with_storage_options(
 const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
                                           size_t columns_len,
                                           const uint8_t *filter_ir,
-                                          size_t filter_ir_len,
-                                          uint8_t verbose);
+                                          size_t filter_ir_len, int64_t limit,
+                                          int64_t offset, uint8_t verbose);
 
 void *lance_get_knn_schema(void *dataset, const char *vector_column,
                            const float *query_values, size_t query_len,
