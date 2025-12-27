@@ -20,6 +20,7 @@ panic = "abort"
 
 # Lance and Arrow dependencies - using compatible versions
 lance = { version = "1.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
+lance-core = "1.0.0"
 lance-namespace = "1.0.0"
 lance-namespace-impls = { version = "1.0.0", features = ["rest"] }
 arrow = { version = "56.2.0", features = ["ffi"] }
