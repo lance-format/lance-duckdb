@@ -80,7 +80,10 @@ impl Drop for WriterHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         drop(sender);
-        let mut guard = self.join.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(join) = guard.take() {
             let _ = join.join();
         }
@@ -170,10 +173,7 @@ fn open_uncommitted_writer_inner(
     let mode = unsafe { cstr_to_str(mode, "mode")? };
 
     if schema.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "schema is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "schema is null"));
     }
 
     if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
@@ -212,8 +212,9 @@ fn open_uncommitted_writer_inner(
     }
 
     let ffi_schema = unsafe { &*(schema as *const arrow_schema::ffi::FFI_ArrowSchema) };
-    let data_type = DataType::try_from(ffi_schema)
-        .map_err(|err| FfiError::new(ErrorCode::DatasetWriteOpen, format!("schema import: {err}")))?;
+    let data_type = DataType::try_from(ffi_schema).map_err(|err| {
+        FfiError::new(ErrorCode::DatasetWriteOpen, format!("schema import: {err}"))
+    })?;
     let DataType::Struct(fields) = &data_type else {
         return Err(FfiError::new(
             ErrorCode::DatasetWriteOpen,
@@ -301,10 +302,7 @@ fn open_writer_inner(
     let mode = unsafe { cstr_to_str(mode, "mode")? };
 
     if schema.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "schema is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "schema is null"));
     }
 
     if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
@@ -343,8 +341,9 @@ fn open_writer_inner(
     }
 
     let ffi_schema = unsafe { &*(schema as *const arrow_schema::ffi::FFI_ArrowSchema) };
-    let data_type = DataType::try_from(ffi_schema)
-        .map_err(|err| FfiError::new(ErrorCode::DatasetWriteOpen, format!("schema import: {err}")))?;
+    let data_type = DataType::try_from(ffi_schema).map_err(|err| {
+        FfiError::new(ErrorCode::DatasetWriteOpen, format!("schema import: {err}"))
+    })?;
     let DataType::Struct(fields) = &data_type else {
         return Err(FfiError::new(
             ErrorCode::DatasetWriteOpen,
@@ -431,16 +430,10 @@ pub unsafe extern "C" fn lance_writer_write_batch(writer: *mut c_void, array: *m
 
 fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResult<()> {
     if writer.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "writer is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "writer is null"));
     }
     if array.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "array is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "array is null"));
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
@@ -452,10 +445,7 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
         guard
             .as_ref()
             .ok_or_else(|| {
-                FfiError::new(
-                    ErrorCode::DatasetWriteBatch,
-                    "writer is already finished",
-                )
+                FfiError::new(ErrorCode::DatasetWriteBatch, "writer is already finished")
             })?
             .clone()
     };
@@ -467,20 +457,21 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
 
     let ffi_array: arrow::ffi::FFI_ArrowArray = unsafe { std::mem::transmute(raw_array) };
 
-    let array_data = unsafe { arrow_array::ffi::from_ffi_and_data_type(ffi_array, handle.data_type.clone()) }
-        .map_err(|err| FfiError::new(ErrorCode::DatasetWriteBatch, format!("array import: {err}")))?;
+    let array_data =
+        unsafe { arrow_array::ffi::from_ffi_and_data_type(ffi_array, handle.data_type.clone()) }
+            .map_err(|err| {
+                FfiError::new(ErrorCode::DatasetWriteBatch, format!("array import: {err}"))
+            })?;
     let array = make_array(array_data);
     let struct_array = array
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| FfiError::new(ErrorCode::DatasetWriteBatch, "array is not a struct"))?;
 
-    let batch = RecordBatch::try_new(handle.schema.clone(), struct_array.columns().to_vec()).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteBatch,
-            format!("record batch: {err}"),
-        )
-    })?;
+    let batch = RecordBatch::try_new(handle.schema.clone(), struct_array.columns().to_vec())
+        .map_err(|err| {
+            FfiError::new(ErrorCode::DatasetWriteBatch, format!("record batch: {err}"))
+        })?;
 
     sender.send(batch).map_err(|_| {
         FfiError::new(
@@ -510,10 +501,7 @@ pub unsafe extern "C" fn lance_writer_finish(writer: *mut c_void) -> i32 {
 
 fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
     if writer.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "writer is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "writer is null"));
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
@@ -545,12 +533,12 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
     drop(sender);
 
     let join = {
-        let mut guard = handle.join.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = handle
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take().ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::DatasetWriteFinish,
-                "writer is already finished",
-            )
+            FfiError::new(ErrorCode::DatasetWriteFinish, "writer is already finished")
         })?
     };
 
@@ -590,10 +578,7 @@ fn writer_finish_uncommitted_inner(
     out_transaction: *mut *mut c_void,
 ) -> FfiResult<()> {
     if writer.is_null() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "writer is null",
-        ));
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "writer is null"));
     }
     if out_transaction.is_null() {
         return Err(FfiError::new(
@@ -631,7 +616,10 @@ fn writer_finish_uncommitted_inner(
     drop(sender);
 
     let join = {
-        let mut guard = handle.join.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = handle
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take().ok_or_else(|| {
             FfiError::new(
                 ErrorCode::DatasetWriteFinishUncommitted,
@@ -755,13 +743,17 @@ fn commit_transaction_inner(
         store_params.storage_options = Some(storage_options);
     }
 
-    let txn = unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
+    let txn =
+        unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
     let fut = CommitBuilder::new(path.as_str())
         .with_store_params(store_params)
         .execute(*txn);
     match runtime::block_on(fut) {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(FfiError::new(ErrorCode::DatasetCommitTransaction, err.to_string())),
+        Ok(Err(err)) => Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            err.to_string(),
+        )),
         Err(err) => Err(FfiError::new(
             ErrorCode::DatasetCommitTransaction,
             format!("runtime: {err}"),

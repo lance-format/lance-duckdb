@@ -8,5 +8,6 @@ mod scan;
 mod search;
 mod stream;
 mod types;
+mod update;
 mod util;
 mod write;

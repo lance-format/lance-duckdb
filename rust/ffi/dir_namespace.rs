@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Error as LanceError;
-use lance_namespace::LanceNamespace;
 use lance_namespace::models::{DropTableRequest, ListTablesRequest};
+use lance_namespace::LanceNamespace;
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -50,10 +50,7 @@ fn parse_storage_options(
             FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
         })?;
         let value = unsafe { CStr::from_ptr(val_ptr) }.to_str().map_err(|err| {
-            FfiError::new(
-                ErrorCode::Utf8,
-                format!("option_values[{idx}] utf8: {err}"),
-            )
+            FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
         })?;
         storage_options.insert(key.to_string(), value.to_string());
     }
@@ -123,7 +120,9 @@ fn open_dataset_in_dir_namespace_inner(
     option_values: *const *const c_char,
     options_len: usize,
 ) -> FfiResult<(DatasetHandle, String)> {
-    let root = unsafe { cstr_to_str(root, "root")? }.trim_end_matches('/').to_string();
+    let root = unsafe { cstr_to_str(root, "root")? }
+        .trim_end_matches('/')
+        .to_string();
     let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
 
@@ -160,7 +159,13 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
         }
     }
 
-    match open_dataset_in_dir_namespace_inner(root, table_name, option_keys, option_values, options_len) {
+    match open_dataset_in_dir_namespace_inner(
+        root,
+        table_name,
+        option_keys,
+        option_values,
+        options_len,
+    ) {
         Ok((handle, table_uri)) => {
             clear_last_error();
             if !out_table_uri.is_null() {
@@ -224,7 +229,8 @@ pub unsafe extern "C" fn lance_dir_namespace_drop_table(
     option_values: *const *const c_char,
     options_len: usize,
 ) -> i32 {
-    match dir_namespace_drop_table_inner(root, table_name, option_keys, option_values, options_len) {
+    match dir_namespace_drop_table_inner(root, table_name, option_keys, option_values, options_len)
+    {
         Ok(()) => {
             clear_last_error();
             0
