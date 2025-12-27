@@ -24,11 +24,6 @@
 
 namespace duckdb {
 
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
-static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
-    90ULL * 1024ULL * 1024ULL * 1024ULL;
-
 static string QuoteIdentifierForDataFusion(const string &name) {
   string escaped;
   escaped.reserve(name.size() + 2);
@@ -353,22 +348,13 @@ public:
     auto open_path = dataset_uri;
     vector<string> option_keys;
     vector<string> option_values;
-    if (StringUtil::StartsWith(open_path, "s3://") ||
-        StringUtil::StartsWith(open_path, "s3a://") ||
-        StringUtil::StartsWith(open_path, "s3n://")) {
-      open_path = LanceNormalizeS3Scheme(open_path);
-      LanceFillS3StorageOptionsFromSecrets(context.client, open_path,
-                                           option_keys, option_values);
-    }
+    ResolveLanceStorageOptions(context.client, dataset_uri, open_path,
+                               option_keys, option_values);
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
-    key_ptrs.reserve(option_keys.size());
-    value_ptrs.reserve(option_values.size());
-    for (idx_t i = 0; i < option_keys.size(); i++) {
-      key_ptrs.push_back(option_keys[i].c_str());
-      value_ptrs.push_back(option_values[i].c_str());
-    }
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
 
     vector<const char *> set_col_ptrs;
     vector<const char *> set_expr_ptrs;
@@ -385,9 +371,9 @@ public:
         open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         predicate.c_str(), set_col_ptrs.data(), set_expr_ptrs.data(),
-        set_columns.size(), DEFAULT_MAX_ROWS_PER_FILE,
-        DEFAULT_MAX_ROWS_PER_GROUP, DEFAULT_MAX_BYTES_PER_FILE, &txn,
-        &rows_updated);
+        set_columns.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+        LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+        &txn, &rows_updated);
     if (rc != 0) {
       throw IOException("Failed to create Lance UPDATE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());
