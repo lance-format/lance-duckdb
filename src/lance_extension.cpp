@@ -16,6 +16,7 @@ void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
+void RegisterLanceTruncate(DBConfig &config);
 
 static void LoadInternal(ExtensionLoader &loader) {
   // Register the lance_scan table function
@@ -32,6 +33,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   auto &config = DBConfig::GetConfig(instance);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
+  RegisterLanceTruncate(config);
 }
 
 std::string LanceExtension::Name() { return "lance"; }

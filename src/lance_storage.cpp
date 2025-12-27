@@ -568,6 +568,11 @@ public:
     return DuckCatalog::PlanInsert(context, planner, op, plan);
   }
 
+  PhysicalOperator &PlanDelete(ClientContext &context,
+                               PhysicalPlanGenerator &planner,
+                               LogicalDelete &op,
+                               PhysicalOperator &plan) override;
+
   PhysicalOperator &PlanCreateTableAs(ClientContext &context,
                                       PhysicalPlanGenerator &planner,
                                       LogicalCreateTable &op,
@@ -710,6 +715,81 @@ private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   bool is_rest_namespace;
 };
+
+class PhysicalLanceTruncate final : public PhysicalOperator {
+public:
+  static constexpr const PhysicalOperatorType TYPE =
+      PhysicalOperatorType::EXTENSION;
+
+  PhysicalLanceTruncate(PhysicalPlan &physical_plan,
+                        vector<LogicalType> types_p, LanceTableEntry &table_p,
+                        idx_t estimated_cardinality)
+      : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
+                         std::move(types_p), estimated_cardinality),
+        table(table_p) {}
+
+  bool IsSource() const override { return true; }
+
+  class LanceTruncateSourceState final : public GlobalSourceState {
+  public:
+    bool emitted = false;
+  };
+
+  unique_ptr<GlobalSourceState>
+  GetGlobalSourceState(ClientContext &) const override {
+    return make_uniq<LanceTruncateSourceState>();
+  }
+
+  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
+                           OperatorSourceInput &input) const override {
+    auto &state = input.global_state.Cast<LanceTruncateSourceState>();
+    if (state.emitted) {
+      return SourceResultType::FINISHED;
+    }
+    state.emitted = true;
+
+    auto row_count = LanceTruncateDataset(context.client, table.DatasetUri());
+    chunk.SetCardinality(1);
+    chunk.SetValue(0, 0, Value::BIGINT(row_count));
+    return SourceResultType::FINISHED;
+  }
+
+  string GetName() const override { return "LanceTruncate"; }
+
+private:
+  LanceTableEntry &table;
+};
+
+static bool IsUnconditionalDelete(const LogicalDelete &op) {
+  if (op.children.size() != 1) {
+    return false;
+  }
+  return op.children[0]->type == LogicalOperatorType::LOGICAL_GET;
+}
+
+PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
+                                               PhysicalPlanGenerator &planner,
+                                               LogicalDelete &op,
+                                               PhysicalOperator &plan) {
+  auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
+  if (!lance_table) {
+    return DuckCatalog::PlanDelete(context, planner, op, plan);
+  }
+  if (op.return_chunk) {
+    throw NotImplementedException(
+        "Lance DELETE/TRUNCATE does not support RETURNING yet");
+  }
+  if (!IsUnconditionalDelete(op)) {
+    throw NotImplementedException(
+        "Lance DELETE only supports deleting all rows (use TRUNCATE TABLE)");
+  }
+
+  auto &truncate = planner.Make<PhysicalLanceTruncate>(
+      op.types, *lance_table, op.estimated_cardinality);
+  (void)context;
+  (void)plan;
+  return truncate;
+}
 
 static unique_ptr<Catalog>
 LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,

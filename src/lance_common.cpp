@@ -2,11 +2,14 @@
 
 #include "lance_ffi.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+
+#include <cstring>
 
 namespace duckdb {
 
@@ -330,6 +333,88 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   return lance_open_dataset_with_storage_options(
       open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
       option_keys.size());
+}
+
+static constexpr uint64_t DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
+static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
+static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
+    90ULL * 1024ULL * 1024ULL * 1024ULL;
+
+int64_t LanceTruncateDataset(ClientContext &context,
+                             const string &dataset_uri) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveStorageOptions(context, dataset_uri, open_path, option_keys,
+                        option_values);
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  key_ptrs.reserve(option_keys.size());
+  value_ptrs.reserve(option_values.size());
+  for (idx_t i = 0; i < option_keys.size(); i++) {
+    key_ptrs.push_back(option_keys[i].c_str());
+    value_ptrs.push_back(option_values[i].c_str());
+  }
+
+  void *dataset = nullptr;
+  if (option_keys.empty()) {
+    dataset = lance_open_dataset(open_path.c_str());
+  } else {
+    dataset = lance_open_dataset_with_storage_options(
+        open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+        option_keys.size());
+  }
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto row_count = lance_dataset_count_rows(dataset);
+  if (row_count < 0) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to count rows from Lance dataset: " +
+                      dataset_uri + LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to get schema from Lance dataset: " +
+                      dataset_uri + LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    lance_close_dataset(dataset);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+
+  lance_free_schema(schema_handle);
+  lance_close_dataset(dataset);
+
+  auto *writer = lance_open_writer_with_storage_options(
+      open_path.c_str(), "overwrite",
+      key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      DEFAULT_MAX_ROWS_PER_FILE, DEFAULT_MAX_ROWS_PER_GROUP,
+      DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+  if (!writer) {
+    throw IOException("Failed to open Lance writer: " + open_path +
+                      LanceFormatErrorSuffix());
+  }
+  auto rc = lance_writer_finish(writer);
+  lance_close_writer(writer);
+  if (rc != 0) {
+    throw IOException("Failed to finalize Lance dataset write" +
+                      LanceFormatErrorSuffix());
+  }
+
+  return row_count;
 }
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,

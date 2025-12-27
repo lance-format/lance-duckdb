@@ -9,15 +9,16 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-	set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
-	                      src/lance_search.cpp src/lance_common.cpp
-	                      src/lance_filter_ir.cpp
-	                      src/lance_storage.cpp
-	                      src/lance_replacement.cpp
-	                      src/lance_insert.cpp
-	                      src/lance_delete.cpp
-	                      src/lance_update.cpp
-	                      src/lance_write.cpp)
+set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
+                      src/lance_search.cpp src/lance_common.cpp
+                      src/lance_filter_ir.cpp
+                      src/lance_storage.cpp
+                      src/lance_replacement.cpp
+                      src/lance_insert.cpp
+                      src/lance_delete.cpp
+                      src/lance_update.cpp
+                      src/lance_write.cpp
+                      src/lance_truncate.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
