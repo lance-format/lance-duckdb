@@ -26,12 +26,13 @@ pub enum ErrorCode {
     DatasetWriteFinish = 20,
     NamespaceListTables = 21,
     NamespaceDescribeTable = 22,
-    DirNamespaceListTables = 23,
-    DatasetWriteFinishUncommitted = 24,
-    DatasetCommitTransaction = 25,
-    DirNamespaceDropTable = 26,
-    DatasetDelete = 27,
-}
+	    DirNamespaceListTables = 23,
+	    DatasetWriteFinishUncommitted = 24,
+	    DatasetCommitTransaction = 25,
+	    DirNamespaceDropTable = 26,
+	    DatasetDelete = 27,
+	    DatasetUpdateOverwrite = 28,
+	}
 
 struct LastError {
     code: i32,

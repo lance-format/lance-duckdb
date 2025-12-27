@@ -1,0 +1,108 @@
+# name: test/sql/lance_update.test
+# description: UPDATE ... SET ... WHERE updates Lance datasets
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, NULL::VARCHAR AS s
+) TO 'test/.tmp/lance_update_basic.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+query II
+SELECT id, s IS NULL FROM ns.main.lance_update_basic ORDER BY id;
+----
+1	0
+2	0
+3	1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_basic SET s = 'bb' WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query T
+SELECT s FROM ns.main.lance_update_basic WHERE id = 2;
+----
+bb
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_basic SET id = id + 10 WHERE id = 1;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM ns.main.lance_update_basic WHERE s = 'a';
+----
+1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_basic SET s = NULL WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query I
+SELECT s IS NULL FROM ns.main.lance_update_basic WHERE id = 1;
+----
+1
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_basic
+SET id = id + 100, s = 'c'
+WHERE s IS NULL;
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, s FROM ns.main.lance_update_basic ORDER BY id;
+----
+2	bb
+101	c
+103	c
+
+statement ok
+UPDATE ns.main.lance_update_basic SET s = 'z' WHERE id = 999;
+
+query T
+SELECT s FROM ns.main.lance_update_basic WHERE id = 2;
+----
+bb
+
+statement error
+UPDATE ns.main.lance_update_basic SET s = 'x';
+----
+Not implemented Error: Lance UPDATE requires a WHERE predicate (full-table UPDATE is not supported)
+
+statement error
+UPDATE ns.main.lance_update_basic SET s = DEFAULT WHERE id = 2;
+----
+Not implemented Error: Lance UPDATE does not support SET column = DEFAULT
+
+statement ok
+DETACH ns;
