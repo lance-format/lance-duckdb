@@ -3687,10 +3687,12 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-index",
+ "lance-linalg",
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
  "roaring",
+ "serde_json",
  "snafu",
  "tokio",
 ]

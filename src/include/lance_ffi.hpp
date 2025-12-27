@@ -163,6 +163,18 @@ void *lance_create_hybrid_stream_ir(void *dataset, const char *vector_column,
                                     size_t filter_ir_len, uint8_t prefilter,
                                     float alpha, uint32_t oversample_factor);
 
+// Index DDL / metadata
+int32_t lance_dataset_create_index(void *dataset, const char *index_name,
+                                   const char **columns, size_t columns_len,
+                                   const char *index_type,
+                                   const char *params_json, uint8_t replace,
+                                   uint8_t train);
+int32_t lance_dataset_drop_index(void *dataset, const char *index_name);
+int32_t lance_dataset_optimize_index(void *dataset, const char *index_name,
+                                     uint8_t retrain);
+void *lance_get_index_list_schema(void *dataset);
+void *lance_create_index_list_stream(void *dataset);
+
 void lance_free_batch(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
                              ArrowSchema *out_schema);
