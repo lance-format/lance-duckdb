@@ -340,7 +340,8 @@ static constexpr uint64_t DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
 static constexpr uint64_t DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
 
-int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri) {
+int64_t LanceTruncateDataset(ClientContext &context,
+                             const string &dataset_uri) {
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;

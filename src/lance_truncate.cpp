@@ -24,7 +24,9 @@ struct LanceTruncateParseData final : public ParserExtensionParseData {
     return make_uniq<LanceTruncateParseData>(table_name_sql);
   }
 
-  string ToString() const override { return "TRUNCATE TABLE " + table_name_sql; }
+  string ToString() const override {
+    return "TRUNCATE TABLE " + table_name_sql;
+  }
 };
 
 static bool IsSpace(char c) {

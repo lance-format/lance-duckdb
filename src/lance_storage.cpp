@@ -456,8 +456,9 @@ public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
-  PhysicalLanceTruncate(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                        LanceTableEntry &table_p, idx_t estimated_cardinality)
+  PhysicalLanceTruncate(PhysicalPlan &physical_plan,
+                        vector<LogicalType> types_p, LanceTableEntry &table_p,
+                        idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         table(table_p) {}
