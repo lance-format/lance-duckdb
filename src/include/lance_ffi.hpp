@@ -15,6 +15,10 @@ const char *lance_dir_namespace_list_tables(const char *root,
                                             const char **option_keys,
                                             const char **option_values,
                                             size_t options_len);
+int32_t lance_dir_namespace_drop_table(const char *root, const char *table_name,
+                                       const char **option_keys,
+                                       const char **option_values,
+                                       size_t options_len);
 void *lance_open_dataset_in_dir_namespace(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, const char **out_table_uri);
@@ -40,6 +44,8 @@ const char *lance_last_error_message();
 void lance_free_string(const char *s);
 
 int64_t lance_dataset_count_rows(void *dataset);
+int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
+                             size_t filter_ir_len, int64_t *out_deleted_rows);
 
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);

@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
+use datafusion_sql::unparser::expr_to_sql;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::DatasetHandle;
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
@@ -227,4 +228,99 @@ pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
         let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
         let _ = Box::<[u64]>::from_raw(slice);
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_delete(
+    dataset: *mut c_void,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    out_deleted_rows: *mut i64,
+) -> i32 {
+    match dataset_delete_inner(dataset, filter_ir, filter_ir_len, out_deleted_rows) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_delete_inner(
+    dataset: *mut c_void,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    out_deleted_rows: *mut i64,
+) -> FfiResult<()> {
+    if out_deleted_rows.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_deleted_rows is null",
+        ));
+    }
+
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let filter = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::DatasetDelete,
+            "delete filter_ir",
+        )?
+    };
+    let predicate = match filter {
+        Some(expr) => expr_to_sql(&expr)
+            .map_err(|err| FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}")))?
+            .to_string(),
+        None => "true".to_string(),
+    };
+
+    let mut ds = (*handle.dataset).clone();
+
+    let before_rows = match runtime::block_on(ds.count_rows(None)) {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDelete,
+                format!("dataset count_rows(before): {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    match runtime::block_on(ds.delete(&predicate)) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDelete,
+                format!("dataset delete: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let after_rows = match runtime::block_on(ds.count_rows(None)) {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDelete,
+                format!("dataset count_rows(after): {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let deleted_rows = before_rows.saturating_sub(after_rows);
+    let deleted_rows_i64 = i64::try_from(deleted_rows).map_err(|_| {
+        FfiError::new(ErrorCode::DatasetDelete, "deleted row count overflow")
+    })?;
+
+    unsafe {
+        std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);
+    }
+    Ok(())
 }

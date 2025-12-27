@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
@@ -548,6 +549,11 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
 
   for (auto &it : input.filters->filters) {
     auto scan_col_idx = it.first;
+    if (!it.second) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
+      continue;
+    }
     auto &filter = *it.second;
 
     if (scan_col_idx >= input.column_ids.size()) {
@@ -617,6 +623,66 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
         return false;
       }
       auto &col_index = column_ids[colref.binding.column_index];
+      if (col_index.IsVirtualColumn()) {
+        return false;
+      }
+      auto col_id = col_index.GetPrimaryIndex();
+      if (col_id >= names.size() || col_id >= types.size()) {
+        return false;
+      }
+
+      out_segments.clear();
+      out_segments.push_back(names[col_id]);
+      out_leaf_type = types[col_id];
+
+      vector<idx_t> child_path;
+      child_path.reserve(col_index.GetChildIndexes().size());
+
+      std::function<bool(const vector<ColumnIndex> &)> linearize_child_indexes;
+      linearize_child_indexes =
+          [&](const vector<ColumnIndex> &children) -> bool {
+        if (children.empty()) {
+          return true;
+        }
+        if (children.size() > 1) {
+          for (auto &child : children) {
+            if (!child.GetChildIndexes().empty()) {
+              return false;
+            }
+            child_path.push_back(child.GetPrimaryIndex());
+          }
+          return true;
+        }
+        auto &child = children[0];
+        child_path.push_back(child.GetPrimaryIndex());
+        return linearize_child_indexes(child.GetChildIndexes());
+      };
+
+      if (!linearize_child_indexes(col_index.GetChildIndexes())) {
+        return false;
+      }
+
+      for (auto child_idx : child_path) {
+        if (out_leaf_type.id() != LogicalTypeId::STRUCT) {
+          return false;
+        }
+        if (child_idx >= StructType::GetChildCount(out_leaf_type)) {
+          return false;
+        }
+        out_segments.push_back(
+            StructType::GetChildName(out_leaf_type, child_idx));
+        out_leaf_type = StructType::GetChildType(out_leaf_type, child_idx);
+      }
+      return true;
+    }
+
+    if (node.expression_class == ExpressionClass::BOUND_REF) {
+      auto &ref = node.Cast<BoundReferenceExpression>();
+      auto &column_ids = get.GetColumnIds();
+      if (ref.index >= column_ids.size()) {
+        return false;
+      }
+      auto &col_index = column_ids[ref.index];
       if (col_index.IsVirtualColumn()) {
         return false;
       }
@@ -769,6 +835,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const Expression &expr, string &out_ir) {
   switch (expr.expression_class) {
   case ExpressionClass::BOUND_COLUMN_REF:
+  case ExpressionClass::BOUND_REF:
   case ExpressionClass::BOUND_FUNCTION:
     return TryBuildLanceExprColumnRefIR(get, names, types,
                                         exclude_computed_columns, expr, out_ir);
