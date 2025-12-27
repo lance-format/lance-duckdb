@@ -1,0 +1,38 @@
+# name: test/sql/truncate_table.test
+# description: TRUNCATE TABLE for Lance namespace tables
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.truncate_table_test AS
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+query I
+SELECT count(*) FROM ns.main.truncate_table_test
+----
+2
+
+statement ok
+TRUNCATE TABLE ns.main.truncate_table_test;
+
+query I
+SELECT count(*) FROM ns.main.truncate_table_test
+----
+0
+
+statement ok
+INSERT INTO ns.main.truncate_table_test VALUES (3::BIGINT, 'c'::VARCHAR);
+
+query I
+SELECT sum(id) FROM ns.main.truncate_table_test
+----
+3
+
+statement ok
+DETACH ns;

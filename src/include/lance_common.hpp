@@ -42,4 +42,6 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &api_key, const string &delimiter,
                             string &out_table_uri);
 
+int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
+
 } // namespace duckdb
