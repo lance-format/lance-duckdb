@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
-	use std::ptr;
-	use std::sync::Arc;
-	
-	use lance::dataset::builder::DatasetBuilder;
-	use lance_core::Error as LanceError;
-	use lance_namespace::LanceNamespace;
-	use lance_namespace::models::{DropTableRequest, ListTablesRequest};
-	use lance_namespace_impls::DirectoryNamespaceBuilder;
+use std::ptr;
+use std::sync::Arc;
+
+use lance::dataset::builder::DatasetBuilder;
+use lance_core::Error as LanceError;
+use lance_namespace::models::{DropTableRequest, ListTablesRequest};
+use lance_namespace::LanceNamespace;
+use lance_namespace_impls::DirectoryNamespaceBuilder;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -229,7 +229,8 @@ pub unsafe extern "C" fn lance_dir_namespace_drop_table(
     option_values: *const *const c_char,
     options_len: usize,
 ) -> i32 {
-    match dir_namespace_drop_table_inner(root, table_name, option_keys, option_values, options_len) {
+    match dir_namespace_drop_table_inner(root, table_name, option_keys, option_values, options_len)
+    {
         Ok(()) => {
             clear_last_error();
             0
