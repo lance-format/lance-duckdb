@@ -32,6 +32,18 @@ pub enum ErrorCode {
     DirNamespaceDropTable = 26,
     DatasetDelete = 27,
     DatasetUpdateOverwrite = 28,
+    DatasetAddColumns = 29,
+    DatasetDropColumns = 30,
+    DatasetAlterColumns = 31,
+    DatasetUpdateMetadata = 32,
+    DatasetUpdateConfig = 33,
+    DatasetUpdateSchemaMetadata = 34,
+    DatasetUpdateFieldMetadata = 35,
+    DatasetCompactFiles = 36,
+    DatasetCleanupOldVersions = 37,
+    DatasetListKeyValues = 38,
+    DatasetListIndices = 39,
+    DatasetCreateScalarIndex = 40,
 }
 
 struct LastError {

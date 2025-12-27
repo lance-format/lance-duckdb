@@ -3676,6 +3676,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "bzip2-sys",
+ "chrono",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
@@ -3690,6 +3691,7 @@ dependencies = [
  "lance-namespace-impls",
  "lance-table",
  "roaring",
+ "snafu",
  "tokio",
 ]
 

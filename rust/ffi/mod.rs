@@ -6,6 +6,7 @@ mod namespace;
 mod projection;
 mod scan;
 mod search;
+mod schema_evolution;
 mod stream;
 mod types;
 mod update;

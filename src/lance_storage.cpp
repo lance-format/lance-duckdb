@@ -20,6 +20,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -364,6 +365,67 @@ public:
                    bool is_rest_namespace)
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
         is_rest_namespace(is_rest_namespace) {}
+
+  void Alter(CatalogTransaction transaction, AlterInfo &info) override {
+    auto &set = GetCatalogSet(info.GetCatalogType());
+    auto entry = set.GetEntry(transaction, info.name);
+    auto *lance_entry =
+        entry ? dynamic_cast<LanceTableEntry *>(entry.get()) : nullptr;
+
+    if (!lance_entry) {
+      DuckSchemaEntry::Alter(transaction, info);
+      return;
+    }
+
+    auto &context = transaction.GetContext();
+    if (!context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance DDL does not support explicit transactions yet");
+    }
+
+    // Allow altering internal entries for attached Lance catalogs.
+    info.allow_internal = true;
+
+    if (info.type == AlterType::SET_COMMENT) {
+      auto &comment = info.Cast<SetCommentInfo>();
+      const char *comment_ptr = nullptr;
+      string comment_str;
+      if (!comment.comment_value.IsNull()) {
+        comment_str = comment.comment_value.DefaultCastAs(LogicalType::VARCHAR)
+                          .GetValue<string>();
+        comment_ptr = comment_str.c_str();
+      }
+
+      void *dataset = LanceOpenDataset(context, lance_entry->DatasetUri());
+      if (!dataset) {
+        throw IOException("Failed to open Lance dataset: " +
+                          lance_entry->DatasetUri() + LanceFormatErrorSuffix());
+      }
+      auto rc =
+          lance_dataset_update_table_metadata(dataset, "comment", comment_ptr);
+      lance_close_dataset(dataset);
+      if (rc != 0) {
+        throw IOException("Failed to update table comment in Lance dataset: " +
+                          lance_entry->DatasetUri() + LanceFormatErrorSuffix());
+      }
+    }
+
+    auto system_tx =
+        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
+    system_tx.context = &context;
+
+    if (info.type == AlterType::CHANGE_OWNERSHIP) {
+      if (!set.AlterOwnership(system_tx, info.Cast<ChangeOwnershipInfo>())) {
+        throw CatalogException("Couldn't change ownership!");
+      }
+      return;
+    }
+
+    if (!set.AlterEntry(system_tx, info.name, info)) {
+      throw CatalogException::MissingEntry(info.GetCatalogType(), info.name,
+                                           string());
+    }
+  }
 
   void DropEntry(ClientContext &context, DropInfo &info) override {
     if (info.type != CatalogType::TABLE_ENTRY) {

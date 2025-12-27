@@ -1,13 +1,21 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -24,6 +32,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <unordered_map>
 
 // FFI ownership contract (Arrow C Data Interface):
 // `lance_get_schema` returns an opaque schema handle; caller frees it via
@@ -744,6 +753,379 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                  CreateTableInfo &info, string dataset_uri)
     : TableCatalogEntry(catalog, schema, info),
       dataset_uri(std::move(dataset_uri)) {}
+
+static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
+  unordered_map<string, string> out;
+  if (!ptr) {
+    return out;
+  }
+
+  string joined = ptr;
+  lance_free_string(ptr);
+
+  for (auto &line : StringUtil::Split(joined, '\n')) {
+    if (line.empty()) {
+      continue;
+    }
+    auto parts = StringUtil::Split(line, '\t');
+    if (parts.size() != 2) {
+      continue;
+    }
+    out[std::move(parts[0])] = std::move(parts[1]);
+  }
+  return out;
+}
+
+static void PopulateLanceTableSchemaFromDataset(
+    ClientContext &context, void *dataset, ColumnList &out_columns,
+    vector<unique_ptr<Constraint>> &out_constraints) {
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get schema from Lance dataset" +
+                      LanceFormatErrorSuffix());
+  }
+
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableSchema arrow_table;
+  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+                                               schema_root.arrow_schema);
+  const auto names = arrow_table.GetNames();
+  const auto types = arrow_table.GetTypes();
+  if (names.size() != types.size()) {
+    throw InternalException(
+        "Arrow table schema returned mismatched names/types sizes");
+  }
+
+  out_columns = ColumnList();
+  out_constraints.clear();
+  for (idx_t i = 0; i < names.size(); i++) {
+    ColumnDefinition col(names[i], types[i]);
+    auto *field_md =
+        lance_dataset_list_field_metadata(dataset, names[i].c_str());
+    if (!field_md) {
+      throw IOException("Failed to list field metadata from Lance dataset" +
+                        LanceFormatErrorSuffix());
+    }
+    auto kvs = ParseTsvKvs(field_md);
+    auto it = kvs.find("comment");
+    if (it != kvs.end()) {
+      col.SetComment(Value(it->second));
+    }
+    out_columns.AddColumn(std::move(col));
+
+    // Reflect not-null constraints for better DuckDB-side UX.
+    auto *child = schema_root.arrow_schema.children[i];
+    if (child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
+      out_constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
+    }
+  }
+}
+
+static unique_ptr<CatalogEntry> BuildUpdatedLanceTableEntryFromDataset(
+    ClientContext &context, Catalog &catalog, SchemaCatalogEntry &schema,
+    const string &table_name, const string &dataset_uri, bool internal) {
+  void *dataset = LanceOpenDataset(context, dataset_uri);
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+                      LanceFormatErrorSuffix());
+  }
+
+  CreateTableInfo create_info(schema, table_name);
+  create_info.internal = internal;
+  create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+
+  try {
+    PopulateLanceTableSchemaFromDataset(context, dataset, create_info.columns,
+                                        create_info.constraints);
+  } catch (...) {
+    lance_close_dataset(dataset);
+    throw;
+  }
+
+  auto entry =
+      make_uniq<LanceTableEntry>(catalog, schema, create_info, dataset_uri);
+  auto *table_md = lance_dataset_list_table_metadata(dataset);
+  if (!table_md) {
+    lance_close_dataset(dataset);
+    throw IOException("Failed to list table metadata from Lance dataset" +
+                      LanceFormatErrorSuffix());
+  }
+  auto table_kvs = ParseTsvKvs(table_md);
+  auto it = table_kvs.find("comment");
+  if (it != table_kvs.end()) {
+    entry->comment = Value(it->second);
+  }
+
+  lance_close_dataset(dataset);
+  return entry;
+}
+
+static void ValidateAlterColumnTypeTarget(const LogicalType &type) {
+  switch (type.id()) {
+  case LogicalTypeId::BOOLEAN:
+  case LogicalTypeId::TINYINT:
+  case LogicalTypeId::UTINYINT:
+  case LogicalTypeId::SMALLINT:
+  case LogicalTypeId::USMALLINT:
+  case LogicalTypeId::INTEGER:
+  case LogicalTypeId::UINTEGER:
+  case LogicalTypeId::BIGINT:
+  case LogicalTypeId::UBIGINT:
+  case LogicalTypeId::FLOAT:
+  case LogicalTypeId::DOUBLE:
+  case LogicalTypeId::DATE:
+  case LogicalTypeId::TIME:
+  case LogicalTypeId::TIMESTAMP:
+  case LogicalTypeId::TIMESTAMP_TZ:
+  case LogicalTypeId::VARCHAR:
+  case LogicalTypeId::BLOB:
+    return;
+  default:
+    break;
+  }
+  throw NotImplementedException(
+      "Lance ALTER COLUMN TYPE only supports a limited set of DuckDB types "
+      "(BOOLEAN, integer/floating, DATE/TIME/TIMESTAMP, VARCHAR, BLOB).");
+}
+
+static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
+                                          const string &column_name,
+                                          const LogicalType &target_type) {
+  auto *cast_expr = dynamic_cast<const CastExpression *>(&expr);
+  if (!cast_expr || cast_expr->try_cast ||
+      cast_expr->cast_type != target_type) {
+    return false;
+  }
+  auto *col_ref =
+      dynamic_cast<const ColumnRefExpression *>(cast_expr->child.get());
+  if (!col_ref || col_ref->column_names.size() != 1) {
+    return false;
+  }
+  return StringUtil::CIEquals(col_ref->column_names[0], column_name);
+}
+
+unique_ptr<CatalogEntry>
+LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
+  if (!transaction.context) {
+    throw InternalException(
+        "LanceTableEntry::AlterEntry missing client context");
+  }
+  return AlterEntry(*transaction.context, info);
+}
+
+unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
+                                                     AlterInfo &info) {
+  if (!context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        "Lance DDL does not support explicit transactions yet");
+  }
+
+  void *dataset = LanceOpenDataset(context, dataset_uri);
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+                      LanceFormatErrorSuffix());
+  }
+
+  unique_ptr<CatalogEntry> result;
+  switch (info.type) {
+  case AlterType::ALTER_TABLE: {
+    auto &alter = info.Cast<AlterTableInfo>();
+    switch (alter.alter_table_type) {
+    case AlterTableType::ADD_COLUMN: {
+      auto &add = info.Cast<AddColumnInfo>();
+      vector<string> names{add.new_column.Name()};
+      vector<LogicalType> types{add.new_column.Type()};
+
+      ArrowSchemaWrapper new_schema_root;
+      memset(&new_schema_root.arrow_schema, 0,
+             sizeof(new_schema_root.arrow_schema));
+      auto props = context.GetClientProperties();
+      ArrowConverter::ToArrowSchema(&new_schema_root.arrow_schema, types, names,
+                                    props);
+
+      vector<string> expressions;
+      if (add.new_column.HasDefaultValue()) {
+        expressions.push_back(add.new_column.DefaultValue().ToString());
+      }
+      vector<const char *> expr_ptrs;
+      expr_ptrs.reserve(expressions.size());
+      for (auto &e : expressions) {
+        expr_ptrs.push_back(e.c_str());
+      }
+
+      auto rc = lance_dataset_add_columns(
+          dataset, &new_schema_root.arrow_schema,
+          expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(), 0);
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to add column to Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    case AlterTableType::REMOVE_COLUMN: {
+      auto &drop = info.Cast<RemoveColumnInfo>();
+      if (drop.if_column_exists && !ColumnExists(drop.removed_column)) {
+        lance_close_dataset(dataset);
+        result = nullptr;
+        break;
+      }
+      const char *cols[1] = {drop.removed_column.c_str()};
+      auto rc = lance_dataset_drop_columns(dataset, cols, 1);
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to drop column from Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    case AlterTableType::RENAME_COLUMN: {
+      auto &rename = info.Cast<RenameColumnInfo>();
+      auto rc = lance_dataset_alter_columns_rename(
+          dataset, rename.old_name.c_str(), rename.new_name.c_str());
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to rename column in Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    case AlterTableType::ALTER_COLUMN_TYPE: {
+      auto &cast = info.Cast<ChangeColumnTypeInfo>();
+      ValidateAlterColumnTypeTarget(cast.target_type);
+      if (!cast.expression ||
+          !IsImplicitCastUsingExpression(*cast.expression, cast.column_name,
+                                         cast.target_type)) {
+        lance_close_dataset(dataset);
+        throw NotImplementedException(
+            "Lance ALTER COLUMN TYPE only supports implicit USING (i.e., a "
+            "simple CAST of the original column)");
+      }
+
+      ArrowSchemaWrapper new_type_schema;
+      memset(&new_type_schema.arrow_schema, 0,
+             sizeof(new_type_schema.arrow_schema));
+      auto props = context.GetClientProperties();
+      ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
+                                    {cast.target_type}, {cast.column_name},
+                                    props);
+
+      auto rc = lance_dataset_alter_columns_cast(
+          dataset, cast.column_name.c_str(), &new_type_schema.arrow_schema);
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to change column type in Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    case AlterTableType::SET_NOT_NULL: {
+      auto &nn = info.Cast<SetNotNullInfo>();
+      auto rc = lance_dataset_alter_columns_set_nullable(
+          dataset, nn.column_name.c_str(), 0);
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to set NOT NULL in Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    case AlterTableType::DROP_NOT_NULL: {
+      auto &nn = info.Cast<DropNotNullInfo>();
+      auto rc = lance_dataset_alter_columns_set_nullable(
+          dataset, nn.column_name.c_str(), 1);
+      if (rc != 0) {
+        lance_close_dataset(dataset);
+        throw IOException("Failed to drop NOT NULL in Lance dataset: " +
+                          dataset_uri + LanceFormatErrorSuffix());
+      }
+      lance_close_dataset(dataset);
+      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
+                                                    ParentSchema(), name,
+                                                    dataset_uri, internal);
+      break;
+    }
+    default:
+      lance_close_dataset(dataset);
+      throw NotImplementedException(
+          "ALTER TABLE operation not supported for Lance tables");
+    }
+    break;
+  }
+  case AlterType::SET_COLUMN_COMMENT: {
+    auto &comment = info.Cast<SetColumnCommentInfo>();
+    const char *comment_ptr = nullptr;
+    string comment_str;
+    if (!comment.comment_value.IsNull()) {
+      comment_str = comment.comment_value.DefaultCastAs(LogicalType::VARCHAR)
+                        .GetValue<string>();
+      comment_ptr = comment_str.c_str();
+    }
+    auto rc = lance_dataset_update_field_metadata(
+        dataset, comment.column_name.c_str(), "comment", comment_ptr);
+    if (rc != 0) {
+      lance_close_dataset(dataset);
+      throw IOException("Failed to update column comment in Lance dataset: " +
+                        dataset_uri + LanceFormatErrorSuffix());
+    }
+    lance_close_dataset(dataset);
+    return BuildUpdatedLanceTableEntryFromDataset(
+        context, ParentCatalog(), ParentSchema(), name, dataset_uri, internal);
+    break;
+  }
+  default:
+    lance_close_dataset(dataset);
+    throw NotImplementedException("ALTER is not supported for Lance tables");
+  }
+
+  return result;
+}
+
+unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
+  (void)context;
+  auto &catalog = const_cast<Catalog &>(ParentCatalog());
+  auto &schema = const_cast<SchemaCatalogEntry &>(ParentSchema());
+  auto create_info = make_uniq<CreateTableInfo>(schema, name);
+  create_info->temporary = temporary;
+  create_info->internal = internal;
+  create_info->comment = comment;
+  create_info->tags = tags;
+  create_info->columns = columns.Copy();
+  for (auto &c : constraints) {
+    create_info->constraints.push_back(c->Copy());
+  }
+  return make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
+}
 
 TableFunction
 LanceTableEntry::GetScanFunction(ClientContext &context,

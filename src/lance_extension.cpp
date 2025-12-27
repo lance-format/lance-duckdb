@@ -15,6 +15,7 @@ void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
+void RegisterLanceMetadata(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
 void RegisterLanceTruncate(DBConfig &config);
 
@@ -23,6 +24,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
   RegisterLanceWrite(loader);
+  RegisterLanceMetadata(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {
