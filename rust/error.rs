@@ -20,6 +20,7 @@ pub enum ErrorCode {
     ExplainPlan = 13,
     FtsSchema = 14,
     FtsStreamCreate = 15,
+    DatasetScan = 16,
     HybridStreamCreate = 17,
     DatasetWriteOpen = 18,
     DatasetWriteBatch = 19,

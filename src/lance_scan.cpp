@@ -9,7 +9,10 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -59,7 +62,9 @@ LanceScanBindData::~LanceScanBindData() {
 
 static bool TryLanceExplainDatasetScan(void *dataset,
                                        const vector<string> *columns,
-                                       const string *filter_ir, bool verbose,
+                                       const string *filter_ir,
+                                       const optional_idx &pushed_limit,
+                                       idx_t pushed_offset, bool verbose,
                                        string &out_plan, string &out_error) {
   out_plan.clear();
   out_error.clear();
@@ -84,9 +89,14 @@ static bool TryLanceExplainDatasetScan(void *dataset,
     filter_len = filter_ir->size();
   }
 
+  auto limit_i64 = pushed_limit.IsValid()
+                       ? NumericCast<int64_t>(pushed_limit.GetIndex())
+                       : int64_t(-1);
+  auto offset_i64 = NumericCast<int64_t>(pushed_offset);
+
   auto *plan_ptr = lance_explain_dataset_scan_ir(
       dataset, col_ptrs.empty() ? nullptr : col_ptrs.data(), col_ptrs.size(),
-      filter_ptr, filter_len, verbose ? 1 : 0);
+      filter_ptr, filter_len, limit_i64, offset_i64, verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -107,6 +117,11 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> record_batch_rows{0};
   std::atomic<idx_t> streams_opened{0};
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
+
+  bool use_dataset_scanner = false;
+  bool limit_offset_pushed_down = false;
+  optional_idx pushed_limit = optional_idx::Invalid();
+  idx_t pushed_offset = 0;
 
   vector<uint64_t> fragment_ids;
   idx_t max_threads = 1;
@@ -364,6 +379,10 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto state = make_uniq_base<GlobalTableFunctionState, LanceScanGlobalState>();
   auto &scan_state = state->Cast<LanceScanGlobalState>();
 
+  scan_state.limit_offset_pushed_down = bind_data.limit_offset_pushed_down;
+  scan_state.pushed_limit = bind_data.pushed_limit;
+  scan_state.pushed_offset = bind_data.pushed_offset;
+
   scan_state.projection_ids = input.projection_ids;
   if (!input.projection_ids.empty()) {
     scan_state.scanned_types.reserve(input.column_ids.size());
@@ -426,6 +445,18 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
+  if (bind_data.limit_offset_pushed_down) {
+    // Limit/offset pushdown requires that any TableFilterSet predicates are
+    // evaluated by Lance. Otherwise limit/offset would apply before filtering.
+    if (input.filters && !input.filters->filters.empty() &&
+        !scan_state.filter_pushed_down) {
+      throw IOException("Lance limit/offset pushdown requires filter pushdown");
+    }
+    scan_state.use_dataset_scanner = true;
+    scan_state.max_threads = 1;
+    return state;
+  }
+
   size_t fragment_count = 0;
   auto fragments_ptr =
       lance_dataset_list_fragments(bind_data.dataset, &fragment_count);
@@ -460,6 +491,9 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   if (scan_global.count_only) {
     return std::move(result);
   }
+  if (scan_global.use_dataset_scanner) {
+    return std::move(result);
+  }
   // Early stop: no fragments left for this thread.
   auto fragment_pos = scan_global.next_fragment_idx.fetch_add(1);
   if (fragment_pos >= scan_global.fragment_ids.size()) {
@@ -478,11 +512,6 @@ static bool LanceScanOpenStream(ClientContext &context,
     local_state.stream = nullptr;
   }
 
-  if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
-    return false;
-  }
-  auto fragment_id = global_state.fragment_ids[local_state.fragment_pos];
-
   vector<const char *> columns;
   columns.reserve(global_state.scan_column_names.size());
   for (auto &name : global_state.scan_column_names) {
@@ -497,20 +526,51 @@ static bool LanceScanOpenStream(ClientContext &context,
   local_state.filter_pushed_down =
       global_state.filter_pushed_down && filter_ir && filter_ir_len > 0;
 
-  auto stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
-                                                columns.data(), columns.size(),
-                                                filter_ir, filter_ir_len);
-  if (!stream && filter_ir) {
-    // Best-effort: if filter pushdown failed, retry without it and rely on
-    // DuckDB-side filter execution for correctness.
-    global_state.filter_pushdown_fallbacks.fetch_add(1);
-    local_state.filter_pushed_down = false;
+  void *stream = nullptr;
+  if (global_state.use_dataset_scanner) {
+    auto limit_i64 =
+        global_state.pushed_limit.IsValid()
+            ? NumericCast<int64_t>(global_state.pushed_limit.GetIndex())
+            : int64_t(-1);
+    auto offset_i64 = NumericCast<int64_t>(global_state.pushed_offset);
+    stream = lance_create_dataset_stream_ir(
+        bind_data.dataset, columns.data(), columns.size(), filter_ir,
+        filter_ir_len, limit_i64, offset_i64);
+    if (!stream && filter_ir) {
+      if (global_state.limit_offset_pushed_down &&
+          local_state.filter_pushed_down) {
+        throw IOException("Lance dataset scan filter pushdown failed" +
+                          LanceFormatErrorSuffix());
+      }
+      // Best-effort: if filter pushdown failed, retry without it and rely on
+      // DuckDB-side filter execution for correctness.
+      global_state.filter_pushdown_fallbacks.fetch_add(1);
+      local_state.filter_pushed_down = false;
+      stream = lance_create_dataset_stream_ir(bind_data.dataset, columns.data(),
+                                              columns.size(), nullptr, 0,
+                                              limit_i64, offset_i64);
+    }
+  } else {
+    if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
+      return false;
+    }
+    auto fragment_id = global_state.fragment_ids[local_state.fragment_pos];
+
     stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
                                              columns.data(), columns.size(),
-                                             nullptr, 0);
+                                             filter_ir, filter_ir_len);
+    if (!stream && filter_ir) {
+      // Best-effort: if filter pushdown failed, retry without it and rely on
+      // DuckDB-side filter execution for correctness.
+      global_state.filter_pushdown_fallbacks.fetch_add(1);
+      local_state.filter_pushed_down = false;
+      stream = lance_create_fragment_stream_ir(bind_data.dataset, fragment_id,
+                                               columns.data(), columns.size(),
+                                               nullptr, 0);
+    }
   }
   if (!stream) {
-    throw IOException("Failed to create Lance fragment stream" +
+    throw IOException("Failed to create Lance scan stream" +
                       LanceFormatErrorSuffix());
   }
   global_state.streams_opened.fetch_add(1);
@@ -595,6 +655,9 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     if (local_state.chunk_offset >=
         NumericCast<idx_t>(local_state.chunk->arrow_array.length)) {
       if (!LanceScanLoadNextBatch(local_state)) {
+        if (global_state.use_dataset_scanner) {
+          return;
+        }
         // Stream finished, try next fragment.
         local_state.fragment_pos = global_state.next_fragment_idx.fetch_add(1);
         continue;
@@ -649,6 +712,12 @@ LanceScanToString(TableFunctionToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
+  result["Lance Limit Offset Pushdown"] =
+      bind_data.limit_offset_pushed_down ? "true" : "false";
+  result["Lance Limit"] = bind_data.pushed_limit.IsValid()
+                              ? to_string(bind_data.pushed_limit.GetIndex())
+                              : "none";
+  result["Lance Offset"] = to_string(bind_data.pushed_offset);
 
   string filter_ir_msg;
   if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
@@ -660,10 +729,11 @@ LanceScanToString(TableFunctionToStringInput &input) {
 
   string plan;
   string error;
-  if (TryLanceExplainDatasetScan(bind_data.dataset, nullptr,
-                                 filter_ir_msg.empty() ? nullptr
-                                                       : &filter_ir_msg,
-                                 bind_data.explain_verbose, plan, error)) {
+  if (TryLanceExplainDatasetScan(
+          bind_data.dataset, nullptr,
+          filter_ir_msg.empty() ? nullptr : &filter_ir_msg,
+          bind_data.pushed_limit, bind_data.pushed_offset,
+          bind_data.explain_verbose, plan, error)) {
     result["Lance Plan (Bind)"] = plan;
   } else if (!error.empty()) {
     result["Lance Plan Error (Bind)"] = error;
@@ -681,6 +751,14 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   result["Lance Path"] = bind_data.file_path;
   result["Lance Explain Verbose"] =
       bind_data.explain_verbose ? "true" : "false";
+  result["Lance Scan Mode"] =
+      global_state.use_dataset_scanner ? "dataset" : "fragment";
+  result["Lance Limit Offset Pushdown"] =
+      global_state.limit_offset_pushed_down ? "true" : "false";
+  result["Lance Limit"] = global_state.pushed_limit.IsValid()
+                              ? to_string(global_state.pushed_limit.GetIndex())
+                              : "none";
+  result["Lance Offset"] = to_string(global_state.pushed_offset);
   result["Lance Fragments"] = to_string(global_state.fragment_ids.size());
   result["Lance Max Threads"] = to_string(global_state.max_threads);
   result["Lance Streams Opened"] =
@@ -716,6 +794,7 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
           bind_data.dataset, &global_state.scan_column_names,
           global_state.lance_filter_ir.empty() ? nullptr
                                                : &global_state.lance_filter_ir,
+          global_state.pushed_limit, global_state.pushed_offset,
           bind_data.explain_verbose, plan, error);
       if (ok) {
         global_state.explain_plan = std::move(plan);
@@ -733,6 +812,98 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   }
 
   return result;
+}
+
+static bool TryParseConstantLimitOffset(const LogicalLimit &limit_op,
+                                        optional_idx &out_limit,
+                                        idx_t &out_offset) {
+  auto limit_type = limit_op.limit_val.Type();
+  switch (limit_type) {
+  case LimitNodeType::UNSET:
+    out_limit.SetInvalid();
+    break;
+  case LimitNodeType::CONSTANT_VALUE:
+    out_limit = optional_idx(limit_op.limit_val.GetConstantValue());
+    break;
+  default:
+    return false;
+  }
+
+  auto offset_type = limit_op.offset_val.Type();
+  switch (offset_type) {
+  case LimitNodeType::UNSET:
+    out_offset = 0;
+    break;
+  case LimitNodeType::CONSTANT_VALUE:
+    out_offset = limit_op.offset_val.GetConstantValue();
+    break;
+  default:
+    return false;
+  }
+  return true;
+}
+
+static bool IsLanceScanTableFunction(const TableFunction &fn) {
+  return fn.name == "lance_scan" || fn.name == "__lance_table_scan" ||
+         fn.name == "__lance_namespace_scan";
+}
+
+static unique_ptr<LogicalOperator>
+LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
+  for (auto &child : op->children) {
+    child = LanceLimitOffsetPushdown(std::move(child));
+  }
+
+  if (op->type != LogicalOperatorType::LOGICAL_LIMIT) {
+    return op;
+  }
+
+  auto &limit_op = op->Cast<LogicalLimit>();
+  optional_idx pushed_limit = optional_idx::Invalid();
+  idx_t pushed_offset = 0;
+  if (!TryParseConstantLimitOffset(limit_op, pushed_limit, pushed_offset)) {
+    return op;
+  }
+  if (op->children.empty() || !op->children[0]) {
+    return op;
+  }
+
+  auto *node = op->children[0].get();
+  while (node && node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+    if (node->children.empty() || !node->children[0]) {
+      return op;
+    }
+    node = node->children[0].get();
+  }
+  if (!node || node->type != LogicalOperatorType::LOGICAL_GET) {
+    return op;
+  }
+
+  auto &get = node->Cast<LogicalGet>();
+  if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
+    return op;
+  }
+
+  auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+  scan_bind.limit_offset_pushed_down = true;
+  scan_bind.pushed_limit = pushed_limit;
+  scan_bind.pushed_offset = pushed_offset;
+
+  auto child = std::move(op->children[0]);
+  child->estimated_cardinality = op->estimated_cardinality;
+  return child;
+}
+
+static void
+LanceLimitOffsetPushdownOptimizer(OptimizerExtensionInput &,
+                                  unique_ptr<LogicalOperator> &plan) {
+  plan = LanceLimitOffsetPushdown(std::move(plan));
+}
+
+void RegisterLanceScanOptimizer(DBConfig &config) {
+  OptimizerExtension ext;
+  ext.optimize_function = LanceLimitOffsetPushdownOptimizer;
+  config.optimizer_extensions.push_back(std::move(ext));
 }
 
 static TableFunction LanceTableScanFunction() {
