@@ -17,6 +17,7 @@ void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
 void RegisterLanceTruncate(DBConfig &config);
+void RegisterLanceScanOptimizer(DBConfig &config);
 
 static void LoadInternal(ExtensionLoader &loader) {
   // Register the lance_scan table function
@@ -31,6 +32,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   // Enable SELECT * FROM '.../dataset.lance'
   auto &instance = loader.GetDatabaseInstance();
   auto &config = DBConfig::GetConfig(instance);
+  RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
   RegisterLanceTruncate(config);
