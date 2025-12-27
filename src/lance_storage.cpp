@@ -26,12 +26,14 @@
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 #include "lance_common.hpp"
+#include "lance_delete.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_table_entry.hpp"
@@ -535,6 +537,8 @@ private:
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
+  using DuckCatalog::PlanDelete;
+
   LanceDuckCatalog(AttachedDatabase &db,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
                    bool is_rest_namespace)
@@ -660,6 +664,15 @@ public:
         execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
     cast_copy.children.push_back(plan);
     return copy;
+  }
+
+  PhysicalOperator &PlanDelete(ClientContext &context,
+                               PhysicalPlanGenerator &planner,
+                               LogicalDelete &op) override {
+    if (dynamic_cast<LanceTableEntry *>(&op.table)) {
+      return PlanLanceDelete(context, planner, op);
+    }
+    return Catalog::PlanDelete(context, planner, op);
   }
 
   void ReplaceDefaultSchemaWithLanceSchema(CatalogTransaction transaction) {

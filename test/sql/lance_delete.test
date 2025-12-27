@@ -1,0 +1,116 @@
+# name: test/sql/lance_delete.test
+# description: DELETE FROM ... WHERE ... deletes rows in Lance datasets
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+  UNION ALL
+  SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s
+) TO 'test/.tmp/lance_delete_basic.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+  UNION ALL
+  SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s
+  UNION ALL
+  SELECT 5::BIGINT AS id, 'e'::VARCHAR AS s
+  UNION ALL
+  SELECT 6::BIGINT AS id, 'f'::VARCHAR AS s
+) TO 'test/.tmp/lance_delete_predicate.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE v_basic AS
+  SELECT count(*)::BIGINT AS c
+  FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE v_pred AS
+  SELECT count(*)::BIGINT AS c
+  FROM glob('test/.tmp/lance_delete_predicate.lance/_versions/*');
+
+statement ok
+ATTACH 'test/.tmp' AS del_ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_basic;
+----
+4
+
+query I
+DELETE FROM del_ns.main.lance_delete_basic WHERE id <= 2;
+----
+2
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_basic;
+----
+2
+
+query I
+SELECT sum(id) FROM del_ns.main.lance_delete_basic;
+----
+7
+
+query T
+SELECT ((SELECT c FROM v_basic) + 1) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*'));
+----
+true
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_predicate;
+----
+6
+
+query I
+DELETE FROM del_ns.main.lance_delete_predicate WHERE id BETWEEN 2 AND 4 OR s IN ('f');
+----
+4
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_predicate;
+----
+2
+
+query I
+SELECT sum(id) FROM del_ns.main.lance_delete_predicate;
+----
+6
+
+query T
+SELECT ((SELECT c FROM v_pred) + 1) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_predicate.lance/_versions/*'));
+----
+true
+
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+DELETE FROM del_ns.main.lance_delete_basic WHERE id = 3;
+----
+Not implemented Error: Lance DELETE does not support explicit transactions yet
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_basic;
+----
+2
+
+statement ok
+DETACH del_ns;

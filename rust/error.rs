@@ -30,6 +30,7 @@ pub enum ErrorCode {
     DatasetWriteFinishUncommitted = 24,
     DatasetCommitTransaction = 25,
     DirNamespaceDropTable = 26,
+    DatasetDelete = 27,
 }
 
 struct LastError {
