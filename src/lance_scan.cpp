@@ -233,7 +233,19 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   idx_t max_threads = 1;
 
   vector<idx_t> projection_ids;
+  // Types for DuckDB's expected scan columns (input.column_ids order).
+  // This can include virtual columns like `rowid` and `_rowid`.
   vector<LogicalType> scanned_types;
+
+  // Types for the Arrow->DuckDB conversion chunk. This is a de-duplicated set
+  // of underlying columns that we actually request from Lance.
+  vector<LogicalType> scan_converted_types;
+
+  // Mapping from DuckDB scan columns (input.column_ids order) into the
+  // conversion chunk.
+  vector<idx_t> output_to_scan_converted_idx;
+  vector<bool> output_is_duckdb_rowid;
+  vector<bool> output_is_empty;
 
   vector<column_t> scan_column_ids;
   vector<string> scan_column_names;
@@ -259,6 +271,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
       : ArrowScanLocalState(std::move(current_chunk), context),
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
+  DataChunk scan_converted;
   void *stream = nullptr;
   LanceScanGlobalState *global_state = nullptr;
   idx_t fragment_pos = 0;
@@ -320,6 +333,39 @@ static bool TryParseRowIdValue(const Value &value, uint64_t &out) {
   }
 }
 
+static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
+  if (count == 0) {
+    return;
+  }
+  if (src.GetType() != LogicalType::UBIGINT ||
+      dst.GetType() != LogicalType::ROW_TYPE) {
+    throw InternalException("Invalid rowid cast types");
+  }
+
+  UnifiedVectorFormat format;
+  src.ToUnifiedFormat(count, format);
+  auto src_data = UnifiedVectorFormat::GetData<uint64_t>(format);
+
+  dst.SetVectorType(VectorType::FLAT_VECTOR);
+  auto dst_data = FlatVector::GetData<int64_t>(dst);
+  auto &dst_validity = FlatVector::Validity(dst);
+  dst_validity.SetAllValid(count);
+
+  for (idx_t i = 0; i < count; i++) {
+    auto idx = format.sel->get_index(i);
+    if (!format.validity.RowIsValid(idx)) {
+      dst_validity.SetInvalid(i);
+      continue;
+    }
+    auto v = src_data[idx];
+    if (v > NumericLimits<int64_t>::Maximum()) {
+      throw InvalidInputException(
+          "Lance rowid values must fit in signed 64-bit integers");
+    }
+    dst_data[i] = NumericCast<int64_t>(v);
+  }
+}
+
 static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
                                            vector<uint64_t> &out_row_ids) {
   switch (filter.filter_type) {
@@ -329,8 +375,8 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
     for (auto &v : in.values) {
       uint64_t row_id = 0;
       if (!TryParseRowIdValue(v, row_id)) {
-        throw InvalidInputException(
-            "Lance point lookup requires integer _rowid values");
+        throw InvalidInputException("Lance point lookup requires non-negative "
+                                    "integer rowid/_rowid values");
       }
       out_row_ids.push_back(row_id);
     }
@@ -343,8 +389,8 @@ static bool TryExtractTakeRowIdsFromFilter(const TableFilter &filter,
     }
     uint64_t row_id = 0;
     if (!TryParseRowIdValue(cmp.constant, row_id)) {
-      throw InvalidInputException(
-          "Lance point lookup requires integer _rowid values");
+      throw InvalidInputException("Lance point lookup requires non-negative "
+                                  "integer rowid/_rowid values");
     }
     out_row_ids.push_back(row_id);
     return true;
@@ -436,8 +482,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         colref.binding.column_index >= col_ids.size()) {
       return false;
     }
-    return IsLanceVirtualRowIdColumnId(
-        col_ids[colref.binding.column_index].GetPrimaryIndex());
+    auto col_id = col_ids[colref.binding.column_index].GetPrimaryIndex();
+    return col_id == COLUMN_IDENTIFIER_ROW_ID ||
+           IsLanceVirtualRowIdColumnId(col_id);
   };
 
   std::function<bool(const Expression &, vector<uint64_t> &)>
@@ -467,7 +514,8 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         auto &v = child->Cast<BoundConstantExpression>().value;
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
-              "Lance point lookup requires integer _rowid values");
+              "Lance point lookup requires non-negative integer rowid/_rowid "
+              "values");
         }
         out.push_back(row_id);
       }
@@ -494,7 +542,8 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         auto &v = rhs.Cast<BoundConstantExpression>().value;
         if (!TryParseRowIdValue(v, row_id)) {
           throw InvalidInputException(
-              "Lance point lookup requires integer _rowid values");
+              "Lance point lookup requires non-negative integer rowid/_rowid "
+              "values");
         }
         out.clear();
         out.push_back(row_id);
@@ -745,42 +794,69 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
   scan_state.projection_ids = input.projection_ids;
   auto rowid_internal_index = NumericCast<column_t>(bind_data.types.size());
-  if (!input.projection_ids.empty()) {
-    scan_state.scanned_types.reserve(input.column_ids.size());
-    for (auto col_id : input.column_ids) {
-      if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-          col_id == COLUMN_IDENTIFIER_EMPTY) {
-        continue;
-      }
-      if (IsLanceVirtualRowIdColumnId(col_id)) {
-        scan_state.scan_includes_virtual_rowid = true;
-        scan_state.scanned_types.push_back(LogicalType::UBIGINT);
-        continue;
-      }
-      if (col_id >= bind_data.types.size()) {
-        throw IOException("Invalid column id in projection");
-      }
-      scan_state.scanned_types.push_back(bind_data.types[col_id]);
-    }
-  }
 
-  scan_state.scan_column_names.reserve(input.column_ids.size());
+  scan_state.scanned_types.reserve(input.column_ids.size());
+  scan_state.output_to_scan_converted_idx.reserve(input.column_ids.size());
+  scan_state.output_is_duckdb_rowid.reserve(input.column_ids.size());
+  scan_state.output_is_empty.reserve(input.column_ids.size());
+
+  unordered_map<column_t, idx_t> scan_idx_by_col_id;
+  scan_idx_by_col_id.reserve(input.column_ids.size());
+  auto add_scan_column = [&](column_t col_id, const string &name,
+                             const LogicalType &type) -> idx_t {
+    auto it = scan_idx_by_col_id.find(col_id);
+    if (it != scan_idx_by_col_id.end()) {
+      return it->second;
+    }
+    auto idx = scan_state.scan_column_ids.size();
+    scan_state.scan_column_ids.push_back(col_id);
+    scan_state.scan_column_names.push_back(name);
+    scan_state.scan_converted_types.push_back(type);
+    scan_idx_by_col_id.emplace(col_id, idx);
+    return idx;
+  };
+
   for (auto col_id : input.column_ids) {
-    if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-        col_id == COLUMN_IDENTIFIER_EMPTY) {
+    if (col_id == COLUMN_IDENTIFIER_EMPTY) {
+      scan_state.scanned_types.push_back(LogicalType::BOOLEAN);
+      scan_state.output_to_scan_converted_idx.push_back(
+          DConstants::INVALID_INDEX);
+      scan_state.output_is_duckdb_rowid.push_back(false);
+      scan_state.output_is_empty.push_back(true);
       continue;
     }
+
+    if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+      scan_state.scan_includes_virtual_rowid = true;
+      auto scan_idx = add_scan_column(
+          rowid_internal_index, LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT);
+      scan_state.scanned_types.push_back(LogicalType::ROW_TYPE);
+      scan_state.output_to_scan_converted_idx.push_back(scan_idx);
+      scan_state.output_is_duckdb_rowid.push_back(true);
+      scan_state.output_is_empty.push_back(false);
+      continue;
+    }
+
     if (IsLanceVirtualRowIdColumnId(col_id)) {
       scan_state.scan_includes_virtual_rowid = true;
-      scan_state.scan_column_ids.push_back(rowid_internal_index);
-      scan_state.scan_column_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
+      auto scan_idx = add_scan_column(
+          rowid_internal_index, LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT);
+      scan_state.scanned_types.push_back(LogicalType::UBIGINT);
+      scan_state.output_to_scan_converted_idx.push_back(scan_idx);
+      scan_state.output_is_duckdb_rowid.push_back(false);
+      scan_state.output_is_empty.push_back(false);
       continue;
     }
-    if (col_id >= bind_data.names.size()) {
+
+    if (col_id >= bind_data.types.size() || col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
     }
-    scan_state.scan_column_ids.push_back(col_id);
-    scan_state.scan_column_names.push_back(bind_data.names[col_id]);
+    auto scan_idx = add_scan_column(col_id, bind_data.names[col_id],
+                                    bind_data.types[col_id]);
+    scan_state.scanned_types.push_back(bind_data.types[col_id]);
+    scan_state.output_to_scan_converted_idx.push_back(scan_idx);
+    scan_state.output_is_duckdb_rowid.push_back(false);
+    scan_state.output_is_empty.push_back(false);
   }
 
   vector<string> filter_parts;
@@ -912,6 +988,8 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   if (scan_global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, scan_global.scanned_types);
   }
+  result->scan_converted.Initialize(context.client,
+                                    scan_global.scan_converted_types);
   if (scan_global.count_only) {
     return std::move(result);
   }
@@ -1136,11 +1214,42 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     auto start = global_state.lines_read.fetch_add(output_size);
 
+    local_state.scan_converted.Reset();
+    local_state.scan_converted.SetCardinality(output_size);
+    ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
+                                      local_state.scan_converted, start);
+
+    auto fill_output_from_converted = [&](DataChunk &target) {
+      if (target.ColumnCount() !=
+          global_state.output_to_scan_converted_idx.size()) {
+        throw InternalException(
+            "Lance scan output column count does not match mapping");
+      }
+      target.SetCardinality(output_size);
+      for (idx_t i = 0; i < target.ColumnCount(); i++) {
+        if (global_state.output_is_empty[i]) {
+          target.data[i].Reference(Value::BOOLEAN(true));
+          continue;
+        }
+        auto scan_idx = global_state.output_to_scan_converted_idx[i];
+        if (scan_idx == DConstants::INVALID_INDEX ||
+            scan_idx >= local_state.scan_converted.ColumnCount()) {
+          throw InternalException(
+              "Lance scan output references invalid column");
+        }
+        if (global_state.output_is_duckdb_rowid[i]) {
+          CastRowIdToDuckDBRowType(local_state.scan_converted.data[scan_idx],
+                                   target.data[i], output_size);
+          continue;
+        }
+        target.data[i].Reference(local_state.scan_converted.data[scan_idx]);
+      }
+    };
+
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                        local_state.all_columns, start);
+      fill_output_from_converted(local_state.all_columns);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -1150,9 +1259,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                               global_state.projection_ids);
       output.SetCardinality(local_state.all_columns);
     } else {
-      output.SetCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
-                                        start);
+      fill_output_from_converted(output);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -1327,7 +1434,8 @@ static bool IsLanceRowIdColumn(const LogicalGet &get,
 
   auto col_id = col_ids[colref.binding.column_index].GetPrimaryIndex();
   (void)scan_bind;
-  return IsLanceVirtualRowIdColumnId(col_id);
+  return col_id == COLUMN_IDENTIFIER_ROW_ID ||
+         IsLanceVirtualRowIdColumnId(col_id);
 }
 
 static bool IsLanceRowIdColumn(const LogicalGet &get,
@@ -1341,7 +1449,8 @@ static bool IsLanceRowIdColumn(const LogicalGet &get,
 
   auto col_id = col_ids[idx].GetPrimaryIndex();
   (void)scan_bind;
-  return IsLanceVirtualRowIdColumnId(col_id);
+  return col_id == COLUMN_IDENTIFIER_ROW_ID ||
+         IsLanceVirtualRowIdColumnId(col_id);
 }
 
 static bool TryExtractTakeRowIdsFromExpression(
@@ -1362,8 +1471,8 @@ static bool TryExtractTakeRowIdsFromExpression(
 
   auto parse_row_id = [&](const Value &v, uint64_t &out) {
     if (!TryParseRowIdValue(v, out)) {
-      throw InvalidInputException(
-          "Lance point lookup requires integer _rowid values");
+      throw InvalidInputException("Lance point lookup requires non-negative "
+                                  "integer rowid/_rowid values");
     }
     return true;
   };
@@ -1460,7 +1569,12 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     }
     auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
 
-    auto it = get.table_filters.filters.find(LANCE_COLUMN_IDENTIFIER_ROW_ID);
+    column_t filter_col_id = LANCE_COLUMN_IDENTIFIER_ROW_ID;
+    auto it = get.table_filters.filters.find(filter_col_id);
+    if (it == get.table_filters.filters.end() || !it->second) {
+      filter_col_id = COLUMN_IDENTIFIER_ROW_ID;
+      it = get.table_filters.filters.find(filter_col_id);
+    }
     if (it == get.table_filters.filters.end() || !it->second) {
       return op;
     }
@@ -1478,19 +1592,21 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     auto &col_ids = get.GetColumnIds();
     optional_idx col_pos = optional_idx::Invalid();
     for (idx_t i = 0; i < col_ids.size(); i++) {
-      if (col_ids[i].GetPrimaryIndex() == LANCE_COLUMN_IDENTIFIER_ROW_ID) {
+      if (col_ids[i].GetPrimaryIndex() == filter_col_id) {
         col_pos = optional_idx(i);
         break;
       }
     }
     if (!col_pos.IsValid()) {
       throw InternalException(
-          "Lance scan found a _rowid table filter without a _rowid column");
+          "Lance scan found a rowid table filter without a rowid column");
     }
 
+    auto col_type = filter_col_id == COLUMN_IDENTIFIER_ROW_ID
+                        ? LogicalType::ROW_TYPE
+                        : LogicalType::UBIGINT;
     auto colref = make_uniq<BoundColumnRefExpression>(
-        LogicalType::UBIGINT,
-        ColumnBinding(get.table_index, col_pos.GetIndex()));
+        col_type, ColumnBinding(get.table_index, col_pos.GetIndex()));
     auto filter_expr = it->second->ToExpression(*colref);
     get.table_filters.filters.erase(it);
 
@@ -1597,7 +1713,8 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
       continue;
     }
     auto col_id = col_ids[entry.first].GetPrimaryIndex();
-    if (!IsLanceVirtualRowIdColumnId(col_id)) {
+    if (col_id != COLUMN_IDENTIFIER_ROW_ID &&
+        !IsLanceVirtualRowIdColumnId(col_id)) {
       continue;
     }
     if (IsTakeRowIdFilter(*entry.second)) {
