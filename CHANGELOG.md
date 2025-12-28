@@ -6,6 +6,27 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-28
+
+### Added
+
+- `COPY ... TO ... (FORMAT lance, ...)` writer for creating and appending Lance datasets.
+- Directory and REST namespaces via `ATTACH ... (TYPE LANCE, ...)`.
+- DDL support for attached namespaces: `CREATE TABLE`, `CTAS`, `DROP TABLE`, `ALTER TABLE` (schema evolution and comments).
+- DML support for attached namespaces: `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`.
+- Index DDL on dataset URIs: `CREATE INDEX`, `SHOW INDEXES`, `DROP INDEX` (vector, scalar, and full-text).
+- Additional scan pushdown and planning improvements: `LIMIT`/`OFFSET`, `TABLESAMPLE SYSTEM`, `LIKE`, `regexp_matches`,
+  `IS (NOT) DISTINCT FROM`, and expanded type coverage (including timestamp/decimal/struct filters).
+- DuckDB `rowid` / Lance `_rowid` support for scans, enabling point-lookup and rowid-based optimizations.
+- Basic scan statistics for improved planning.
+
+### Changed
+
+- Scan and maintenance helper table functions are internal-only; the user-facing surface is replacement scan, namespaces,
+  search functions, and the `lance` copy format.
+- Improved parallelism for writing datasets.
+- Refined test coverage and organization for sqllogictests.
+
 ## [0.2.0] - 2025-12-25
 
 ### Added
