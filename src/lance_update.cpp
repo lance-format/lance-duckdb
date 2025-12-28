@@ -465,8 +465,8 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
       if (expr->IsFoldable()) {
         Value folded;
         if (ExpressionExecutor::TryEvaluateScalar(context, *expr, folded) &&
-            folded.type() == LogicalTypeId::BOOLEAN &&
-            !folded.IsNull() && folded.GetValue<bool>()) {
+            folded.type() == LogicalTypeId::BOOLEAN && !folded.IsNull() &&
+            folded.GetValue<bool>()) {
           continue;
         }
       }
