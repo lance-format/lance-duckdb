@@ -18,6 +18,10 @@ const TAG_IS_NULL: u8 = 7;
 const TAG_IS_NOT_NULL: u8 = 8;
 const TAG_IN_LIST: u8 = 9;
 const TAG_LIKE: u8 = 10;
+const TAG_REGEXP: u8 = 11;
+
+const REGEXP_MODE_PARTIAL_MATCH: u8 = 0;
+const REGEXP_MODE_FULL_MATCH: u8 = 1;
 
 const LIT_NULL: u8 = 0;
 const LIT_BOOL: u8 = 1;
@@ -43,10 +47,17 @@ const OP_GT: u8 = 4;
 const OP_GT_EQ: u8 = 5;
 
 static GETFIELD_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static REGEXP_LIKE_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
 
 fn getfield_udf() -> Arc<ScalarUDF> {
     GETFIELD_UDF
         .get_or_init(|| Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())))
+        .clone()
+}
+
+fn regexp_like_udf() -> Arc<ScalarUDF> {
+    REGEXP_LIKE_UDF
+        .get_or_init(datafusion_functions::regex::regexp_like)
         .clone()
 }
 
@@ -177,6 +188,7 @@ fn parse_node(cursor: &mut Cursor<'_>) -> Result<Expr> {
         }
         TAG_IN_LIST => parse_in_list(cursor),
         TAG_LIKE => parse_like(cursor),
+        TAG_REGEXP => parse_regexp(cursor),
         other => Err(anyhow!("unknown node tag: {other}")),
     }
 }
@@ -313,4 +325,76 @@ fn parse_like(cursor: &mut Cursor<'_>) -> Result<Expr> {
         escape_char,
         case_insensitive,
     )))
+}
+
+fn parse_regexp(cursor: &mut Cursor<'_>) -> Result<Expr> {
+    let mode = cursor.read_u8()?;
+    let has_flags = cursor.read_u8()? != 0;
+
+    let value = parse_len_prefixed_node(cursor)?;
+    let mut pattern = parse_len_prefixed_node(cursor)?;
+    let normalized_flags = if has_flags {
+        let flags_expr = parse_len_prefixed_node(cursor)?;
+        let flags_str = match flags_expr {
+            Expr::Literal(ScalarValue::Utf8(Some(v)), _) => v,
+            other => {
+                return Err(anyhow!(
+                    "regexp_matches expects a non-null string literal options, got: {other:?}"
+                ))
+            }
+        };
+
+        let mut has_i = false;
+        let mut has_s = false;
+        for c in flags_str.chars() {
+            match c {
+                'i' => has_i = true,
+                's' => has_s = true,
+                ' ' | '\t' | '\n' => {}
+                other => bail!("unsupported regexp option: {other}"),
+            }
+        }
+
+        let mut normalized = String::new();
+        if has_i {
+            normalized.push('i');
+        }
+        if has_s {
+            normalized.push('s');
+        }
+        if normalized.is_empty() { None } else { Some(normalized) }
+    } else {
+        None
+    };
+
+    if mode == REGEXP_MODE_FULL_MATCH {
+        let pattern_str = match &pattern {
+            Expr::Literal(ScalarValue::Utf8(Some(v)), _) => v,
+            other => {
+                return Err(anyhow!(
+                    "regexp_full_match expects a non-null string literal pattern, got: {other:?}"
+                ))
+            }
+        };
+        pattern = Expr::Literal(ScalarValue::Utf8(Some(format!("^(?:{pattern_str})$"))), None);
+    } else if mode != REGEXP_MODE_PARTIAL_MATCH {
+        bail!("unknown regexp mode: {mode}");
+    }
+
+    let pattern_str = match &pattern {
+        Expr::Literal(ScalarValue::Utf8(Some(v)), _) => v,
+        other => {
+            return Err(anyhow!(
+                "regexp_matches expects a non-null string literal pattern, got: {other:?}"
+            ))
+        }
+    };
+    datafusion_functions::regex::compile_regex(pattern_str, normalized_flags.as_deref())
+        .map_err(|e| anyhow!("regexp compile failed: {e}"))?;
+
+    let mut args = vec![value, pattern];
+    if let Some(flags) = normalized_flags {
+        args.push(Expr::Literal(ScalarValue::Utf8(Some(flags)), None));
+    }
+    Ok(regexp_like_udf().call(args))
 }

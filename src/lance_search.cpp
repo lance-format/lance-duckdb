@@ -213,8 +213,7 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
   auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
 
   for (auto &expr : filters) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile() ||
-        expr->CanThrow()) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile()) {
       continue;
     }
     string filter_ir;

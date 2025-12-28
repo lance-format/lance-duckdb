@@ -71,6 +71,7 @@ enum class LanceFilterIRTag : uint8_t {
   IS_NOT_NULL = 8,
   IN_LIST = 9,
   LIKE = 10,
+  REGEXP = 11,
 };
 
 enum class LanceFilterIRLiteralTag : uint8_t {
@@ -104,6 +105,9 @@ enum class LanceFilterIRComparisonOp : uint8_t {
 
 static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE = 1;
 static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_HAS_ESCAPE = 2;
+
+static constexpr uint8_t LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH = 0;
+static constexpr uint8_t LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH = 1;
 
 static void LanceFilterIRAppendU8(string &out, uint8_t v) {
   out.push_back(static_cast<char>(v));
@@ -492,6 +496,29 @@ static bool TryEncodeLanceFilterIRLike(bool case_insensitive, bool has_escape,
   }
   if (has_escape) {
     LanceFilterIRAppendU8(out_ir, escape_char);
+  }
+  return true;
+}
+
+static bool TryEncodeLanceFilterIRRegexp(uint8_t mode, bool has_flags,
+                                         const string &expr,
+                                         const string &pattern,
+                                         const string &flags, string &out_ir) {
+  if (mode != LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH &&
+      mode != LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH) {
+    return false;
+  }
+
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRTag::REGEXP));
+  LanceFilterIRAppendU8(out_ir, mode);
+  LanceFilterIRAppendU8(out_ir, has_flags ? 1 : 0);
+  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr) ||
+      !LanceFilterIRAppendLenPrefixed(out_ir, pattern)) {
+    return false;
+  }
+  if (has_flags) {
+    return LanceFilterIRAppendLenPrefixed(out_ir, flags);
   }
   return true;
 }
@@ -910,6 +937,52 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         func.function.name == "struct_extract_at") {
       return TryBuildLanceExprColumnRefIR(
           get, names, types, exclude_computed_columns, expr, out_ir);
+    }
+
+    if (func.function.name == "regexp_matches" ||
+        func.function.name == "regexp_full_match") {
+      if (func.children.size() != 2 && func.children.size() != 3) {
+        return false;
+      }
+      for (auto &child : func.children) {
+        if (!child) {
+          return false;
+        }
+      }
+
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.children[0], input_ir)) {
+        return false;
+      }
+
+      string pattern_value;
+      if (!TryGetNonNullVarcharConstant(*func.children[1], pattern_value)) {
+        return false;
+      }
+      string pattern_ir;
+      if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
+        return false;
+      }
+
+      bool has_flags = func.children.size() == 3;
+      string flags_ir;
+      if (has_flags) {
+        string flags_value;
+        if (!TryGetNonNullVarcharConstant(*func.children[2], flags_value)) {
+          return false;
+        }
+        if (!TryEncodeLanceFilterIRLiteral(Value(flags_value), flags_ir)) {
+          return false;
+        }
+      }
+
+      uint8_t mode = func.function.name == "regexp_full_match"
+                         ? LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH
+                         : LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH;
+      return TryEncodeLanceFilterIRRegexp(mode, has_flags, input_ir, pattern_ir,
+                                          flags_ir, out_ir);
     }
 
     bool case_insensitive = false;
