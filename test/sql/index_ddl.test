@@ -8,21 +8,18 @@ statement ok
 COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
 TO 'test/.tmp/index_ddl_base.lance' (FORMAT lance, mode 'overwrite');
 
-query I
-SELECT count(*) FROM lance_indexes('test/.tmp/index_ddl_base.lance');
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
 ----
-0
 
 statement ok
 CREATE INDEX vec_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
 
-query TT
-SELECT index_name, index_type
-FROM lance_indexes('test/.tmp/index_ddl_base.lance')
-ORDER BY index_name;
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
 ----
-vec_idx	<REGEX>:.*
+vec_idx	<REGEX>:.*	vec	2048	<REGEX>:.*
 
 query II
 EXPLAIN (FORMAT JSON)
@@ -179,35 +176,32 @@ SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label % 2 = 1;
 physical_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "0"[\s\S]*
 
 statement ok
-CREATE INDEX label_idx_untrained ON 'test/.tmp/index_ddl_base.lance' (label)
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO 'test/.tmp/index_ddl_untrained.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance' (label)
 USING BTREE WITH (train=false);
 
-query I
-SELECT CASE WHEN rows_indexed = 0 THEN 1 ELSE 0 END
-FROM lance_indexes('test/.tmp/index_ddl_base.lance')
-WHERE index_name = 'label_idx_untrained';
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
 ----
-1
+label_idx_untrained	<REGEX>:.*	label	0	<REGEX>:.*
 
 statement ok
-REINDEX label_idx_untrained ON 'test/.tmp/index_ddl_base.lance' RETRAIN;
+REINDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance' RETRAIN;
 
-query I
-SELECT CASE WHEN rows_indexed = 2048 THEN 1 ELSE 0 END
-FROM lance_indexes('test/.tmp/index_ddl_base.lance')
-WHERE index_name = 'label_idx_untrained';
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
 ----
-1
+label_idx_untrained	<REGEX>:.*	label	2048	<REGEX>:.*
 
 statement ok
-DROP INDEX label_idx_untrained ON 'test/.tmp/index_ddl_base.lance';
+DROP INDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance';
 
-query I
-SELECT count(*)
-FROM lance_indexes('test/.tmp/index_ddl_base.lance')
-WHERE index_name = 'label_idx_untrained';
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
 ----
-0
 
 statement ok
 COPY (
@@ -236,12 +230,9 @@ text_idx	<REGEX>:.*	text	3	<REGEX>:.*
 statement ok
 DROP INDEX text_idx ON 'test/.tmp/index_ddl_text.lance';
 
-query I
-SELECT count(*)
-FROM lance_indexes('test/.tmp/index_ddl_text.lance')
-WHERE index_name = 'text_idx';
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_text.lance';
 ----
-0
 
 query I
 SELECT count(*)
