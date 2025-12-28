@@ -217,6 +217,40 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
         expr->CanThrow()) {
       continue;
     }
+    if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
+      auto &cmp = expr->Cast<BoundComparisonExpression>();
+      if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
+          cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        auto is_constant = [](const unique_ptr<Expression> &node) -> bool {
+          if (!node) {
+            return false;
+          }
+          if (node->expression_class == ExpressionClass::BOUND_CONSTANT) {
+            return true;
+          }
+          if (node->expression_class == ExpressionClass::BOUND_CAST) {
+            auto &cast = node->Cast<BoundCastExpression>();
+            return !cast.try_cast && cast.child &&
+                   cast.child->expression_class ==
+                       ExpressionClass::BOUND_CONSTANT;
+          }
+          return false;
+        };
+
+        auto is_column = [](const unique_ptr<Expression> &node) -> bool {
+          if (!node) {
+            return false;
+          }
+          return node->expression_class == ExpressionClass::BOUND_COLUMN_REF ||
+                 node->expression_class == ExpressionClass::BOUND_REF;
+        };
+
+        if ((is_column(cmp.left) && is_constant(cmp.right)) ||
+            (is_column(cmp.right) && is_constant(cmp.left))) {
+          continue;
+        }
+      }
+    }
     string filter_ir;
     if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
                                    *expr, filter_ir)) {
@@ -224,6 +258,16 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     }
     scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
   }
+}
+
+static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
+                                    Expression &expr) {
+  if (expr.expression_class != ExpressionClass::BOUND_COMPARISON) {
+    return false;
+  }
+  auto &cmp = expr.Cast<BoundComparisonExpression>();
+  return cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
+         cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
 static unique_ptr<FunctionData>
@@ -625,6 +669,7 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
     fun.projection_pushdown = true;
     fun.filter_pushdown = true;
     fun.filter_prune = true;
+    fun.pushdown_expression = LancePushdownExpression;
     fun.pushdown_complex_filter = LancePushdownComplexFilter;
     fun.to_string = LanceKnnToString;
     fun.dynamic_to_string = LanceKnnDynamicToString;
@@ -1109,6 +1154,7 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.projection_pushdown = true;
   fts.filter_pushdown = true;
   fts.filter_prune = true;
+  fts.pushdown_expression = LancePushdownExpression;
   loader.RegisterFunction(fts);
 }
 
@@ -1121,6 +1167,7 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.projection_pushdown = true;
     fun.filter_pushdown = true;
     fun.filter_prune = true;
+    fun.pushdown_expression = LancePushdownExpression;
   };
 
   TableFunction hybrid_f32("lance_hybrid_search",

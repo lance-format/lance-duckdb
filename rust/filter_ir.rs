@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion_common::{Column, ScalarValue};
-use datafusion_expr::expr::{InList, Like, ScalarFunction};
-use datafusion_expr::{Expr, ScalarUDF};
+use datafusion_expr::expr::{BinaryExpr, InList, Like, ScalarFunction};
+use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_functions::core::getfield::GetFieldFunc;
 
 const MAGIC: &[u8; 4] = b"LFT1";
@@ -41,6 +41,8 @@ const OP_LT: u8 = 2;
 const OP_LT_EQ: u8 = 3;
 const OP_GT: u8 = 4;
 const OP_GT_EQ: u8 = 5;
+const OP_DISTINCT_FROM: u8 = 6;
+const OP_NOT_DISTINCT_FROM: u8 = 7;
 
 static GETFIELD_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
 
@@ -271,6 +273,16 @@ fn parse_comparison(cursor: &mut Cursor<'_>) -> Result<Expr> {
     Ok(match op {
         OP_EQ => left.eq(right),
         OP_NOT_EQ => left.not_eq(right),
+        OP_DISTINCT_FROM => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::IsDistinctFrom,
+            right: Box::new(right),
+        }),
+        OP_NOT_DISTINCT_FROM => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::IsNotDistinctFrom,
+            right: Box::new(right),
+        }),
         OP_LT => left.lt(right),
         OP_LT_EQ => left.lt_eq(right),
         OP_GT => left.gt(right),

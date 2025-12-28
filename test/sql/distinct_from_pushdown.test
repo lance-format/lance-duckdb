@@ -1,0 +1,152 @@
+# name: test/sql/distinct_from_pushdown.test
+# description: Filter IR supports IS DISTINCT FROM / IS NOT DISTINCT FROM
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT
+    1::BIGINT AS id,
+    NULL::INTEGER AS a,
+    NULL::INTEGER AS b,
+    'nan'::DOUBLE AS f1,
+    'nan'::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    2::BIGINT AS id,
+    NULL::INTEGER AS a,
+    1::INTEGER AS b,
+    'nan'::DOUBLE AS f1,
+    1.0::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    3::BIGINT AS id,
+    1::INTEGER AS a,
+    NULL::INTEGER AS b,
+    NULL::DOUBLE AS f1,
+    NULL::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    4::BIGINT AS id,
+    1::INTEGER AS a,
+    1::INTEGER AS b,
+    1.0::DOUBLE AS f1,
+    1.0::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    5::BIGINT AS id,
+    1::INTEGER AS a,
+    2::INTEGER AS b,
+    2.0::DOUBLE AS f1,
+    3.0::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    6::BIGINT AS id,
+    1::INTEGER AS a,
+    1::INTEGER AS b,
+    'inf'::DOUBLE AS f1,
+    'inf'::DOUBLE AS f2
+  UNION ALL
+  SELECT
+    7::BIGINT AS id,
+    1::INTEGER AS a,
+    1::INTEGER AS b,
+    '-inf'::DOUBLE AS f1,
+    'inf'::DOUBLE AS f2
+) TO 'test/.tmp/distinct_from_pushdown.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b;
+----
+4
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b;
+----
+3
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
+WHERE f1 IS NOT DISTINCT FROM f2;
+----
+4
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
+WHERE f1 IS DISTINCT FROM f2;
+----
+3
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM NULL;
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM NULL;
+----
+6
+
+# Verify we emit a non-empty Filter IR for these operators.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
+WHERE f1 IS NOT DISTINCT FROM f2;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# Non-finite float literals are encoded and pushed down (no DuckDB-side re-filtering).
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM 'nan'::DOUBLE;
+----
+5
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'nan'::DOUBLE;
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 <> 'nan'::DOUBLE;
+----
+4
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = '-inf'::DOUBLE;
+----
+1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "0"[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*

@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -100,6 +101,8 @@ enum class LanceFilterIRComparisonOp : uint8_t {
   LT_EQ = 3,
   GT = 4,
   GT_EQ = 5,
+  DISTINCT_FROM = 6,
+  NOT_DISTINCT_FROM = 7,
 };
 
 static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE = 1;
@@ -262,9 +265,6 @@ static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
     return true;
   case LogicalTypeId::FLOAT: {
     auto v = value.GetValue<float>();
-    if (!std::isfinite(v)) {
-      return false;
-    }
     LanceFilterIRAppendU8(out_ir,
                           static_cast<uint8_t>(LanceFilterIRLiteralTag::F32));
     LanceFilterIRAppendF32(out_ir, v);
@@ -272,9 +272,6 @@ static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
   }
   case LogicalTypeId::DOUBLE: {
     auto v = value.GetValue<double>();
-    if (!std::isfinite(v)) {
-      return false;
-    }
     LanceFilterIRAppendU8(out_ir,
                           static_cast<uint8_t>(LanceFilterIRLiteralTag::F64));
     LanceFilterIRAppendF64(out_ir, v);
@@ -395,6 +392,12 @@ static bool TryEncodeLanceFilterIRComparisonOp(ExpressionType type,
     return true;
   case ExpressionType::COMPARE_NOTEQUAL:
     out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::NOT_EQ);
+    return true;
+  case ExpressionType::COMPARE_DISTINCT_FROM:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::DISTINCT_FROM);
+    return true;
+  case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::NOT_DISTINCT_FROM);
     return true;
   case ExpressionType::COMPARE_LESSTHAN:
     out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::LT);
@@ -538,6 +541,137 @@ static bool TryGetNonNullVarcharConstant(const Expression &expr,
 static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
                                            const TableFilter &filter,
                                            string &out_ir) {
+  std::function<bool(const Expression &, string &)> build_from_expr;
+
+  build_from_expr = [&](const Expression &expr, string &out_expr_ir) -> bool {
+    switch (expr.expression_class) {
+    case ExpressionClass::BOUND_REF: {
+      out_expr_ir = col_ref_ir;
+      return true;
+    }
+    case ExpressionClass::BOUND_CONSTANT: {
+      auto &c = expr.Cast<BoundConstantExpression>();
+      return TryEncodeLanceFilterIRLiteral(c.value, out_expr_ir);
+    }
+    case ExpressionClass::BOUND_CAST: {
+      auto &cast = expr.Cast<BoundCastExpression>();
+      if (cast.try_cast) {
+        return false;
+      }
+      if (!cast.child ||
+          cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
+        return false;
+      }
+      auto &c = cast.child->Cast<BoundConstantExpression>();
+      try {
+        auto casted = c.value.DefaultCastAs(cast.return_type);
+        return TryEncodeLanceFilterIRLiteral(casted, out_expr_ir);
+      } catch (...) {
+        return false;
+      }
+    }
+    case ExpressionClass::BOUND_COMPARISON: {
+      auto &cmp = expr.Cast<BoundComparisonExpression>();
+      uint8_t op = 0;
+      if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
+        return false;
+      }
+      string lhs_ir, rhs_ir;
+      if (!cmp.left || !cmp.right) {
+        return false;
+      }
+      if (!build_from_expr(*cmp.left, lhs_ir) ||
+          !build_from_expr(*cmp.right, rhs_ir)) {
+        return false;
+      }
+      return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_expr_ir);
+    }
+    case ExpressionClass::BOUND_CONJUNCTION: {
+      auto &conj = expr.Cast<BoundConjunctionExpression>();
+      LanceFilterIRTag tag;
+      if (conj.type == ExpressionType::CONJUNCTION_AND) {
+        tag = LanceFilterIRTag::AND;
+      } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
+        tag = LanceFilterIRTag::OR;
+      } else {
+        return false;
+      }
+      vector<string> children;
+      children.reserve(conj.children.size());
+      for (auto &child : conj.children) {
+        if (!child) {
+          return false;
+        }
+        string child_ir;
+        if (!build_from_expr(*child, child_ir)) {
+          return false;
+        }
+        children.push_back(std::move(child_ir));
+      }
+      return TryEncodeLanceFilterIRConjunction(tag, children, out_expr_ir);
+    }
+    case ExpressionClass::BOUND_OPERATOR: {
+      auto &op = expr.Cast<BoundOperatorExpression>();
+      if (op.type == ExpressionType::OPERATOR_NOT) {
+        if (op.children.size() != 1 || !op.children[0]) {
+          return false;
+        }
+        string child_ir;
+        if (!build_from_expr(*op.children[0], child_ir)) {
+          return false;
+        }
+        return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir,
+                                           out_expr_ir);
+      }
+      if (op.type == ExpressionType::OPERATOR_IS_NULL ||
+          op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+        if (op.children.size() != 1 || !op.children[0]) {
+          return false;
+        }
+        string child_ir;
+        if (!build_from_expr(*op.children[0], child_ir)) {
+          return false;
+        }
+        return TryEncodeLanceFilterIRUnary(
+            op.type == ExpressionType::OPERATOR_IS_NULL
+                ? LanceFilterIRTag::IS_NULL
+                : LanceFilterIRTag::IS_NOT_NULL,
+            child_ir, out_expr_ir);
+      }
+      if (op.type == ExpressionType::COMPARE_IN ||
+          op.type == ExpressionType::COMPARE_NOT_IN) {
+        if (op.children.size() < 2 || !op.children[0]) {
+          return false;
+        }
+        string lhs_ir;
+        if (!build_from_expr(*op.children[0], lhs_ir)) {
+          return false;
+        }
+        vector<string> values;
+        values.reserve(op.children.size() - 1);
+        for (idx_t i = 1; i < op.children.size(); i++) {
+          if (!op.children[i] || op.children[i]->expression_class !=
+                                     ExpressionClass::BOUND_CONSTANT) {
+            return false;
+          }
+          auto &c = op.children[i]->Cast<BoundConstantExpression>();
+          string lit_ir;
+          if (!TryEncodeLanceFilterIRLiteral(c.value, lit_ir)) {
+            return false;
+          }
+          values.push_back(std::move(lit_ir));
+        }
+        return TryEncodeLanceFilterIRInList(op.type ==
+                                                ExpressionType::COMPARE_NOT_IN,
+                                            lhs_ir, values, out_expr_ir);
+      }
+      return false;
+    }
+    default:
+      return false;
+    }
+  };
+
   switch (filter.filter_type) {
   case TableFilterType::CONSTANT_COMPARISON: {
     auto &f = filter.Cast<ConstantFilter>();
@@ -597,6 +731,13 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
     }
     return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::OR, children,
                                              out_ir);
+  }
+  case TableFilterType::EXPRESSION_FILTER: {
+    auto &f = filter.Cast<ExpressionFilter>();
+    if (!f.expr) {
+      return false;
+    }
+    return build_from_expr(*f.expr, out_ir);
   }
   default:
     return false;
@@ -995,10 +1136,6 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   }
   case ExpressionClass::BOUND_COMPARISON: {
     auto &cmp = expr.Cast<BoundComparisonExpression>();
-    if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
-        cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      return false;
-    }
     uint8_t op = 0;
     if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
       return false;

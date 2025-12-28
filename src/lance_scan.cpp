@@ -21,6 +21,8 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 
 #include "lance_common.hpp"
@@ -275,6 +277,43 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         expr->CanThrow()) {
       continue;
     }
+    if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
+      auto &cmp = expr->Cast<BoundComparisonExpression>();
+      if (cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
+          cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        auto is_constant = [](const unique_ptr<Expression> &node) -> bool {
+          if (!node) {
+            return false;
+          }
+          if (node->expression_class == ExpressionClass::BOUND_CONSTANT) {
+            return true;
+          }
+          if (node->expression_class == ExpressionClass::BOUND_CAST) {
+            auto &cast = node->Cast<BoundCastExpression>();
+            return !cast.try_cast && cast.child &&
+                   cast.child->expression_class ==
+                       ExpressionClass::BOUND_CONSTANT;
+          }
+          return false;
+        };
+
+        auto is_column = [](const unique_ptr<Expression> &node) -> bool {
+          if (!node) {
+            return false;
+          }
+          return node->expression_class == ExpressionClass::BOUND_COLUMN_REF ||
+                 node->expression_class == ExpressionClass::BOUND_REF;
+        };
+
+        // Prefer TableFilterSet + ExpressionFilter for the 1-column + constant
+        // form (keeps DuckDB fallback available without duplicating the
+        // predicate in LancePushedFilterParts).
+        if ((is_column(cmp.left) && is_constant(cmp.right)) ||
+            (is_column(cmp.right) && is_constant(cmp.left))) {
+          continue;
+        }
+      }
+    }
     string filter_ir;
     if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, false,
                                    *expr, filter_ir)) {
@@ -303,6 +342,16 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
     auto sql_part = expr_copy->ToString();
     scan_bind.duckdb_pushed_filter_sql_parts.push_back(sql_part);
   }
+}
+
+static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
+                                    Expression &expr) {
+  if (expr.expression_class != ExpressionClass::BOUND_COMPARISON) {
+    return false;
+  }
+  auto &cmp = expr.Cast<BoundComparisonExpression>();
+  return cmp.type == ExpressionType::COMPARE_DISTINCT_FROM ||
+         cmp.type == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
 static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
@@ -971,6 +1020,7 @@ static TableFunction LanceTableScanFunction() {
   function.cardinality = LanceScanCardinality;
   function.get_partition_stats = LanceScanGetPartitionStats;
   function.supports_pushdown_type = LanceSupportsPushdownType;
+  function.pushdown_expression = LancePushdownExpression;
   function.pushdown_complex_filter = LancePushdownComplexFilter;
   function.to_string = LanceScanToString;
   function.dynamic_to_string = LanceScanDynamicToString;
@@ -1408,6 +1458,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.cardinality = LanceScanCardinality;
   lance_scan.get_partition_stats = LanceScanGetPartitionStats;
   lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
+  lance_scan.pushdown_expression = LancePushdownExpression;
   lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   lance_scan.to_string = LanceScanToString;
   lance_scan.dynamic_to_string = LanceScanDynamicToString;
@@ -1431,6 +1482,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.cardinality = LanceScanCardinality;
   internal_namespace_scan.get_partition_stats = LanceScanGetPartitionStats;
   internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
+  internal_namespace_scan.pushdown_expression = LancePushdownExpression;
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.dynamic_to_string = LanceScanDynamicToString;
