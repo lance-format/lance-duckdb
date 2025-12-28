@@ -1654,7 +1654,8 @@ LanceLikePushdown(unique_ptr<LogicalOperator> op) {
   auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
 
   for (auto &expr : filter_op.expressions) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile() || expr->CanThrow()) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile() ||
+        expr->CanThrow()) {
       continue;
     }
     if (expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
