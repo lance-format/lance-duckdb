@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion_common::{Column, ScalarValue};
-use datafusion_expr::expr::{InList, ScalarFunction};
+use datafusion_expr::expr::{InList, Like, ScalarFunction};
 use datafusion_expr::{Expr, ScalarUDF};
 use datafusion_functions::core::getfield::GetFieldFunc;
 
@@ -17,6 +17,7 @@ const TAG_COMPARISON: u8 = 6;
 const TAG_IS_NULL: u8 = 7;
 const TAG_IS_NOT_NULL: u8 = 8;
 const TAG_IN_LIST: u8 = 9;
+const TAG_LIKE: u8 = 10;
 
 const LIT_NULL: u8 = 0;
 const LIT_BOOL: u8 = 1;
@@ -175,6 +176,7 @@ fn parse_node(cursor: &mut Cursor<'_>) -> Result<Expr> {
             Ok(Expr::IsNotNull(Box::new(child)))
         }
         TAG_IN_LIST => parse_in_list(cursor),
+        TAG_LIKE => parse_like(cursor),
         other => Err(anyhow!("unknown node tag: {other}")),
     }
 }
@@ -286,4 +288,29 @@ fn parse_in_list(cursor: &mut Cursor<'_>) -> Result<Expr> {
         list.push(parse_len_prefixed_node(cursor)?);
     }
     Ok(Expr::InList(InList::new(Box::new(expr), list, negated)))
+}
+
+fn parse_like(cursor: &mut Cursor<'_>) -> Result<Expr> {
+    let flags = cursor.read_u8()?;
+    if (flags & !0x03) != 0 {
+        bail!("unknown like flags: {flags}");
+    }
+    let case_insensitive = (flags & 0x01) != 0;
+    let has_escape = (flags & 0x02) != 0;
+
+    let expr = parse_len_prefixed_node(cursor)?;
+    let pattern = parse_len_prefixed_node(cursor)?;
+    let escape_char = if has_escape {
+        Some(char::from(cursor.read_u8()?))
+    } else {
+        None
+    };
+
+    Ok(Expr::Like(Like::new(
+        false,
+        Box::new(expr),
+        Box::new(pattern),
+        escape_char,
+        case_insensitive,
+    )))
 }
