@@ -343,7 +343,7 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
   return true;
 }
 
-// --- Index table function: lance_indexes(path) ---
+// --- Lance index metadata listing (SHOW INDEXES / PRAGMA / system table) ---
 
 struct LanceIndexListBindData final : public TableFunctionData {
   string file_path;
@@ -388,16 +388,16 @@ static unique_ptr<FunctionData>
 LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
                    vector<LogicalType> &return_types, vector<string> &names) {
   if (input.inputs.size() != 1) {
-    throw BinderException("lance_indexes requires exactly one input");
+    throw BinderException("__lance_indexes requires exactly one input");
   }
   if (input.inputs[0].IsNull()) {
-    throw BinderException("lance_indexes dataset uri cannot be NULL");
+    throw BinderException("__lance_indexes dataset uri cannot be NULL");
   }
 
   auto result = make_uniq<LanceIndexListBindData>();
   result->file_path = input.inputs[0].GetValue<string>();
   if (result->file_path.empty()) {
-    throw BinderException("lance_indexes dataset uri cannot be empty");
+    throw BinderException("__lance_indexes dataset uri cannot be empty");
   }
 
   result->dataset = LanceOpenDataset(context, result->file_path);
@@ -544,12 +544,12 @@ static void LanceIndexListFunc(ClientContext &context, TableFunctionInput &data,
   }
 }
 
-static void RegisterLanceIndexList(ExtensionLoader &loader) {
-  TableFunction f("lance_indexes", {LogicalType::VARCHAR}, LanceIndexListFunc,
+static TableFunction LanceInternalIndexesTableFunction() {
+  TableFunction f("__lance_indexes", {LogicalType::VARCHAR}, LanceIndexListFunc,
                   LanceIndexListBind, LanceIndexListInitGlobal,
                   LanceIndexListInitLocal);
   f.projection_pushdown = true;
-  loader.RegisterFunction(f);
+  return f;
 }
 
 // --- Internal DDL table functions ---
@@ -1229,10 +1229,7 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
     break;
   }
   case LanceIndexStmtKind::Show: {
-    TableFunction show_fun("lance_indexes", {LogicalType::VARCHAR},
-                           LanceIndexListFunc, LanceIndexListBind,
-                           LanceIndexListInitGlobal, LanceIndexListInitLocal);
-    show_fun.projection_pushdown = true;
+    auto show_fun = LanceInternalIndexesTableFunction();
     result.function = show_fun;
     result.parameters = {Value(dataset_uri)};
     result.return_type = StatementReturnType::QUERY_RESULT;
@@ -1253,8 +1250,6 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
 }
 
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader) {
-  RegisterLanceIndexList(loader);
-
   ParserExtension extension;
   extension.parse_function = LanceIndexParse;
   extension.plan_function = LanceIndexPlan;

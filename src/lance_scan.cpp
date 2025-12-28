@@ -1,4 +1,5 @@
 #include "duckdb.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -62,6 +63,78 @@
 // On error, the callee leaves output `ArrowSchema` / `ArrowArray` untouched; do
 // not call `release` unless the caller initialized them to a valid value.
 namespace duckdb {
+
+static unique_ptr<BaseStatistics>
+LanceScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                    column_t column_id) {
+  (void)context;
+  if (!bind_data_p) {
+    return nullptr;
+  }
+  auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
+  if (column_id >= bind_data.types.size()) {
+    return nullptr;
+  }
+  return BaseStatistics::CreateUnknown(bind_data.types[column_id]).ToUnique();
+}
+
+static unique_ptr<NodeStatistics>
+LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+  (void)context;
+  if (!bind_data_p) {
+    return nullptr;
+  }
+  auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
+  if (!bind_data.dataset) {
+    return nullptr;
+  }
+  auto rows = lance_dataset_count_rows(bind_data.dataset);
+  if (rows < 0) {
+    return nullptr;
+  }
+  auto count = NumericCast<idx_t>(rows);
+  return make_uniq<NodeStatistics>(count, count);
+}
+
+static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
+                                    Expression &expr) {
+  if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+    return true;
+  }
+  auto &func = expr.Cast<BoundFunctionExpression>();
+  auto &name = func.function.name;
+  // Keep LIKE/ILIKE as expressions so we can build and surface Lance Filter IR
+  // (instead of letting DuckDB rewrite them into TableFilters).
+  if (name == "~~" || name == "~~*" || name == "like_escape" ||
+      name == "ilike_escape") {
+    return false;
+  }
+  return true;
+}
+
+static vector<PartitionStatistics>
+LanceScanGetPartitionStats(ClientContext &context,
+                           GetPartitionStatsInput &input) {
+  (void)context;
+  if (!input.bind_data) {
+    return {};
+  }
+  auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
+  if (!bind_data.dataset) {
+    return {};
+  }
+  auto rows = lance_dataset_count_rows(bind_data.dataset);
+  if (rows < 0) {
+    return {};
+  }
+  PartitionStatistics stats;
+  stats.row_start = 0;
+  stats.count = NumericCast<idx_t>(rows);
+  stats.count_type = CountType::COUNT_EXACT;
+  vector<PartitionStatistics> out;
+  out.push_back(stats);
+  return out;
+}
 
 LanceScanBindData::~LanceScanBindData() {
   if (dataset) {
@@ -1551,14 +1624,136 @@ static void LanceRowIdInRewriteOptimizer(OptimizerExtensionInput &,
   plan = LanceRowIdInRewrite(std::move(plan));
 }
 
+static unique_ptr<LogicalOperator>
+LanceLikePushdown(unique_ptr<LogicalOperator> op) {
+  for (auto &child : op->children) {
+    child = LanceLikePushdown(std::move(child));
+  }
+
+  if (op->type != LogicalOperatorType::LOGICAL_FILTER ||
+      op->children.size() != 1 || !op->children[0]) {
+    return op;
+  }
+
+  auto &filter_op = op->Cast<LogicalFilter>();
+  auto *node = op->children[0].get();
+  while (node && node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+    if (node->children.empty() || !node->children[0]) {
+      return op;
+    }
+    node = node->children[0].get();
+  }
+  if (!node || node->type != LogicalOperatorType::LOGICAL_GET) {
+    return op;
+  }
+
+  auto &get = node->Cast<LogicalGet>();
+  if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
+    return op;
+  }
+  auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+
+  for (auto &expr : filter_op.expressions) {
+    if (!expr || expr->HasParameter() || expr->IsVolatile() || expr->CanThrow()) {
+      continue;
+    }
+    if (expr->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+      continue;
+    }
+    auto &func = expr->Cast<BoundFunctionExpression>();
+    auto &name = func.function.name;
+    if (name != "~~" && name != "~~*" && name != "like_escape" &&
+        name != "ilike_escape") {
+      continue;
+    }
+
+    string filter_ir;
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, false,
+                                   *expr, filter_ir)) {
+      continue;
+    }
+    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
+  }
+
+  return op;
+}
+
+static void LanceLikePushdownOptimizer(OptimizerExtensionInput &,
+                                       unique_ptr<LogicalOperator> &plan) {
+  plan = LanceLikePushdown(std::move(plan));
+}
+
+static unique_ptr<LogicalOperator>
+LanceCardinalityFixup(ClientContext &context, unique_ptr<LogicalOperator> op) {
+  for (auto &child : op->children) {
+    child = LanceCardinalityFixup(context, std::move(child));
+  }
+
+  if (op->type != LogicalOperatorType::LOGICAL_GET) {
+    return op;
+  }
+
+  auto &get = op->Cast<LogicalGet>();
+  if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
+    if (get.function.name != "lance_scan" || get.parameters.size() != 1 ||
+        get.parameters[0].IsNull() ||
+        get.parameters[0].type() != LogicalType::VARCHAR) {
+      return op;
+    }
+
+    auto path = get.parameters[0].GetValue<string>();
+    auto *dataset = LanceOpenDataset(context, path);
+    if (!dataset) {
+      return op;
+    }
+    auto rows = lance_dataset_count_rows(dataset);
+    lance_close_dataset(dataset);
+    if (rows < 0) {
+      return op;
+    }
+    get.SetEstimatedCardinality(NumericCast<idx_t>(rows));
+    return op;
+  }
+
+  auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+  if (!scan_bind.take_row_ids.empty()) {
+    get.SetEstimatedCardinality(scan_bind.take_row_ids.size());
+    return op;
+  }
+
+  if (!scan_bind.dataset) {
+    return op;
+  }
+
+  auto rows = lance_dataset_count_rows(scan_bind.dataset);
+  if (rows < 0) {
+    return op;
+  }
+  get.SetEstimatedCardinality(NumericCast<idx_t>(rows));
+  return op;
+}
+
+static void LanceCardinalityFixupOptimizer(OptimizerExtensionInput &input,
+                                           unique_ptr<LogicalOperator> &plan) {
+  plan = LanceCardinalityFixup(input.context, std::move(plan));
+}
+
 void RegisterLanceScanOptimizer(DBConfig &config) {
   OptimizerExtension rowid_take_ext;
   rowid_take_ext.optimize_function = LanceRowIdInRewriteOptimizer;
   config.optimizer_extensions.push_back(std::move(rowid_take_ext));
 
+  OptimizerExtension like_ext;
+  like_ext.optimize_function = LanceLikePushdownOptimizer;
+  config.optimizer_extensions.push_back(std::move(like_ext));
+
   OptimizerExtension limit_ext;
   limit_ext.optimize_function = LanceLimitOffsetPushdownOptimizer;
   config.optimizer_extensions.push_back(std::move(limit_ext));
+
+  OptimizerExtension cardinality_ext;
+  cardinality_ext.optimize_function = LanceCardinalityFixupOptimizer;
+  config.optimizer_extensions.push_back(std::move(cardinality_ext));
 }
 
 static TableFunction LanceTableScanFunction() {
@@ -1566,8 +1761,12 @@ static TableFunction LanceTableScanFunction() {
   function.projection_pushdown = true;
   function.filter_pushdown = true;
   function.filter_prune = true;
+  function.statistics = LanceScanStatistics;
+  function.cardinality = LanceScanCardinality;
+  function.get_partition_stats = LanceScanGetPartitionStats;
   function.supports_pushdown_type = LanceSupportsPushdownType;
   function.pushdown_complex_filter = LancePushdownComplexFilter;
+  function.pushdown_expression = LancePushdownExpression;
   function.get_virtual_columns = LanceGetVirtualColumns;
   function.to_string = LanceScanToString;
   function.dynamic_to_string = LanceScanDynamicToString;
@@ -2019,8 +2218,12 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.projection_pushdown = true;
   lance_scan.filter_pushdown = true;
   lance_scan.filter_prune = true;
+  lance_scan.statistics = LanceScanStatistics;
+  lance_scan.cardinality = LanceScanCardinality;
+  lance_scan.get_partition_stats = LanceScanGetPartitionStats;
   lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
   lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
+  lance_scan.pushdown_expression = LancePushdownExpression;
   lance_scan.get_virtual_columns = LanceGetVirtualColumns;
   lance_scan.to_string = LanceScanToString;
   lance_scan.dynamic_to_string = LanceScanDynamicToString;
@@ -2040,8 +2243,12 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.projection_pushdown = true;
   internal_namespace_scan.filter_pushdown = true;
   internal_namespace_scan.filter_prune = true;
+  internal_namespace_scan.statistics = LanceScanStatistics;
+  internal_namespace_scan.cardinality = LanceScanCardinality;
+  internal_namespace_scan.get_partition_stats = LanceScanGetPartitionStats;
   internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
+  internal_namespace_scan.pushdown_expression = LancePushdownExpression;
   internal_namespace_scan.get_virtual_columns = LanceGetVirtualColumns;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.dynamic_to_string = LanceScanDynamicToString;
