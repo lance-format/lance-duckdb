@@ -749,11 +749,7 @@ static TableFunction LanceDropIndexTableFunction() {
 
 // --- Parser extension ---
 
-enum class LanceIndexStmtKind : uint8_t {
-  Create = 0,
-  Drop = 1,
-  Show = 2
-};
+enum class LanceIndexStmtKind : uint8_t { Create = 0, Drop = 1, Show = 2 };
 
 struct LanceIndexParseData final : public ParserExtensionParseData {
   explicit LanceIndexParseData(LanceIndexStmtKind kind_p) : kind(kind_p) {}
