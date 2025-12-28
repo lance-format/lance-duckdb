@@ -15,18 +15,16 @@ void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
-void RegisterLanceMetadata(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
 void RegisterLanceTruncate(DBConfig &config);
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceScanOptimizer(DBConfig &config);
 
 static void LoadInternal(ExtensionLoader &loader) {
-  // Register the lance_scan table function
+  // Register internal scan table functions.
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
   RegisterLanceWrite(loader);
-  RegisterLanceMetadata(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {

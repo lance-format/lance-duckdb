@@ -842,7 +842,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
-  // materializes per-table entries mapping to `lance_scan` / internal namespace
+  // materializes per-table entries mapping to internal scan / namespace scan,
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
   auto catalog =

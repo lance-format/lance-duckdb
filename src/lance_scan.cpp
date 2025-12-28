@@ -668,7 +668,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
                                               vector<LogicalType> &return_types,
                                               vector<string> &names) {
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
-    throw InvalidInputException("lance_scan requires a dataset root path");
+    throw InvalidInputException("Lance scan requires a dataset root path");
   }
 
   auto result = make_uniq<LanceScanBindData>();
@@ -1528,7 +1528,7 @@ static bool TryParseConstantLimitOffset(const LogicalLimit &limit_op,
 }
 
 static bool IsLanceScanTableFunction(const TableFunction &fn) {
-  return fn.name == "lance_scan" || fn.name == "__lance_table_scan" ||
+  return fn.name == "__lance_scan" || fn.name == "__lance_table_scan" ||
          fn.name == "__lance_namespace_scan";
 }
 
@@ -1953,7 +1953,7 @@ LanceCardinalityFixup(ClientContext &context, unique_ptr<LogicalOperator> op) {
 
   auto &get = op->Cast<LogicalGet>();
   if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
-    if (get.function.name != "lance_scan" || get.parameters.size() != 1 ||
+    if (get.function.name != "__lance_scan" || get.parameters.size() != 1 ||
         get.parameters[0].IsNull() ||
         get.parameters[0].type() != LogicalType::VARCHAR) {
       return op;
@@ -2471,25 +2471,28 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
 }
 
 void RegisterLanceScan(ExtensionLoader &loader) {
-  TableFunction lance_scan("lance_scan", {LogicalType::VARCHAR}, LanceScanFunc,
-                           LanceScanBind, LanceScanInitGlobal,
-                           LanceScanLocalInit);
-  lance_scan.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
-  lance_scan.projection_pushdown = true;
-  lance_scan.filter_pushdown = true;
-  lance_scan.filter_prune = true;
-  lance_scan.sampling_pushdown = true;
-  lance_scan.statistics = LanceScanStatistics;
-  lance_scan.cardinality = LanceScanCardinality;
-  lance_scan.get_partition_stats = LanceScanGetPartitionStats;
-  lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
-  lance_scan.pushdown_expression = LancePushdownExpression;
-  lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
-  lance_scan.pushdown_expression = LancePushdownExpression;
-  lance_scan.get_virtual_columns = LanceGetVirtualColumns;
-  lance_scan.to_string = LanceScanToString;
-  lance_scan.dynamic_to_string = LanceScanDynamicToString;
-  loader.RegisterFunction(lance_scan);
+  TableFunction internal_scan("__lance_scan", {LogicalType::VARCHAR},
+                              LanceScanFunc, LanceScanBind, LanceScanInitGlobal,
+                              LanceScanLocalInit);
+  internal_scan.named_parameters["explain_verbose"] = LogicalType::BOOLEAN;
+  internal_scan.projection_pushdown = true;
+  internal_scan.filter_pushdown = true;
+  internal_scan.filter_prune = true;
+  internal_scan.sampling_pushdown = true;
+  internal_scan.statistics = LanceScanStatistics;
+  internal_scan.cardinality = LanceScanCardinality;
+  internal_scan.get_partition_stats = LanceScanGetPartitionStats;
+  internal_scan.supports_pushdown_type = LanceSupportsPushdownType;
+  internal_scan.pushdown_expression = LancePushdownExpression;
+  internal_scan.pushdown_complex_filter = LancePushdownComplexFilter;
+  internal_scan.pushdown_expression = LancePushdownExpression;
+  internal_scan.get_virtual_columns = LanceGetVirtualColumns;
+  internal_scan.to_string = LanceScanToString;
+  internal_scan.dynamic_to_string = LanceScanDynamicToString;
+
+  CreateTableFunctionInfo scan_info(std::move(internal_scan));
+  scan_info.internal = true;
+  loader.RegisterFunction(std::move(scan_info));
 
   TableFunction internal_namespace_scan(
       "__lance_namespace_scan",

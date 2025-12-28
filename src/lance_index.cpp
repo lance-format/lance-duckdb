@@ -558,12 +558,12 @@ struct LanceIndexDdlBindData final : public FunctionData {
   explicit LanceIndexDdlBindData(string dataset_uri_p, string index_name_p,
                                  vector<string> columns_p, string index_type_p,
                                  string params_json_p, bool replace_p,
-                                 bool train_p, bool retrain_p)
+                                 bool train_p)
       : dataset_uri(std::move(dataset_uri_p)),
         index_name(std::move(index_name_p)), columns(std::move(columns_p)),
         index_type(std::move(index_type_p)),
         params_json(std::move(params_json_p)), replace(replace_p),
-        train(train_p), retrain(retrain_p) {}
+        train(train_p) {}
 
   string dataset_uri;
   string index_name;
@@ -572,12 +572,11 @@ struct LanceIndexDdlBindData final : public FunctionData {
   string params_json;
   bool replace = false;
   bool train = true;
-  bool retrain = false;
 
   unique_ptr<FunctionData> Copy() const override {
     return make_uniq<LanceIndexDdlBindData>(dataset_uri, index_name, columns,
                                             index_type, params_json, replace,
-                                            train, retrain);
+                                            train);
   }
 
   bool Equals(const FunctionData &other_p) const override {
@@ -585,7 +584,7 @@ struct LanceIndexDdlBindData final : public FunctionData {
     return dataset_uri == other.dataset_uri && index_name == other.index_name &&
            columns == other.columns && index_type == other.index_type &&
            params_json == other.params_json && replace == other.replace &&
-           train == other.train && retrain == other.retrain;
+           train == other.train;
   }
 };
 
@@ -632,7 +631,7 @@ LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
   return make_uniq<LanceIndexDdlBindData>(
       std::move(dataset_uri), std::move(index_name), std::move(columns),
       NormalizeIndexType(std::move(index_type)), std::move(params_json),
-      replace, train, false);
+      replace, train);
 }
 
 static unique_ptr<FunctionData>
@@ -659,36 +658,7 @@ LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
   names = {"Count"};
   return make_uniq<LanceIndexDdlBindData>(
       std::move(dataset_uri), std::move(index_name), vector<string>{}, "", "{}",
-      false, true, false);
-}
-
-static unique_ptr<FunctionData>
-LanceReindexBind(ClientContext &, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
-  if (input.inputs.size() != 3) {
-    throw BinderException("__lance_reindex requires 3 inputs");
-  }
-  for (idx_t i = 0; i < input.inputs.size(); i++) {
-    if (input.inputs[i].IsNull()) {
-      throw BinderException("__lance_reindex inputs cannot be NULL");
-    }
-  }
-  auto dataset_uri = input.inputs[0].GetValue<string>();
-  auto index_name = input.inputs[1].GetValue<string>();
-  auto retrain =
-      input.inputs[2].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
-  if (dataset_uri.empty()) {
-    throw BinderException("__lance_reindex dataset uri cannot be empty");
-  }
-  if (index_name.empty()) {
-    throw BinderException("__lance_reindex index name cannot be empty");
-  }
-
-  return_types = {LogicalType::BIGINT};
-  names = {"Count"};
-  return make_uniq<LanceIndexDdlBindData>(
-      std::move(dataset_uri), std::move(index_name), vector<string>{}, "", "{}",
-      false, true, retrain);
+      false, true);
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -760,33 +730,6 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   output.SetCardinality(0);
 }
 
-static void LanceReindexFunc(ClientContext &context, TableFunctionInput &data,
-                             DataChunk &output) {
-  auto &gstate = data.global_state->Cast<LanceIndexDdlGlobalState>();
-  if (gstate.finished) {
-    output.SetCardinality(0);
-    return;
-  }
-  gstate.finished = true;
-
-  auto &bind_data = data.bind_data->Cast<LanceIndexDdlBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
-                      LanceFormatErrorSuffix());
-  }
-
-  auto rc = lance_dataset_optimize_index(dataset, bind_data.index_name.c_str(),
-                                         bind_data.retrain ? 1 : 0);
-  lance_close_dataset(dataset);
-  if (rc != 0) {
-    throw IOException("Failed to optimize Lance index" +
-                      LanceFormatErrorSuffix());
-  }
-
-  output.SetCardinality(0);
-}
-
 static TableFunction LanceCreateIndexTableFunction() {
   TableFunction function(
       "__lance_create_index",
@@ -804,22 +747,9 @@ static TableFunction LanceDropIndexTableFunction() {
   return function;
 }
 
-static TableFunction LanceReindexTableFunction() {
-  TableFunction function(
-      "__lance_reindex",
-      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN},
-      LanceReindexFunc, LanceReindexBind, LanceIndexDdlInitGlobal);
-  return function;
-}
-
 // --- Parser extension ---
 
-enum class LanceIndexStmtKind : uint8_t {
-  Create = 0,
-  Drop = 1,
-  Show = 2,
-  Reindex = 3
-};
+enum class LanceIndexStmtKind : uint8_t { Create = 0, Drop = 1, Show = 2 };
 
 struct LanceIndexParseData final : public ParserExtensionParseData {
   explicit LanceIndexParseData(LanceIndexStmtKind kind_p) : kind(kind_p) {}
@@ -836,7 +766,6 @@ struct LanceIndexParseData final : public ParserExtensionParseData {
   string params_json;
   bool replace = false;
   bool train = true;
-  bool retrain = false;
 
   unique_ptr<ParserExtensionParseData> Copy() const override {
     auto out = make_uniq<LanceIndexParseData>(kind);
@@ -849,7 +778,6 @@ struct LanceIndexParseData final : public ParserExtensionParseData {
     out->params_json = params_json;
     out->replace = replace;
     out->train = train;
-    out->retrain = retrain;
     return std::move(out);
   }
 
@@ -862,8 +790,6 @@ struct LanceIndexParseData final : public ParserExtensionParseData {
       return "DROP INDEX " + index_name + " ON " + target_sql;
     case LanceIndexStmtKind::Show:
       return "SHOW INDEXES ON " + target_sql;
-    case LanceIndexStmtKind::Reindex:
-      return "REINDEX " + index_name + " ON " + target_sql;
     default:
       return "LANCE INDEX STMT";
     }
@@ -977,7 +903,7 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       }
       if (retrain) {
         return ParserExtensionParseResult(
-            "CREATE INDEX does not accept retrain; use REINDEX instead");
+            "CREATE INDEX does not accept retrain");
       }
     }
 
@@ -1099,73 +1025,6 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
     return ParserExtensionParseResult(std::move(out));
   }
 
-  // REINDEX <name> ON <dataset> [RETRAIN]
-  if (HasKeywordPrefix(lower, "reindex")) {
-    auto rest = TrimCopy(trimmed.substr(strlen("reindex")));
-    string index_name;
-    idx_t consumed = 0;
-    if (!TryParseIdentifier(rest, index_name, consumed)) {
-      return ParserExtensionParseResult();
-    }
-    rest = TrimCopy(rest.substr(consumed));
-    if (!ConsumeKeyword(rest, "on")) {
-      return ParserExtensionParseResult();
-    }
-
-    bool target_is_path = false;
-    string dataset_uri;
-    string target_sql;
-    if (StartsWithQuotedString(rest)) {
-      string lit;
-      idx_t lit_consumed = 0;
-      if (!TryParseSqlStringLiteral(rest, lit, lit_consumed)) {
-        return ParserExtensionParseResult(
-            "invalid dataset path string literal");
-      }
-      dataset_uri = lit;
-      target_sql = rest.substr(0, lit_consumed);
-      rest = TrimCopy(rest.substr(lit_consumed));
-      target_is_path = true;
-    } else {
-      string ident;
-      if (!TryParseIdentifier(rest, ident, consumed)) {
-        return ParserExtensionParseResult();
-      }
-      target_sql = ident;
-      rest = TrimCopy(rest.substr(consumed));
-    }
-
-    bool replace = false;
-    bool train = true;
-    bool retrain = false;
-    string params_json = "{}";
-    string err;
-    if (!rest.empty()) {
-      auto rest_lower = StringUtil::Lower(rest);
-      if (HasKeywordPrefix(rest_lower, "retrain")) {
-        retrain = true;
-        rest = TrimCopy(rest.substr(strlen("retrain")));
-      } else if (HasKeywordPrefix(rest_lower, "with")) {
-        if (!TryBuildParamsJsonFromWithClause(rest, replace, train, retrain,
-                                              params_json, err)) {
-          return ParserExtensionParseResult(err);
-        }
-        rest.clear();
-      }
-    }
-    if (!rest.empty()) {
-      return ParserExtensionParseResult();
-    }
-
-    auto out = make_uniq<LanceIndexParseData>(LanceIndexStmtKind::Reindex);
-    out->index_name = index_name;
-    out->target_sql = target_sql;
-    out->target_is_path = target_is_path;
-    out->dataset_uri = dataset_uri;
-    out->retrain = retrain;
-    return ParserExtensionParseResult(std::move(out));
-  }
-
   return ParserExtensionParseResult();
 }
 
@@ -1186,7 +1045,7 @@ ResolveDatasetUriFromTarget(ClientContext &context,
   auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
   if (!lance_entry) {
     throw NotImplementedException(
-        "Lance CREATE/DROP/SHOW/REINDEX INDEX only supports dataset paths or "
+        "Lance CREATE/DROP/SHOW INDEX only supports dataset paths or "
         "tables in ATTACH TYPE LANCE directory namespaces");
   }
   return lance_entry->DatasetUri();
@@ -1233,13 +1092,6 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
     result.function = show_fun;
     result.parameters = {Value(dataset_uri)};
     result.return_type = StatementReturnType::QUERY_RESULT;
-    break;
-  }
-  case LanceIndexStmtKind::Reindex: {
-    result.function = LanceReindexTableFunction();
-    result.parameters = {Value(dataset_uri), Value(parse_data->index_name),
-                         Value::BOOLEAN(parse_data->retrain)};
-    result.return_type = StatementReturnType::NOTHING;
     break;
   }
   default:

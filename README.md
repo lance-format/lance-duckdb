@@ -4,8 +4,48 @@ Query [Lance](https://github.com/lance-format/lance/) datasets directly from Duc
 
 Lance is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension brings Lance into a familiar SQL workflow.
 
+## Install
+
+### Install from DuckDB Community Extensions (recommended)
+
+If you just want to use the extension, install it directly from DuckDB's community extensions repository:
+
+```sql
+INSTALL lance FROM community;
+LOAD lance;
+
+SELECT *
+  FROM 'path/to/dataset.lance'
+  LIMIT 1;
+```
+
+See DuckDB's extension page for `lance` for the latest release details: https://duckdb.org/community_extensions/extensions/lance
+
+### Build from source (development)
+
+This repository focuses on source builds for development and CI.
+
+1. Initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+2. Build:
+
+```bash
+GEN=ninja make release
+```
+
+3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
+
+```bash
+duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
+```
 
 ## Usage
+
+Full SQL reference: `docs/sql.md`
 
 ### Query a Lance dataset
 
@@ -158,45 +198,6 @@ ORDER BY _hybrid_score DESC;
   - `oversample_factor` (INTEGER, default `4`): Oversample factor for candidate generation (larger can improve recall at higher cost).
 - Output:
   - Dataset columns plus `_hybrid_score` (larger is better), `_distance`, and `_score`.
-
-## Install
-
-### Install from DuckDB Community Extensions (recommended)
-
-If you just want to use the extension, install it directly from DuckDB's community extensions repository:
-
-```sql
-INSTALL lance FROM community;
-LOAD lance;
-
-SELECT *
-  FROM 'path/to/dataset.lance'
-  LIMIT 1;
-```
-
-See DuckDB's extension page for `lance` for the latest details: https://duckdb.org/community_extensions/extensions/lance
-
-### Build from source (development)
-
-This repository focuses on source builds for development and CI.
-
-1. Initialize submodules:
-
-```bash
-git submodule update --init --recursive
-```
-
-2. Build:
-
-```bash
-GEN=ninja make release
-```
-
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
-
-```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
-```
 
 ## Contributing
 
