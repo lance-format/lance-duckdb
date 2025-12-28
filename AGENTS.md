@@ -18,6 +18,21 @@ This project is delivered as a fully self-contained DuckDB extension artifact (s
 - There are no external downstream users that depend on them.
 - When planning/implementing/refactoring, prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
 
+## SQL Export Policy (Release Requirement)
+
+For releases, keep the exported function surface minimal. Only the search table functions and the `COPY ... (FORMAT lance)` writer should be user-visible:
+
+- Exported (user-facing):
+  - `lance_vector_search`
+  - `lance_fts`
+  - `lance_hybrid_search`
+  - `COPY ... TO ... (FORMAT lance, ...)` (registered as the `lance` copy format)
+- Not exported (must be internal-only), including but not limited to:
+  - `lance_scan` (and any scan/namespace helper table functions)
+  - all metadata/maintenance table functions (e.g. `lance_*metadata`, `lance_*config`, `lance_*indices`, compaction/cleanup)
+
+Prefer exposing capabilities via DuckDB standard SQL mechanisms (replacement scan, `ATTACH ... (TYPE LANCE)`, standard DDL/DML) rather than new user-facing functions.
+
 ## Essential Commands
 
 ### Building

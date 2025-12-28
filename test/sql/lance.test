@@ -10,9 +10,9 @@ SELECT 1
 ----
 1
 
-# Test that lance_scan can read a local dataset root
+# Test that replacement scan can read a local dataset root
 statement ok
-SELECT * FROM lance_scan('test/data/test_data.lance') LIMIT 1
+SELECT * FROM 'test/data/test_data.lance' LIMIT 1
 
 # LIMIT/OFFSET pushdown correctness
 query I

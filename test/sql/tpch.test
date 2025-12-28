@@ -1,5 +1,5 @@
 # name: test/sql/tpch.test
-# description: TPC-H correctness suite for lance_scan
+# description: TPC-H correctness suite for Lance replacement scan
 # group: [sql]
 
 require lance
