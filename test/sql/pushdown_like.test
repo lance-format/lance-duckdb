@@ -1,4 +1,4 @@
-# name: test/sql/like_pushdown.test
+# name: test/sql/pushdown_like.test
 # description: LIKE/ILIKE filter pushdown
 # group: [sql]
 

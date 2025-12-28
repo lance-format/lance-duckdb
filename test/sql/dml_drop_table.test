@@ -1,4 +1,4 @@
-# name: test/sql/drop_table.test
+# name: test/sql/dml_drop_table.test
 # description: DROP TABLE deletes Lance datasets in attached directory namespaces
 # group: [sql]
 

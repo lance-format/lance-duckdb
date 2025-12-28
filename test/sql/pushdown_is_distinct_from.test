@@ -1,4 +1,4 @@
-# name: test/sql/distinct_from_pushdown.test
+# name: test/sql/pushdown_is_distinct_from.test
 # description: Filter IR supports IS DISTINCT FROM / IS NOT DISTINCT FROM
 # group: [sql]
 

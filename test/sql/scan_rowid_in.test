@@ -1,4 +1,4 @@
-# name: test/sql/lance_rowid_in.test
+# name: test/sql/scan_rowid_in.test
 # description: Point lookup via `WHERE _rowid IN (...)` rewrite
 # group: [sql]
 
@@ -26,4 +26,3 @@ SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4)
 ----
 Alice
 Eve
-

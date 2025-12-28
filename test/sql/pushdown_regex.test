@@ -1,4 +1,4 @@
-# name: test/sql/regex_pushdown.test
+# name: test/sql/pushdown_regex.test
 # description: regexp_matches/SIMILAR TO filter pushdown
 # group: [sql]
 

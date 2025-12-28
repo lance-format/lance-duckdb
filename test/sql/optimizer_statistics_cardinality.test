@@ -1,4 +1,4 @@
-# name: test/sql/statistics_cardinality.test
+# name: test/sql/optimizer_statistics_cardinality.test
 # description: Optimizer statistics hooks (cardinality/partition stats)
 # group: [sql]
 

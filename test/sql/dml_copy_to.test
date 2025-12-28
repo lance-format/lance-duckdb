@@ -1,4 +1,4 @@
-# name: test/sql/lance_write.test
+# name: test/sql/dml_copy_to.test
 # description: COPY TO (FORMAT lance) writes datasets
 # group: [sql]
 

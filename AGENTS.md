@@ -91,10 +91,12 @@ Uses DuckDB's `sqllogictest` format in `test/sql/`:
 - `require lance`: Load the extension
 
 Key test files:
-- `test/sql/lance.test` (scan, pushdown, explain diagnostics, replacement scan)
-- `test/sql/knn.test` (KNN API validation)
-- `test/sql/search.test` (vector/FTS/hybrid search surface)
-- `test/sql/lance_s3_minio.test` (S3 scan/search via DuckDB secrets, gated by `LANCE_TEST_S3=1`)
+- `test/sql/scan_smoke.test` (scan smoke + replacement scan + error handling)
+- `test/sql/scan_limit_offset_sampling.test` (LIMIT/OFFSET and TABLESAMPLE pushdown)
+- `test/sql/scan_filter_pushdown.test` (filter/projection pushdown + explain diagnostics)
+- `test/sql/search_functions.test` (vector/FTS/hybrid search surface)
+- `test/sql/index_ddl.test` (index DDL + index-backed query paths)
+- `test/sql/s3_scan_minio.test` (S3 scan/search via DuckDB secrets, gated by `LANCE_TEST_S3=1`)
 
 ## Common Issues
 

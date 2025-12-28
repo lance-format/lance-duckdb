@@ -1,0 +1,26 @@
+# name: test/sql/scan_smoke.test
+# description: Smoke tests for scan and replacement scan
+# group: [sql]
+
+require lance
+
+# Extension loads
+query I
+SELECT 1;
+----
+1
+
+# lance_scan can read a local dataset root
+statement ok
+SELECT * FROM lance_scan('test/data/test_data.lance') LIMIT 1;
+
+# Replacement scan for SELECT * FROM '.../dataset.lance'
+statement ok
+SELECT * FROM 'test/data/test_data.lance' LIMIT 1;
+
+# Error handling: invalid dataset root
+statement error
+SELECT * FROM 'dummy_path.lance';
+----
+IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
+

@@ -1,4 +1,4 @@
-# name: test/sql/attach_namespace_create_table.test
+# name: test/sql/namespace_create_table.test
 # description: CREATE TABLE in attached LANCE directory namespace
 # group: [sql]
 

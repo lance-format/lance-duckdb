@@ -1,4 +1,4 @@
-# name: test/sql/alter_table_schema_evolution.test
+# name: test/sql/dml_alter_table_schema_evolution.test
 # description: ALTER TABLE schema evolution for attached Lance tables
 # group: [sql]
 

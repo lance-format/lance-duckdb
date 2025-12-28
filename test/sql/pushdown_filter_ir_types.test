@@ -1,4 +1,4 @@
-# name: test/sql/filter_ir_types.test
+# name: test/sql/pushdown_filter_ir_types.test
 # description: Filter IR supports timestamps/decimals/struct fields
 # group: [sql]
 

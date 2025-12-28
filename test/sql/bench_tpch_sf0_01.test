@@ -1,4 +1,4 @@
-# name: test/sql/tpch.test
+# name: test/sql/bench_tpch_sf0_01.test
 # description: TPC-H correctness suite for lance_scan
 # group: [sql]
 

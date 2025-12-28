@@ -1,4 +1,4 @@
-# name: test/sql/lance_insert.test
+# name: test/sql/dml_insert.test
 # description: INSERT INTO appends to Lance datasets
 # group: [sql]
 
@@ -70,4 +70,3 @@ SELECT sum(id) FROM ns.main.lance_insert_append;
 
 statement ok
 DETACH ns;
-

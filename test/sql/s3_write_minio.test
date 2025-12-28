@@ -1,21 +1,15 @@
-# name: test/sql/lance_write_s3_minio.test
+# name: test/sql/s3_write_minio.test
 # description: End-to-end S3 write against MinIO using DuckDB secrets
 # group: [sql]
 
 require-env LANCE_TEST_S3 1
 
 test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
-
 test-env LANCE_S3_REGION us-east-1
-
 test-env LANCE_S3_BUCKET lance-test
-
 test-env LANCE_S3_ACCESS_KEY_ID minioadmin
-
 test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
-
 test-env LANCE_S3_WRITE_DATASET_PREFIX write_test_data.lance
-
 require lance
 
 statement ok

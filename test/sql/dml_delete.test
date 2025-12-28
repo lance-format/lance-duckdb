@@ -1,4 +1,4 @@
-# name: test/sql/lance_delete.test
+# name: test/sql/dml_delete.test
 # description: DELETE FROM ... WHERE ... deletes rows in Lance datasets
 # group: [sql]
 

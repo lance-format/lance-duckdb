@@ -1,4 +1,4 @@
-# name: test/sql/lance_update.test
+# name: test/sql/dml_update.test
 # description: UPDATE ... SET ... WHERE updates Lance datasets
 # group: [sql]
 

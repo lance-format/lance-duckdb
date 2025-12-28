@@ -1,4 +1,4 @@
-# name: test/sql/attach_namespace_dynamic_discovery.test
+# name: test/sql/namespace_dynamic_discovery.test
 # description: Dynamic table discovery in attached LANCE directory namespace
 # group: [sql]
 

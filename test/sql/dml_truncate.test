@@ -1,4 +1,4 @@
-# name: test/sql/truncate_table.test
+# name: test/sql/dml_truncate.test
 # description: TRUNCATE TABLE for Lance namespace tables
 # group: [sql]
 

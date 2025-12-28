@@ -1,0 +1,47 @@
+# name: test/sql/scan_limit_offset_sampling.test
+# description: LIMIT/OFFSET and TABLESAMPLE pushdown
+# group: [sql]
+
+require lance
+
+# LIMIT/OFFSET pushdown correctness
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' LIMIT 2);
+----
+2
+
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1);
+----
+2
+
+# Explain output includes LIMIT/OFFSET diagnostics
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit": "2"[\s\S]*"Lance Offset": "1"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2 OFFSET 1;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+# TABLESAMPLE SYSTEM (%): sampling pushdown diagnostics
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (10 PERCENT);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Sampling Pushdown": "true"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (10 PERCENT);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+statement ok
+SELECT count(*) FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (100 PERCENT);
+

@@ -1,4 +1,4 @@
-# name: test/sql/bigann_tiny.test
+# name: test/sql/bench_bigann_tiny.test
 # description: Big-ANN style fixture coverage (exact + prefilter + index path)
 # group: [sql]
 

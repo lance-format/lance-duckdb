@@ -1,4 +1,4 @@
-# name: test/sql/lance_rowid_native.test
+# name: test/sql/scan_rowid_native.test
 # description: Point lookup and projection via DuckDB `rowid`
 # group: [sql]
 

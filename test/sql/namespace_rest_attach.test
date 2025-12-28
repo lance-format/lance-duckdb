@@ -1,4 +1,4 @@
-# name: test/sql/lance_namespace_rest.test
+# name: test/sql/namespace_rest_attach.test
 # description: End-to-end Lance REST namespace attach (requires external service)
 # group: [sql]
 
