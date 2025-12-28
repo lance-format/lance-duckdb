@@ -1,8 +1,6 @@
 # Lance DuckDB Extension
 
-Query [Lance](https://github.com/lance-format/lance/) datasets directly from DuckDB.
-
-Lance is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension brings Lance into a familiar SQL workflow.
+[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
 
 ## Install
 
