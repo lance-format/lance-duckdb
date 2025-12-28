@@ -20,6 +20,7 @@
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 
@@ -119,6 +120,10 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
   bool use_dataset_scanner = false;
+  bool sampling_pushed_down = false;
+  double sample_percentage = 0.0;
+  int64_t sample_seed = -1;
+  bool sample_repeatable = false;
   bool limit_offset_pushed_down = false;
   optional_idx pushed_limit = optional_idx::Invalid();
   idx_t pushed_offset = 0;
@@ -410,34 +415,63 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.scan_column_names.push_back(bind_data.names[col_id]);
   }
 
-  vector<string> filter_parts;
+  if (input.sample_options &&
+      input.sample_options->method == SampleMethod::SYSTEM_SAMPLE &&
+      input.sample_options->is_percentage) {
+    scan_state.sampling_pushed_down = true;
+    scan_state.sample_percentage =
+        input.sample_options->sample_size.DefaultCastAs(LogicalType::DOUBLE)
+            .GetValue<double>();
+    scan_state.sample_seed = input.sample_options->GetSeed();
+    scan_state.sample_repeatable = input.sample_options->repeatable;
 
-  auto table_filters = BuildLanceTableFilterIRParts(
-      bind_data.names, bind_data.types, input, false);
-  filter_parts = std::move(table_filters.parts);
+    // Sampling is applied before filtering and limiting, so do not combine it
+    // with the Lance-side filter / limit-offset pushdown paths.
+    scan_state.limit_offset_pushed_down = false;
+    scan_state.pushed_limit = optional_idx::Invalid();
+    scan_state.pushed_offset = 0;
 
-  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
-    filter_parts.reserve(filter_parts.size() +
-                         bind_data.lance_pushed_filter_ir_parts.size());
-    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
-      filter_parts.push_back(part);
+    scan_state.filter_pushed_down = false;
+    scan_state.lance_filter_ir.clear();
+
+    scan_state.use_dataset_scanner = true;
+    scan_state.max_threads = 1;
+  } else {
+    vector<string> filter_parts;
+
+    auto table_filters = BuildLanceTableFilterIRParts(
+        bind_data.names, bind_data.types, input, false);
+    filter_parts = std::move(table_filters.parts);
+
+    if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+      filter_parts.reserve(filter_parts.size() +
+                           bind_data.lance_pushed_filter_ir_parts.size());
+      for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+        filter_parts.push_back(part);
+      }
     }
-  }
 
-  string filter_ir_msg;
-  if (!filter_parts.empty() &&
-      TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
-    scan_state.lance_filter_ir = std::move(filter_ir_msg);
+    string filter_ir_msg;
+    if (!filter_parts.empty() &&
+        TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
+      scan_state.lance_filter_ir = std::move(filter_ir_msg);
+    }
+    scan_state.filter_pushed_down =
+        table_filters.all_filters_pushed && !scan_state.lance_filter_ir.empty();
   }
-  scan_state.filter_pushed_down =
-      table_filters.all_filters_pushed && !scan_state.lance_filter_ir.empty();
 
   if (scan_state.scan_column_names.empty() &&
+      (!input.filters || input.filters->filters.empty()) &&
       scan_state.lance_filter_ir.empty()) {
     auto rows = lance_dataset_count_rows(bind_data.dataset);
     if (rows < 0) {
       throw IOException("Failed to count Lance rows" +
                         LanceFormatErrorSuffix());
+    }
+    if (scan_state.sampling_pushed_down) {
+      auto pct = scan_state.sample_percentage / 100.0;
+      pct = MaxValue<double>(0.0, MinValue<double>(1.0, pct));
+      rows = static_cast<int64_t>(std::floor(static_cast<double>(rows) * pct));
     }
     scan_state.count_only = true;
     scan_state.count_only_total_rows = NumericCast<idx_t>(rows);
@@ -445,13 +479,19 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
-  if (bind_data.limit_offset_pushed_down) {
+  if (!scan_state.sampling_pushed_down && bind_data.limit_offset_pushed_down) {
     // Limit/offset pushdown requires that any TableFilterSet predicates are
     // evaluated by Lance. Otherwise limit/offset would apply before filtering.
     if (input.filters && !input.filters->filters.empty() &&
         !scan_state.filter_pushed_down) {
       throw IOException("Lance limit/offset pushdown requires filter pushdown");
     }
+    scan_state.use_dataset_scanner = true;
+    scan_state.max_threads = 1;
+    return state;
+  }
+
+  if (scan_state.sampling_pushed_down) {
     scan_state.use_dataset_scanner = true;
     scan_state.max_threads = 1;
     return state;
@@ -527,7 +567,13 @@ static bool LanceScanOpenStream(ClientContext &context,
       global_state.filter_pushed_down && filter_ir && filter_ir_len > 0;
 
   void *stream = nullptr;
-  if (global_state.use_dataset_scanner) {
+  if (global_state.sampling_pushed_down) {
+    local_state.filter_pushed_down = false;
+    stream = lance_create_dataset_sample_stream_ir(
+        bind_data.dataset, columns.data(), columns.size(),
+        global_state.sample_percentage, global_state.sample_seed,
+        global_state.sample_repeatable ? 1 : 0);
+  } else if (global_state.use_dataset_scanner) {
     auto limit_i64 =
         global_state.pushed_limit.IsValid()
             ? NumericCast<int64_t>(global_state.pushed_limit.GetIndex())
@@ -712,6 +758,14 @@ LanceScanToString(TableFunctionToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
+  result["Lance Sampling Pushdown"] =
+      bind_data.sampling_pushed_down ? "true" : "false";
+  if (bind_data.sampling_pushed_down) {
+    result["Lance Sample Percentage"] = to_string(bind_data.sample_percentage);
+    result["Lance Sample Seed"] = to_string(bind_data.sample_seed);
+    result["Lance Sample Repeatable"] =
+        bind_data.sample_repeatable ? "true" : "false";
+  }
   result["Lance Limit Offset Pushdown"] =
       bind_data.limit_offset_pushed_down ? "true" : "false";
   result["Lance Limit"] = bind_data.pushed_limit.IsValid()
@@ -753,6 +807,15 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Scan Mode"] =
       global_state.use_dataset_scanner ? "dataset" : "fragment";
+  result["Lance Sampling Pushdown"] =
+      global_state.sampling_pushed_down ? "true" : "false";
+  if (global_state.sampling_pushed_down) {
+    result["Lance Sample Percentage"] =
+        to_string(global_state.sample_percentage);
+    result["Lance Sample Seed"] = to_string(global_state.sample_seed);
+    result["Lance Sample Repeatable"] =
+        global_state.sample_repeatable ? "true" : "false";
+  }
   result["Lance Limit Offset Pushdown"] =
       global_state.limit_offset_pushed_down ? "true" : "false";
   result["Lance Limit"] = global_state.pushed_limit.IsValid()
@@ -854,6 +917,31 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
     child = LanceLimitOffsetPushdown(std::move(child));
   }
 
+  if (op->type == LogicalOperatorType::LOGICAL_GET) {
+    auto &get = op->Cast<LogicalGet>();
+    if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
+      return op;
+    }
+
+    auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+    scan_bind.sampling_pushed_down = false;
+    scan_bind.sample_percentage = 0.0;
+    scan_bind.sample_seed = -1;
+    scan_bind.sample_repeatable = false;
+
+    if (get.extra_info.sample_options &&
+        get.extra_info.sample_options->method == SampleMethod::SYSTEM_SAMPLE &&
+        get.extra_info.sample_options->is_percentage) {
+      scan_bind.sampling_pushed_down = true;
+      scan_bind.sample_percentage = get.extra_info.sample_options->sample_size
+                                        .DefaultCastAs(LogicalType::DOUBLE)
+                                        .GetValue<double>();
+      scan_bind.sample_seed = get.extra_info.sample_options->GetSeed();
+      scan_bind.sample_repeatable = get.extra_info.sample_options->repeatable;
+    }
+    return op;
+  }
+
   if (op->type != LogicalOperatorType::LOGICAL_LIMIT) {
     return op;
   }
@@ -881,6 +969,10 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
 
   auto &get = node->Cast<LogicalGet>();
   if (!IsLanceScanTableFunction(get.function) || !get.bind_data) {
+    return op;
+  }
+  if (get.extra_info.sample_options) {
+    // Sampling must occur before limiting, so do not remove the LIMIT node.
     return op;
   }
 
@@ -911,6 +1003,7 @@ static TableFunction LanceTableScanFunction() {
   function.projection_pushdown = true;
   function.filter_pushdown = true;
   function.filter_prune = true;
+  function.sampling_pushdown = true;
   function.supports_pushdown_type = LanceSupportsPushdownType;
   function.pushdown_complex_filter = LancePushdownComplexFilter;
   function.to_string = LanceScanToString;
@@ -1345,6 +1438,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.projection_pushdown = true;
   lance_scan.filter_pushdown = true;
   lance_scan.filter_prune = true;
+  lance_scan.sampling_pushdown = true;
   lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
   lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   lance_scan.to_string = LanceScanToString;
@@ -1365,6 +1459,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.projection_pushdown = true;
   internal_namespace_scan.filter_pushdown = true;
   internal_namespace_scan.filter_prune = true;
+  internal_namespace_scan.sampling_pushdown = true;
   internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_namespace_scan.to_string = LanceScanToString;

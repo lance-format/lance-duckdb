@@ -97,6 +97,10 @@ void *lance_create_dataset_stream_ir(void *dataset, const char **columns,
                                      const uint8_t *filter_ir,
                                      size_t filter_ir_len, int64_t limit,
                                      int64_t offset);
+void *lance_create_dataset_sample_stream_ir(void *dataset, const char **columns,
+                                            size_t columns_len,
+                                            double sample_percentage,
+                                            int64_t seed, uint8_t repeatable);
 
 void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
