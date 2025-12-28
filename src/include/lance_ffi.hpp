@@ -88,6 +88,23 @@ int32_t lance_dataset_create_scalar_index(void *dataset, const char *column,
 
 uint64_t *lance_dataset_list_fragments(void *dataset, size_t *out_len);
 void lance_free_fragment_list(uint64_t *ptr, size_t len);
+typedef struct LanceFieldStats {
+  uint32_t field_id;
+  uint64_t bytes_on_disk;
+} LanceFieldStats;
+
+typedef struct LanceFragmentStats {
+  uint64_t fragment_id;
+  int64_t num_rows;
+  uint64_t bytes_on_disk;
+} LanceFragmentStats;
+
+LanceFragmentStats *lance_dataset_list_fragment_stats(void *dataset,
+                                                      size_t *out_len);
+void lance_free_fragment_stats_list(LanceFragmentStats *ptr, size_t len);
+
+LanceFieldStats *lance_dataset_list_field_stats(void *dataset, size_t *out_len);
+void lance_free_field_stats_list(LanceFieldStats *ptr, size_t len);
 void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const char **columns, size_t columns_len,
                                       const uint8_t *filter_ir,

@@ -1,0 +1,70 @@
+# name: test/sql/like_pushdown.test
+# description: LIKE/ILIKE filter pushdown
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('Alice'),
+    ('ALICE'),
+    ('a_c'),
+    ('a%c'),
+    ('aXc'),
+    ('prefix_suffix'),
+    ('prefixxx'),
+    ('xxsuffix')
+  ) t(s)
+) TO 'test/.tmp/like_pushdown.lance' (FORMAT lance, mode 'overwrite');
+
+# Case-sensitive LIKE
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'Al%';
+----
+1
+
+# Case-insensitive ILIKE
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s ILIKE 'al%';
+----
+2
+
+# Prefix wildcard
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'pre%';
+----
+2
+
+# Suffix wildcard
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE '%suffix';
+----
+2
+
+# Escape percent and underscore using ESCAPE '\'
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE E'a\\%c' ESCAPE E'\\';
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE E'a\\_c' ESCAPE E'\\';
+----
+1
+
+# Explain diagnostics indicate LIKE/ILIKE are pushed to Lance
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'a%c';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*full_filter=s LIKE[\s\S]*a%c[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s ILIKE 'a%c';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*full_filter=s ILIKE[\s\S]*a%c[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'a%c';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*

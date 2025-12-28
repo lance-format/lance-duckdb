@@ -4,6 +4,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use datafusion_sql::unparser::expr_to_sql;
+use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
 
@@ -12,6 +13,23 @@ use crate::runtime;
 
 use super::types::DatasetHandle;
 use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceFieldStats {
+    pub field_id: u32,
+    pub bytes_on_disk: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LanceFragmentStats {
+    pub fragment_id: u64,
+    /// Number of rows in the fragment. `-1` means unknown.
+    pub num_rows: i64,
+    /// Sum of known data file sizes in bytes. Missing/unknown sizes are treated as 0.
+    pub bytes_on_disk: u64,
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
@@ -220,6 +238,62 @@ fn dataset_list_fragments_inner(dataset: *mut c_void, out_len: *mut usize) -> Ff
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_fragment_stats(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut LanceFragmentStats {
+    match dataset_list_fragment_stats_inner(dataset, out_len) {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn dataset_list_fragment_stats_inner(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> FfiResult<*mut LanceFragmentStats> {
+    if out_len.is_null() {
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
+    }
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
+    for frag in handle.dataset.fragments().iter() {
+        let mut bytes_on_disk = 0u64;
+        for file in frag.files.iter() {
+            if let Some(sz) = file.file_size_bytes.get() {
+                bytes_on_disk = bytes_on_disk.saturating_add(sz.get());
+            }
+        }
+        let num_rows = match frag.num_rows() {
+            Some(v) => i64::try_from(v).unwrap_or(-1),
+            None => -1,
+        };
+        out.push(LanceFragmentStats {
+            fragment_id: frag.id,
+            num_rows,
+            bytes_on_disk,
+        });
+    }
+
+    let mut boxed = out.into_boxed_slice();
+    let len = boxed.len();
+    let data = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+
+    unsafe {
+        std::ptr::write_unaligned(out_len, len);
+    }
+    Ok(data)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     if ptr.is_null() {
         return;
@@ -227,6 +301,85 @@ pub unsafe extern "C" fn lance_free_fragment_list(ptr: *mut u64, len: usize) {
     unsafe {
         let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
         let _ = Box::<[u64]>::from_raw(slice);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_fragment_stats_list(ptr: *mut LanceFragmentStats, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = Box::<[LanceFragmentStats]>::from_raw(slice);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_field_stats(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut LanceFieldStats {
+    match dataset_list_field_stats_inner(dataset, out_len) {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn dataset_list_field_stats_inner(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> FfiResult<*mut LanceFieldStats> {
+    if out_len.is_null() {
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
+    }
+
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let stats = match runtime::block_on(handle.dataset.calculate_data_stats()) {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCalculateDataStats,
+                format!("dataset calculate_data_stats: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let mut out: Vec<LanceFieldStats> = Vec::with_capacity(stats.fields.len());
+    for field in stats.fields {
+        out.push(LanceFieldStats {
+            field_id: field.id,
+            bytes_on_disk: field.bytes_on_disk,
+        });
+    }
+
+    let mut boxed = out.into_boxed_slice();
+    let len = boxed.len();
+    let data = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+
+    unsafe {
+        std::ptr::write_unaligned(out_len, len);
+    }
+    Ok(data)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_field_stats_list(ptr: *mut LanceFieldStats, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = Box::<[LanceFieldStats]>::from_raw(slice);
     }
 }
 

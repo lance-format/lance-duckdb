@@ -70,6 +70,7 @@ enum class LanceFilterIRTag : uint8_t {
   IS_NULL = 7,
   IS_NOT_NULL = 8,
   IN_LIST = 9,
+  LIKE = 10,
 };
 
 enum class LanceFilterIRLiteralTag : uint8_t {
@@ -100,6 +101,9 @@ enum class LanceFilterIRComparisonOp : uint8_t {
   GT = 4,
   GT_EQ = 5,
 };
+
+static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE = 1;
+static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_HAS_ESCAPE = 2;
 
 static void LanceFilterIRAppendU8(string &out, uint8_t v) {
   out.push_back(static_cast<char>(v));
@@ -469,6 +473,68 @@ static bool TryEncodeLanceFilterIRInList(bool negated, const string &expr,
   return true;
 }
 
+static bool TryEncodeLanceFilterIRLike(bool case_insensitive, bool has_escape,
+                                       uint8_t escape_char, const string &expr,
+                                       const string &pattern, string &out_ir) {
+  out_ir.clear();
+  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRTag::LIKE));
+  uint8_t flags = 0;
+  if (case_insensitive) {
+    flags |= LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE;
+  }
+  if (has_escape) {
+    flags |= LANCE_FILTER_IR_LIKE_FLAG_HAS_ESCAPE;
+  }
+  LanceFilterIRAppendU8(out_ir, flags);
+  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr) ||
+      !LanceFilterIRAppendLenPrefixed(out_ir, pattern)) {
+    return false;
+  }
+  if (has_escape) {
+    LanceFilterIRAppendU8(out_ir, escape_char);
+  }
+  return true;
+}
+
+static bool TryGetNonNullVarcharConstant(const Expression &expr,
+                                         string &out_value) {
+  if (expr.expression_class == ExpressionClass::BOUND_CONSTANT) {
+    auto &c = expr.Cast<BoundConstantExpression>();
+    if (c.value.IsNull()) {
+      return false;
+    }
+    try {
+      out_value =
+          c.value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+  if (expr.expression_class == ExpressionClass::BOUND_CAST) {
+    auto &cast = expr.Cast<BoundCastExpression>();
+    if (cast.try_cast) {
+      return false;
+    }
+    if (!cast.child ||
+        cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
+      return false;
+    }
+    auto &c = cast.child->Cast<BoundConstantExpression>();
+    if (c.value.IsNull()) {
+      return false;
+    }
+    try {
+      auto casted = c.value.DefaultCastAs(cast.return_type);
+      out_value = casted.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+  return false;
+}
+
 static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
                                            const TableFilter &filter,
                                            string &out_ir) {
@@ -836,9 +902,77 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   switch (expr.expression_class) {
   case ExpressionClass::BOUND_COLUMN_REF:
   case ExpressionClass::BOUND_REF:
-  case ExpressionClass::BOUND_FUNCTION:
     return TryBuildLanceExprColumnRefIR(get, names, types,
                                         exclude_computed_columns, expr, out_ir);
+  case ExpressionClass::BOUND_FUNCTION: {
+    auto &func = expr.Cast<BoundFunctionExpression>();
+    if (func.function.name == "struct_extract" ||
+        func.function.name == "struct_extract_at") {
+      return TryBuildLanceExprColumnRefIR(
+          get, names, types, exclude_computed_columns, expr, out_ir);
+    }
+
+    bool case_insensitive = false;
+    bool has_escape = false;
+    if (func.function.name == "~~") {
+      case_insensitive = false;
+      has_escape = false;
+    } else if (func.function.name == "~~*") {
+      case_insensitive = true;
+      has_escape = false;
+    } else if (func.function.name == "like_escape") {
+      case_insensitive = false;
+      has_escape = true;
+    } else if (func.function.name == "ilike_escape") {
+      case_insensitive = true;
+      has_escape = true;
+    } else {
+      return false;
+    }
+
+    if ((has_escape && func.children.size() != 3) ||
+        (!has_escape && func.children.size() != 2)) {
+      return false;
+    }
+    for (auto &child : func.children) {
+      if (!child) {
+        return false;
+      }
+    }
+
+    string input_ir;
+    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *func.children[0], input_ir)) {
+      return false;
+    }
+
+    string pattern_value;
+    if (!TryGetNonNullVarcharConstant(*func.children[1], pattern_value)) {
+      return false;
+    }
+    string pattern_ir;
+    if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
+      return false;
+    }
+
+    uint8_t escape_char = 0;
+    if (has_escape) {
+      string escape_value;
+      if (!TryGetNonNullVarcharConstant(*func.children[2], escape_value)) {
+        return false;
+      }
+      if (escape_value.size() != 1) {
+        return false;
+      }
+      escape_char = static_cast<uint8_t>(escape_value[0]);
+      if (escape_char != static_cast<uint8_t>('\\')) {
+        return false;
+      }
+    }
+
+    return TryEncodeLanceFilterIRLike(case_insensitive, has_escape, escape_char,
+                                      input_ir, pattern_ir, out_ir);
+  }
   case ExpressionClass::BOUND_CONSTANT: {
     auto &c = expr.Cast<BoundConstantExpression>();
     return TryEncodeLanceFilterIRLiteral(c.value, out_ir);
