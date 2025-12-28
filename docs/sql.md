@@ -131,10 +131,6 @@ UPDATE ns.main.my_table SET s = 'bb' WHERE id = 2;
 DETACH ns;
 ```
 
-Notes:
-- `UPDATE` requires a `WHERE` predicate (full-table `UPDATE` is not supported).
-- `SET column = DEFAULT` is not supported.
-
 ### `DELETE`
 
 ```sql

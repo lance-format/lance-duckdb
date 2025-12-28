@@ -582,6 +582,33 @@ public:
                         LanceFormatErrorSuffix());
     }
 
+    // Best-effort persistence of DuckDB column defaults in Lance field
+    // metadata. Lance itself does not currently expose defaults through
+    // DuckDB's catalog, but we can still use the metadata during UPDATE
+    // execution to resolve SET col = DEFAULT.
+    if (create_info.columns.LogicalColumnCount() > 0) {
+      void *dataset = nullptr;
+      if (option_keys.empty()) {
+        dataset = lance_open_dataset(dataset_path.c_str());
+      } else {
+        dataset = lance_open_dataset_with_storage_options(
+            dataset_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+            option_keys.size());
+      }
+      if (dataset) {
+        for (auto &col : create_info.columns.Logical()) {
+          if (!col.HasDefaultValue()) {
+            continue;
+          }
+          auto default_expr = col.DefaultValue().ToString();
+          (void)lance_dataset_update_field_metadata(dataset, col.Name().c_str(),
+                                                    "duckdb_default_expr",
+                                                    default_expr.c_str());
+        }
+        lance_close_dataset(dataset);
+      }
+    }
+
     return nullptr;
   }
 

@@ -506,8 +506,9 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
 
     if (op.expressions[i]->GetExpressionType() ==
         ExpressionType::VALUE_DEFAULT) {
-      throw NotImplementedException(
-          "Lance UPDATE does not support SET column = DEFAULT");
+      // Keep DEFAULT as a marker and let the Lance execution layer resolve it.
+      set_expressions.push_back("DEFAULT");
+      continue;
     }
 
     unique_ptr<Expression> set_expr;

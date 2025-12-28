@@ -290,8 +290,17 @@ fn rewrite_rows_update_transaction_inner(
                 .field(column.as_str())
                 .ok_or_else(|| format!("column does not exist: {}", column))?;
 
+            let value_sql = if value_sql.trim().eq_ignore_ascii_case("DEFAULT") {
+                field.metadata
+                    .get("duckdb_default_expr")
+                    .map(|s| s.as_str())
+                    .unwrap_or("NULL")
+            } else {
+                value_sql.as_str()
+            };
+
             let mut value_expr = planner
-                .parse_expr(value_sql.as_str())
+                .parse_expr(value_sql)
                 .map_err(|e| e.to_string())?;
 
             let dest_type = field.data_type();

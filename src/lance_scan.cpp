@@ -2257,7 +2257,25 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
         throw IOException("Failed to add column to Lance dataset: " +
                           dataset_uri + LanceFormatErrorSuffix());
       }
+
+      // Best-effort persistence of DuckDB column defaults in Lance field
+      // metadata. Re-open the dataset after schema evolution so the new field
+      // is visible to the metadata updater.
       lance_close_dataset(dataset);
+      dataset = nullptr;
+      if (add.new_column.HasDefaultValue()) {
+        dataset = LanceOpenDataset(context, dataset_uri);
+        if (dataset) {
+          auto default_expr = add.new_column.DefaultValue().ToString();
+          (void)lance_dataset_update_field_metadata(
+              dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
+              default_expr.c_str());
+          lance_close_dataset(dataset);
+          dataset = nullptr;
+        }
+      } else {
+        // The dataset was already closed above, keep going.
+      }
       return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
                                                     ParentSchema(), name,
                                                     dataset_uri, internal);
