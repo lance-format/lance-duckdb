@@ -867,16 +867,16 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       // lookup pushdown (which would filter first).
       scan_state.take_row_ids.clear();
     } else {
-    if (bind_data.limit_offset_pushed_down) {
-      throw IOException(
-          "Lance point lookup does not support limit/offset pushdown");
-    }
-    scan_state.lance_filter_ir.clear();
-    scan_state.filter_pushed_down = false;
-    scan_state.use_dataset_scanner = true;
-    scan_state.use_dataset_take = true;
-    scan_state.max_threads = 1;
-    return state;
+      if (bind_data.limit_offset_pushed_down) {
+        throw IOException(
+            "Lance point lookup does not support limit/offset pushdown");
+      }
+      scan_state.lance_filter_ir.clear();
+      scan_state.filter_pushed_down = false;
+      scan_state.use_dataset_scanner = true;
+      scan_state.use_dataset_take = true;
+      scan_state.max_threads = 1;
+      return state;
     }
   }
 
