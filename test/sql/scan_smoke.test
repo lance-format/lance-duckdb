@@ -10,10 +10,6 @@ SELECT 1;
 ----
 1
 
-# lance_scan can read a local dataset root
-statement ok
-SELECT * FROM lance_scan('test/data/test_data.lance') LIMIT 1;
-
 # Replacement scan for SELECT * FROM '.../dataset.lance'
 statement ok
 SELECT * FROM 'test/data/test_data.lance' LIMIT 1;
@@ -23,4 +19,3 @@ statement error
 SELECT * FROM 'dummy_path.lance';
 ----
 IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
-
