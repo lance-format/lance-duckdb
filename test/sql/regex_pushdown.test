@@ -1,0 +1,52 @@
+# name: test/sql/regex_pushdown.test
+# description: regexp_matches/SIMILAR TO filter pushdown
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('Alice'),
+    ('ALICE'),
+    ('a.c'),
+    ('abc'),
+    ('aXc'),
+    ('zzz')
+  ) t(s)
+) TO 'test/.tmp/regex_pushdown.lance' (FORMAT lance, mode 'overwrite');
+
+# Basic regexp_matches
+query I
+SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE regexp_matches(s, 'a.c');
+----
+3
+
+# regexp_matches with options
+query I
+SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE regexp_matches(s, '^ali', 'i');
+----
+2
+
+# SIMILAR TO is rewritten to regexp_full_match
+query I
+SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE s SIMILAR TO 'A.*';
+----
+2
+
+# Explain diagnostics indicate regexp filters are attempted for pushdown
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE regexp_matches(s, '^ali', 'i');
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*
+
+# Unsupported options should fall back to DuckDB-side filtering (and not fail the query)
+query I
+SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE regexp_matches(s, 'a.c', 'p');
+----
+3
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/regex_pushdown.lance' WHERE regexp_matches(s, 'a.c', 'p');
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "[1-9][0-9]*"[\s\S]*

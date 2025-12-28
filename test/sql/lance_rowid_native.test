@@ -1,0 +1,37 @@
+# name: test/sql/lance_rowid_native.test
+# description: Point lookup and projection via DuckDB `rowid`
+# group: [sql]
+
+require lance
+
+# Basic ordering: output matches the IN-list order
+query T
+SELECT name FROM 'test/data/test_data.lance' WHERE rowid IN (2, 0, 4)
+----
+Charlie
+Alice
+Eve
+
+# Duplicate row ids: output preserves duplicates
+query T
+SELECT name FROM 'test/data/test_data.lance' WHERE rowid IN (1, 1, 3)
+----
+Bob
+Bob
+David
+
+# Project `rowid` (cast to BIGINT for stable test typing)
+query TI
+SELECT name, CAST(rowid AS BIGINT) FROM 'test/data/test_data.lance' WHERE rowid IN (2, 0, 4)
+----
+Charlie	2
+Alice	0
+Eve	4
+
+# `rowid` matches `_rowid`
+query I
+SELECT COUNT(*) FROM (
+  SELECT CAST(rowid AS BIGINT) AS r, _rowid AS u FROM 'test/data/test_data.lance'
+) WHERE r != u
+----
+0

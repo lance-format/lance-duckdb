@@ -125,7 +125,12 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
             Arc::new(StringArray::from(details)),
         ],
     )
-    .map_err(|err| FfiError::new(ErrorCode::IndexStreamCreate, format!("index list batch: {err}")))?;
+    .map_err(|err| {
+        FfiError::new(
+            ErrorCode::IndexStreamCreate,
+            format!("index list batch: {err}"),
+        )
+    })?;
 
     Ok(StreamHandle::Batches(vec![batch].into_iter()))
 }
@@ -240,7 +245,11 @@ fn dataset_create_index_inner(
         None
     } else {
         let s = unsafe { cstr_to_str(params_json, "params_json")? };
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     };
 
     let columns = unsafe { super::util::optional_cstr_array(columns, columns_len, "columns")? };
@@ -255,11 +264,14 @@ fn dataset_create_index_inner(
         None
     } else {
         let s = unsafe { cstr_to_str(index_name, "index_name")? };
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     };
 
-    let (lance_index_type, params) =
-        build_index_params(&index_type_norm, params_json.as_deref())?;
+    let (lance_index_type, params) = build_index_params(&index_type_norm, params_json.as_deref())?;
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
     let replace = replace != 0;
@@ -408,16 +420,18 @@ fn build_index_params(
     };
 
     let mut params = ScalarIndexParams::for_builtin(scalar_type.try_into().map_err(|err| {
-        FfiError::new(ErrorCode::DatasetCreateIndex, format!("scalar index type: {err}"))
+        FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("scalar index type: {err}"),
+        )
     })?);
     if let Some(json) = params_json {
         params.params = Some(json.to_string());
     } else if scalar_type == IndexType::Inverted {
         // lance-index's InvertedIndexParams requires at least `base_tokenizer` and `language`.
         // Provide a stable default that is also eligible for query acceleration.
-        params.params = Some(
-            r#"{"base_tokenizer":"simple","language":"English","stem":false}"#.to_string(),
-        );
+        params.params =
+            Some(r#"{"base_tokenizer":"simple","language":"English","stem":false}"#.to_string());
     }
     Ok((scalar_type, Box::new(params)))
 }
@@ -435,7 +449,10 @@ fn is_vector_index_type(index_type: &str) -> bool {
     )
 }
 
-fn build_vector_params(index_type: &str, params_json: Option<&str>) -> FfiResult<VectorIndexParams> {
+fn build_vector_params(
+    index_type: &str,
+    params_json: Option<&str>,
+) -> FfiResult<VectorIndexParams> {
     let mut params = serde_json::Map::<String, serde_json::Value>::new();
     if let Some(json) = params_json {
         let v: serde_json::Value = serde_json::from_str(json).map_err(|err| {
@@ -459,19 +476,15 @@ fn build_vector_params(index_type: &str, params_json: Option<&str>) -> FfiResult
         .and_then(|v| v.as_str())
         .unwrap_or("l2");
     let metric_type = DistanceType::try_from(metric).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetCreateIndex,
-            format!("metric_type: {err}"),
-        )
+        FfiError::new(ErrorCode::DatasetCreateIndex, format!("metric_type: {err}"))
     })?;
 
     let version = params
         .get("version")
         .and_then(|v| v.as_str())
         .unwrap_or("v3");
-    let version = IndexFileVersion::try_from(version).map_err(|err| {
-        FfiError::new(ErrorCode::DatasetCreateIndex, format!("version: {err}"))
-    })?;
+    let version = IndexFileVersion::try_from(version)
+        .map_err(|err| FfiError::new(ErrorCode::DatasetCreateIndex, format!("version: {err}")))?;
 
     let num_partitions = params
         .get("num_partitions")
@@ -481,10 +494,7 @@ fn build_vector_params(index_type: &str, params_json: Option<&str>) -> FfiResult
     let out = match index_type {
         "IVF_FLAT" => VectorIndexParams::ivf_flat(num_partitions, metric_type),
         "IVF_PQ" => {
-            let num_bits = params
-                .get("num_bits")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(8) as u8;
+            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
             let num_sub_vectors = params
                 .get("num_sub_vectors")
                 .and_then(|v| v.as_u64())
@@ -502,17 +512,11 @@ fn build_vector_params(index_type: &str, params_json: Option<&str>) -> FfiResult
             )
         }
         "IVF_RQ" => {
-            let num_bits = params
-                .get("num_bits")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(8) as u8;
+            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
             VectorIndexParams::ivf_rq(num_partitions, num_bits, metric_type)
         }
         "IVF_SQ" => {
-            let num_bits = params
-                .get("num_bits")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(8) as u8;
+            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
             let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
             let sq = lance_index::vector::sq::builder::SQBuildParams {
                 num_bits: num_bits as u16,

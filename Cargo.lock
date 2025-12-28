@@ -3691,6 +3691,7 @@ dependencies = [
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
+ "rand 0.8.5",
  "roaring",
  "serde_json",
  "snafu",

@@ -3,11 +3,13 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_sql::unparser::expr_to_sql;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
 
+use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
@@ -199,6 +201,38 @@ pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
 fn get_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     Ok(handle.arrow_schema.clone())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut c_void {
+    match get_schema_for_scan_inner(dataset) {
+        Ok(schema) => {
+            clear_last_error();
+            Box::into_raw(Box::new(schema)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let mut schema: Schema = (*handle.arrow_schema).clone();
+    let has_row_id = schema.fields.iter().any(|f| f.name() == ROW_ID_COLUMN);
+    if !has_row_id {
+        let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(Field::new(
+            ROW_ID_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
+        schema.fields = fields.into();
+    }
+
+    Ok(Arc::new(schema))
 }
 
 #[no_mangle]

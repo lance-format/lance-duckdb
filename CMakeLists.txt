@@ -125,13 +125,14 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
+	    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
 

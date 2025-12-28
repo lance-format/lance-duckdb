@@ -41,6 +41,20 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' LIMIT 2
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
 
+# TABLESAMPLE SYSTEM (%): sampling pushdown diagnostics
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (10 PERCENT);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Sampling Pushdown": "true"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (10 PERCENT);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+statement ok
+SELECT count(*) FROM 'test/data/test_data.lance' TABLESAMPLE SYSTEM (100 PERCENT);
+
 # Baseline: materialize once and evaluate filters in DuckDB
 statement ok
 CREATE TEMP TABLE baseline AS SELECT * FROM 'test/data/test_data.lance'

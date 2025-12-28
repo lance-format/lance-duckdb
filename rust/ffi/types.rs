@@ -4,7 +4,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use lance::Dataset;
 
-use crate::scanner::LanceStream;
+use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::projection;
 
@@ -34,6 +34,7 @@ impl DatasetHandle {
 
 pub(crate) enum StreamHandle {
     Lance(LanceStream),
+    Take(LanceTakeStream),
     Batches(std::vec::IntoIter<RecordBatch>),
 }
 
@@ -41,6 +42,7 @@ impl StreamHandle {
     pub(crate) fn next_batch(&mut self) -> Result<Option<RecordBatch>, anyhow::Error> {
         match self {
             StreamHandle::Lance(stream) => stream.next().map_err(anyhow::Error::new),
+            StreamHandle::Take(stream) => stream.next().map_err(anyhow::Error::new),
             StreamHandle::Batches(iter) => Ok(iter.next()),
         }
     }
