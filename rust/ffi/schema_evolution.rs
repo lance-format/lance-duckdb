@@ -56,7 +56,13 @@ pub unsafe extern "C" fn lance_dataset_add_columns(
     expressions_len: usize,
     batch_size: u32,
 ) -> i32 {
-    match dataset_add_columns_inner(dataset, new_columns_schema, expressions, expressions_len, batch_size) {
+    match dataset_add_columns_inner(
+        dataset,
+        new_columns_schema,
+        expressions,
+        expressions_len,
+        batch_size,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -185,13 +191,12 @@ fn dataset_add_columns_inner(
                         )
                     })?;
                 let arr = if arr.data_type() != field.data_type() {
-                    compute::cast(&arr, field.data_type())
-                        .map_err(|err| {
-                            lance::Error::invalid_input(
-                                format!("expression[{idx}] cast: {err}"),
-                                location!(),
-                            )
-                        })?
+                    compute::cast(&arr, field.data_type()).map_err(|err| {
+                        lance::Error::invalid_input(
+                            format!("expression[{idx}] cast: {err}"),
+                            location!(),
+                        )
+                    })?
                 } else {
                     arr
                 };
@@ -422,9 +427,11 @@ fn dataset_update_table_metadata_inner(
     let value = if value.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}"))
-        })?)
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}")))?,
+        )
     };
 
     let mut ds = (*handle.dataset).clone();
@@ -467,9 +474,11 @@ fn dataset_update_config_inner(
     let value = if value.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}"))
-        })?)
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}")))?,
+        )
     };
 
     let mut ds = (*handle.dataset).clone();
@@ -512,9 +521,11 @@ fn dataset_update_schema_metadata_inner(
     let value = if value.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}"))
-        })?)
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}")))?,
+        )
     };
 
     let mut ds = (*handle.dataset).clone();
@@ -560,9 +571,11 @@ fn dataset_update_field_metadata_inner(
     let value = if value.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(value) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}"))
-        })?)
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_str()
+                .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("value utf8: {err}")))?,
+        )
     };
 
     let mut ds = (*handle.dataset).clone();
@@ -770,12 +783,7 @@ fn dataset_list_kv_inner(dataset: *mut c_void, which: &'static str) -> FfiResult
                 out.push('\n');
             }
         }
-        _ => {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "unknown kv type",
-            ))
-        }
+        _ => return Err(FfiError::new(ErrorCode::InvalidArgument, "unknown kv type")),
     }
 
     Ok(out)

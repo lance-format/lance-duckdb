@@ -59,6 +59,7 @@ pub enum ErrorCode {
     DatasetListKeyValues = 44,
     DatasetListIndices = 45,
     DatasetCreateScalarIndex = 46,
+    DatasetTake = 47,
 }
 
 struct LastError {
