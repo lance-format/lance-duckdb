@@ -27,8 +27,7 @@ Each file starts with:
 For environment-gated tests, use this order:
 
 1. `require-env ...`
-2. `test-env ...` (no blank lines between entries)
+2. `test-env ...` (separate each entry with an empty line)
 3. `require lance`
 
 Prefer small, focused files with section comments for setup, correctness, and diagnostics.
-

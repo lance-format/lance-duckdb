@@ -5,7 +5,9 @@
 require-env LANCE_TEST_NAMESPACE 1
 
 test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
 test-env LANCE_NAMESPACE_ID default
+
 test-env LANCE_NAMESPACE_TABLE default.table
 
 require lance
