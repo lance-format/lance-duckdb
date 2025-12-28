@@ -44,6 +44,15 @@ statement ok
 BEGIN TRANSACTION;
 
 statement ok
+UPDATE ns.main.lance_update_basic SET s = 'x' WHERE TRUE;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
 UPDATE ns.main.lance_update_basic SET id = id + 10 WHERE id = 1;
 
 statement ok
@@ -94,10 +103,13 @@ SELECT s FROM ns.main.lance_update_basic WHERE id = 2;
 ----
 bb
 
-statement error
+statement ok
 UPDATE ns.main.lance_update_basic SET s = 'x';
+
+query I
+SELECT COUNT(*) FROM ns.main.lance_update_basic WHERE s = 'x';
 ----
-Not implemented Error: Lance UPDATE requires a WHERE predicate (full-table UPDATE is not supported)
+3
 
 statement error
 UPDATE ns.main.lance_update_basic SET s = DEFAULT WHERE id = 2;

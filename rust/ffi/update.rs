@@ -137,14 +137,18 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-    let predicate = unsafe { cstr_to_str(predicate, "predicate")? }.to_string();
-
-    if predicate.trim().is_empty() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "predicate cannot be empty",
-        ));
-    }
+    let predicate = if predicate.is_null() {
+        None
+    } else {
+        let predicate = unsafe { cstr_to_str(predicate, "predicate")? }.to_string();
+        if predicate.trim().is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "predicate cannot be empty (pass NULL for full-table update)",
+            ));
+        }
+        Some(predicate)
+    };
 
     if set_len == 0 {
         return Err(FfiError::new(
@@ -264,12 +268,17 @@ fn rewrite_rows_update_transaction_inner(
 
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
         let planner = Planner::new(arrow_schema.clone());
-        let predicate_expr = planner
-            .parse_filter(predicate.as_str())
-            .map_err(|e| e.to_string())?;
-        let predicate_expr = planner
-            .optimize_expr(predicate_expr)
-            .map_err(|e| e.to_string())?;
+        let predicate_expr = if let Some(predicate) = predicate.as_deref() {
+            let predicate_expr = planner
+                .parse_filter(predicate)
+                .map_err(|e| e.to_string())?;
+            let predicate_expr = planner
+                .optimize_expr(predicate_expr)
+                .map_err(|e| e.to_string())?;
+            Some(predicate_expr)
+        } else {
+            None
+        };
 
         let df_schema =
             DFSchema::try_from(arrow_schema.as_ref().clone()).map_err(|e| e.to_string())?;
@@ -315,7 +324,9 @@ fn rewrite_rows_update_transaction_inner(
 
         let mut scanner = dataset.scan();
         scanner.with_row_id();
-        scanner.filter_expr(predicate_expr);
+        if let Some(predicate_expr) = predicate_expr {
+            scanner.filter_expr(predicate_expr);
+        }
 
         let mut input_stream: SendableRecordBatchStream = scanner
             .try_into_stream()
