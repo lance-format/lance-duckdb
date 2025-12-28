@@ -1,0 +1,29 @@
+# name: test/sql/lance_rowid_in.test
+# description: Point lookup via `WHERE _rowid IN (...)` rewrite
+# group: [sql]
+
+require lance
+
+# Basic ordering: output matches the IN-list order
+query T
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (2, 0, 4)
+----
+Charlie
+Alice
+Eve
+
+# Duplicate row ids: output preserves duplicates
+query T
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (1, 1, 3)
+----
+Bob
+Bob
+David
+
+# Non-existent row ids: missing ids are ignored
+query T
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 999, 4)
+----
+Alice
+Eve
+

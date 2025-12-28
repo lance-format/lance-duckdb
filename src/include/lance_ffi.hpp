@@ -33,6 +33,7 @@ void *lance_open_dataset_in_namespace(
 void lance_close_dataset(void *dataset);
 
 void *lance_get_schema(void *dataset);
+void *lance_get_schema_for_scan(void *dataset);
 void lance_free_schema(void *schema);
 int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
 
@@ -118,6 +119,9 @@ void *lance_create_dataset_sample_stream_ir(void *dataset, const char **columns,
                                             size_t columns_len,
                                             double sample_percentage,
                                             int64_t seed, uint8_t repeatable);
+void *lance_create_dataset_take_stream(void *dataset, const uint64_t *row_ids,
+                                       size_t row_ids_len, const char **columns,
+                                       size_t columns_len);
 
 void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,

@@ -3,6 +3,7 @@ use std::ptr;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
+use crate::constants::ROW_ID_COLUMN;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::types::StreamHandle;
@@ -68,6 +69,9 @@ fn create_fragment_stream_ir_inner(
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {
+        if projection.iter().any(|c| c == ROW_ID_COLUMN) {
+            scan.with_row_id();
+        }
         scan.project(&projection).map_err(|err| {
             FfiError::new(
                 ErrorCode::FragmentScan,
@@ -152,6 +156,9 @@ fn create_dataset_stream_ir_inner(
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {
+        if projection.iter().any(|c| c == ROW_ID_COLUMN) {
+            scan.with_row_id();
+        }
         scan.project(&projection).map_err(|err| {
             FfiError::new(
                 ErrorCode::DatasetScan,
@@ -176,10 +183,7 @@ fn create_dataset_stream_ir_inner(
         let limit_opt = if limit == -1 { None } else { Some(limit) };
         let offset_opt = if offset == 0 { None } else { Some(offset) };
         scan.limit(limit_opt, offset_opt).map_err(|err| {
-            FfiError::new(
-                ErrorCode::DatasetScan,
-                format!("dataset scan limit: {err}"),
-            )
+            FfiError::new(ErrorCode::DatasetScan, format!("dataset scan limit: {err}"))
         })?;
     }
 
