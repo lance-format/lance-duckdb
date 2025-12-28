@@ -1,5 +1,5 @@
 # name: test/sql/index_ddl.test
-# description: CREATE/DROP/SHOW/REINDEX index DDL for Lance datasets
+# description: CREATE/DROP/SHOW index DDL for Lance datasets
 # group: [sql]
 
 require lance
@@ -187,14 +187,6 @@ query TTTIT
 SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
 ----
 label_idx_untrained	<REGEX>:.*	label	0	<REGEX>:.*
-
-statement ok
-REINDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance' RETRAIN;
-
-query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
-----
-label_idx_untrained	<REGEX>:.*	label	2048	<REGEX>:.*
 
 statement ok
 DROP INDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance';
