@@ -54,6 +54,62 @@
 // not call `release` unless the caller initialized them to a valid value.
 namespace duckdb {
 
+static unique_ptr<BaseStatistics>
+LanceScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                    column_t column_id) {
+  (void)context;
+  if (!bind_data_p) {
+    return nullptr;
+  }
+  auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
+  if (column_id >= bind_data.types.size()) {
+    return nullptr;
+  }
+  return BaseStatistics::CreateUnknown(bind_data.types[column_id]).ToUnique();
+}
+
+static unique_ptr<NodeStatistics>
+LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+  (void)context;
+  if (!bind_data_p) {
+    return nullptr;
+  }
+  auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
+  if (!bind_data.dataset) {
+    return nullptr;
+  }
+  auto rows = lance_dataset_count_rows(bind_data.dataset);
+  if (rows < 0) {
+    return nullptr;
+  }
+  auto count = NumericCast<idx_t>(rows);
+  return make_uniq<NodeStatistics>(count, count);
+}
+
+static vector<PartitionStatistics>
+LanceScanGetPartitionStats(ClientContext &context,
+                           GetPartitionStatsInput &input) {
+  (void)context;
+  if (!input.bind_data) {
+    return {};
+  }
+  auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
+  if (!bind_data.dataset) {
+    return {};
+  }
+  auto rows = lance_dataset_count_rows(bind_data.dataset);
+  if (rows < 0) {
+    return {};
+  }
+  PartitionStatistics stats;
+  stats.row_start = 0;
+  stats.count = NumericCast<idx_t>(rows);
+  stats.count_type = CountType::COUNT_EXACT;
+  vector<PartitionStatistics> out;
+  out.push_back(stats);
+  return out;
+}
+
 LanceScanBindData::~LanceScanBindData() {
   if (dataset) {
     lance_close_dataset(dataset);
@@ -911,6 +967,9 @@ static TableFunction LanceTableScanFunction() {
   function.projection_pushdown = true;
   function.filter_pushdown = true;
   function.filter_prune = true;
+  function.statistics = LanceScanStatistics;
+  function.cardinality = LanceScanCardinality;
+  function.get_partition_stats = LanceScanGetPartitionStats;
   function.supports_pushdown_type = LanceSupportsPushdownType;
   function.pushdown_complex_filter = LancePushdownComplexFilter;
   function.to_string = LanceScanToString;
@@ -1345,6 +1404,9 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   lance_scan.projection_pushdown = true;
   lance_scan.filter_pushdown = true;
   lance_scan.filter_prune = true;
+  lance_scan.statistics = LanceScanStatistics;
+  lance_scan.cardinality = LanceScanCardinality;
+  lance_scan.get_partition_stats = LanceScanGetPartitionStats;
   lance_scan.supports_pushdown_type = LanceSupportsPushdownType;
   lance_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   lance_scan.to_string = LanceScanToString;
@@ -1365,6 +1427,9 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.projection_pushdown = true;
   internal_namespace_scan.filter_pushdown = true;
   internal_namespace_scan.filter_prune = true;
+  internal_namespace_scan.statistics = LanceScanStatistics;
+  internal_namespace_scan.cardinality = LanceScanCardinality;
+  internal_namespace_scan.get_partition_stats = LanceScanGetPartitionStats;
   internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_namespace_scan.to_string = LanceScanToString;
