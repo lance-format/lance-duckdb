@@ -45,6 +45,8 @@ duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'
 
 ## Usage
 
+Full SQL reference: `docs/sql.md`
+
 ### Query a Lance dataset
 
 ```sql
