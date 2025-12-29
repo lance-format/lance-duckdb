@@ -1,0 +1,54 @@
+# name: test/sql/pushdown_string_functions.test
+# description: String scalar function predicate pushdown
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('Alice'),
+    ('ALICE'),
+    ('prefix_suffix'),
+    ('xxsuffix'),
+    ('middle'),
+    (NULL)
+  ) t(s)
+) TO 'test/.tmp/string_functions_pushdown.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE starts_with(s, 'Al');
+----
+1
+
+query I
+SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE ends_with(s, 'suffix');
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE contains(s, 'fix');
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE lower(s) = 'alice';
+----
+2
+
+query I
+SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE upper(s) = 'ALICE';
+----
+2
+
+# Explain diagnostics indicate these predicates are pushed to Lance
+query II
+EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE starts_with(s, 'Al');
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*starts_with[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE starts_with(s, 'Al');
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*
+

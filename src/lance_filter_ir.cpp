@@ -73,6 +73,7 @@ enum class LanceFilterIRTag : uint8_t {
   IN_LIST = 9,
   LIKE = 10,
   REGEXP = 11,
+  SCALAR_FUNCTION = 12,
 };
 
 enum class LanceFilterIRLiteralTag : uint8_t {
@@ -526,6 +527,28 @@ static bool TryEncodeLanceFilterIRRegexp(uint8_t mode, bool has_flags,
   return true;
 }
 
+static bool TryEncodeLanceFilterIRScalarFunction(const string &name,
+                                                 const vector<string> &args,
+                                                 string &out_ir) {
+  if (args.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  out_ir.clear();
+  LanceFilterIRAppendU8(
+      out_ir, static_cast<uint8_t>(LanceFilterIRTag::SCALAR_FUNCTION));
+  if (!LanceFilterIRAppendLenPrefixedString(out_ir, name)) {
+    return false;
+  }
+  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(args.size()));
+  for (auto &arg : args) {
+    if (!LanceFilterIRAppendLenPrefixed(out_ir, arg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool TryGetNonNullVarcharConstant(const Expression &expr,
                                          string &out_value) {
   if (expr.expression_class == ExpressionClass::BOUND_CONSTANT) {
@@ -575,6 +598,58 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
     case ExpressionClass::BOUND_REF: {
       out_expr_ir = col_ref_ir;
       return true;
+    }
+    case ExpressionClass::BOUND_FUNCTION: {
+      auto &func = expr.Cast<BoundFunctionExpression>();
+      for (auto &child : func.children) {
+        if (!child) {
+          return false;
+        }
+      }
+
+      if (func.function.name == "lower" || func.function.name == "upper") {
+        if (func.children.size() != 1) {
+          return false;
+        }
+        string input_ir;
+        if (!build_from_expr(*func.children[0], input_ir)) {
+          return false;
+        }
+        vector<string> args;
+        args.push_back(std::move(input_ir));
+        return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                    out_expr_ir);
+      }
+
+      if (func.function.name == "starts_with" ||
+          func.function.name == "ends_with" ||
+          func.function.name == "contains") {
+        if (func.children.size() != 2) {
+          return false;
+        }
+
+        string input_ir;
+        if (!build_from_expr(*func.children[0], input_ir)) {
+          return false;
+        }
+
+        string needle_value;
+        if (!TryGetNonNullVarcharConstant(*func.children[1], needle_value)) {
+          return false;
+        }
+        string needle_ir;
+        if (!TryEncodeLanceFilterIRLiteral(Value(needle_value), needle_ir)) {
+          return false;
+        }
+
+        vector<string> args;
+        args.push_back(std::move(input_ir));
+        args.push_back(std::move(needle_ir));
+        return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                    out_expr_ir);
+      }
+
+      return false;
     }
     case ExpressionClass::BOUND_CONSTANT: {
       auto &c = expr.Cast<BoundConstantExpression>();
@@ -1078,6 +1153,50 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         func.function.name == "struct_extract_at") {
       return TryBuildLanceExprColumnRefIR(
           get, names, types, exclude_computed_columns, expr, out_ir);
+    }
+
+    if (func.function.name == "lower" || func.function.name == "upper") {
+      if (func.children.size() != 1 || !func.children[0]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.children[0], input_ir)) {
+        return false;
+      }
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                  out_ir);
+    }
+
+    if (func.function.name == "starts_with" ||
+        func.function.name == "ends_with" || func.function.name == "contains") {
+      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.children[0], input_ir)) {
+        return false;
+      }
+
+      string needle_value;
+      if (!TryGetNonNullVarcharConstant(*func.children[1], needle_value)) {
+        return false;
+      }
+      string needle_ir;
+      if (!TryEncodeLanceFilterIRLiteral(Value(needle_value), needle_ir)) {
+        return false;
+      }
+
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      args.push_back(std::move(needle_ir));
+      return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                  out_ir);
     }
 
     if (func.function.name == "regexp_matches" ||

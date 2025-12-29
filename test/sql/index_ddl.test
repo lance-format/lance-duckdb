@@ -21,6 +21,21 @@ SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
 ----
 vec_idx	<REGEX>:.*	vec	2048	<REGEX>:.*
 
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+CREATE INDEX attached_label_idx ON ns.main.index_ddl_base (label) USING BTREE;
+
+query TTTIT
+SHOW INDEXES ON ns.main.index_ddl_base;
+----
+attached_label_idx	<REGEX>:.*	label	2048	<REGEX>:.*
+vec_idx	<REGEX>:.*	vec	2048	<REGEX>:.*
+
+statement ok
+DETACH ns;
+
 query II
 EXPLAIN (FORMAT JSON)
 SELECT id

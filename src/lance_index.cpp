@@ -4,12 +4,16 @@
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/index/index_type.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/operator/logical_create_index.hpp"
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
@@ -341,6 +345,153 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
     out_params_json = json;
   }
   return true;
+}
+
+static bool ValueToBoolOrThrow(const Value &value, const string &key) {
+  if (value.IsNull()) {
+    throw BinderException("WITH " + key + " cannot be NULL");
+  }
+  switch (value.type().id()) {
+  case LogicalTypeId::BOOLEAN:
+    return value.GetValue<bool>();
+  case LogicalTypeId::TINYINT:
+    return value.GetValue<int8_t>() != 0;
+  case LogicalTypeId::SMALLINT:
+    return value.GetValue<int16_t>() != 0;
+  case LogicalTypeId::INTEGER:
+    return value.GetValue<int32_t>() != 0;
+  case LogicalTypeId::BIGINT:
+    return value.GetValue<int64_t>() != 0;
+  case LogicalTypeId::UTINYINT:
+    return value.GetValue<uint8_t>() != 0;
+  case LogicalTypeId::USMALLINT:
+    return value.GetValue<uint16_t>() != 0;
+  case LogicalTypeId::UINTEGER:
+    return value.GetValue<uint32_t>() != 0;
+  case LogicalTypeId::UBIGINT:
+    return value.GetValue<uint64_t>() != 0;
+  case LogicalTypeId::VARCHAR: {
+    auto v = StringUtil::Lower(value.GetValue<string>());
+    if (v == "true" || v == "1") {
+      return true;
+    }
+    if (v == "false" || v == "0") {
+      return false;
+    }
+    throw BinderException("WITH " + key + " must be a boolean");
+  }
+  default:
+    throw BinderException("WITH " + key + " must be a boolean");
+  }
+}
+
+static string ValueToStringOrThrow(const Value &value, const string &key) {
+  if (value.IsNull()) {
+    throw BinderException("WITH " + key + " cannot be NULL");
+  }
+  if (value.type().id() != LogicalTypeId::VARCHAR) {
+    throw BinderException("WITH " + key + " must be a string");
+  }
+  return value.GetValue<string>();
+}
+
+static void AppendJsonValue(string &json, const Value &value) {
+  if (value.IsNull()) {
+    json += "null";
+    return;
+  }
+  switch (value.type().id()) {
+  case LogicalTypeId::BOOLEAN:
+    json += value.GetValue<bool>() ? "true" : "false";
+    return;
+  case LogicalTypeId::TINYINT:
+  case LogicalTypeId::SMALLINT:
+  case LogicalTypeId::INTEGER:
+  case LogicalTypeId::BIGINT:
+  case LogicalTypeId::UTINYINT:
+  case LogicalTypeId::USMALLINT:
+  case LogicalTypeId::UINTEGER:
+  case LogicalTypeId::UBIGINT:
+  case LogicalTypeId::FLOAT:
+  case LogicalTypeId::DOUBLE:
+  case LogicalTypeId::DECIMAL:
+    json += value.ToString();
+    return;
+  case LogicalTypeId::VARCHAR: {
+    json += "\"";
+    json += EscapeJsonString(value.GetValue<string>());
+    json += "\"";
+    return;
+  }
+  default:
+    json += "\"";
+    json += EscapeJsonString(value.ToString());
+    json += "\"";
+    return;
+  }
+}
+
+static void BuildLanceParamsJsonFromDuckdbWithOptions(
+    const case_insensitive_map_t<Value> &options, bool &out_replace,
+    bool &out_train, string &out_params_json) {
+  out_replace = false;
+  out_train = true;
+  out_params_json.clear();
+
+  bool has_raw_params_json = false;
+  string raw_params_json;
+  vector<pair<string, Value>> passthrough;
+  passthrough.reserve(options.size());
+
+  for (auto &kv : options) {
+    auto key_lower = StringUtil::Lower(kv.first);
+    if (key_lower == "replace") {
+      out_replace = ValueToBoolOrThrow(kv.second, "replace");
+      continue;
+    }
+    if (key_lower == "train") {
+      out_train = ValueToBoolOrThrow(kv.second, "train");
+      continue;
+    }
+    if (key_lower == "retrain") {
+      throw BinderException("CREATE INDEX does not accept retrain");
+    }
+    if (key_lower == "params") {
+      raw_params_json = ValueToStringOrThrow(kv.second, "params");
+      has_raw_params_json = true;
+      continue;
+    }
+    passthrough.emplace_back(kv.first, kv.second);
+  }
+
+  if (has_raw_params_json) {
+    out_params_json = raw_params_json;
+    return;
+  }
+
+  if (passthrough.empty()) {
+    out_params_json.clear();
+    return;
+  }
+
+  string json = "{";
+  bool first = true;
+  for (auto &kv : passthrough) {
+    if (!first) {
+      json += ",";
+    }
+    first = false;
+    json += "\"";
+    json += EscapeJsonString(kv.first);
+    json += "\":";
+    AppendJsonValue(json, kv.second);
+  }
+  json += "}";
+  if (json == "{}") {
+    out_params_json.clear();
+  } else {
+    out_params_json = json;
+  }
 }
 
 // --- Lance index metadata listing (SHOW INDEXES / PRAGMA / system table) ---
@@ -747,6 +898,111 @@ static TableFunction LanceDropIndexTableFunction() {
   return function;
 }
 
+// --- DuckDB CREATE INDEX integration (ON attached Lance tables) ---
+
+class PhysicalLanceCreateIndex final : public PhysicalOperator {
+public:
+  static constexpr const PhysicalOperatorType TYPE =
+      PhysicalOperatorType::EXTENSION;
+
+  PhysicalLanceCreateIndex(PhysicalPlan &physical_plan,
+                           vector<LogicalType> types, string dataset_uri_p,
+                           string index_name_p, string column_p,
+                           string index_type_p, string params_json_p,
+                           bool replace_p, bool train_p,
+                           idx_t estimated_cardinality)
+      : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
+                         std::move(types), estimated_cardinality),
+        dataset_uri(std::move(dataset_uri_p)),
+        index_name(std::move(index_name_p)), column(std::move(column_p)),
+        index_type(std::move(index_type_p)),
+        params_json(std::move(params_json_p)), replace(replace_p),
+        train(train_p) {}
+
+  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
+                           OperatorSourceInput &input) const override {
+    (void)input;
+    auto &client_context = context.client;
+
+    void *dataset = LanceOpenDataset(client_context, dataset_uri);
+    if (!dataset) {
+      throw IOException("Failed to open Lance dataset: " + dataset_uri +
+                        LanceFormatErrorSuffix());
+    }
+
+    const char *column_ptr = column.c_str();
+    const char *name_ptr = index_name.empty() ? nullptr : index_name.c_str();
+    const char *params_ptr =
+        params_json.empty() ? nullptr : params_json.c_str();
+
+    auto rc = lance_dataset_create_index(dataset, name_ptr, &column_ptr, 1,
+                                         index_type.c_str(), params_ptr,
+                                         replace ? 1 : 0, train ? 1 : 0);
+    lance_close_dataset(dataset);
+    if (rc != 0) {
+      throw IOException("Failed to create Lance index" +
+                        LanceFormatErrorSuffix());
+    }
+
+    chunk.SetCardinality(0);
+    return SourceResultType::FINISHED;
+  }
+
+  bool IsSource() const override { return true; }
+
+private:
+  string dataset_uri;
+  string index_name;
+  string column;
+  string index_type;
+  string params_json;
+  bool replace;
+  bool train;
+};
+
+static string GetSingleColumnNameOrThrow(const CreateIndexInfo &info) {
+  if (info.parsed_expressions.size() != 1) {
+    throw NotImplementedException(
+        "Lance CREATE INDEX currently supports a single column");
+  }
+  auto &expr = *info.parsed_expressions[0];
+  if (expr.GetExpressionType() != ExpressionType::COLUMN_REF) {
+    throw NotImplementedException(
+        "Lance CREATE INDEX currently supports a single column");
+  }
+  auto &col_ref = expr.Cast<ColumnRefExpression>();
+  if (col_ref.column_names.empty()) {
+    throw InternalException("column ref has no column names");
+  }
+  return col_ref.column_names.back();
+}
+
+static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
+  auto &op = input.op;
+  auto &planner = input.planner;
+
+  auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
+  if (!lance_table) {
+    throw NotImplementedException(
+        "BTREE index type is only supported for Lance tables");
+  }
+
+  auto column = GetSingleColumnNameOrThrow(*op.info);
+  auto dataset_uri = lance_table->DatasetUri();
+  auto index_type = NormalizeIndexType(op.info->index_type);
+
+  bool replace = false;
+  bool train = true;
+  string params_json;
+  BuildLanceParamsJsonFromDuckdbWithOptions(op.info->options, replace, train,
+                                            params_json);
+
+  return planner.Make<PhysicalLanceCreateIndex>(
+      op.types, std::move(dataset_uri), op.info->index_name, std::move(column),
+      std::move(index_type), std::move(params_json), replace, train,
+      op.estimated_cardinality);
+}
+
 // --- Parser extension ---
 
 enum class LanceIndexStmtKind : uint8_t { Create = 0, Drop = 1, Show = 2 };
@@ -865,12 +1121,10 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
       rest = TrimCopy(rest.substr(consumed));
     }
 
-    // Avoid intercepting DuckDB's CREATE INDEX on regular tables (including
-    // cases that use a USING clause). Lance index DDL is only supported when
-    // the target is a dataset path string literal.
-    if (!target_is_path) {
-      return ParserExtensionParseResult();
-    }
+    // Note: Parser extensions are only invoked when DuckDB fails to parse a
+    // statement. We accept both dataset path literals and table identifiers
+    // (for tables in ATTACH TYPE LANCE namespaces). For non-Lance tables, the
+    // binder will reject the statement with a clear error.
 
     vector<string> columns;
     idx_t paren_consumed = 0;
@@ -1107,6 +1361,15 @@ void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader) {
   extension.plan_function = LanceIndexPlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
   config.parser_extensions.push_back(std::move(extension));
+
+  // Register DuckDB index types that should route to Lance index DDL when used
+  // on tables in ATTACH TYPE LANCE namespaces.
+  if (!config.GetIndexTypes().FindByName("BTREE")) {
+    IndexType btree;
+    btree.name = "BTREE";
+    btree.create_plan = LanceBtreeCreatePlan;
+    config.GetIndexTypes().RegisterIndexType(btree);
+  }
 }
 
 } // namespace duckdb

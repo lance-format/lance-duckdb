@@ -47,6 +47,10 @@ void lance_free_string(const char *s);
 int64_t lance_dataset_count_rows(void *dataset);
 int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
                              size_t filter_ir_len, int64_t *out_deleted_rows);
+int32_t lance_delete_transaction_with_storage_options(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, const uint8_t *filter_ir, size_t filter_ir_len,
+    void **out_transaction, int64_t *out_deleted_rows);
 
 int32_t lance_dataset_add_columns(void *dataset,
                                   const ArrowSchema *new_columns_schema,

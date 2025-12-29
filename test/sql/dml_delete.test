@@ -99,10 +99,10 @@ true
 statement ok
 BEGIN TRANSACTION;
 
-statement error
+query I
 DELETE FROM del_ns.main.lance_delete_basic WHERE id = 3;
 ----
-Not implemented Error: Lance DELETE does not support explicit transactions yet
+1
 
 statement ok
 ROLLBACK;
@@ -111,6 +111,22 @@ query I
 SELECT count(*) FROM del_ns.main.lance_delete_basic;
 ----
 2
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+DELETE FROM del_ns.main.lance_delete_predicate WHERE id = 1;
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM del_ns.main.lance_delete_predicate;
+----
+1
 
 query I
 DELETE FROM del_ns.main.lance_delete_basic;

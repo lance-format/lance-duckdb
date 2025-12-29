@@ -4,16 +4,25 @@ use std::ptr;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::scalar::ScalarValue;
 use datafusion_sql::unparser::expr_to_sql;
-use lance::dataset::statistics::DatasetStatisticsExt;
+use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::statistics::DatasetStatisticsExt;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::Dataset;
+use roaring::RoaringTreemap;
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::DatasetHandle;
+use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
 use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
 
 #[repr(C)]
@@ -224,11 +233,7 @@ fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::Sc
     let has_row_id = schema.fields.iter().any(|f| f.name() == ROW_ID_COLUMN);
     if !has_row_id {
         let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
-        fields.push(Arc::new(Field::new(
-            ROW_ID_COLUMN,
-            DataType::UInt64,
-            false,
-        )));
+        fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
         schema.fields = fields.into();
     }
 
@@ -434,6 +439,236 @@ pub unsafe extern "C" fn lance_dataset_delete(
             -1
         }
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    out_transaction: *mut *mut c_void,
+    out_deleted_rows: *mut i64,
+) -> i32 {
+    match delete_transaction_with_storage_options_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        filter_ir,
+        filter_ir_len,
+        out_transaction,
+        out_deleted_rows,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn delete_transaction_with_storage_options_inner(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    out_transaction: *mut *mut c_void,
+    out_deleted_rows: *mut i64,
+) -> FfiResult<()> {
+    if out_transaction.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_transaction is null",
+        ));
+    }
+    if out_deleted_rows.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_deleted_rows is null",
+        ));
+    }
+
+    let path_str = unsafe { cstr_to_str(path, "path")? };
+    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "option_keys/option_values is null with non-zero length",
+        ));
+    }
+
+    let keys = if options_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
+    };
+    let values = if options_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
+    };
+
+    let mut storage_options = HashMap::<String, String>::new();
+    for (idx, (&key_ptr, &val_ptr)) in keys.iter().zip(values.iter()).enumerate() {
+        if key_ptr.is_null() || val_ptr.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("option key/value is null at index {idx}"),
+            ));
+        }
+        let key = unsafe { CStr::from_ptr(key_ptr) }.to_str().map_err(|err| {
+            FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
+        })?;
+        let value = unsafe { CStr::from_ptr(val_ptr) }.to_str().map_err(|err| {
+            FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
+        })?;
+        storage_options.insert(key.to_string(), value.to_string());
+    }
+
+    let filter = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::DatasetDelete,
+            "delete filter_ir",
+        )?
+    };
+    let predicate = match filter {
+        Some(expr) => expr_to_sql(&expr)
+            .map_err(|err| {
+                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
+            })?
+            .to_string(),
+        None => "true".to_string(),
+    };
+
+    let (maybe_txn, deleted_rows) = match runtime::block_on(async {
+        let dataset = DatasetBuilder::from_uri(path_str)
+            .with_storage_options(storage_options)
+            .load()
+            .await
+            .map_err(|e| e.to_string())?;
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .with_row_id()
+            .project(&[lance_core::ROW_ID])
+            .map_err(|e| e.to_string())?
+            .filter(&predicate)
+            .map_err(|e| e.to_string())?;
+
+        let Some(filter_expr) = scanner.get_filter().map_err(|e| e.to_string())? else {
+            return Ok::<_, String>((None, 0_i64));
+        };
+
+        if matches!(
+            filter_expr,
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+        ) {
+            return Ok::<_, String>((None, 0_i64));
+        }
+
+        let (updated_fragments, deleted_fragment_ids, deleted_rows) = if matches!(
+            filter_expr,
+            Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+        ) {
+            let deleted_fragment_ids = dataset
+                .get_fragments()
+                .iter()
+                .map(|f| f.id() as u64)
+                .collect::<Vec<_>>();
+            let deleted_rows = dataset.count_rows(None).await.map_err(|e| e.to_string())?;
+            let deleted_rows = i64::try_from(deleted_rows)
+                .map_err(|_| "deleted row count overflow".to_string())?;
+            (Vec::new(), deleted_fragment_ids, deleted_rows)
+        } else {
+            let stable_row_ids = dataset.manifest.uses_stable_row_ids();
+            let mut captured_row_ids = CapturedRowIds::new(stable_row_ids);
+
+            let stream: SendableRecordBatchStream = scanner
+                .try_into_stream()
+                .await
+                .map_err(|e| e.to_string())?
+                .into();
+
+            futures::pin_mut!(stream);
+            while let Some(batch) = stream.try_next().await.map_err(|e| e.to_string())? {
+                let row_ids = batch
+                    .column_by_name(lance_core::ROW_ID)
+                    .ok_or_else(|| "missing _rowid column".to_string())?
+                    .as_primitive::<UInt64Type>()
+                    .values();
+                captured_row_ids
+                    .capture(row_ids)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let deleted_rows = captured_row_ids.len();
+            let deleted_rows_i64 = i64::try_from(deleted_rows)
+                .map_err(|_| "deleted row count overflow".to_string())?;
+
+            let row_addrs = match &captured_row_ids {
+                CapturedRowIds::AddressStyle(addrs) => addrs.clone(),
+                CapturedRowIds::SequenceStyle(sequence) => {
+                    let row_id_index = build_row_id_index(dataset.as_ref()).await?;
+                    let mut addrs = RoaringTreemap::new();
+                    for row_id in sequence.iter() {
+                        let addr = row_id_index
+                            .get(row_id)
+                            .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
+                        addrs.insert(u64::from(addr));
+                    }
+                    addrs
+                }
+            };
+
+            let (fragments, deleted_ids) = apply_deletions(dataset.as_ref(), &row_addrs).await?;
+            (fragments, deleted_ids, deleted_rows_i64)
+        };
+
+        if updated_fragments.is_empty() && deleted_fragment_ids.is_empty() {
+            return Ok::<_, String>((None, deleted_rows));
+        }
+
+        let operation = Operation::Delete {
+            updated_fragments,
+            deleted_fragment_ids,
+            predicate,
+        };
+        let txn = Transaction::new(dataset.manifest.version, operation, None);
+        Ok::<_, String>((Some(txn), deleted_rows))
+    }) {
+        Ok(Ok(v)) => v,
+        Ok(Err(message)) => return Err(FfiError::new(ErrorCode::DatasetDelete, message)),
+        Err(err) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDelete,
+                format!("runtime: {err}"),
+            ))
+        }
+    };
+
+    unsafe {
+        std::ptr::write_unaligned(out_deleted_rows, deleted_rows);
+        std::ptr::write_unaligned(out_transaction, std::ptr::null_mut());
+    }
+
+    if let Some(txn) = maybe_txn {
+        let boxed = Box::new(txn);
+        unsafe {
+            std::ptr::write_unaligned(out_transaction, Box::into_raw(boxed) as *mut c_void);
+        }
+    }
+
+    Ok(())
 }
 
 fn dataset_delete_inner(

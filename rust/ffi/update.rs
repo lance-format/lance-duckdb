@@ -72,13 +72,13 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_storage_options
 }
 
 #[derive(Debug, Clone)]
-enum CapturedRowIds {
+pub(super) enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
     SequenceStyle(RowIdSequence),
 }
 
 impl CapturedRowIds {
-    fn new(stable_row_ids: bool) -> Self {
+    pub(super) fn new(stable_row_ids: bool) -> Self {
         if stable_row_ids {
             Self::SequenceStyle(RowIdSequence::new())
         } else {
@@ -86,7 +86,7 @@ impl CapturedRowIds {
         }
     }
 
-    fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
+    pub(super) fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
         match self {
             Self::AddressStyle(addrs) => {
                 addrs
@@ -100,7 +100,7 @@ impl CapturedRowIds {
         Ok(())
     }
 
-    fn len(&self) -> u64 {
+    pub(super) fn len(&self) -> u64 {
         match self {
             Self::AddressStyle(addrs) => addrs.len(),
             Self::SequenceStyle(sequence) => sequence.len(),
@@ -502,7 +502,7 @@ fn rewrite_rows_update_transaction_inner(
     Ok(())
 }
 
-async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
+pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
     if !dataset.manifest.uses_stable_row_ids() {
         return Err("row id index requested for dataset without stable row ids".to_string());
     }
@@ -553,7 +553,7 @@ async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, Stri
     RowIdIndex::new(&indices).map_err(|e| e.to_string())
 }
 
-async fn apply_deletions(
+pub(super) async fn apply_deletions(
     dataset: &lance::Dataset,
     row_addrs: &RoaringTreemap,
 ) -> Result<(Vec<lance_table::format::Fragment>, Vec<u64>), String> {
