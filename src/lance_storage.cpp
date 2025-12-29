@@ -53,6 +53,14 @@ struct LanceDirectoryNamespaceConfig {
   vector<string> option_values;
 };
 
+struct LanceRestNamespaceConfig {
+  string endpoint;
+  string namespace_id;
+  string delimiter;
+  string bearer_token_override;
+  string api_key_override;
+};
+
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
   for (auto &kv : info.options) {
     if (!StringUtil::CIEquals(kv.first, "endpoint") || kv.second.IsNull()) {
@@ -278,41 +286,85 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
+    unordered_map<string, Value> overrides;
+    if (!bearer_token_override.empty()) {
+      overrides["bearer_token"] = Value(bearer_token_override);
+    }
+    if (!api_key_override.empty()) {
+      overrides["api_key"] = Value(api_key_override);
+    }
+
+    string resolved_bearer;
+    string resolved_api_key;
+    ResolveLanceNamespaceAuth(context, endpoint, overrides, resolved_bearer,
+                              resolved_api_key);
+    // Backward-compatible fallback to credentials resolved during ATTACH.
+    if (resolved_bearer.empty() && resolved_api_key.empty() &&
+        (!bearer_token.empty() || !api_key.empty())) {
+      resolved_bearer = bearer_token;
+      resolved_api_key = api_key;
+    }
+
+    auto candidate_table_id = entry_name;
+    string fallback_table_id;
+    if (!namespace_id.empty()) {
+      auto delim = delimiter.empty() ? "$" : delimiter;
+      auto prefix = namespace_id + delim;
+      if (!StringUtil::StartsWith(entry_name, prefix)) {
+        fallback_table_id = prefix + entry_name;
+      }
+    }
+
+    string table_id = candidate_table_id;
     string table_uri;
-    auto *dataset =
-        LanceOpenDatasetInNamespace(context, endpoint, entry_name, bearer_token,
-                                    api_key, delimiter, table_uri);
+    auto *dataset = LanceOpenDatasetInNamespace(
+        context, endpoint, candidate_table_id, resolved_bearer,
+        resolved_api_key, delimiter, table_uri);
+    if (!dataset && !fallback_table_id.empty()) {
+      table_id = fallback_table_id;
+      dataset = LanceOpenDatasetInNamespace(context, endpoint, table_id,
+                                            resolved_bearer, resolved_api_key,
+                                            delimiter, table_uri);
+    }
     if (!dataset) {
       return nullptr;
     }
+
+    CreateTableInfo info(schema, entry_name);
+    info.internal = true;
+    info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+    try {
+      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+    } catch (...) {
+      lance_close_dataset(dataset);
+      throw;
+    }
     lance_close_dataset(dataset);
 
-    auto view = make_uniq<CreateViewInfo>();
-    view->schema = DEFAULT_SCHEMA;
-    view->view_name = entry_name;
-    auto view_sql = StringUtil::Format(
-        "SELECT * FROM __lance_namespace_scan(%s, %s, %s", SQLString(endpoint),
-        SQLString(entry_name), SQLString(delimiter));
-    if (!bearer_token_override.empty()) {
-      view_sql += StringUtil::Format(", bearer_token=%s",
-                                     SQLString(bearer_token_override));
-    }
-    if (!api_key_override.empty()) {
-      view_sql +=
-          StringUtil::Format(", api_key=%s", SQLString(api_key_override));
-    }
-    view->sql = view_sql + ")";
-    view->internal = false;
-    view->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-
-    auto view_info = CreateViewInfo::FromSelect(context, std::move(view));
-    return make_uniq_base<CatalogEntry, ViewCatalogEntry>(catalog, schema,
-                                                          *view_info);
+    LanceNamespaceTableConfig cfg;
+    cfg.endpoint = endpoint;
+    cfg.table_id = table_id;
+    cfg.delimiter = delimiter;
+    cfg.bearer_token_override = bearer_token_override;
+    cfg.api_key_override = api_key_override;
+    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
+                                                         std::move(cfg));
   }
 
   vector<string> GetDefaultEntries() override {
-    return ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
-                                   api_key, delimiter);
+    auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
+                                          api_key, delimiter);
+    if (namespace_id.empty()) {
+      return tables;
+    }
+    auto delim = delimiter.empty() ? "$" : delimiter;
+    auto prefix = namespace_id + delim;
+    for (auto &t : tables) {
+      if (StringUtil::StartsWith(t, prefix)) {
+        t = t.substr(prefix.size());
+      }
+    }
+    return tables;
   }
 
 private:
@@ -362,9 +414,9 @@ class LanceSchemaEntry final : public DuckSchemaEntry {
 public:
   LanceSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
-                   bool is_rest_namespace)
+                   shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
-        is_rest_namespace(is_rest_namespace) {}
+        rest_ns(std::move(rest_ns)) {}
 
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
     auto &set = GetCatalogSet(info.GetCatalogType());
@@ -396,17 +448,19 @@ public:
         comment_ptr = comment_str.c_str();
       }
 
-      void *dataset = LanceOpenDataset(context, lance_entry->DatasetUri());
+      string display_uri;
+      void *dataset =
+          LanceOpenDatasetForTable(context, *lance_entry, display_uri);
       if (!dataset) {
-        throw IOException("Failed to open Lance dataset: " +
-                          lance_entry->DatasetUri() + LanceFormatErrorSuffix());
+        throw IOException("Failed to open Lance dataset: " + display_uri +
+                          LanceFormatErrorSuffix());
       }
       auto rc =
           lance_dataset_update_table_metadata(dataset, "comment", comment_ptr);
       lance_close_dataset(dataset);
       if (rc != 0) {
         throw IOException("Failed to update table comment in Lance dataset: " +
-                          lance_entry->DatasetUri() + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
     }
 
@@ -432,10 +486,6 @@ public:
       DuckSchemaEntry::DropEntry(context, info);
       return;
     }
-    if (is_rest_namespace) {
-      throw NotImplementedException(
-          "DROP TABLE is not supported for Lance REST namespaces");
-    }
 
     // DuckDB stores TABLE and VIEW entries in the same catalog set (see
     // DuckSchemaEntry::GetCatalogSet), so we need to resolve the existing entry
@@ -449,34 +499,87 @@ public:
     }
     auto existing_type = existing_entry->type;
 
-    if (!IsSafeDatasetTableName(info.name)) {
-      throw InvalidInputException("Unsafe Lance dataset name for DROP TABLE: " +
-                                  info.name);
-    }
+    if (rest_ns) {
+      unordered_map<string, Value> overrides;
+      if (!rest_ns->bearer_token_override.empty()) {
+        overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+      }
+      if (!rest_ns->api_key_override.empty()) {
+        overrides["api_key"] = Value(rest_ns->api_key_override);
+      }
 
-    if (!directory_ns || directory_ns->root.empty()) {
-      throw InternalException("Lance directory namespace root is empty");
-    }
-    auto root = directory_ns->root;
+      string bearer_token;
+      string api_key;
+      ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+                                bearer_token, api_key);
 
-    vector<string> option_keys;
-    vector<string> option_values;
-    option_keys = directory_ns->option_keys;
-    option_values = directory_ns->option_values;
+      auto leaf_id = info.name;
+      string prefixed_id;
+      if (!rest_ns->namespace_id.empty()) {
+        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
+        auto prefix = rest_ns->namespace_id + delim;
+        if (!StringUtil::StartsWith(leaf_id, prefix)) {
+          prefixed_id = prefix + leaf_id;
+        }
+      }
 
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                    value_ptrs);
+      vector<string> discovered;
+      string list_error;
+      if (!TryLanceNamespaceListTables(
+              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
+              api_key, rest_ns->delimiter, discovered, list_error)) {
+        throw IOException("Failed to list tables from Lance namespace: " +
+                          (list_error.empty() ? "unknown error" : list_error));
+      }
+      string table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
+      for (auto &t : discovered) {
+        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+          table_id_for_ops = prefixed_id;
+          break;
+        }
+        if (StringUtil::CIEquals(t, leaf_id)) {
+          table_id_for_ops = leaf_id;
+          break;
+        }
+      }
 
-    auto rc = lance_dir_namespace_drop_table(
-        root.c_str(), info.name.c_str(),
-        key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
-    if (rc != 0) {
-      throw IOException("Failed to drop Lance dataset: " + root + "/" +
-                        GetDatasetDirName(info.name) +
-                        LanceFormatErrorSuffix());
+      string drop_error;
+      if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
+                                      table_id_for_ops, bearer_token, api_key,
+                                      rest_ns->delimiter, drop_error)) {
+        throw IOException("Failed to drop Lance table via namespace: " +
+                          (drop_error.empty() ? "unknown error" : drop_error));
+      }
+    } else {
+      if (!IsSafeDatasetTableName(info.name)) {
+        throw InvalidInputException(
+            "Unsafe Lance dataset name for DROP TABLE: " + info.name);
+      }
+
+      if (!directory_ns || directory_ns->root.empty()) {
+        throw InternalException("Lance directory namespace root is empty");
+      }
+      auto root = directory_ns->root;
+
+      vector<string> option_keys;
+      vector<string> option_values;
+      option_keys = directory_ns->option_keys;
+      option_values = directory_ns->option_values;
+
+      vector<const char *> key_ptrs;
+      vector<const char *> value_ptrs;
+      BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                      value_ptrs);
+
+      auto rc = lance_dir_namespace_drop_table(
+          root.c_str(), info.name.c_str(),
+          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
+      if (rc != 0) {
+        throw IOException("Failed to drop Lance dataset: " + root + "/" +
+                          GetDatasetDirName(info.name) +
+                          LanceFormatErrorSuffix());
+      }
     }
 
     // Drop the DuckDB catalog entry after the dataset has been deleted
@@ -508,35 +611,140 @@ public:
       throw NotImplementedException(
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
-    if (is_rest_namespace) {
-      throw NotImplementedException(
-          "CREATE TABLE is not supported for Lance REST namespaces");
-    }
     if (!info.constraints.empty() || !create_info.constraints.empty()) {
       throw NotImplementedException(
           "Lance CREATE TABLE does not support constraints");
     }
-    if (!IsSafeDatasetTableName(create_info.table)) {
-      throw InvalidInputException(
-          "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
-    }
-    if (!directory_ns || directory_ns->root.empty()) {
-      throw InternalException("Lance directory namespace root is empty");
-    }
-
     auto &context = transaction.GetContext();
-    auto dataset_path = JoinNamespacePath(directory_ns->root,
-                                          GetDatasetDirName(create_info.table));
+    string dataset_path;
+    vector<string> option_keys;
+    vector<string> option_values;
 
-    auto exists =
-        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
-    if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
-        exists) {
-      return nullptr;
-    }
-    if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
-        exists) {
-      throw IOException("Lance dataset already exists: " + dataset_path);
+    if (rest_ns) {
+      unordered_map<string, Value> overrides;
+      if (!rest_ns->bearer_token_override.empty()) {
+        overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+      }
+      if (!rest_ns->api_key_override.empty()) {
+        overrides["api_key"] = Value(rest_ns->api_key_override);
+      }
+
+      string bearer_token;
+      string api_key;
+      ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+                                bearer_token, api_key);
+
+      auto leaf_id = create_info.table;
+      string prefixed_id;
+      if (!rest_ns->namespace_id.empty()) {
+        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
+        auto prefix = rest_ns->namespace_id + delim;
+        if (!StringUtil::StartsWith(leaf_id, prefix)) {
+          prefixed_id = prefix + leaf_id;
+        }
+      }
+
+      vector<string> discovered;
+      string list_error;
+      if (!TryLanceNamespaceListTables(
+              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
+              api_key, rest_ns->delimiter, discovered, list_error)) {
+        throw IOException("Failed to list tables from Lance namespace: " +
+                          (list_error.empty() ? "unknown error" : list_error));
+      }
+      bool exists = false;
+      string existing_id;
+      for (auto &t : discovered) {
+        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+          exists = true;
+          existing_id = prefixed_id;
+          break;
+        }
+        if (StringUtil::CIEquals(t, leaf_id)) {
+          exists = true;
+          existing_id = leaf_id;
+          break;
+        }
+      }
+      auto table_id_for_ops =
+          exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
+      if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+          exists) {
+        return nullptr;
+      }
+      if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
+          exists) {
+        throw IOException("Lance table already exists: " + existing_id);
+      }
+      if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT &&
+          exists) {
+        string drop_error;
+        if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
+                                        table_id_for_ops, bearer_token, api_key,
+                                        rest_ns->delimiter, drop_error)) {
+          throw IOException(
+              "Failed to drop Lance table via namespace: " +
+              (drop_error.empty() ? "unknown error" : drop_error));
+        }
+      }
+
+      string create_error;
+      if (!TryLanceNamespaceCreateEmptyTable(
+              context, rest_ns->endpoint, table_id_for_ops, bearer_token,
+              api_key, rest_ns->delimiter, dataset_path, option_keys,
+              option_values, create_error)) {
+        // Best-effort fallback for namespace implementations that do not use
+        // a qualified object identifier for tables in ListTables.
+        if (!prefixed_id.empty() && table_id_for_ops == prefixed_id) {
+          option_keys.clear();
+          option_values.clear();
+          dataset_path.clear();
+          create_error.clear();
+          if (!TryLanceNamespaceCreateEmptyTable(
+                  context, rest_ns->endpoint, leaf_id, bearer_token, api_key,
+                  rest_ns->delimiter, dataset_path, option_keys, option_values,
+                  create_error)) {
+            throw IOException(
+                "Failed to create Lance table via namespace: " +
+                (create_error.empty() ? "unknown error" : create_error));
+          }
+          table_id_for_ops = leaf_id;
+        } else {
+          throw IOException(
+              "Failed to create Lance table via namespace: " +
+              (create_error.empty() ? "unknown error" : create_error));
+        }
+      }
+      if (dataset_path.empty()) {
+        throw IOException(
+            "Failed to create Lance table via namespace: empty location");
+      }
+      dataset_path = LanceNormalizeS3Scheme(dataset_path);
+    } else {
+      if (!IsSafeDatasetTableName(create_info.table)) {
+        throw InvalidInputException(
+            "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
+      }
+      if (!directory_ns || directory_ns->root.empty()) {
+        throw InternalException("Lance directory namespace root is empty");
+      }
+
+      dataset_path = JoinNamespacePath(directory_ns->root,
+                                       GetDatasetDirName(create_info.table));
+
+      auto exists =
+          DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+      if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+          exists) {
+        return nullptr;
+      }
+      if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
+          exists) {
+        throw IOException("Lance dataset already exists: " + dataset_path);
+      }
+
+      option_keys = directory_ns->option_keys;
+      option_values = directory_ns->option_values;
     }
 
     vector<string> names;
@@ -555,11 +763,6 @@ public:
                                   props);
 
     auto mode = CreateTableModeFromConflict(create_info.on_conflict);
-
-    vector<string> option_keys;
-    vector<string> option_values;
-    option_keys = directory_ns->option_keys;
-    option_values = directory_ns->option_values;
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -614,7 +817,7 @@ public:
 
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
-  bool is_rest_namespace;
+  shared_ptr<LanceRestNamespaceConfig> rest_ns;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
@@ -623,9 +826,9 @@ public:
 
   LanceDuckCatalog(AttachedDatabase &db,
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
-                   bool is_rest_namespace)
+                   shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
-        is_rest_namespace(is_rest_namespace) {}
+        rest_ns(std::move(rest_ns)) {}
 
   using DuckCatalog::PlanUpdate;
 
@@ -662,10 +865,374 @@ public:
       throw NotImplementedException(
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
-    if (is_rest_namespace) {
-      throw NotImplementedException(
-          "CREATE TABLE is not supported for Lance REST namespaces");
+    if (rest_ns) {
+      class PhysicalLanceCreateTableAs final : public PhysicalOperator {
+      public:
+        PhysicalLanceCreateTableAs(PhysicalPlan &physical_plan,
+                                   vector<LogicalType> types_p, string endpoint,
+                                   string namespace_id, string delimiter,
+                                   string bearer_token_override,
+                                   string api_key_override, string table_name,
+                                   string writer_mode,
+                                   vector<string> column_names_p,
+                                   vector<LogicalType> column_types_p,
+                                   idx_t estimated_cardinality)
+            : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
+                               std::move(types_p), estimated_cardinality),
+              endpoint(std::move(endpoint)),
+              namespace_id(std::move(namespace_id)),
+              delimiter(std::move(delimiter)),
+              bearer_token_override(std::move(bearer_token_override)),
+              api_key_override(std::move(api_key_override)),
+              table_name(std::move(table_name)),
+              writer_mode(std::move(writer_mode)),
+              column_names(std::move(column_names_p)),
+              column_types(std::move(column_types_p)) {}
+
+        bool IsSink() const override { return true; }
+        bool IsSource() const override { return true; }
+        bool ParallelSink() const override { return false; }
+        bool SinkOrderDependent() const override { return false; }
+
+        struct GlobalState final : public GlobalSinkState {
+          mutex lock;
+
+          string endpoint;
+          string namespace_id;
+          string delimiter;
+          string bearer_token_override;
+          string api_key_override;
+          string table_name;
+          string writer_mode;
+
+          string table_id;
+          string open_path;
+          vector<string> option_keys;
+          vector<string> option_values;
+
+          vector<string> column_names;
+          vector<LogicalType> column_types;
+
+          idx_t insert_count = 0;
+          void *writer = nullptr;
+          ArrowSchemaWrapper schema_root;
+
+          explicit GlobalState(string endpoint_p, string namespace_id_p,
+                               string delimiter_p, string bearer_override_p,
+                               string api_override_p, string table_name_p,
+                               string writer_mode_p, vector<string> col_names_p,
+                               vector<LogicalType> col_types_p)
+              : endpoint(std::move(endpoint_p)),
+                namespace_id(std::move(namespace_id_p)),
+                delimiter(std::move(delimiter_p)),
+                bearer_token_override(std::move(bearer_override_p)),
+                api_key_override(std::move(api_override_p)),
+                table_name(std::move(table_name_p)),
+                writer_mode(std::move(writer_mode_p)),
+                column_names(std::move(col_names_p)),
+                column_types(std::move(col_types_p)) {}
+
+          ~GlobalState() override {
+            if (writer) {
+              lance_close_writer(writer);
+              writer = nullptr;
+            }
+          }
+        };
+
+        unique_ptr<GlobalSinkState>
+        GetGlobalSinkState(ClientContext &context) const override {
+          auto state = make_uniq<GlobalState>(
+              endpoint, namespace_id, delimiter, bearer_token_override,
+              api_key_override, table_name, writer_mode, column_names,
+              column_types);
+
+          auto props = context.GetClientProperties();
+          memset(&state->schema_root.arrow_schema, 0,
+                 sizeof(state->schema_root.arrow_schema));
+          ArrowConverter::ToArrowSchema(&state->schema_root.arrow_schema,
+                                        state->column_types,
+                                        state->column_names, props);
+
+          unordered_map<string, Value> overrides;
+          if (!state->bearer_token_override.empty()) {
+            overrides["bearer_token"] = Value(state->bearer_token_override);
+          }
+          if (!state->api_key_override.empty()) {
+            overrides["api_key"] = Value(state->api_key_override);
+          }
+
+          string bearer_token;
+          string api_key;
+          ResolveLanceNamespaceAuth(context, state->endpoint, overrides,
+                                    bearer_token, api_key);
+
+          auto delim = state->delimiter.empty() ? "$" : state->delimiter;
+          auto prefix = state->namespace_id.empty()
+                            ? string()
+                            : (state->namespace_id + delim);
+          auto leaf_id = state->table_name;
+          string prefixed_id;
+          if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
+            prefixed_id = prefix + leaf_id;
+          }
+
+          vector<string> discovered;
+          string list_error;
+          if (!TryLanceNamespaceListTables(
+                  context, state->endpoint, state->namespace_id, bearer_token,
+                  api_key, state->delimiter, discovered, list_error)) {
+            throw IOException(
+                "Failed to list tables from Lance namespace: " +
+                (list_error.empty() ? "unknown error" : list_error));
+          }
+
+          state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
+          for (auto &t : discovered) {
+            if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+              state->table_id = prefixed_id;
+              break;
+            }
+            if (StringUtil::CIEquals(t, leaf_id)) {
+              state->table_id = leaf_id;
+              break;
+            }
+          }
+
+          // If overwriting, drop any existing table first.
+          if (state->writer_mode == "overwrite") {
+            string drop_error;
+            if (!TryLanceNamespaceDropTable(
+                    context, state->endpoint, state->table_id, bearer_token,
+                    api_key, state->delimiter, drop_error)) {
+              throw IOException(
+                  "Failed to drop Lance table via namespace: " +
+                  (drop_error.empty() ? "unknown error" : drop_error));
+            }
+          }
+
+          string create_error;
+          if (!TryLanceNamespaceCreateEmptyTable(
+                  context, state->endpoint, state->table_id, bearer_token,
+                  api_key, state->delimiter, state->open_path,
+                  state->option_keys, state->option_values, create_error)) {
+            if (!prefixed_id.empty() && state->table_id == prefixed_id) {
+              state->table_id = leaf_id;
+              state->open_path.clear();
+              state->option_keys.clear();
+              state->option_values.clear();
+              create_error.clear();
+              if (!TryLanceNamespaceCreateEmptyTable(
+                      context, state->endpoint, state->table_id, bearer_token,
+                      api_key, state->delimiter, state->open_path,
+                      state->option_keys, state->option_values, create_error)) {
+                throw IOException(
+                    "Failed to create Lance table via namespace: " +
+                    (create_error.empty() ? "unknown error" : create_error));
+              }
+            } else {
+              throw IOException(
+                  "Failed to create Lance table via namespace: " +
+                  (create_error.empty() ? "unknown error" : create_error));
+            }
+          }
+          if (state->open_path.empty()) {
+            throw IOException(
+                "Failed to create Lance table via namespace: empty location");
+          }
+          state->open_path = LanceNormalizeS3Scheme(state->open_path);
+
+          vector<const char *> key_ptrs;
+          vector<const char *> value_ptrs;
+          BuildStorageOptionPointerArrays(
+              state->option_keys, state->option_values, key_ptrs, value_ptrs);
+
+          state->writer = lance_open_writer_with_storage_options(
+              state->open_path.c_str(), state->writer_mode.c_str(),
+              key_ptrs.empty() ? nullptr : key_ptrs.data(),
+              value_ptrs.empty() ? nullptr : value_ptrs.data(),
+              state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+              LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
+              LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+              &state->schema_root.arrow_schema);
+          if (!state->writer) {
+            throw IOException("Failed to open Lance writer: " +
+                              state->open_path + LanceFormatErrorSuffix());
+          }
+
+          return state;
+        }
+
+        struct LocalState final : public LocalSinkState {};
+        unique_ptr<LocalSinkState>
+        GetLocalSinkState(ExecutionContext &) const override {
+          return make_uniq<LocalState>();
+        }
+
+        SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
+                            OperatorSinkInput &input) const override {
+          if (chunk.size() == 0) {
+            return SinkResultType::NEED_MORE_INPUT;
+          }
+
+          auto &gstate = input.global_state.Cast<GlobalState>();
+          lock_guard<mutex> guard(gstate.lock);
+
+          unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
+              extension_type_cast;
+          auto props = context.client.GetClientProperties();
+
+          ArrowArray array;
+          memset(&array, 0, sizeof(array));
+          ArrowConverter::ToArrowArray(chunk, &array, props,
+                                       extension_type_cast);
+
+          auto rc = lance_writer_write_batch(gstate.writer, &array);
+          if (array.release) {
+            array.release(&array);
+          }
+          if (rc != 0) {
+            throw IOException("Failed to write to Lance dataset" +
+                              LanceFormatErrorSuffix());
+          }
+          gstate.insert_count += chunk.size();
+          return SinkResultType::NEED_MORE_INPUT;
+        }
+
+        SinkCombineResultType
+        Combine(ExecutionContext &, OperatorSinkCombineInput &) const override {
+          return SinkCombineResultType::FINISHED;
+        }
+
+        SinkFinalizeType
+        Finalize(Pipeline &, Event &, ClientContext &context,
+                 OperatorSinkFinalizeInput &input) const override {
+          (void)context;
+          auto &gstate = input.global_state.Cast<GlobalState>();
+
+          {
+            lock_guard<mutex> guard(gstate.lock);
+            auto rc = lance_writer_finish(gstate.writer);
+            lance_close_writer(gstate.writer);
+            gstate.writer = nullptr;
+            if (rc != 0) {
+              throw IOException("Failed to finalize Lance CTAS write" +
+                                LanceFormatErrorSuffix());
+            }
+          }
+
+          return SinkFinalizeType::READY;
+        }
+
+        class SourceState : public GlobalSourceState {
+        public:
+          bool emitted = false;
+        };
+
+        unique_ptr<GlobalSourceState>
+        GetGlobalSourceState(ClientContext &) const override {
+          return make_uniq<SourceState>();
+        }
+
+        SourceResultType GetData(ExecutionContext &, DataChunk &chunk,
+                                 OperatorSourceInput &input) const override {
+          auto &state = input.global_state.Cast<SourceState>();
+          if (state.emitted) {
+            return SourceResultType::FINISHED;
+          }
+          state.emitted = true;
+
+          auto &gstate = sink_state->Cast<GlobalState>();
+          chunk.SetCardinality(1);
+          chunk.SetValue(
+              0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
+          return SourceResultType::FINISHED;
+        }
+
+        string GetName() const override { return "LanceCreateTableAs"; }
+
+      private:
+        string endpoint;
+        string namespace_id;
+        string delimiter;
+        string bearer_token_override;
+        string api_key_override;
+        string table_name;
+        string writer_mode;
+        vector<string> column_names;
+        vector<LogicalType> column_types;
+      };
+
+      // Use LIST TABLES to implement conflict behavior in a side-effect-free
+      // way.
+      unordered_map<string, Value> overrides;
+      if (!rest_ns->bearer_token_override.empty()) {
+        overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+      }
+      if (!rest_ns->api_key_override.empty()) {
+        overrides["api_key"] = Value(rest_ns->api_key_override);
+      }
+      string bearer_token;
+      string api_key;
+      ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+                                bearer_token, api_key);
+
+      vector<string> discovered;
+      string list_error;
+      if (!TryLanceNamespaceListTables(
+              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
+              api_key, rest_ns->delimiter, discovered, list_error)) {
+        throw IOException("Failed to list tables from Lance namespace: " +
+                          (list_error.empty() ? "unknown error" : list_error));
+      }
+
+      auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
+      auto prefix = rest_ns->namespace_id.empty()
+                        ? string()
+                        : (rest_ns->namespace_id + delim);
+      auto leaf_id = create_info.table;
+      string prefixed_id;
+      if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
+        prefixed_id = prefix + leaf_id;
+      }
+
+      bool exists = false;
+      string existing_id;
+      for (auto &t : discovered) {
+        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+          exists = true;
+          existing_id = prefixed_id;
+          break;
+        }
+        if (StringUtil::CIEquals(t, leaf_id)) {
+          exists = true;
+          existing_id = leaf_id;
+          break;
+        }
+      }
+
+      if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+          exists) {
+        return planner.Make<PhysicalEmptyResult>(op.types,
+                                                 op.estimated_cardinality);
+      }
+      if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
+          exists) {
+        throw IOException("Lance table already exists: " + existing_id);
+      }
+
+      auto names = create_info.columns.GetColumnNames();
+      auto types = create_info.columns.GetColumnTypes();
+      string mode = CreateTableModeFromConflict(create_info.on_conflict);
+      auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
+          op.types, rest_ns->endpoint, rest_ns->namespace_id,
+          rest_ns->delimiter, rest_ns->bearer_token_override,
+          rest_ns->api_key_override, create_info.table, mode, std::move(names),
+          std::move(types), op.estimated_cardinality);
+      create_as.children.push_back(plan);
+      return create_as;
     }
+
     if (!IsSafeDatasetTableName(create_info.table)) {
       throw InvalidInputException(
           "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
@@ -783,8 +1350,8 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
     LogicalDependencyList dependencies;
-    auto entry = make_uniq<LanceSchemaEntry>(*this, info, directory_ns,
-                                             is_rest_namespace);
+    auto entry =
+        make_uniq<LanceSchemaEntry>(*this, info, directory_ns, rest_ns);
     if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
                              dependencies)) {
       throw InternalException("Failed to replace Lance schema entry");
@@ -793,7 +1360,7 @@ public:
 
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
-  bool is_rest_namespace;
+  shared_ptr<LanceRestNamespaceConfig> rest_ns;
 };
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
@@ -818,6 +1385,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
 
   unique_ptr<DefaultGenerator> generator;
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
+  shared_ptr<LanceRestNamespaceConfig> rest_ns;
 
   auto is_rest_namespace = !endpoint.empty();
   string namespace_id;
@@ -866,14 +1434,20 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
       throw IOException("Failed to list tables from Lance namespace: " +
                         list_error);
     }
+
+    rest_ns = make_shared_ptr<LanceRestNamespaceConfig>();
+    rest_ns->endpoint = endpoint;
+    rest_ns->namespace_id = namespace_id;
+    rest_ns->delimiter = delimiter;
+    rest_ns->bearer_token_override = bearer_token_override;
+    rest_ns->api_key_override = api_key_override;
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
   // materializes per-table entries mapping to internal scan / namespace scan,
   // scan, and supports CREATE TABLE for directory namespaces.
   info.path = ":memory:";
-  auto catalog =
-      make_uniq<LanceDuckCatalog>(db, directory_ns, is_rest_namespace);
+  auto catalog = make_uniq<LanceDuckCatalog>(db, directory_ns, rest_ns);
   catalog->Initialize(false);
 
   auto system_transaction =
@@ -882,17 +1456,15 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
 
   auto &duck_schema = schema.Cast<DuckSchemaEntry>();
-  auto &catalog_set = duck_schema.GetCatalogSet(
-      is_rest_namespace ? CatalogType::VIEW_ENTRY : CatalogType::TABLE_ENTRY);
+  auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
 
   if (!is_rest_namespace) {
     generator = make_uniq<LanceDirectoryDefaultGenerator>(*catalog, schema,
                                                           directory_ns);
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
-        *catalog, schema, std::move(endpoint), std::move(namespace_id),
-        std::move(bearer_token), std::move(api_key), std::move(delimiter),
-        std::move(bearer_token_override), std::move(api_key_override));
+        *catalog, schema, endpoint, namespace_id, std::move(bearer_token),
+        std::move(api_key), delimiter, bearer_token_override, api_key_override);
   }
   catalog_set.SetDefaultGenerator(std::move(generator));
 

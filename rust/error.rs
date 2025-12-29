@@ -61,6 +61,10 @@ pub enum ErrorCode {
     DatasetCreateScalarIndex = 46,
     DatasetCalculateDataStats = 47,
     DatasetTake = 48,
+
+    NamespaceDescribeTableInfo = 49,
+    NamespaceCreateEmptyTable = 50,
+    NamespaceDropTable = 51,
 }
 
 struct LastError {

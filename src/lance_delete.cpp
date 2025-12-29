@@ -144,12 +144,11 @@ public:
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceDelete(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                      LanceTableEntry &table_p, string dataset_uri_p,
-                      string filter_ir_p, idx_t estimated_cardinality)
+                      LanceTableEntry &table_p, string filter_ir_p,
+                      idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), dataset_uri(std::move(dataset_uri_p)),
-        filter_ir(std::move(filter_ir_p)) {}
+        table(table_p), filter_ir(std::move(filter_ir_p)) {}
 
   bool IsSource() const override { return true; }
 
@@ -166,11 +165,12 @@ public:
     }
     state.emitted = true;
 
-    auto open_path = dataset_uri;
+    string open_path;
     vector<string> option_keys;
     vector<string> option_values;
-    ResolveLanceStorageOptions(context.client, dataset_uri, open_path,
-                               option_keys, option_values);
+    string display_uri;
+    ResolveLanceStorageOptionsForTable(context.client, table, open_path,
+                                       option_keys, option_values, display_uri);
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -207,7 +207,7 @@ public:
                           open_path + "'" + LanceFormatErrorSuffix());
       }
     } else {
-      RegisterLancePendingAppend(context.client, table.ParentCatalog(),
+      RegisterLancePendingAppend(context.client, table.catalog,
                                  std::move(open_path), std::move(option_keys),
                                  std::move(option_values), txn);
     }
@@ -221,7 +221,6 @@ public:
 
 private:
   LanceTableEntry &table;
-  string dataset_uri;
   string filter_ir;
 };
 
@@ -248,8 +247,7 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
   }
 
   auto &del = planner.Make<PhysicalLanceDelete>(
-      op.types, *lance_table, lance_table->DatasetUri(), std::move(filter_ir),
-      op.estimated_cardinality);
+      op.types, *lance_table, std::move(filter_ir), op.estimated_cardinality);
   (void)context;
   return del;
 }

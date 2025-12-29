@@ -59,6 +59,41 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &api_key, const string &delimiter,
                             string &out_table_uri);
 
+bool TryLanceNamespaceDescribeTable(
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    string &out_location, vector<string> &out_option_keys,
+    vector<string> &out_option_values, string &out_error);
+
+bool TryLanceNamespaceCreateEmptyTable(
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    string &out_location, vector<string> &out_option_keys,
+    vector<string> &out_option_values, string &out_error);
+
+bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
+                                const string &table_id,
+                                const string &bearer_token,
+                                const string &api_key, const string &delimiter,
+                                string &out_error);
+
+class LanceTableEntry;
+
+void *LanceOpenDatasetForTable(ClientContext &context,
+                               const LanceTableEntry &table,
+                               string &out_display_uri);
+
+void ResolveLanceStorageOptionsForTable(ClientContext &context,
+                                        const LanceTableEntry &table,
+                                        string &out_open_path,
+                                        vector<string> &out_option_keys,
+                                        vector<string> &out_option_values,
+                                        string &out_display_uri);
+
+int64_t LanceTruncateDatasetWithStorageOptions(
+    const string &open_path, const vector<string> &option_keys,
+    const vector<string> &option_values, const string &display_uri);
+
 int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
 
 } // namespace duckdb

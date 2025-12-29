@@ -3,8 +3,11 @@ use std::ptr;
 use std::sync::Arc;
 
 use lance::dataset::builder::DatasetBuilder;
+use lance_core::Error as LanceError;
 
-use lance_namespace::models::{DescribeTableRequest, ListTablesRequest};
+use lance_namespace::models::{
+    CreateEmptyTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
+};
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::RestNamespaceBuilder;
 
@@ -41,6 +44,19 @@ fn build_config(
         builder = builder.header("x-api-key", key.to_string());
     }
     builder
+}
+
+fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, String>) -> String {
+    if storage_options.is_empty() {
+        return String::new();
+    }
+    let mut items: Vec<(String, String)> = storage_options.into_iter().collect();
+    items.sort_by(|(a, _), (b, _)| a.cmp(b));
+    items
+        .into_iter()
+        .map(|(k, v)| format!("{k}\t{v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn list_tables_inner(
@@ -109,6 +125,239 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
         Err(err) => {
             set_last_error(err.code, err.message);
             ptr::null()
+        }
+    }
+}
+
+fn describe_table_info_inner(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+) -> FfiResult<(String, String)> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
+        .delimiter(delimiter)
+        .build();
+
+    let (location, storage_options_tsv) = runtime::block_on(async move {
+        let mut req = DescribeTableRequest::new();
+        req.id = Some(vec![table_id.to_string()]);
+        let resp = namespace.describe_table(req).await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTableInfo,
+                format!("namespace describe_table: {err}"),
+            )
+        })?;
+        let location = resp.location.ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTableInfo,
+                "namespace describe_table: missing location",
+            )
+        })?;
+        let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());
+        Ok::<_, FfiError>((location, storage_options_tsv))
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+
+    Ok((location, storage_options_tsv))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_describe_table(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    out_location: *mut *const c_char,
+    out_storage_options_tsv: *mut *const c_char,
+) -> i32 {
+    if !out_location.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_location, ptr::null());
+        }
+    }
+    if !out_storage_options_tsv.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_storage_options_tsv, ptr::null());
+        }
+    }
+
+    match describe_table_info_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+        Ok((location, storage_options_tsv)) => {
+            clear_last_error();
+            if !out_location.is_null() {
+                let c = CString::new(location).unwrap_or_else(|_| to_c_string("invalid location"));
+                unsafe {
+                    std::ptr::write_unaligned(out_location, c.into_raw() as *const c_char);
+                }
+            }
+            if !out_storage_options_tsv.is_null() {
+                let c = CString::new(storage_options_tsv)
+                    .unwrap_or_else(|_| to_c_string("invalid storage options"));
+                unsafe {
+                    std::ptr::write_unaligned(
+                        out_storage_options_tsv,
+                        c.into_raw() as *const c_char,
+                    );
+                }
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn create_empty_table_inner(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+) -> FfiResult<(String, String)> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
+        .delimiter(delimiter)
+        .build();
+
+    let (location, storage_options_tsv) = runtime::block_on(async move {
+        let mut req = CreateEmptyTableRequest::new();
+        req.id = Some(vec![table_id.to_string()]);
+        let resp = namespace.create_empty_table(req).await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceCreateEmptyTable,
+                format!("namespace create_empty_table: {err}"),
+            )
+        })?;
+        let location = resp.location.ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::NamespaceCreateEmptyTable,
+                "namespace create_empty_table: missing location",
+            )
+        })?;
+        let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());
+        Ok::<_, FfiError>((location, storage_options_tsv))
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+
+    Ok((location, storage_options_tsv))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_create_empty_table(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    out_location: *mut *const c_char,
+    out_storage_options_tsv: *mut *const c_char,
+) -> i32 {
+    if !out_location.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_location, ptr::null());
+        }
+    }
+    if !out_storage_options_tsv.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_storage_options_tsv, ptr::null());
+        }
+    }
+
+    match create_empty_table_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+        Ok((location, storage_options_tsv)) => {
+            clear_last_error();
+            if !out_location.is_null() {
+                let c = CString::new(location).unwrap_or_else(|_| to_c_string("invalid location"));
+                unsafe {
+                    std::ptr::write_unaligned(out_location, c.into_raw() as *const c_char);
+                }
+            }
+            if !out_storage_options_tsv.is_null() {
+                let c = CString::new(storage_options_tsv)
+                    .unwrap_or_else(|_| to_c_string("invalid storage options"));
+                unsafe {
+                    std::ptr::write_unaligned(
+                        out_storage_options_tsv,
+                        c.into_raw() as *const c_char,
+                    );
+                }
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn drop_table_inner(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+) -> FfiResult<()> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
+        .delimiter(delimiter)
+        .build();
+
+    runtime::block_on(async move {
+        let mut req = DropTableRequest::new();
+        req.id = Some(vec![table_id.to_string()]);
+        match namespace.drop_table(req).await {
+            Ok(_) => Ok(()),
+            Err(LanceError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(FfiError::new(
+                ErrorCode::NamespaceDropTable,
+                format!("namespace drop_table '{table_id}': {err}"),
+            )),
+        }
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_drop_table(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+) -> i32 {
+    match drop_table_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
         }
     }
 }

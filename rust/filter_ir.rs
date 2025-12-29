@@ -88,11 +88,15 @@ fn contains_udf() -> Arc<ScalarUDF> {
 }
 
 fn lower_udf() -> Arc<ScalarUDF> {
-    LOWER_UDF.get_or_init(datafusion_functions::string::lower).clone()
+    LOWER_UDF
+        .get_or_init(datafusion_functions::string::lower)
+        .clone()
 }
 
 fn upper_udf() -> Arc<ScalarUDF> {
-    UPPER_UDF.get_or_init(datafusion_functions::string::upper).clone()
+    UPPER_UDF
+        .get_or_init(datafusion_functions::string::upper)
+        .clone()
 }
 
 pub fn parse_filter_ir(filter_ir: &[u8]) -> Result<Expr> {

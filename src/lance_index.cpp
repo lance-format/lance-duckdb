@@ -584,6 +584,77 @@ LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
   return std::move(result);
 }
 
+static unique_ptr<FunctionData>
+LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
+                        vector<LogicalType> &return_types,
+                        vector<string> &names) {
+  if (input.inputs.size() != 3) {
+    throw BinderException(
+        "__lance_indexes_table requires (catalog, schema, table)");
+  }
+  if (input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull()) {
+    throw BinderException("__lance_indexes_table inputs cannot be NULL");
+  }
+
+  auto catalog = input.inputs[0].GetValue<string>();
+  auto schema = input.inputs[1].GetValue<string>();
+  auto table = input.inputs[2].GetValue<string>();
+  if (catalog.empty() || schema.empty() || table.empty()) {
+    throw BinderException(
+        "__lance_indexes_table catalog/schema/table cannot be empty");
+  }
+
+  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
+                                  schema, table);
+  auto &table_entry = entry.Cast<TableCatalogEntry>();
+  auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+  if (!lance_entry) {
+    throw NotImplementedException(
+        "__lance_indexes_table only supports tables backed by Lance");
+  }
+
+  auto result = make_uniq<LanceIndexListBindData>();
+  result->file_path = catalog + "." + schema + "." + table;
+
+  string display_uri;
+  result->dataset =
+      LanceOpenDatasetForTable(context, *lance_entry, display_uri);
+  if (!display_uri.empty()) {
+    result->file_path = display_uri;
+  }
+  if (!result->dataset) {
+    throw IOException("Failed to open Lance dataset: " + result->file_path +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_index_list_schema(result->dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get Lance index list schema: " +
+                      result->file_path + LanceFormatErrorSuffix());
+  }
+
+  memset(&result->schema_root.arrow_schema, 0,
+         sizeof(result->schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &result->schema_root.arrow_schema) !=
+      0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance index list schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+
+  auto &config = DBConfig::GetConfig(context);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      config, result->arrow_table, result->schema_root.arrow_schema);
+  result->names = result->arrow_table.GetNames();
+  result->types = result->arrow_table.GetTypes();
+  names = result->names;
+  return_types = result->types;
+  return std::move(result);
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceIndexListInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceIndexListBindData>();
@@ -703,6 +774,16 @@ static TableFunction LanceInternalIndexesTableFunction() {
   return f;
 }
 
+static TableFunction LanceInternalIndexesTableTableFunction() {
+  TableFunction f(
+      "__lance_indexes_table",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LanceIndexListFunc, LanceIndexListTableBind, LanceIndexListInitGlobal,
+      LanceIndexListInitLocal);
+  f.projection_pushdown = true;
+  return f;
+}
+
 // --- Internal DDL table functions ---
 
 struct LanceIndexDdlBindData final : public FunctionData {
@@ -716,7 +797,22 @@ struct LanceIndexDdlBindData final : public FunctionData {
         params_json(std::move(params_json_p)), replace(replace_p),
         train(train_p) {}
 
+  LanceIndexDdlBindData(string catalog_p, string schema_p, string table_p,
+                        string index_name_p, vector<string> columns_p,
+                        string index_type_p, string params_json_p,
+                        bool replace_p, bool train_p)
+      : target_is_table(true), catalog(std::move(catalog_p)),
+        schema(std::move(schema_p)), table(std::move(table_p)),
+        index_name(std::move(index_name_p)), columns(std::move(columns_p)),
+        index_type(std::move(index_type_p)),
+        params_json(std::move(params_json_p)), replace(replace_p),
+        train(train_p) {}
+
+  bool target_is_table = false;
   string dataset_uri;
+  string catalog;
+  string schema;
+  string table;
   string index_name;
   vector<string> columns;
   string index_type;
@@ -725,6 +821,11 @@ struct LanceIndexDdlBindData final : public FunctionData {
   bool train = true;
 
   unique_ptr<FunctionData> Copy() const override {
+    if (target_is_table) {
+      return make_uniq<LanceIndexDdlBindData>(catalog, schema, table,
+                                              index_name, columns, index_type,
+                                              params_json, replace, train);
+    }
     return make_uniq<LanceIndexDdlBindData>(dataset_uri, index_name, columns,
                                             index_type, params_json, replace,
                                             train);
@@ -732,6 +833,16 @@ struct LanceIndexDdlBindData final : public FunctionData {
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceIndexDdlBindData>();
+    if (target_is_table != other.target_is_table) {
+      return false;
+    }
+    if (target_is_table) {
+      return catalog == other.catalog && schema == other.schema &&
+             table == other.table && index_name == other.index_name &&
+             columns == other.columns && index_type == other.index_type &&
+             params_json == other.params_json && replace == other.replace &&
+             train == other.train;
+    }
     return dataset_uri == other.dataset_uri && index_name == other.index_name &&
            columns == other.columns && index_type == other.index_type &&
            params_json == other.params_json && replace == other.replace &&
@@ -786,6 +897,63 @@ LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
 }
 
 static unique_ptr<FunctionData>
+LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
+                          vector<LogicalType> &return_types,
+                          vector<string> &names) {
+  if (input.inputs.size() != 9) {
+    throw BinderException("__lance_create_index_table requires 9 inputs");
+  }
+  for (idx_t i = 0; i < input.inputs.size(); i++) {
+    if (input.inputs[i].IsNull()) {
+      throw BinderException("__lance_create_index_table inputs cannot be NULL");
+    }
+  }
+
+  auto catalog = input.inputs[0].GetValue<string>();
+  auto schema = input.inputs[1].GetValue<string>();
+  auto table = input.inputs[2].GetValue<string>();
+  auto index_name = input.inputs[3].GetValue<string>();
+  auto column = input.inputs[4].GetValue<string>();
+  auto index_type = input.inputs[5].GetValue<string>();
+  auto params_json = input.inputs[6].GetValue<string>();
+  auto replace =
+      input.inputs[7].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+  auto train =
+      input.inputs[8].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+
+  if (catalog.empty() || schema.empty() || table.empty()) {
+    throw BinderException(
+        "__lance_create_index_table catalog/schema/table cannot be empty");
+  }
+  if (column.empty()) {
+    throw BinderException("__lance_create_index_table column cannot be empty");
+  }
+  if (index_type.empty()) {
+    throw BinderException(
+        "__lance_create_index_table index type cannot be empty");
+  }
+
+  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
+                                  schema, table);
+  auto &table_entry = entry.Cast<TableCatalogEntry>();
+  auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+  if (!lance_entry) {
+    throw NotImplementedException(
+        "__lance_create_index_table only supports tables backed by Lance");
+  }
+
+  return_types = {LogicalType::BIGINT};
+  names = {"Count"};
+  vector<string> columns;
+  columns.push_back(std::move(column));
+  return make_uniq<LanceIndexDdlBindData>(
+      std::move(catalog), std::move(schema), std::move(table),
+      std::move(index_name), std::move(columns),
+      NormalizeIndexType(std::move(index_type)), std::move(params_json),
+      replace, train);
+}
+
+static unique_ptr<FunctionData>
 LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
                    vector<LogicalType> &return_types, vector<string> &names) {
   if (input.inputs.size() != 2) {
@@ -812,6 +980,48 @@ LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
       false, true);
 }
 
+static unique_ptr<FunctionData>
+LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
+                        vector<LogicalType> &return_types,
+                        vector<string> &names) {
+  if (input.inputs.size() != 4) {
+    throw BinderException("__lance_drop_index_table requires 4 inputs");
+  }
+  for (idx_t i = 0; i < input.inputs.size(); i++) {
+    if (input.inputs[i].IsNull()) {
+      throw BinderException("__lance_drop_index_table inputs cannot be NULL");
+    }
+  }
+
+  auto catalog = input.inputs[0].GetValue<string>();
+  auto schema = input.inputs[1].GetValue<string>();
+  auto table = input.inputs[2].GetValue<string>();
+  auto index_name = input.inputs[3].GetValue<string>();
+  if (catalog.empty() || schema.empty() || table.empty()) {
+    throw BinderException(
+        "__lance_drop_index_table catalog/schema/table cannot be empty");
+  }
+  if (index_name.empty()) {
+    throw BinderException(
+        "__lance_drop_index_table index name cannot be empty");
+  }
+
+  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
+                                  schema, table);
+  auto &table_entry = entry.Cast<TableCatalogEntry>();
+  auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+  if (!lance_entry) {
+    throw NotImplementedException(
+        "__lance_drop_index_table only supports tables backed by Lance");
+  }
+
+  return_types = {LogicalType::BIGINT};
+  names = {"Count"};
+  return make_uniq<LanceIndexDdlBindData>(
+      std::move(catalog), std::move(schema), std::move(table),
+      std::move(index_name), vector<string>{}, "", "{}", false, true);
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceIndexDdlInitGlobal(ClientContext &, TableFunctionInitInput &) {
   return make_uniq<LanceIndexDdlGlobalState>();
@@ -827,9 +1037,24 @@ static void LanceCreateIndexFunc(ClientContext &context,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceIndexDdlBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  void *dataset = nullptr;
+  string display_uri = bind_data.dataset_uri;
+  if (bind_data.target_is_table) {
+    auto &entry =
+        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
+                          bind_data.schema, bind_data.table);
+    auto &table_entry = entry.Cast<TableCatalogEntry>();
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+    if (!lance_entry) {
+      throw InternalException(
+          "__lance_create_index_table resolved non-Lance table entry");
+    }
+    dataset = LanceOpenDatasetForTable(context, *lance_entry, display_uri);
+  } else {
+    dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  }
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
@@ -866,9 +1091,24 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceIndexDdlBindData>();
-  void *dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  void *dataset = nullptr;
+  string display_uri = bind_data.dataset_uri;
+  if (bind_data.target_is_table) {
+    auto &entry =
+        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
+                          bind_data.schema, bind_data.table);
+    auto &table_entry = entry.Cast<TableCatalogEntry>();
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+    if (!lance_entry) {
+      throw InternalException(
+          "__lance_drop_index_table resolved non-Lance table entry");
+    }
+    dataset = LanceOpenDatasetForTable(context, *lance_entry, display_uri);
+  } else {
+    dataset = LanceOpenDataset(context, bind_data.dataset_uri);
+  }
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + bind_data.dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
@@ -891,10 +1131,29 @@ static TableFunction LanceCreateIndexTableFunction() {
   return function;
 }
 
+static TableFunction LanceCreateIndexTableTableFunction() {
+  TableFunction function(
+      "__lance_create_index_table",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+      LanceCreateIndexFunc, LanceCreateIndexTableBind, LanceIndexDdlInitGlobal);
+  return function;
+}
+
 static TableFunction LanceDropIndexTableFunction() {
   TableFunction function(
       "__lance_drop_index", {LogicalType::VARCHAR, LogicalType::VARCHAR},
       LanceDropIndexFunc, LanceDropIndexBind, LanceIndexDdlInitGlobal);
+  return function;
+}
+
+static TableFunction LanceDropIndexTableTableFunction() {
+  TableFunction function("__lance_drop_index_table",
+                         {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                          LogicalType::VARCHAR, LogicalType::VARCHAR},
+                         LanceDropIndexFunc, LanceDropIndexTableBind,
+                         LanceIndexDdlInitGlobal);
   return function;
 }
 
@@ -906,16 +1165,15 @@ public:
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceCreateIndex(PhysicalPlan &physical_plan,
-                           vector<LogicalType> types, string dataset_uri_p,
+                           vector<LogicalType> types, LanceTableEntry &table_p,
                            string index_name_p, string column_p,
                            string index_type_p, string params_json_p,
                            bool replace_p, bool train_p,
                            idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types), estimated_cardinality),
-        dataset_uri(std::move(dataset_uri_p)),
-        index_name(std::move(index_name_p)), column(std::move(column_p)),
-        index_type(std::move(index_type_p)),
+        table(table_p), index_name(std::move(index_name_p)),
+        column(std::move(column_p)), index_type(std::move(index_type_p)),
         params_json(std::move(params_json_p)), replace(replace_p),
         train(train_p) {}
 
@@ -924,9 +1182,11 @@ public:
     (void)input;
     auto &client_context = context.client;
 
-    void *dataset = LanceOpenDataset(client_context, dataset_uri);
+    string display_uri;
+    void *dataset =
+        LanceOpenDatasetForTable(client_context, table, display_uri);
     if (!dataset) {
-      throw IOException("Failed to open Lance dataset: " + dataset_uri +
+      throw IOException("Failed to open Lance dataset: " + display_uri +
                         LanceFormatErrorSuffix());
     }
 
@@ -951,7 +1211,7 @@ public:
   bool IsSource() const override { return true; }
 
 private:
-  string dataset_uri;
+  LanceTableEntry &table;
   string index_name;
   string column;
   string index_type;
@@ -988,7 +1248,6 @@ static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
   }
 
   auto column = GetSingleColumnNameOrThrow(*op.info);
-  auto dataset_uri = lance_table->DatasetUri();
   auto index_type = NormalizeIndexType(op.info->index_type);
 
   bool replace = false;
@@ -998,7 +1257,7 @@ static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
                                             params_json);
 
   return planner.Make<PhysicalLanceCreateIndex>(
-      op.types, std::move(dataset_uri), op.info->index_name, std::move(column),
+      op.types, *lance_table, op.info->index_name, std::move(column),
       std::move(index_type), std::move(params_json), replace, train,
       op.estimated_cardinality);
 }
@@ -1282,29 +1541,6 @@ static ParserExtensionParseResult LanceIndexParse(ParserExtensionInfo *,
   return ParserExtensionParseResult();
 }
 
-static string
-ResolveDatasetUriFromTarget(ClientContext &context,
-                            const LanceIndexParseData &parse_data) {
-  if (parse_data.target_is_path) {
-    if (parse_data.dataset_uri.empty()) {
-      throw BinderException("dataset uri cannot be empty");
-    }
-    return parse_data.dataset_uri;
-  }
-
-  auto qname = QualifiedName::Parse(parse_data.target_sql);
-  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
-                                  qname.catalog, qname.schema, qname.name);
-  auto &table_entry = entry.Cast<TableCatalogEntry>();
-  auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
-  if (!lance_entry) {
-    throw NotImplementedException(
-        "Lance CREATE/DROP/SHOW INDEX only supports dataset paths or "
-        "tables in ATTACH TYPE LANCE directory namespaces");
-  }
-  return lance_entry->DatasetUri();
-}
-
 static ParserExtensionPlanResult
 LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
                unique_ptr<ParserExtensionParseData> parse_data_p) {
@@ -1313,38 +1549,87 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
     throw InternalException("LanceIndexPlan received unexpected parse data");
   }
 
-  auto dataset_uri = ResolveDatasetUriFromTarget(context, *parse_data);
-
   ParserExtensionPlanResult result;
+  optional_ptr<QualifiedName> qname;
+  QualifiedName parsed;
+  if (!parse_data->target_is_path) {
+    parsed = QualifiedName::Parse(parse_data->target_sql);
+    qname = &parsed;
+  }
   switch (parse_data->kind) {
   case LanceIndexStmtKind::Create: {
     if (parse_data->columns.size() != 1) {
       throw NotImplementedException(
           "Lance CREATE INDEX currently supports a single column");
     }
-    result.function = LanceCreateIndexTableFunction();
-    result.parameters = {
-        Value(dataset_uri),
-        Value(parse_data->index_name),
-        Value(parse_data->columns[0]),
-        Value(parse_data->index_type),
-        Value(parse_data->params_json),
-        Value::BOOLEAN(parse_data->replace),
-        Value::BOOLEAN(parse_data->train),
-    };
+    if (parse_data->target_is_path) {
+      if (parse_data->dataset_uri.empty()) {
+        throw BinderException("dataset uri cannot be empty");
+      }
+      result.function = LanceCreateIndexTableFunction();
+      result.parameters = {
+          Value(parse_data->dataset_uri),
+          Value(parse_data->index_name),
+          Value(parse_data->columns[0]),
+          Value(parse_data->index_type),
+          Value(parse_data->params_json),
+          Value::BOOLEAN(parse_data->replace),
+          Value::BOOLEAN(parse_data->train),
+      };
+    } else {
+      if (!qname) {
+        throw InternalException("CREATE INDEX is missing a target");
+      }
+      result.function = LanceCreateIndexTableTableFunction();
+      result.parameters = {
+          Value(qname->catalog),
+          Value(qname->schema),
+          Value(qname->name),
+          Value(parse_data->index_name),
+          Value(parse_data->columns[0]),
+          Value(parse_data->index_type),
+          Value(parse_data->params_json),
+          Value::BOOLEAN(parse_data->replace),
+          Value::BOOLEAN(parse_data->train),
+      };
+    }
     result.return_type = StatementReturnType::NOTHING;
     break;
   }
   case LanceIndexStmtKind::Drop: {
-    result.function = LanceDropIndexTableFunction();
-    result.parameters = {Value(dataset_uri), Value(parse_data->index_name)};
+    if (parse_data->target_is_path) {
+      if (parse_data->dataset_uri.empty()) {
+        throw BinderException("dataset uri cannot be empty");
+      }
+      result.function = LanceDropIndexTableFunction();
+      result.parameters = {Value(parse_data->dataset_uri),
+                           Value(parse_data->index_name)};
+    } else {
+      if (!qname) {
+        throw InternalException("DROP INDEX is missing a target");
+      }
+      result.function = LanceDropIndexTableTableFunction();
+      result.parameters = {Value(qname->catalog), Value(qname->schema),
+                           Value(qname->name), Value(parse_data->index_name)};
+    }
     result.return_type = StatementReturnType::NOTHING;
     break;
   }
   case LanceIndexStmtKind::Show: {
-    auto show_fun = LanceInternalIndexesTableFunction();
-    result.function = show_fun;
-    result.parameters = {Value(dataset_uri)};
+    if (parse_data->target_is_path) {
+      if (parse_data->dataset_uri.empty()) {
+        throw BinderException("dataset uri cannot be empty");
+      }
+      result.function = LanceInternalIndexesTableFunction();
+      result.parameters = {Value(parse_data->dataset_uri)};
+    } else {
+      if (!qname) {
+        throw InternalException("SHOW INDEX is missing a target");
+      }
+      result.function = LanceInternalIndexesTableTableFunction();
+      result.parameters = {Value(qname->catalog), Value(qname->schema),
+                           Value(qname->name)};
+    }
     result.return_type = StatementReturnType::QUERY_RESULT;
     break;
   }

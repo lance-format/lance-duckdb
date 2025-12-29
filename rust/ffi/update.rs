@@ -269,9 +269,7 @@ fn rewrite_rows_update_transaction_inner(
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
         let planner = Planner::new(arrow_schema.clone());
         let predicate_expr = if let Some(predicate) = predicate.as_deref() {
-            let predicate_expr = planner
-                .parse_filter(predicate)
-                .map_err(|e| e.to_string())?;
+            let predicate_expr = planner.parse_filter(predicate).map_err(|e| e.to_string())?;
             let predicate_expr = planner
                 .optimize_expr(predicate_expr)
                 .map_err(|e| e.to_string())?;
@@ -300,7 +298,8 @@ fn rewrite_rows_update_transaction_inner(
                 .ok_or_else(|| format!("column does not exist: {}", column))?;
 
             let value_sql = if value_sql.trim().eq_ignore_ascii_case("DEFAULT") {
-                field.metadata
+                field
+                    .metadata
                     .get("duckdb_default_expr")
                     .map(|s| s.as_str())
                     .unwrap_or("NULL")
@@ -308,9 +307,7 @@ fn rewrite_rows_update_transaction_inner(
                 value_sql.as_str()
             };
 
-            let mut value_expr = planner
-                .parse_expr(value_sql)
-                .map_err(|e| e.to_string())?;
+            let mut value_expr = planner.parse_expr(value_sql).map_err(|e| e.to_string())?;
 
             let dest_type = field.data_type();
             let src_type = value_expr.get_type(&df_schema).map_err(|e| e.to_string())?;

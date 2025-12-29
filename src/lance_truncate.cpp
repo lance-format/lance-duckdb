@@ -88,18 +88,22 @@ static ParserExtensionParseResult LanceTruncateParse(ParserExtensionInfo *,
 }
 
 struct LanceTruncateBindData final : public FunctionData {
-  explicit LanceTruncateBindData(string dataset_uri_p)
-      : dataset_uri(std::move(dataset_uri_p)) {}
+  LanceTruncateBindData(string catalog_p, string schema_p, string table_p)
+      : catalog(std::move(catalog_p)), schema(std::move(schema_p)),
+        table(std::move(table_p)) {}
 
-  string dataset_uri;
+  string catalog;
+  string schema;
+  string table;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceTruncateBindData>(dataset_uri);
+    return make_uniq<LanceTruncateBindData>(catalog, schema, table);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceTruncateBindData>();
-    return dataset_uri == other.dataset_uri;
+    return catalog == other.catalog && schema == other.schema &&
+           table == other.table;
   }
 };
 
@@ -110,20 +114,27 @@ struct LanceTruncateGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<FunctionData>
 LanceTruncateBind(ClientContext &, TableFunctionBindInput &input,
                   vector<LogicalType> &return_types, vector<string> &names) {
-  if (input.inputs.size() != 1) {
-    throw BinderException("__lance_truncate_table requires exactly one input");
+  if (input.inputs.size() != 3) {
+    throw BinderException(
+        "__lance_truncate_table requires (catalog, schema, table)");
   }
-  if (input.inputs[0].IsNull()) {
-    throw BinderException("__lance_truncate_table dataset uri cannot be NULL");
+  if (input.inputs[0].IsNull() || input.inputs[1].IsNull() ||
+      input.inputs[2].IsNull()) {
+    throw BinderException(
+        "__lance_truncate_table catalog/schema/table cannot be NULL");
   }
-  auto dataset_uri = input.inputs[0].GetValue<string>();
-  if (dataset_uri.empty()) {
-    throw BinderException("__lance_truncate_table dataset uri cannot be empty");
+  auto catalog = input.inputs[0].GetValue<string>();
+  auto schema = input.inputs[1].GetValue<string>();
+  auto table = input.inputs[2].GetValue<string>();
+  if (catalog.empty() || schema.empty() || table.empty()) {
+    throw BinderException(
+        "__lance_truncate_table catalog/schema/table cannot be empty");
   }
 
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
-  return make_uniq<LanceTruncateBindData>(std::move(dataset_uri));
+  return make_uniq<LanceTruncateBindData>(std::move(catalog), std::move(schema),
+                                          std::move(table));
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -141,16 +152,35 @@ static void LanceTruncateFunc(ClientContext &context, TableFunctionInput &data,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceTruncateBindData>();
-  auto row_count = LanceTruncateDataset(context, bind_data.dataset_uri);
+  auto &entry =
+      Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
+                        bind_data.schema, bind_data.table);
+  auto &table_entry = entry.Cast<TableCatalogEntry>();
+
+  auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+  if (!lance_entry) {
+    throw NotImplementedException(
+        "TRUNCATE TABLE is only supported for tables backed by Lance");
+  }
+
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  string display_uri;
+  ResolveLanceStorageOptionsForTable(context, *lance_entry, open_path,
+                                     option_keys, option_values, display_uri);
+  auto row_count = LanceTruncateDatasetWithStorageOptions(
+      open_path, option_keys, option_values, display_uri);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(row_count));
 }
 
 static TableFunction LanceTruncateTableFunction() {
-  TableFunction function("__lance_truncate_table", {LogicalType::VARCHAR},
-                         LanceTruncateFunc, LanceTruncateBind,
-                         LanceTruncateInitGlobal);
+  TableFunction function(
+      "__lance_truncate_table",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+      LanceTruncateFunc, LanceTruncateBind, LanceTruncateInitGlobal);
   return function;
 }
 
@@ -170,13 +200,13 @@ LanceTruncatePlan(ParserExtensionInfo *, ClientContext &context,
   auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
   if (!lance_entry) {
     throw NotImplementedException(
-        "TRUNCATE TABLE is only supported for tables in ATTACH TYPE LANCE "
-        "directory namespaces");
+        "TRUNCATE TABLE is only supported for tables backed by Lance");
   }
 
   ParserExtensionPlanResult result;
   result.function = LanceTruncateTableFunction();
-  result.parameters = {Value(lance_entry->DatasetUri())};
+  result.parameters = {Value(qname.catalog), Value(qname.schema),
+                       Value(qname.name)};
 
   auto &catalog = table_entry.ParentCatalog();
   result.modified_databases[catalog.GetName()] =

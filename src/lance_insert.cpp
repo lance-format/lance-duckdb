@@ -16,16 +16,16 @@
 namespace duckdb {
 
 struct LanceInsertGlobalState : public GlobalSinkState {
-  explicit LanceInsertGlobalState(string dataset_uri_p,
+  explicit LanceInsertGlobalState(const LanceTableEntry &table_p,
                                   vector<string> column_names_p,
                                   vector<LogicalType> column_types_p)
-      : dataset_uri(std::move(dataset_uri_p)),
-        column_names(std::move(column_names_p)),
+      : table(&table_p), column_names(std::move(column_names_p)),
         column_types(std::move(column_types_p)) {}
 
   mutex lock;
 
-  string dataset_uri;
+  const LanceTableEntry *table = nullptr;
+  string display_uri;
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
@@ -54,14 +54,12 @@ public:
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                      LanceTableEntry &table_p, string dataset_uri_p,
-                      vector<string> column_names_p,
+                      LanceTableEntry &table_p, vector<string> column_names_p,
                       vector<LogicalType> column_types_p,
                       idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), dataset_uri(std::move(dataset_uri_p)),
-        column_names(std::move(column_names_p)),
+        table(table_p), column_names(std::move(column_names_p)),
         column_types(std::move(column_types_p)) {}
 
   bool IsSink() const override { return true; }
@@ -71,8 +69,7 @@ public:
 
   unique_ptr<GlobalSinkState>
   GetGlobalSinkState(ClientContext &) const override {
-    return make_uniq<LanceInsertGlobalState>(dataset_uri, column_names,
-                                             column_types);
+    return make_uniq<LanceInsertGlobalState>(table, column_names, column_types);
   }
 
   unique_ptr<LocalSinkState>
@@ -97,9 +94,12 @@ public:
                                     gstate.column_types, gstate.column_names,
                                     props);
 
-      ResolveLanceStorageOptions(context.client, gstate.dataset_uri,
-                                 gstate.open_path, gstate.option_keys,
-                                 gstate.option_values);
+      if (!gstate.table) {
+        throw InternalException("Lance INSERT missing table reference");
+      }
+      ResolveLanceStorageOptionsForTable(
+          context.client, *gstate.table, gstate.open_path, gstate.option_keys,
+          gstate.option_values, gstate.display_uri);
 
       vector<const char *> key_ptrs;
       vector<const char *> value_ptrs;
@@ -164,7 +164,7 @@ public:
     }
 
     RegisterLancePendingAppend(
-        context, table.ParentCatalog(), std::move(gstate.open_path),
+        context, table.catalog, std::move(gstate.open_path),
         std::move(gstate.option_keys), std::move(gstate.option_values), txn);
     return SinkFinalizeType::READY;
   }
@@ -198,7 +198,6 @@ public:
 
 private:
   LanceTableEntry &table;
-  string dataset_uri;
   vector<string> column_names;
   vector<LogicalType> column_types;
 };
@@ -235,8 +234,7 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   }
 
   auto &insert = planner.Make<PhysicalLanceInsert>(
-      op.types, *lance_table, lance_table->DatasetUri(),
-      std::move(column_names), std::move(column_types),
+      op.types, *lance_table, std::move(column_names), std::move(column_types),
       op.estimated_cardinality);
   insert.children.push_back(*plan);
   return insert;

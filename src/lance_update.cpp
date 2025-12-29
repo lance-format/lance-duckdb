@@ -310,14 +310,13 @@ public:
 
   PhysicalLanceUpdateOverwrite(PhysicalPlan &physical_plan,
                                vector<LogicalType> types_p,
-                               LanceTableEntry &table_p, string dataset_uri_p,
-                               string predicate_p, vector<string> set_columns_p,
+                               LanceTableEntry &table_p, string predicate_p,
+                               vector<string> set_columns_p,
                                vector<string> set_expressions_p,
                                idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), dataset_uri(std::move(dataset_uri_p)),
-        predicate(std::move(predicate_p)),
+        table(table_p), predicate(std::move(predicate_p)),
         set_columns(std::move(set_columns_p)),
         set_expressions(std::move(set_expressions_p)) {}
 
@@ -346,11 +345,12 @@ public:
       throw InternalException("Lance UPDATE has mismatched SET columns/values");
     }
 
-    auto open_path = dataset_uri;
+    string open_path;
     vector<string> option_keys;
     vector<string> option_values;
-    ResolveLanceStorageOptions(context.client, dataset_uri, open_path,
-                               option_keys, option_values);
+    string display_uri;
+    ResolveLanceStorageOptionsForTable(context.client, table, open_path,
+                                       option_keys, option_values, display_uri);
 
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -393,7 +393,7 @@ public:
       return SourceResultType::FINISHED;
     }
 
-    RegisterLancePendingAppend(context.client, table.ParentCatalog(),
+    RegisterLancePendingAppend(context.client, table.catalog,
                                std::move(open_path), std::move(option_keys),
                                std::move(option_values), txn);
 
@@ -417,7 +417,6 @@ public:
 
 private:
   LanceTableEntry &table;
-  string dataset_uri;
   string predicate;
   vector<string> set_columns;
   vector<string> set_expressions;
@@ -550,9 +549,8 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
   }
 
   return planner.Make<PhysicalLanceUpdateOverwrite>(
-      op.types, *lance_table, lance_table->DatasetUri(), std::move(predicate),
-      std::move(set_columns), std::move(set_expressions),
-      op.estimated_cardinality);
+      op.types, *lance_table, std::move(predicate), std::move(set_columns),
+      std::move(set_expressions), op.estimated_cardinality);
 }
 
 } // namespace duckdb

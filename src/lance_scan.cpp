@@ -2040,6 +2040,14 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
     : TableCatalogEntry(catalog, schema, info),
       dataset_uri(std::move(dataset_uri)) {}
 
+LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
+                                 CreateTableInfo &info,
+                                 LanceNamespaceTableConfig config)
+    : TableCatalogEntry(catalog, schema, info),
+      dataset_uri(config.endpoint + "/" + config.table_id),
+      namespace_config(
+          make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
+
 static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
   unordered_map<string, string> out;
   if (!ptr) {
@@ -2117,16 +2125,20 @@ static void PopulateLanceTableSchemaFromDataset(
   }
 }
 
-static unique_ptr<CatalogEntry> BuildUpdatedLanceTableEntryFromDataset(
-    ClientContext &context, Catalog &catalog, SchemaCatalogEntry &schema,
-    const string &table_name, const string &dataset_uri, bool internal) {
-  void *dataset = LanceOpenDataset(context, dataset_uri);
+static unique_ptr<CatalogEntry>
+BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
+                            bool internal) {
+  string display_uri;
+  void *dataset = LanceOpenDatasetForTable(context, base, display_uri);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
-  CreateTableInfo create_info(schema, table_name);
+  auto &catalog = base.catalog;
+  auto &schema = base.schema;
+
+  CreateTableInfo create_info(schema, base.name);
   create_info.internal = internal;
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
@@ -2138,8 +2150,15 @@ static unique_ptr<CatalogEntry> BuildUpdatedLanceTableEntryFromDataset(
     throw;
   }
 
-  auto entry =
-      make_uniq<LanceTableEntry>(catalog, schema, create_info, dataset_uri);
+  unique_ptr<LanceTableEntry> entry;
+  if (base.IsNamespaceBacked()) {
+    entry = make_uniq<LanceTableEntry>(catalog, schema, create_info,
+                                       base.NamespaceConfig());
+  } else {
+    entry = make_uniq<LanceTableEntry>(catalog, schema, create_info,
+                                       base.DatasetUri());
+  }
+
   auto *table_md = lance_dataset_list_table_metadata(dataset);
   if (!table_md) {
     lance_close_dataset(dataset);
@@ -2153,7 +2172,7 @@ static unique_ptr<CatalogEntry> BuildUpdatedLanceTableEntryFromDataset(
   }
 
   lance_close_dataset(dataset);
-  return entry;
+  return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
 }
 
 static void ValidateAlterColumnTypeTarget(const LogicalType &type) {
@@ -2216,9 +2235,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
         "Lance DDL does not support explicit transactions yet");
   }
 
-  void *dataset = LanceOpenDataset(context, dataset_uri);
+  string display_uri;
+  void *dataset = LanceOpenDatasetForTable(context, *this, display_uri);
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
@@ -2255,7 +2275,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to add column to Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
 
       // Best-effort persistence of DuckDB column defaults in Lance field
@@ -2264,7 +2284,8 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       lance_close_dataset(dataset);
       dataset = nullptr;
       if (add.new_column.HasDefaultValue()) {
-        dataset = LanceOpenDataset(context, dataset_uri);
+        string reopen_uri;
+        dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
         if (dataset) {
           auto default_expr = add.new_column.DefaultValue().ToString();
           (void)lance_dataset_update_field_metadata(
@@ -2276,9 +2297,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       } else {
         // The dataset was already closed above, keep going.
       }
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::REMOVE_COLUMN: {
@@ -2293,12 +2312,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to drop column from Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::RENAME_COLUMN: {
@@ -2308,12 +2325,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to rename column in Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::ALTER_COLUMN_TYPE: {
@@ -2341,12 +2356,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to change column type in Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::SET_NOT_NULL: {
@@ -2356,12 +2369,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to set NOT NULL in Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::DROP_NOT_NULL: {
@@ -2371,12 +2382,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to drop NOT NULL in Lance dataset: " +
-                          dataset_uri + LanceFormatErrorSuffix());
+                          display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      return BuildUpdatedLanceTableEntryFromDataset(context, ParentCatalog(),
-                                                    ParentSchema(), name,
-                                                    dataset_uri, internal);
+      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     default:
@@ -2400,11 +2409,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
     if (rc != 0) {
       lance_close_dataset(dataset);
       throw IOException("Failed to update column comment in Lance dataset: " +
-                        dataset_uri + LanceFormatErrorSuffix());
+                        display_uri + LanceFormatErrorSuffix());
     }
     lance_close_dataset(dataset);
-    return BuildUpdatedLanceTableEntryFromDataset(
-        context, ParentCatalog(), ParentSchema(), name, dataset_uri, internal);
+    return BuildUpdatedLanceTableEntry(context, *this, internal);
     break;
   }
   default:
@@ -2417,8 +2425,8 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
 
 unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   (void)context;
-  auto &catalog = const_cast<Catalog &>(ParentCatalog());
-  auto &schema = const_cast<SchemaCatalogEntry &>(ParentSchema());
+  auto &catalog = this->catalog;
+  auto &schema = this->schema;
   auto create_info = make_uniq<CreateTableInfo>(schema, name);
   create_info->temporary = temporary;
   create_info->internal = internal;
@@ -2428,7 +2436,12 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   for (auto &c : constraints) {
     create_info->constraints.push_back(c->Copy());
   }
-  return make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
+  if (IsNamespaceBacked()) {
+    return make_uniq_base<CatalogEntry, LanceTableEntry>(
+        catalog, schema, *create_info, NamespaceConfig());
+  }
+  return make_uniq_base<CatalogEntry, LanceTableEntry>(
+      catalog, schema, *create_info, dataset_uri);
 }
 
 TableFunction
@@ -2437,7 +2450,9 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   auto result = make_uniq<LanceScanBindData>();
   result->file_path = dataset_uri;
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
+  string display_uri;
+  result->dataset = LanceOpenDatasetForTable(context, *this, display_uri);
+  result->file_path = display_uri;
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());

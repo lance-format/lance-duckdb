@@ -1,6 +1,7 @@
 #include "lance_common.hpp"
 
 #include "lance_ffi.hpp"
+#include "lance_table_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -241,6 +242,126 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
   return true;
 }
 
+static void ParseStorageOptionsTsv(const char *ptr, vector<string> &out_keys,
+                                   vector<string> &out_values) {
+  out_keys.clear();
+  out_values.clear();
+  if (!ptr) {
+    return;
+  }
+  string joined = ptr;
+  lance_free_string(ptr);
+
+  for (auto &line : StringUtil::Split(joined, '\n')) {
+    if (line.empty()) {
+      continue;
+    }
+    auto parts = StringUtil::Split(line, '\t');
+    if (parts.size() != 2) {
+      continue;
+    }
+    out_keys.push_back(std::move(parts[0]));
+    out_values.push_back(std::move(parts[1]));
+  }
+}
+
+bool TryLanceNamespaceDescribeTable(
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    string &out_location, vector<string> &out_option_keys,
+    vector<string> &out_option_values, string &out_error) {
+  (void)context;
+  out_location.clear();
+  out_option_keys.clear();
+  out_option_values.clear();
+  out_error.clear();
+
+  const char *bearer_ptr =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+  const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+
+  const char *location_ptr = nullptr;
+  const char *options_ptr = nullptr;
+  auto rc = lance_namespace_describe_table(
+      endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+      delimiter_ptr, &location_ptr, &options_ptr);
+  if (rc != 0) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+  if (location_ptr) {
+    out_location = location_ptr;
+    lance_free_string(location_ptr);
+  }
+  ParseStorageOptionsTsv(options_ptr, out_option_keys, out_option_values);
+  return true;
+}
+
+bool TryLanceNamespaceCreateEmptyTable(
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    string &out_location, vector<string> &out_option_keys,
+    vector<string> &out_option_values, string &out_error) {
+  (void)context;
+  out_location.clear();
+  out_option_keys.clear();
+  out_option_values.clear();
+  out_error.clear();
+
+  const char *bearer_ptr =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+  const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+
+  const char *location_ptr = nullptr;
+  const char *options_ptr = nullptr;
+  auto rc = lance_namespace_create_empty_table(
+      endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+      delimiter_ptr, &location_ptr, &options_ptr);
+  if (rc != 0) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+  if (location_ptr) {
+    out_location = location_ptr;
+    lance_free_string(location_ptr);
+  }
+  ParseStorageOptionsTsv(options_ptr, out_option_keys, out_option_values);
+  return true;
+}
+
+bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
+                                const string &table_id,
+                                const string &bearer_token,
+                                const string &api_key, const string &delimiter,
+                                string &out_error) {
+  (void)context;
+  out_error.clear();
+
+  const char *bearer_ptr =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+  const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+
+  auto rc = lance_namespace_drop_table(endpoint.c_str(), table_id.c_str(),
+                                       bearer_ptr, api_key_ptr, delimiter_ptr);
+  if (rc != 0) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+  return true;
+}
+
 bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
                                     vector<string> &out_tables,
                                     string &out_error) {
@@ -324,14 +445,96 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
       option_keys.size());
 }
 
-int64_t LanceTruncateDataset(ClientContext &context,
-                             const string &dataset_uri) {
-  string open_path;
+static unordered_map<string, Value>
+BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
+                                  const string &api_key_override) {
+  unordered_map<string, Value> options;
+  if (!bearer_token_override.empty()) {
+    options["bearer_token"] = Value(bearer_token_override);
+  }
+  if (!api_key_override.empty()) {
+    options["api_key"] = Value(api_key_override);
+  }
+  return options;
+}
+
+void *LanceOpenDatasetForTable(ClientContext &context,
+                               const LanceTableEntry &table,
+                               string &out_display_uri) {
+  out_display_uri = table.DatasetUri();
+  if (!table.IsNamespaceBacked()) {
+    return LanceOpenDataset(context, table.DatasetUri());
+  }
+
+  auto &cfg = table.NamespaceConfig();
+  unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
+      cfg.bearer_token_override, cfg.api_key_override);
+  string bearer_token;
+  string api_key;
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
+                            api_key);
+
+  string table_uri;
+  auto *dataset = LanceOpenDatasetInNamespace(
+      context, cfg.endpoint, cfg.table_id, bearer_token, api_key, cfg.delimiter,
+      table_uri);
+  if (!table_uri.empty()) {
+    out_display_uri = table_uri;
+  } else {
+    out_display_uri = cfg.endpoint + "/" + cfg.table_id;
+  }
+  return dataset;
+}
+
+void ResolveLanceStorageOptionsForTable(ClientContext &context,
+                                        const LanceTableEntry &table,
+                                        string &out_open_path,
+                                        vector<string> &out_option_keys,
+                                        vector<string> &out_option_values,
+                                        string &out_display_uri) {
+  out_display_uri = table.DatasetUri();
+  if (!table.IsNamespaceBacked()) {
+    ResolveLanceStorageOptions(context, table.DatasetUri(), out_open_path,
+                               out_option_keys, out_option_values);
+    return;
+  }
+
+  auto &cfg = table.NamespaceConfig();
+  unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
+      cfg.bearer_token_override, cfg.api_key_override);
+  string bearer_token;
+  string api_key;
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
+                            api_key);
+
+  string location;
+  string error;
   vector<string> option_keys;
   vector<string> option_values;
-  ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
-                             option_values);
+  if (!TryLanceNamespaceDescribeTable(
+          context, cfg.endpoint, cfg.table_id, bearer_token, api_key,
+          cfg.delimiter, location, option_keys, option_values, error)) {
+    throw IOException("Failed to describe Lance table via namespace: " +
+                      (error.empty() ? "unknown error" : error));
+  }
 
+  out_display_uri =
+      location.empty() ? (cfg.endpoint + "/" + cfg.table_id) : location;
+
+  if (!option_keys.empty()) {
+    out_open_path = LanceNormalizeS3Scheme(location);
+    out_option_keys = std::move(option_keys);
+    out_option_values = std::move(option_values);
+    return;
+  }
+
+  ResolveLanceStorageOptions(context, location, out_open_path, out_option_keys,
+                             out_option_values);
+}
+
+int64_t LanceTruncateDatasetWithStorageOptions(
+    const string &open_path, const vector<string> &option_keys,
+    const vector<string> &option_values, const string &display_uri) {
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -346,7 +549,7 @@ int64_t LanceTruncateDataset(ClientContext &context,
         option_keys.size());
   }
   if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + dataset_uri +
+    throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
@@ -354,14 +557,14 @@ int64_t LanceTruncateDataset(ClientContext &context,
   if (row_count < 0) {
     lance_close_dataset(dataset);
     throw IOException("Failed to count rows from Lance dataset: " +
-                      dataset_uri + LanceFormatErrorSuffix());
+                      display_uri + LanceFormatErrorSuffix());
   }
 
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     lance_close_dataset(dataset);
     throw IOException("Failed to get schema from Lance dataset: " +
-                      dataset_uri + LanceFormatErrorSuffix());
+                      display_uri + LanceFormatErrorSuffix());
   }
 
   ArrowSchemaWrapper schema_root;
@@ -395,6 +598,17 @@ int64_t LanceTruncateDataset(ClientContext &context,
   }
 
   return row_count;
+}
+
+int64_t LanceTruncateDataset(ClientContext &context,
+                             const string &dataset_uri) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
+                             option_values);
+  return LanceTruncateDatasetWithStorageOptions(open_path, option_keys,
+                                                option_values, dataset_uri);
 }
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
