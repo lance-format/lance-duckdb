@@ -12,6 +12,7 @@
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_insert.hpp"
 #include "lance_table_entry.hpp"
 
 namespace duckdb {
@@ -143,11 +144,11 @@ public:
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceDelete(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                      string dataset_uri_p, string filter_ir_p,
-                      idx_t estimated_cardinality)
+                      LanceTableEntry &table_p, string dataset_uri_p,
+                      string filter_ir_p, idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        dataset_uri(std::move(dataset_uri_p)),
+        table(table_p), dataset_uri(std::move(dataset_uri_p)),
         filter_ir(std::move(filter_ir_p)) {}
 
   bool IsSource() const override { return true; }
@@ -165,27 +166,50 @@ public:
     }
     state.emitted = true;
 
-    if (!context.client.transaction.IsAutoCommit()) {
-      throw NotImplementedException(
-          "Lance DELETE does not support explicit transactions yet");
-    }
+    auto open_path = dataset_uri;
+    vector<string> option_keys;
+    vector<string> option_values;
+    ResolveLanceStorageOptions(context.client, dataset_uri, open_path,
+                               option_keys, option_values);
 
-    auto *dataset = LanceOpenDataset(context.client, dataset_uri);
-    if (!dataset) {
-      throw IOException("Failed to open Lance dataset: " + dataset_uri +
-                        LanceFormatErrorSuffix());
-    }
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                    value_ptrs);
 
+    void *txn = nullptr;
     int64_t deleted_rows = 0;
     auto *filter_ptr =
         filter_ir.empty() ? nullptr
                           : reinterpret_cast<const uint8_t *>(filter_ir.data());
-    auto rc = lance_dataset_delete(dataset, filter_ptr, filter_ir.size(),
-                                   &deleted_rows);
-    lance_close_dataset(dataset);
+    auto rc = lance_delete_transaction_with_storage_options(
+        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+        filter_ptr, filter_ir.size(), &txn, &deleted_rows);
     if (rc != 0) {
-      throw IOException("Failed to delete from Lance dataset: " + dataset_uri +
-                        LanceFormatErrorSuffix());
+      throw IOException("Failed to create Lance DELETE transaction for '" +
+                        open_path + "'" + LanceFormatErrorSuffix());
+    }
+    if (!txn) {
+      if (deleted_rows != 0) {
+        throw IOException("Failed to create Lance DELETE transaction for '" +
+                          open_path +
+                          "': null transaction returned for non-zero deleted "
+                          "rows");
+      }
+    } else if (context.client.transaction.IsAutoCommit()) {
+      rc = lance_commit_transaction_with_storage_options(
+          open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+          txn);
+      if (rc != 0) {
+        throw IOException("Failed to commit Lance DELETE transaction for '" +
+                          open_path + "'" + LanceFormatErrorSuffix());
+      }
+    } else {
+      RegisterLancePendingAppend(context.client, table.ParentCatalog(),
+                                 std::move(open_path), std::move(option_keys),
+                                 std::move(option_values), txn);
     }
 
     chunk.SetCardinality(1);
@@ -196,6 +220,7 @@ public:
   string GetName() const override { return "LanceDelete"; }
 
 private:
+  LanceTableEntry &table;
   string dataset_uri;
   string filter_ir;
 };
@@ -223,7 +248,7 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
   }
 
   auto &del = planner.Make<PhysicalLanceDelete>(
-      op.types, lance_table->DatasetUri(), std::move(filter_ir),
+      op.types, *lance_table, lance_table->DatasetUri(), std::move(filter_ir),
       op.estimated_cardinality);
   (void)context;
   return del;
