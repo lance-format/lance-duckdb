@@ -1,9 +1,9 @@
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
+use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
-use crate::constants::ROW_ID_COLUMN;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::types::StreamHandle;

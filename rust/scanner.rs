@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use lance::dataset::{Dataset, ProjectionRequest};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::dataset::{Dataset, ProjectionRequest};
 use lance::io::RecordBatchStream;
 use tokio::runtime::Handle;
 

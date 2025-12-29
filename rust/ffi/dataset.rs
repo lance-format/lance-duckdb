@@ -11,9 +11,9 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::scalar::ScalarValue;
 use datafusion_sql::unparser::expr_to_sql;
 use futures::TryStreamExt;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::builder::DatasetBuilder;
 use lance::Dataset;
 use roaring::RoaringTreemap;
 
@@ -233,11 +233,7 @@ fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::Sc
     let has_row_id = schema.fields.iter().any(|f| f.name() == ROW_ID_COLUMN);
     if !has_row_id {
         let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
-        fields.push(Arc::new(Field::new(
-            ROW_ID_COLUMN,
-            DataType::UInt64,
-            false,
-        )));
+        fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
         schema.fields = fields.into();
     }
 
@@ -634,8 +630,7 @@ fn delete_transaction_with_storage_options_inner(
                 }
             };
 
-            let (fragments, deleted_ids) =
-                apply_deletions(dataset.as_ref(), &row_addrs).await?;
+            let (fragments, deleted_ids) = apply_deletions(dataset.as_ref(), &row_addrs).await?;
             (fragments, deleted_ids, deleted_rows_i64)
         };
 
