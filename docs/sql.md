@@ -127,6 +127,8 @@ DETACH ns;
 ATTACH 'path/to/dir' AS ns (TYPE LANCE);
 
 UPDATE ns.main.my_table SET s = 'bb' WHERE id = 2;
+UPDATE ns.main.my_table SET s = 'x'; -- update all rows
+UPDATE ns.main.my_table SET s = DEFAULT WHERE id = 2;
 
 DETACH ns;
 ```
@@ -141,9 +143,6 @@ DELETE FROM ns.main.my_table; -- delete all rows
 
 DETACH ns;
 ```
-
-Notes:
-- Explicit transactions for `DELETE` are currently not supported.
 
 ### `TRUNCATE TABLE`
 

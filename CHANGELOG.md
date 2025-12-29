@@ -6,6 +6,24 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-12-29
+
+### Added
+
+- Transactional `DELETE` support (honors `BEGIN`/`COMMIT`/`ROLLBACK`).
+- Support `UPDATE` without a `WHERE` clause to update all rows.
+- Predicate pushdown for string functions: `starts_with`, `ends_with`, `contains`.
+- Support `CREATE INDEX ... ON ns.main.tbl(col) USING BTREE` on attached namespaces.
+
+### Changed
+
+- **Breaking:** Object store credential/configuration now uses `CREATE SECRET (TYPE LANCE, ...)` (instead of `TYPE S3`).
+- Aligned directory and REST namespace behavior.
+
+### Fixed
+
+- `UPDATE ... SET col = DEFAULT` now works correctly.
+
 ## [0.3.0] - 2025-12-28
 
 ### Added
