@@ -19,6 +19,9 @@ test-env LANCE_S3_DROP_DATASET_PREFIX drop_table_test_data.lance
 require lance
 
 statement ok
+INSTALL httpfs;
+
+statement ok
 LOAD httpfs;
 
 statement ok
