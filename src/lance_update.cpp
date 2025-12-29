@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -367,10 +368,11 @@ public:
 
     void *txn = nullptr;
     uint64_t rows_updated = 0;
+    const char *predicate_ptr = predicate.empty() ? nullptr : predicate.c_str();
     auto rc = lance_overwrite_update_transaction_with_storage_options(
         open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        predicate.c_str(), set_col_ptrs.data(), set_expr_ptrs.data(),
+        predicate_ptr, set_col_ptrs.data(), set_expr_ptrs.data(),
         set_columns.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
         LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
         &txn, &rows_updated);
@@ -460,6 +462,14 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
       if (!expr) {
         continue;
       }
+      if (expr->IsFoldable()) {
+        Value folded;
+        if (ExpressionExecutor::TryEvaluateScalar(context, *expr, folded) &&
+            folded.type() == LogicalTypeId::BOOLEAN && !folded.IsNull() &&
+            folded.GetValue<bool>()) {
+          continue;
+        }
+      }
       auto s =
           StringifyExprForDataFusion(*expr, *filter->children[0], op.table);
       predicate_parts.push_back("(" + s + ")");
@@ -476,11 +486,6 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     } else {
       predicate += " AND " + part;
     }
-  }
-
-  if (predicate.empty()) {
-    throw NotImplementedException("Lance UPDATE requires a WHERE predicate "
-                                  "(full-table UPDATE is not supported)");
   }
 
   vector<string> set_columns;
@@ -506,8 +511,9 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
 
     if (op.expressions[i]->GetExpressionType() ==
         ExpressionType::VALUE_DEFAULT) {
-      throw NotImplementedException(
-          "Lance UPDATE does not support SET column = DEFAULT");
+      // Keep DEFAULT as a marker and let the Lance execution layer resolve it.
+      set_expressions.push_back("DEFAULT");
+      continue;
     }
 
     unique_ptr<Expression> set_expr;

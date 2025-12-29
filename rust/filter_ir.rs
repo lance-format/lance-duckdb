@@ -19,6 +19,7 @@ const TAG_IS_NOT_NULL: u8 = 8;
 const TAG_IN_LIST: u8 = 9;
 const TAG_LIKE: u8 = 10;
 const TAG_REGEXP: u8 = 11;
+const TAG_SCALAR_FUNCTION: u8 = 12;
 
 const REGEXP_MODE_PARTIAL_MATCH: u8 = 0;
 const REGEXP_MODE_FULL_MATCH: u8 = 1;
@@ -50,6 +51,11 @@ const OP_NOT_DISTINCT_FROM: u8 = 7;
 
 static GETFIELD_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
 static REGEXP_LIKE_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static STARTS_WITH_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static ENDS_WITH_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static CONTAINS_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static LOWER_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+static UPPER_UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
 
 fn getfield_udf() -> Arc<ScalarUDF> {
     GETFIELD_UDF
@@ -61,6 +67,32 @@ fn regexp_like_udf() -> Arc<ScalarUDF> {
     REGEXP_LIKE_UDF
         .get_or_init(datafusion_functions::regex::regexp_like)
         .clone()
+}
+
+fn starts_with_udf() -> Arc<ScalarUDF> {
+    STARTS_WITH_UDF
+        .get_or_init(datafusion_functions::string::starts_with)
+        .clone()
+}
+
+fn ends_with_udf() -> Arc<ScalarUDF> {
+    ENDS_WITH_UDF
+        .get_or_init(datafusion_functions::string::ends_with)
+        .clone()
+}
+
+fn contains_udf() -> Arc<ScalarUDF> {
+    CONTAINS_UDF
+        .get_or_init(datafusion_functions::string::contains)
+        .clone()
+}
+
+fn lower_udf() -> Arc<ScalarUDF> {
+    LOWER_UDF.get_or_init(datafusion_functions::string::lower).clone()
+}
+
+fn upper_udf() -> Arc<ScalarUDF> {
+    UPPER_UDF.get_or_init(datafusion_functions::string::upper).clone()
 }
 
 pub fn parse_filter_ir(filter_ir: &[u8]) -> Result<Expr> {
@@ -191,6 +223,7 @@ fn parse_node(cursor: &mut Cursor<'_>) -> Result<Expr> {
         TAG_IN_LIST => parse_in_list(cursor),
         TAG_LIKE => parse_like(cursor),
         TAG_REGEXP => parse_regexp(cursor),
+        TAG_SCALAR_FUNCTION => parse_scalar_function(cursor),
         other => Err(anyhow!("unknown node tag: {other}")),
     }
 }
@@ -409,4 +442,49 @@ fn parse_regexp(cursor: &mut Cursor<'_>) -> Result<Expr> {
         args.push(Expr::Literal(ScalarValue::Utf8(Some(flags)), None));
     }
     Ok(regexp_like_udf().call(args))
+}
+
+fn parse_scalar_function(cursor: &mut Cursor<'_>) -> Result<Expr> {
+    let name = cursor.read_len_prefixed_string()?;
+    let args_len = usize::try_from(cursor.read_u32_le()?)?;
+    let mut args = Vec::with_capacity(args_len);
+    for _ in 0..args_len {
+        args.push(parse_len_prefixed_node(cursor)?);
+    }
+
+    let func = match name.as_str() {
+        "starts_with" => {
+            if args.len() != 2 {
+                bail!("starts_with expects 2 args, got {}", args.len());
+            }
+            starts_with_udf()
+        }
+        "ends_with" => {
+            if args.len() != 2 {
+                bail!("ends_with expects 2 args, got {}", args.len());
+            }
+            ends_with_udf()
+        }
+        "contains" => {
+            if args.len() != 2 {
+                bail!("contains expects 2 args, got {}", args.len());
+            }
+            contains_udf()
+        }
+        "lower" => {
+            if args.len() != 1 {
+                bail!("lower expects 1 arg, got {}", args.len());
+            }
+            lower_udf()
+        }
+        "upper" => {
+            if args.len() != 1 {
+                bail!("upper expects 1 arg, got {}", args.len());
+            }
+            upper_udf()
+        }
+        other => bail!("unsupported scalar function: {other}"),
+    };
+
+    Ok(Expr::ScalarFunction(ScalarFunction { func, args }))
 }

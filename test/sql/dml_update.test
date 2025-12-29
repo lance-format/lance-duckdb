@@ -44,6 +44,15 @@ statement ok
 BEGIN TRANSACTION;
 
 statement ok
+UPDATE ns.main.lance_update_basic SET s = 'x' WHERE TRUE;
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
 UPDATE ns.main.lance_update_basic SET id = id + 10 WHERE id = 1;
 
 statement ok
@@ -94,15 +103,53 @@ SELECT s FROM ns.main.lance_update_basic WHERE id = 2;
 ----
 bb
 
-statement error
+statement ok
 UPDATE ns.main.lance_update_basic SET s = 'x';
-----
-Not implemented Error: Lance UPDATE requires a WHERE predicate (full-table UPDATE is not supported)
 
-statement error
-UPDATE ns.main.lance_update_basic SET s = DEFAULT WHERE id = 2;
+query I
+SELECT COUNT(*) FROM ns.main.lance_update_basic WHERE s = 'x';
 ----
-Not implemented Error: Lance UPDATE does not support SET column = DEFAULT
+3
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_basic SET s = DEFAULT WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query I
+SELECT s IS NULL FROM ns.main.lance_update_basic WHERE id = 2;
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.lance_update_default (id BIGINT, v INTEGER DEFAULT 42);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO ns.main.lance_update_default VALUES (1, 0);
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_default SET v = DEFAULT WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query I
+SELECT v FROM ns.main.lance_update_default WHERE id = 1;
+----
+42
 
 statement ok
 DETACH ns;
