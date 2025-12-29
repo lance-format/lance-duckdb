@@ -62,22 +62,13 @@ static string SecretValueToString(const Value &value) {
   return value.ToString();
 }
 
-static void AddIfNotEmpty(vector<string> &keys, vector<string> &values,
-                          const string &key, const string &value) {
-  if (value.empty()) {
-    return;
-  }
-  keys.push_back(key);
-  values.push_back(value);
-}
-
-void LanceFillS3StorageOptionsFromSecrets(ClientContext &context,
-                                          const string &path,
-                                          vector<string> &out_keys,
-                                          vector<string> &out_values) {
+void LanceFillStorageOptionsFromSecrets(ClientContext &context,
+                                        const string &path,
+                                        vector<string> &out_keys,
+                                        vector<string> &out_values) {
   auto &secret_manager = SecretManager::Get(context);
   auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-  auto secret_match = secret_manager.LookupSecret(transaction, path, "s3");
+  auto secret_match = secret_manager.LookupSecret(transaction, path, "lance");
   if (!secret_match.HasMatch() || !secret_match.secret_entry ||
       !secret_match.secret_entry->secret) {
     return;
@@ -89,40 +80,12 @@ void LanceFillS3StorageOptionsFromSecrets(ClientContext &context,
     return;
   }
 
-  auto key_id = SecretValueToString(kv_secret->TryGetValue("key_id"));
-  auto secret_access_key =
-      SecretValueToString(kv_secret->TryGetValue("secret"));
-  auto session_token =
-      SecretValueToString(kv_secret->TryGetValue("session_token"));
-  auto region = SecretValueToString(kv_secret->TryGetValue("region"));
-  auto endpoint = SecretValueToString(kv_secret->TryGetValue("endpoint"));
-  auto url_style = SecretValueToString(kv_secret->TryGetValue("url_style"));
-  auto use_ssl = SecretValueToString(kv_secret->TryGetValue("use_ssl"));
-
-  if (key_id.empty() && secret_access_key.empty()) {
-    AddIfNotEmpty(out_keys, out_values, "skip_signature", "true");
-  } else {
-    AddIfNotEmpty(out_keys, out_values, "access_key_id", key_id);
-    AddIfNotEmpty(out_keys, out_values, "secret_access_key", secret_access_key);
-    AddIfNotEmpty(out_keys, out_values, "session_token", session_token);
-  }
-
-  AddIfNotEmpty(out_keys, out_values, "region", region);
-  AddIfNotEmpty(out_keys, out_values, "endpoint", endpoint);
-
-  if (StringUtil::CIEquals(url_style, "vhost") ||
-      StringUtil::CIEquals(url_style, "virtual_hosted")) {
-    AddIfNotEmpty(out_keys, out_values, "virtual_hosted_style_request", "true");
-  } else if (StringUtil::CIEquals(url_style, "path")) {
-    AddIfNotEmpty(out_keys, out_values, "virtual_hosted_style_request",
-                  "false");
-  }
-
-  if (!use_ssl.empty()) {
-    if (StringUtil::CIEquals(use_ssl, "false") ||
-        StringUtil::CIEquals(use_ssl, "0")) {
-      AddIfNotEmpty(out_keys, out_values, "allow_http", "true");
+  for (auto &kv : kv_secret->secret_map) {
+    if (kv.second.IsNull()) {
+      continue;
     }
+    out_keys.push_back(kv.first);
+    out_values.push_back(kv.second.ToString());
   }
 }
 
@@ -220,10 +183,8 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
   out_values.clear();
 
   out_open_path = LanceNormalizeS3Scheme(out_open_path);
-  if (StringUtil::StartsWith(out_open_path, "s3://")) {
-    LanceFillS3StorageOptionsFromSecrets(context, out_open_path, out_keys,
-                                         out_values);
-  }
+  LanceFillStorageOptionsFromSecrets(context, out_open_path, out_keys,
+                                     out_values);
 }
 
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,

@@ -1,5 +1,5 @@
 # name: test/sql/s3_drop_table_minio.test
-# description: DROP TABLE deletes Lance datasets in S3 directory namespaces (MinIO)
+# description: DROP TABLE deletes Lance datasets in S3 directory namespaces (MinIO, TYPE LANCE secret)
 # group: [sql]
 
 require-env LANCE_TEST_S3 1
@@ -19,22 +19,16 @@ test-env LANCE_S3_DROP_DATASET_PREFIX drop_table_test_data.lance
 require lance
 
 statement ok
-INSTALL httpfs;
-
-statement ok
-LOAD httpfs;
-
-statement ok
 CREATE SECRET (
-  TYPE S3,
+  TYPE LANCE,
   PROVIDER config,
   SCOPE 's3://${LANCE_S3_BUCKET}/',
-  KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
-  SECRET '${LANCE_S3_SECRET_ACCESS_KEY}',
+  ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}',
   REGION '${LANCE_S3_REGION}',
   ENDPOINT '${LANCE_S3_ENDPOINT}',
-  URL_STYLE 'path',
-  USE_SSL false
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
 );
 
 statement ok

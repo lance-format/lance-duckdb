@@ -43,7 +43,8 @@ duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'
 
 ## Usage
 
-Full SQL reference: `docs/sql.md`
+- Full SQL reference: [`docs/sql.md`](./docs/sql.md)
+- Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
 
 ### Query a Lance dataset
 
@@ -58,10 +59,14 @@ SELECT *
   LIMIT 10;
 ```
 
-To read `s3://` paths, the extension can use DuckDB's native Secrets mechanism to obtain credentials:
+To access object store URIs (e.g. `s3://...`), configure a `TYPE LANCE` secret (see [`docs/cloud.md`](./docs/cloud.md)).
 
 ```sql
-CREATE SECRET (TYPE S3, provider credential_chain);
+CREATE SECRET (
+  TYPE LANCE,
+  PROVIDER credential_chain,
+  SCOPE 's3://bucket/'
+);
 
 SELECT *
   FROM 's3://bucket/path/to/dataset.lance'
@@ -95,13 +100,14 @@ COPY (
 ) TO 'path/to/empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
 ```
 
-To write to `s3://...` paths, load DuckDB's `httpfs` extension and configure an S3 secret:
+To write to `s3://...` paths, configure a `TYPE LANCE` secret for that scope (see [`docs/cloud.md`](./docs/cloud.md)).
 
 ```sql
-INSTALL httpfs;
-LOAD httpfs;
-
-CREATE SECRET (TYPE S3, provider credential_chain);
+CREATE SECRET (
+  TYPE LANCE,
+  PROVIDER credential_chain,
+  SCOPE 's3://bucket/'
+);
 
 COPY (SELECT 1 AS id) TO 's3://bucket/path/to/out.lance' (FORMAT lance, mode 'overwrite');
 ```

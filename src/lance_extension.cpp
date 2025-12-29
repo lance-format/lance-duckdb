@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "lance_extension.hpp"
+#include "lance_secrets.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -32,6 +33,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
 
   // Enable SELECT * FROM '.../dataset.lance'
   auto &instance = loader.GetDatabaseInstance();
+  RegisterLanceSecrets(instance);
   auto &config = DBConfig::GetConfig(instance);
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);

@@ -13,7 +13,7 @@ Tests are grouped by prefix to keep related coverage discoverable:
 - `optimizer_*`: Optimizer/statistics integration
 - `namespace_*`: `ATTACH ... (TYPE LANCE)` namespace mapping and table discovery
 - `dml_*`: Write-path SQL (COPY/INSERT/UPDATE/DELETE/TRUNCATE/DROP/ALTER)
-- `s3_*`: End-to-end S3 tests (MinIO), gated by `require-env`
+- `s3_*`: End-to-end S3 tests (MinIO), gated by `require-env` and using a `TYPE LANCE` secret
 - `tpch.test`: TPC-H correctness suite
 - `bench_*`: Larger correctness suites and fixtures (e.g., BigANN)
 
