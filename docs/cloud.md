@@ -115,6 +115,8 @@ Typical keys:
 
 The extension also accepts `AWS_*` aliases (e.g. `AWS_ACCESS_KEY_ID`, `AWS_REGION`, ...).
 
+Note: DuckDB requires `LOAD httpfs;` before running `ATTACH 's3://...' AS ... (TYPE LANCE, ...)`.
+
 Example (MinIO):
 
 ```sql
