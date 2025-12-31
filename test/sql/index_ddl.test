@@ -61,11 +61,13 @@ FROM lance_vector_search(
     0.41665298
   ]::FLOAT[16],
   k = 1,
+  nprobs = 2,
+  refine_factor = 3,
   use_index = true,
   explain_verbose = true
 );
 ----
-physical_plan	<REGEX>:[\s\S]*ANNSubIndex: name=vec_idx[\s\S]*
+physical_plan	<REGEX>:[\s\S]*ANNSubIndex: name=vec_idx, k=3[\s\S]*minimum_nprobes=2[\s\S]*maximum_nprobes=Some\(2\)[\s\S]*
 
 query II
 EXPLAIN (FORMAT JSON)

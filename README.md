@@ -142,18 +142,7 @@ FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::F
 ORDER BY _distance ASC;
 ```
 
-- Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
-- Positional arguments:
-  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
-  - `vector_column` (VARCHAR): Vector column name.
-  - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
-- Named parameters:
-  - `k` (BIGINT, default `10`): Number of results to return.
-  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-  - `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage when available.
-  - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
-- Output:
-  - Dataset columns plus `_distance` (smaller is closer).
+See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
 
 ### Full-text search (FTS)
 
@@ -164,16 +153,7 @@ FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10, prefilter = tru
 ORDER BY _score DESC;
 ```
 
-- Signature: `lance_fts(uri, text_column, query, ...)`
-- Positional arguments:
-  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
-  - `text_column` (VARCHAR): Text column name.
-  - `query` (VARCHAR): Query string.
-- Named parameters:
-  - `k` (BIGINT, default `10`): Number of results to return.
-  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-- Output:
-  - Dataset columns plus `_score` (larger is better).
+See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
 
 ### Hybrid search (vector + FTS)
 
@@ -188,20 +168,7 @@ FROM lance_hybrid_search('path/to/dataset.lance',
 ORDER BY _hybrid_score DESC;
 ```
 
-- Signature: `lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)`
-- Positional arguments:
-  - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
-  - `vector_column` (VARCHAR): Vector column name.
-  - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
-  - `text_column` (VARCHAR): Text column name.
-  - `query` (VARCHAR): Query string.
-- Named parameters:
-  - `k` (BIGINT, default `10`): Number of results to return.
-  - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-  - `alpha` (FLOAT, default `0.5`): Vector/text mixing weight.
-  - `oversample_factor` (INTEGER, default `4`): Oversample factor for candidate generation (larger can improve recall at higher cost).
-- Output:
-  - Dataset columns plus `_hybrid_score` (larger is better), `_distance`, and `_score`.
+See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
 
 ## Contributing
 

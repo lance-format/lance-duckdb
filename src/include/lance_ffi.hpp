@@ -174,16 +174,19 @@ const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
 
 void *lance_get_knn_schema(void *dataset, const char *vector_column,
                            const float *query_values, size_t query_len,
-                           uint64_t k, uint8_t prefilter, uint8_t use_index);
+                           uint64_t k, uint64_t nprobes, uint64_t refine_factor,
+                           uint8_t prefilter, uint8_t use_index);
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  const float *query_values, size_t query_len,
-                                 uint64_t k, const uint8_t *filter_ir,
-                                 size_t filter_ir_len, uint8_t prefilter,
-                                 uint8_t use_index);
+                                 uint64_t k, uint64_t nprobes,
+                                 uint64_t refine_factor,
+                                 const uint8_t *filter_ir, size_t filter_ir_len,
+                                 uint8_t prefilter, uint8_t use_index);
 
 const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       const float *query_values,
                                       size_t query_len, uint64_t k,
+                                      uint64_t nprobes, uint64_t refine_factor,
                                       const uint8_t *filter_ir,
                                       size_t filter_ir_len, uint8_t prefilter,
                                       uint8_t use_index, uint8_t verbose);

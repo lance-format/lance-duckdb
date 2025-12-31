@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- `lance_vector_search` now supports the `nprobs` and `refine_factor` parameters.
+
 ## [0.4.0] - 2025-12-29
 
 ### Added

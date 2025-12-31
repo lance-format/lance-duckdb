@@ -21,6 +21,8 @@ pub unsafe extern "C" fn lance_get_knn_schema(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -30,6 +32,8 @@ pub unsafe extern "C" fn lance_get_knn_schema(
         query_values,
         query_len,
         k,
+        nprobes,
+        refine_factor,
         prefilter,
         use_index,
     ) {
@@ -50,6 +54,8 @@ fn get_knn_schema_inner(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<SchemaHandle> {
@@ -71,6 +77,19 @@ fn get_knn_schema_inner(
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     scan.nearest(vector_column, &query, k_usize)
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema nearest: {err}")))?;
+    if nprobes != 0 {
+        let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;
+        scan.nprobes(nprobes_usize);
+    }
+    if refine_factor != 0 {
+        let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "refine_factor must fit in u32",
+            )
+        })?;
+        scan.refine(refine_factor_u32);
+    }
     scan.use_index(use_index != 0);
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref())
@@ -90,6 +109,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -101,6 +122,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         query_values,
         query_len,
         k,
+        nprobes,
+        refine_factor,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -124,6 +147,8 @@ fn create_knn_stream_ir_inner(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -163,6 +188,19 @@ fn create_knn_stream_ir_inner(
                 format!("knn scan nearest: {err}"),
             )
         })?;
+    if nprobes != 0 {
+        let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;
+        scan.nprobes(nprobes_usize);
+    }
+    if refine_factor != 0 {
+        let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "refine_factor must fit in u32",
+            )
+        })?;
+        scan.refine(refine_factor_u32);
+    }
     scan.use_index(use_index != 0);
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref()).map_err(|err| {
@@ -189,6 +227,8 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -201,6 +241,8 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
         query_values,
         query_len,
         k,
+        nprobes,
+        refine_factor,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -225,6 +267,8 @@ fn explain_knn_scan_ir_inner(
     query_values: *const f32,
     query_len: usize,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -260,6 +304,19 @@ fn explain_knn_scan_ir_inner(
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     scan.nearest(vector_column, &query, k_usize)
         .map_err(|err| FfiError::new(ErrorCode::ExplainPlan, format!("knn scan nearest: {err}")))?;
+    if nprobes != 0 {
+        let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;
+        scan.nprobes(nprobes_usize);
+    }
+    if refine_factor != 0 {
+        let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "refine_factor must fit in u32",
+            )
+        })?;
+        scan.refine(refine_factor_u32);
+    }
     scan.use_index(use_index != 0);
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref())
