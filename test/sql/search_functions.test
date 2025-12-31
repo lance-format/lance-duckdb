@@ -6,7 +6,7 @@ require lance
 
 # Invalid dataset root
 statement error
-SELECT * FROM lance_vector_search('dummy_path.lance', 'vec', [1.0]::FLOAT[], k = 1)
+SELECT * FROM lance_vector_search('dummy_path.lance', 'vec', [1.0]::FLOAT[1], k = 1)
 ----
 IO Error: Failed to open Lance dataset: dummy_path.lance (Lance error: dataset open 'dummy_path.lance':
 
@@ -18,7 +18,7 @@ Invalid Input Error: lance_vector_search requires a non-empty query vector
 
 # Non-positive k is rejected
 statement error
-SELECT * FROM lance_vector_search('test/data/test_data.lance', 'vec', [1.0]::FLOAT[], k = 0)
+SELECT * FROM lance_vector_search('test/data/test_data.lance', 'vec', [1.0]::FLOAT[1], k = 0)
 ----
 Invalid Input Error: lance_vector_search requires k > 0
 
@@ -49,7 +49,7 @@ SELECT id
 FROM lance_vector_search(
   'test/data/search_test_data.lance',
   'vec',
-  [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   k = 3,
   use_index = false
 )
@@ -65,7 +65,7 @@ SELECT id
 FROM lance_vector_search(
   'test/data/search_test_data.lance',
   'vec',
-  [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   k = 10,
   prefilter = true,
   use_index = false
@@ -76,13 +76,87 @@ ORDER BY _distance
 4
 5
 
+# Vector search over ARRAY vectors written by DuckDB (preferred usage)
+statement ok
+COPY (
+  SELECT *
+  FROM (
+    VALUES
+      (1::BIGINT, 'duck'::VARCHAR, [0.9, 0.7, 0.1]::FLOAT[3]),
+      (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::FLOAT[3]),
+      (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::FLOAT[3])
+  ) AS t(id, animal, vec)
+) TO 'test/.tmp/knn_array_f32.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'test/.tmp/knn_array_f32.lance',
+  'vec',
+  [0.8, 0.7, 0.2]::FLOAT[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+1
+
+statement ok
+COPY (
+  SELECT *
+  FROM (
+    VALUES
+      (1::BIGINT, 'duck'::VARCHAR, [0.9, 0.7, 0.1]::DOUBLE[3]),
+      (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::DOUBLE[3]),
+      (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::DOUBLE[3])
+  ) AS t(id, animal, vec)
+) TO 'test/.tmp/knn_array_f64.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'test/.tmp/knn_array_f64.lance',
+  'vec',
+  [0.8, 0.7, 0.2]::DOUBLE[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+1
+
+# Vector search over LIST vectors written by DuckDB is supported via writer normalization (issue #117)
+statement ok
+COPY (
+  SELECT *
+  FROM (
+    VALUES
+      (1::BIGINT, 'duck'::VARCHAR, [0.9, 0.7, 0.1]::FLOAT[]),
+      (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::FLOAT[]),
+      (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::FLOAT[])
+  ) AS t(id, animal, vec)
+) TO 'test/.tmp/knn_list_f32.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'test/.tmp/knn_list_f32.lance',
+  'vec',
+  [0.8, 0.7, 0.2]::FLOAT[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+1
+
 # Hybrid search (vector + fts)
 query I
 SELECT id
 FROM lance_hybrid_search(
   'test/data/search_test_data.lance',
   'vec',
-  [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   'text',
   'puppy',
   k = 3,
@@ -102,7 +176,7 @@ SELECT id
 FROM lance_hybrid_search(
   'test/data/search_test_data.lance',
   'vec',
-  [0.0, 0.0, 0.0, 0.0]::FLOAT[],
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   'text',
   'puppy',
   k = 3,

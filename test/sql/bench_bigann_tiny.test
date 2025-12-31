@@ -51,7 +51,7 @@ WITH got AS (
       -0.3673502,
       -0.68120277,
       0.41665298
-    ]::FLOAT[],
+    ]::FLOAT[16],
     k = 10,
     use_index = false
   ) r
@@ -95,7 +95,7 @@ WITH got AS (
       -0.3673502,
       -0.68120277,
       0.41665298
-    ]::FLOAT[],
+    ]::FLOAT[16],
     k = 10,
     prefilter = true,
     use_index = false
@@ -141,7 +141,7 @@ WITH got AS (
       -0.3673502,
       -0.68120277,
       0.41665298
-    ]::FLOAT[],
+    ]::FLOAT[16],
     k = 10,
     use_index = true
   ) r
@@ -173,7 +173,7 @@ WITH got AS (
       -0.3673502,
       -0.68120277,
       0.41665298
-    ]::FLOAT[],
+    ]::FLOAT[16],
     k = 10,
     use_index = true
   ) r
@@ -211,7 +211,7 @@ FROM lance_vector_search(
     -0.3673502,
     -0.68120277,
     0.41665298
-  ]::FLOAT[],
+  ]::FLOAT[16],
   k = 10,
   prefilter = true,
   use_index = true
@@ -243,7 +243,7 @@ WITH got AS (
       -0.3673502,
       -0.68120277,
       0.41665298
-    ]::FLOAT[],
+    ]::FLOAT[16],
     k = 10,
     prefilter = true,
     use_index = true
@@ -285,7 +285,7 @@ FROM lance_vector_search(
     -0.3673502,
     -0.68120277,
     0.41665298
-  ]::FLOAT[],
+  ]::FLOAT[16],
   k = 1,
   use_index = true
 );
@@ -315,7 +315,7 @@ FROM lance_vector_search(
     -0.3673502,
     -0.68120277,
     0.41665298
-  ]::FLOAT[],
+  ]::FLOAT[16],
   k = 1,
   use_index = false
 );

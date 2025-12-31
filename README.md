@@ -137,7 +137,7 @@ SELECT count(*) FROM lance_ns.main.my_dataset;
 ```sql
 -- Search a vector column, returning distances in `_distance` (smaller is closer)
 SELECT id, label, _distance
-FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+FROM lance_vector_search('path/to/dataset.lance', 'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
                          k = 5, prefilter = true)
 ORDER BY _distance ASC;
 ```
@@ -146,7 +146,7 @@ ORDER BY _distance ASC;
 - Positional arguments:
   - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
   - `vector_column` (VARCHAR): Vector column name.
-  - `query_vector` (FLOAT[] or DOUBLE[]): Query vector (must be non-empty; values are cast to float32).
+  - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
 - Named parameters:
   - `k` (BIGINT, default `10`): Number of results to return.
   - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
@@ -181,7 +181,7 @@ ORDER BY _score DESC;
 -- Combine vector and text scores, returning `_hybrid_score` in addition to `_distance` / `_score`
 SELECT id, _hybrid_score, _distance, _score
 FROM lance_hybrid_search('path/to/dataset.lance',
-                         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[],
+                         'vec', [0.1, 0.2, 0.3, 0.4]::FLOAT[4],
                          'text', 'puppy',
                          k = 10, prefilter = false,
                          alpha = 0.5, oversample_factor = 4)
@@ -192,7 +192,7 @@ ORDER BY _hybrid_score DESC;
 - Positional arguments:
   - `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
   - `vector_column` (VARCHAR): Vector column name.
-  - `query_vector` (FLOAT[] or DOUBLE[]): Query vector (must be non-empty; values are cast to float32).
+  - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
   - `text_column` (VARCHAR): Text column name.
   - `query` (VARCHAR): Query string.
 - Named parameters:

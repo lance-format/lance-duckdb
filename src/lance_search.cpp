@@ -79,11 +79,17 @@ static vector<float> ParseQueryVector(const Value &value,
     throw InvalidInputException(function_name +
                                 " requires a non-null query vector");
   }
-  if (value.type().id() != LogicalTypeId::LIST) {
+  if (value.type().id() != LogicalTypeId::LIST &&
+      value.type().id() != LogicalTypeId::ARRAY) {
     throw InvalidInputException(function_name +
-                                " requires query vector to be a LIST");
+                                " requires query vector to be a LIST or ARRAY");
   }
-  auto children = ListValue::GetChildren(value);
+  vector<Value> children;
+  if (value.type().id() == LogicalTypeId::LIST) {
+    children = ListValue::GetChildren(value);
+  } else {
+    children = ArrayValue::GetChildren(value);
+  }
   if (children.empty()) {
     throw InvalidInputException(function_name +
                                 " requires a non-empty query vector");
