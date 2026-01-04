@@ -6,9 +6,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-01-04
+
 ### Added
 
 - `lance_vector_search` now supports the `nprobs` and `refine_factor` parameters.
+
+### Fixed
+
+- Fixed vector search to accept query vectors as DuckDB ARRAY types (e.g. `FLOAT[dim]`, `DOUBLE[dim]`) in addition to LIST types.
+- Fixed `COPY ... (FORMAT lance)` to normalize LIST vector columns so they can be used with vector search and indexing.
 
 ## [0.4.0] - 2025-12-29
 
