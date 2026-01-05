@@ -87,14 +87,40 @@ LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
     return nullptr;
   }
   auto &bind_data = bind_data_p->Cast<LanceScanBindData>();
-  if (!bind_data.dataset) {
-    return nullptr;
+
+  idx_t count = 0;
+  if (!bind_data.take_row_ids.empty()) {
+    count = NumericCast<idx_t>(bind_data.take_row_ids.size());
+  } else {
+    if (!bind_data.dataset) {
+      return nullptr;
+    }
+    auto rows = lance_dataset_count_rows(bind_data.dataset);
+    if (rows < 0) {
+      return nullptr;
+    }
+    count = NumericCast<idx_t>(rows);
   }
-  auto rows = lance_dataset_count_rows(bind_data.dataset);
-  if (rows < 0) {
-    return nullptr;
+
+  if (bind_data.sampling_pushed_down) {
+    auto pct = bind_data.sample_percentage / 100.0;
+    pct = MaxValue<double>(0.0, MinValue<double>(1.0, pct));
+    auto sampled_rows =
+        static_cast<int64_t>(std::floor(static_cast<double>(count) * pct));
+    count = NumericCast<idx_t>(sampled_rows);
   }
-  auto count = NumericCast<idx_t>(rows);
+
+  if (bind_data.limit_offset_pushed_down) {
+    if (bind_data.pushed_offset >= count) {
+      count = 0;
+    } else {
+      count -= bind_data.pushed_offset;
+      if (bind_data.pushed_limit.IsValid()) {
+        count = MinValue<idx_t>(count, bind_data.pushed_limit.GetIndex());
+      }
+    }
+  }
+
   return make_uniq<NodeStatistics>(count, count);
 }
 
@@ -122,17 +148,46 @@ LanceScanGetPartitionStats(ClientContext &context,
     return {};
   }
   auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
-  if (!bind_data.dataset) {
-    return {};
-  }
-  auto rows = lance_dataset_count_rows(bind_data.dataset);
-  if (rows < 0) {
-    return {};
-  }
   PartitionStatistics stats;
   stats.row_start = 0;
-  stats.count = NumericCast<idx_t>(rows);
-  stats.count_type = CountType::COUNT_EXACT;
+
+  idx_t count = 0;
+  if (!bind_data.take_row_ids.empty()) {
+    count = NumericCast<idx_t>(bind_data.take_row_ids.size());
+  } else {
+    if (!bind_data.dataset) {
+      return {};
+    }
+    auto rows = lance_dataset_count_rows(bind_data.dataset);
+    if (rows < 0) {
+      return {};
+    }
+    count = NumericCast<idx_t>(rows);
+  }
+
+  if (bind_data.sampling_pushed_down) {
+    auto pct = bind_data.sample_percentage / 100.0;
+    pct = MaxValue<double>(0.0, MinValue<double>(1.0, pct));
+    auto sampled_rows =
+        static_cast<int64_t>(std::floor(static_cast<double>(count) * pct));
+    count = NumericCast<idx_t>(sampled_rows);
+  }
+
+  if (bind_data.limit_offset_pushed_down) {
+    if (bind_data.pushed_offset >= count) {
+      count = 0;
+    } else {
+      count -= bind_data.pushed_offset;
+      if (bind_data.pushed_limit.IsValid()) {
+        count = MinValue<idx_t>(count, bind_data.pushed_limit.GetIndex());
+      }
+    }
+  }
+
+  stats.count = count;
+  stats.count_type = bind_data.sampling_pushed_down
+                         ? CountType::COUNT_APPROXIMATE
+                         : CountType::COUNT_EXACT;
   vector<PartitionStatistics> out;
   out.push_back(stats);
   return out;

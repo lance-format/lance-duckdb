@@ -1,0 +1,31 @@
+# name: test/sql/profiling_rows_scanned.test
+# description: Ensure OPERATOR_ROWS_SCANNED reflects Lance point lookups
+# group: [profiling]
+
+require lance
+
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '__TEST_DIR__/profiling_output.json';
+
+statement ok
+PRAGMA custom_profiling_settings='{"OPERATOR_ROWS_SCANNED": "true", "CUMULATIVE_ROWS_SCANNED": "true"}';
+
+statement ok
+SELECT name FROM 'test/data/test_data.lance' WHERE _rowid IN (0, 1, 2, 4);
+
+statement ok
+PRAGMA disable_profiling;
+
+query I
+SELECT
+	CAST(regexp_extract(
+		content,
+		'"cumulative_rows_scanned"[[:space:]]*:[[:space:]]*([0-9]+)',
+		1
+	) AS BIGINT)
+FROM read_text('__TEST_DIR__/profiling_output.json');
+----
+4
