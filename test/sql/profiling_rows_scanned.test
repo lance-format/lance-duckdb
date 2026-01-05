@@ -1,6 +1,6 @@
 # name: test/sql/profiling_rows_scanned.test
 # description: Ensure OPERATOR_ROWS_SCANNED reflects Lance point lookups
-# group: [profiling]
+# group: [sql]
 
 require lance
 
