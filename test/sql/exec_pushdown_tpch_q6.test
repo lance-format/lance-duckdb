@@ -1,0 +1,13 @@
+# name: test/sql/exec_pushdown_tpch_q6.test
+# description: Exec pushdown applies to TPC-H Q6 (ungrouped aggregate + filters)
+# group: [sql]
+
+require lance
+
+statement ok
+CREATE OR REPLACE VIEW lineitem AS SELECT * FROM 'test/data/tpch_sf0_01/lineitem.lance';
+
+query II
+EXPLAIN (FORMAT JSON) SELECT sum(l_extendedprice * l_discount) AS revenue FROM lineitem WHERE l_shipdate >= CAST('1994-01-01' AS date) AND l_shipdate < CAST('1995-01-01' AS date) AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*

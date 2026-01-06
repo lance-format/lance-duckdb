@@ -2017,16 +2017,29 @@ LanceExecPushdown(ClientContext &context, unique_ptr<LogicalOperator> op) {
   extra_scan_col_ids.reserve(scan_get.table_filters.filters.size());
 
   if (!scan_get.table_filters.filters.empty()) {
-    vector<column_t> column_ids;
-    auto &col_indexes = scan_get.GetColumnIds();
-    column_ids.reserve(col_indexes.size());
-    for (auto &col_index : col_indexes) {
-      column_ids.push_back(col_index.GetPrimaryIndex());
+    idx_t max_col_id = 0;
+    for (auto &it : scan_get.table_filters.filters) {
+      auto col_id = NumericCast<idx_t>(it.first);
+      if (col_id >= scan_bind.names.size() || col_id >= scan_bind.types.size()) {
+        return op;
+      }
+      if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
+          IsLanceVirtualRowIdColumnId(col_id)) {
+        return op;
+      }
+      max_col_id = MaxValue(max_col_id, col_id);
     }
 
-    TableFunctionInitInput init_input(
-        scan_get.bind_data.get(), std::move(column_ids),
-        scan_get.projection_ids, &scan_get.table_filters);
+    vector<column_t> column_ids;
+    column_ids.reserve(max_col_id + 1);
+    for (idx_t i = 0; i <= max_col_id; i++) {
+      column_ids.push_back(NumericCast<column_t>(i));
+    }
+
+    vector<idx_t> projection_ids;
+    TableFunctionInitInput init_input(scan_get.bind_data.get(),
+                                      std::move(column_ids), projection_ids,
+                                      &scan_get.table_filters);
     auto table_filters = BuildLanceTableFilterIRParts(
         scan_bind.names, scan_bind.types, init_input, false);
     if (!table_filters.all_filters_pushed) {
@@ -2035,15 +2048,8 @@ LanceExecPushdown(ClientContext &context, unique_ptr<LogicalOperator> op) {
     filter_parts = std::move(table_filters.parts);
 
     for (auto &it : scan_get.table_filters.filters) {
-      auto scan_col_idx = it.first;
-      if (scan_col_idx >= col_indexes.size()) {
-        continue;
-      }
-      auto &col_index = col_indexes[scan_col_idx];
-      if (col_index.IsVirtualColumn()) {
-        continue;
-      }
-      extra_scan_col_ids.push_back(col_index.GetPrimaryIndex());
+      auto col_id = NumericCast<idx_t>(it.first);
+      extra_scan_col_ids.push_back(col_id);
     }
   }
 
