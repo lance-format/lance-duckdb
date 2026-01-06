@@ -13,6 +13,7 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_search.cpp src/lance_common.cpp
                       src/lance_secrets.cpp
                       src/lance_filter_ir.cpp
+                      src/lance_exec_ir.cpp
                       src/lance_storage.cpp
                       src/lance_metadata.cpp
                       src/lance_replacement.cpp
@@ -117,10 +118,13 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
     ${CMAKE_CURRENT_LIST_DIR}/rust/constants.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/datafusion_stream.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/error.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/exec_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/exec.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/index.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs

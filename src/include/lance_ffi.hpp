@@ -52,6 +52,11 @@ int32_t lance_schema_to_arrow(void *schema, ArrowSchema *out_schema);
 int32_t lance_stream_next(void *stream, void **out_batch);
 void lance_close_stream(void *stream);
 
+void *lance_get_exec_schema(void *dataset, const uint8_t *exec_ir,
+                             size_t exec_ir_len);
+void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
+                                          size_t exec_ir_len);
+
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
 void lance_free_string(const char *s);

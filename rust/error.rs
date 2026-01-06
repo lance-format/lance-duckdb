@@ -65,6 +65,7 @@ pub enum ErrorCode {
     NamespaceDescribeTableInfo = 49,
     NamespaceCreateEmptyTable = 50,
     NamespaceDropTable = 51,
+    Exec = 52,
 }
 
 struct LastError {

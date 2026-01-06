@@ -1,0 +1,70 @@
+# name: test/sql/exec_pushdown_p0.test
+# description: P0 exec pushdown (global aggregates + filter) via __lance_exec
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT
+    1::BIGINT AS id,
+    DATE '2020-01-01' AS d,
+    TIMESTAMP '2020-01-01 00:00:00' AS ts,
+    CAST('9.99' AS DECIMAL(9,2)) AS dec
+  UNION ALL
+  SELECT
+    2::BIGINT AS id,
+    DATE '2020-01-03' AS d,
+    TIMESTAMP '2020-01-03 00:00:00' AS ts,
+    CAST('10.00' AS DECIMAL(9,2)) AS dec
+  UNION ALL
+  SELECT
+    3::BIGINT AS id,
+    DATE '2020-01-05' AS d,
+    TIMESTAMP '2020-01-05 00:00:00' AS ts,
+    CAST('10.01' AS DECIMAL(9,2)) AS dec
+  UNION ALL
+  SELECT
+    4::BIGINT AS id,
+    DATE '2020-01-07' AS d,
+    NULL::TIMESTAMP AS ts,
+    NULL::DECIMAL(9,2) AS dec
+) TO 'test/.tmp/exec_pushdown_p0.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+SELECT 1;
+
+query II
+EXPLAIN (FORMAT JSON) SELECT avg(id) FROM 'test/.tmp/exec_pushdown_p0.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT sum(dec) FROM 'test/.tmp/exec_pushdown_p0.lance' WHERE id > 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query R
+SELECT avg(id) FROM 'test/.tmp/exec_pushdown_p0.lance';
+----
+2.5
+
+query T
+SELECT min(d) FROM 'test/.tmp/exec_pushdown_p0.lance';
+----
+2020-01-01
+
+query T
+SELECT sum(dec) FROM 'test/.tmp/exec_pushdown_p0.lance';
+----
+30.00
+
+query T
+SELECT sum(dec) FROM 'test/.tmp/exec_pushdown_p0.lance' WHERE id > 1;
+----
+20.01
+
+query I
+SELECT count(dec) FROM 'test/.tmp/exec_pushdown_p0.lance';
+----
+3
