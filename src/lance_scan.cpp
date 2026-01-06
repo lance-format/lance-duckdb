@@ -2024,9 +2024,9 @@ LanceExecPushdown(ClientContext &context, unique_ptr<LogicalOperator> op) {
       column_ids.push_back(col_index.GetPrimaryIndex());
     }
 
-    TableFunctionInitInput init_input(scan_get.bind_data.get(), std::move(column_ids),
-                                      scan_get.projection_ids,
-                                      &scan_get.table_filters);
+    TableFunctionInitInput init_input(
+        scan_get.bind_data.get(), std::move(column_ids),
+        scan_get.projection_ids, &scan_get.table_filters);
     auto table_filters = BuildLanceTableFilterIRParts(
         scan_bind.names, scan_bind.types, init_input, false);
     if (!table_filters.all_filters_pushed) {
@@ -2135,9 +2135,11 @@ LanceExecPushdown(ClientContext &context, unique_ptr<LogicalOperator> op) {
     }
   }
 
-  auto exec_get = make_uniq<LogicalGet>(agg_op.aggregate_index, LanceExecFunction(),
-                                       std::move(exec_bind), exec_types, exec_names);
-  exec_get->parameters.push_back(Value(exec_get->bind_data->Cast<LanceExecBindData>().file_path));
+  auto exec_get =
+      make_uniq<LogicalGet>(agg_op.aggregate_index, LanceExecFunction(),
+                            std::move(exec_bind), exec_types, exec_names);
+  exec_get->parameters.push_back(
+      Value(exec_get->bind_data->Cast<LanceExecBindData>().file_path));
   exec_get->parameters.push_back(Value::BLOB_RAW(exec_ir));
 
   vector<ColumnIndex> column_ids;
@@ -2478,8 +2480,8 @@ static void LanceExecFunc(ClientContext &context, TableFunctionInput &data,
     auto start = global_state.lines_read.fetch_add(output_size);
 
     output.SetCardinality(output_size);
-    ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(),
-                                      output, start, false);
+    ArrowTableFunction::ArrowToDuckDB(
+        local_state, bind_data.arrow_table.GetColumns(), output, start, false);
     local_state.chunk_offset += output_size;
 
     if (output.size() == 0) {
@@ -2515,10 +2517,9 @@ LanceExecDynamicToString(TableFunctionDynamicToStringInput &input) {
 }
 
 static TableFunction LanceExecFunction() {
-  TableFunction function("__lance_exec",
-                         {LogicalType::VARCHAR, LogicalType::BLOB},
-                         LanceExecFunc, LanceExecBind, LanceExecInitGlobal,
-                         LanceExecLocalInit);
+  TableFunction function(
+      "__lance_exec", {LogicalType::VARCHAR, LogicalType::BLOB}, LanceExecFunc,
+      LanceExecBind, LanceExecInitGlobal, LanceExecLocalInit);
   function.to_string = LanceExecToString;
   function.dynamic_to_string = LanceExecDynamicToString;
   return function;

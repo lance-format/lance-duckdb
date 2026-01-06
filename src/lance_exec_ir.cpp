@@ -197,11 +197,10 @@ static bool TryMapBinaryOp(const BoundFunctionExpression &fn,
   return false;
 }
 
-static bool TryEncodeExecExpr(const LogicalGet &scan_get,
-                              const LanceScanBindData &scan_bind,
-                              const vector<unique_ptr<Expression>> *projection_exprs,
-                              const Expression &expr, string &out,
-                              unordered_set<idx_t> &out_col_idxs);
+static bool TryEncodeExecExpr(
+    const LogicalGet &scan_get, const LanceScanBindData &scan_bind,
+    const vector<unique_ptr<Expression>> *projection_exprs,
+    const Expression &expr, string &out, unordered_set<idx_t> &out_col_idxs);
 
 static bool TryEncodeLiteral(const Value &v, string &out) {
   WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::LITERAL));
@@ -245,22 +244,22 @@ static bool TryEncodeLiteral(const Value &v, string &out) {
   }
 }
 
-static bool TryEncodeExecExpr(const LogicalGet &scan_get,
-                              const LanceScanBindData &scan_bind,
-                              const vector<unique_ptr<Expression>> *projection_exprs,
-                              const Expression &expr, string &out,
-                              unordered_set<idx_t> &out_col_idxs) {
+static bool TryEncodeExecExpr(
+    const LogicalGet &scan_get, const LanceScanBindData &scan_bind,
+    const vector<unique_ptr<Expression>> *projection_exprs,
+    const Expression &expr, string &out, unordered_set<idx_t> &out_col_idxs) {
   switch (expr.GetExpressionClass()) {
   case ExpressionClass::BOUND_COLUMN_REF: {
     auto &colref = expr.Cast<BoundColumnRefExpression>();
     if (colref.binding.table_index != scan_get.table_index) {
-      if (!projection_exprs || colref.binding.column_index >= projection_exprs->size() ||
+      if (!projection_exprs ||
+          colref.binding.column_index >= projection_exprs->size() ||
           !(*projection_exprs)[colref.binding.column_index]) {
         return false;
       }
-      return TryEncodeExecExpr(scan_get, scan_bind, nullptr,
-                               *(*projection_exprs)[colref.binding.column_index], out,
-                               out_col_idxs);
+      return TryEncodeExecExpr(
+          scan_get, scan_bind, nullptr,
+          *(*projection_exprs)[colref.binding.column_index], out, out_col_idxs);
     }
     auto &column_ids = scan_get.GetColumnIds();
     if (colref.binding.column_index >= column_ids.size()) {
@@ -327,13 +326,11 @@ static bool TryEncodeExecExpr(const LogicalGet &scan_get,
     WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::BINARY));
     WriteU8(out, static_cast<uint8_t>(bop));
     if (!TryEncodeExecExpr(scan_get, scan_bind, projection_exprs,
-                           *fn.children[0], out,
-                           out_col_idxs)) {
+                           *fn.children[0], out, out_col_idxs)) {
       return false;
     }
     if (!TryEncodeExecExpr(scan_get, scan_bind, projection_exprs,
-                           *fn.children[1], out,
-                           out_col_idxs)) {
+                           *fn.children[1], out, out_col_idxs)) {
       return false;
     }
     return true;
@@ -343,13 +340,11 @@ static bool TryEncodeExecExpr(const LogicalGet &scan_get,
   }
 }
 
-bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
-                            const LanceScanBindData &scan_bind,
-                            const string &filter_ir_msg,
-                            const vector<idx_t> &extra_scan_col_ids,
-                            const vector<unique_ptr<Expression>> *projection_exprs,
-                            const LogicalAggregate &aggregate,
-                            string &out_exec_ir) {
+bool TryEncodeLanceExecIRv1(
+    const LogicalGet &scan_get, const LanceScanBindData &scan_bind,
+    const string &filter_ir_msg, const vector<idx_t> &extra_scan_col_ids,
+    const vector<unique_ptr<Expression>> *projection_exprs,
+    const LogicalAggregate &aggregate, string &out_exec_ir) {
   if (!aggregate.groups.empty()) {
     return false;
   }
@@ -410,7 +405,8 @@ bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
       if (name == "sum") {
         func = ExecIrAggFunc::SUM;
       } else if (name == "count") {
-        func = fn.children.empty() ? ExecIrAggFunc::COUNT_STAR : ExecIrAggFunc::COUNT;
+        func = fn.children.empty() ? ExecIrAggFunc::COUNT_STAR
+                                   : ExecIrAggFunc::COUNT;
       } else if (name == "min") {
         func = ExecIrAggFunc::MIN;
       } else if (name == "max") {
@@ -452,8 +448,8 @@ bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
       if (!arg_expr) {
         return false;
       }
-      if (!TryEncodeExecExpr(scan_get, scan_bind, projection_exprs,
-                             *arg_expr, args_buf, tmp_idxs)) {
+      if (!TryEncodeExecExpr(scan_get, scan_bind, projection_exprs, *arg_expr,
+                             args_buf, tmp_idxs)) {
         return false;
       }
       for (auto idx : tmp_idxs) {
@@ -487,8 +483,7 @@ bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
   }
 
   out_exec_ir.clear();
-  out_exec_ir.reserve(64 + filter_ir_msg.size() +
-                      scan_projection.size() * 16 +
+  out_exec_ir.reserve(64 + filter_ir_msg.size() + scan_projection.size() * 16 +
                       aggregate.expressions.size() * 32);
 
   WriteBytes(out_exec_ir, reinterpret_cast<const_data_ptr_t>("LEX1"), 4);
@@ -500,7 +495,8 @@ bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(filter_ir_msg.size()));
-  WriteBytes(out_exec_ir, reinterpret_cast<const_data_ptr_t>(filter_ir_msg.data()),
+  WriteBytes(out_exec_ir,
+             reinterpret_cast<const_data_ptr_t>(filter_ir_msg.data()),
              filter_ir_msg.size());
 
   if (scan_projection.size() >
@@ -526,9 +522,10 @@ bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
                  agg.encoded_args.size());
     }
     if (!agg.output_type_hint.empty()) {
-      WriteBytes(out_exec_ir,
-                 reinterpret_cast<const_data_ptr_t>(agg.output_type_hint.data()),
-                 agg.output_type_hint.size());
+      WriteBytes(
+          out_exec_ir,
+          reinterpret_cast<const_data_ptr_t>(agg.output_type_hint.data()),
+          agg.output_type_hint.size());
     }
   }
 

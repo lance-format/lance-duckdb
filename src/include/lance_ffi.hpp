@@ -53,7 +53,7 @@ int32_t lance_stream_next(void *stream, void **out_batch);
 void lance_close_stream(void *stream);
 
 void *lance_get_exec_schema(void *dataset, const uint8_t *exec_ir,
-                             size_t exec_ir_len);
+                            size_t exec_ir_len);
 void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
                                           size_t exec_ir_len);
 

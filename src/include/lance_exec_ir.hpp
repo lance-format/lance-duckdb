@@ -22,12 +22,10 @@ struct LanceScanBindData;
 // - filter_ir bytes (reuses existing FilterIR message)
 // - global aggregates (no GROUP BY)
 // - aggregate argument expressions: ColumnRef, Constant, Binary(+,-,*,/)
-bool TryEncodeLanceExecIRv1(const LogicalGet &scan_get,
-                            const LanceScanBindData &scan_bind,
-                            const string &filter_ir_msg,
-                            const vector<idx_t> &extra_scan_col_ids,
-                            const vector<unique_ptr<Expression>> *projection_exprs,
-                            const LogicalAggregate &aggregate,
-                            string &out_exec_ir);
+bool TryEncodeLanceExecIRv1(
+    const LogicalGet &scan_get, const LanceScanBindData &scan_bind,
+    const string &filter_ir_msg, const vector<idx_t> &extra_scan_col_ids,
+    const vector<unique_ptr<Expression>> *projection_exprs,
+    const LogicalAggregate &aggregate, string &out_exec_ir);
 
 } // namespace duckdb
