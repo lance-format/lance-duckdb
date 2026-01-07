@@ -1988,7 +1988,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
         auto &proj = child->Cast<LogicalProjection>();
         projection_stack.push_back(&proj.expressions);
         if (child->children.size() != 1 || !child->children[0]) {
-          return bail("Lance exec pushdown: projection child shape not supported");
+          return bail(
+              "Lance exec pushdown: projection child shape not supported");
         }
         child = child->children[0].get();
         continue;
@@ -2026,8 +2027,10 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       idx_t max_col_id = 0;
       for (auto &it : scan_get.table_filters.filters) {
         auto col_id = NumericCast<idx_t>(it.first);
-        if (col_id >= scan_bind.names.size() || col_id >= scan_bind.types.size()) {
-          return bail("Lance exec pushdown: table_filters column out of bounds");
+        if (col_id >= scan_bind.names.size() ||
+            col_id >= scan_bind.types.size()) {
+          return bail(
+              "Lance exec pushdown: table_filters column out of bounds");
         }
         if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
             IsLanceVirtualRowIdColumnId(col_id)) {
@@ -2067,8 +2070,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
           return bail("Lance exec pushdown: filter expression not pushable");
         }
         string part;
-        if (!TryBuildLanceExprFilterIR(scan_get, scan_bind.names, scan_bind.types,
-                                       false, *expr, part)) {
+        if (!TryBuildLanceExprFilterIR(scan_get, scan_bind.names,
+                                       scan_bind.types, false, *expr, part)) {
           return bail("Lance exec pushdown: filter IR encode failed");
         }
         filter_parts.push_back(std::move(part));
@@ -2166,10 +2169,9 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     // The child LogicalGet is used for physical planning/execution only. We
     // wrap it in LogicalLanceExec to preserve the original grouped aggregate
     // column bindings (group_index/aggregate_index) for upstream operators.
-    auto exec_get = make_uniq<LogicalGet>(optimizer.binder.GenerateTableIndex(),
-                                          LanceExecFunction(),
-                                          std::move(exec_bind), exec_types,
-                                          exec_names);
+    auto exec_get = make_uniq<LogicalGet>(
+        optimizer.binder.GenerateTableIndex(), LanceExecFunction(),
+        std::move(exec_bind), exec_types, exec_names);
     exec_get->parameters.push_back(
         Value(exec_get->bind_data->Cast<LanceExecBindData>().file_path));
     exec_get->parameters.push_back(Value::BLOB_RAW(exec_ir));
@@ -2201,8 +2203,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
         }
         child = child->children[0].get();
       }
-      if (child && child->type ==
-                       LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+      if (child &&
+          child->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
         auto &agg = child->Cast<LogicalAggregate>();
         if (auto rewritten =
                 try_rewrite(agg, &order, post_projection, op->types,
@@ -2221,8 +2223,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     return op;
   }
   auto &agg = op->Cast<LogicalAggregate>();
-  if (auto rewritten =
-          try_rewrite(agg, nullptr, nullptr, op->types, op->estimated_cardinality)) {
+  if (auto rewritten = try_rewrite(agg, nullptr, nullptr, op->types,
+                                   op->estimated_cardinality)) {
     return rewritten;
   }
   return op;

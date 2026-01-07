@@ -18,7 +18,7 @@ LogicalLanceExec::LogicalLanceExec(idx_t group_index, idx_t aggregate_index,
 }
 
 PhysicalOperator &LogicalLanceExec::CreatePlan(ClientContext &,
-                                              PhysicalPlanGenerator &planner) {
+                                               PhysicalPlanGenerator &planner) {
   D_ASSERT(children.size() == 1);
   return planner.CreatePlan(*children[0]);
 }
@@ -43,9 +43,7 @@ vector<idx_t> LogicalLanceExec::GetTableIndex() const {
   return vector<idx_t>{group_index_, aggregate_index_};
 }
 
-string LogicalLanceExec::GetName() const {
-  return "__LANCE_EXEC";
-}
+string LogicalLanceExec::GetName() const { return "__LANCE_EXEC"; }
 
 InsertionOrderPreservingMap<string> LogicalLanceExec::ParamsToString() const {
   InsertionOrderPreservingMap<string> result;
@@ -58,4 +56,3 @@ string LogicalLanceExec::GetExtensionName() const { return "lance"; }
 void LogicalLanceExec::ResolveTypes() { types = output_types_; }
 
 } // namespace duckdb
-

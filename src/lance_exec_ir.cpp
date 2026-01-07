@@ -321,7 +321,8 @@ static bool IsExecIrSafeCast(const LogicalType &from, const LogicalType &to) {
 
   // Safe widening decimal cast: allow only if target width is at least the
   // source width. Narrowing may overflow.
-  if (from.id() == LogicalTypeId::DECIMAL && to.id() == LogicalTypeId::DECIMAL) {
+  if (from.id() == LogicalTypeId::DECIMAL &&
+      to.id() == LogicalTypeId::DECIMAL) {
     auto from_width = DecimalType::GetWidth(from);
     auto to_width = DecimalType::GetWidth(to);
     return to_width >= from_width;
@@ -383,10 +384,9 @@ static bool TryEncodeExecExpr(
     const vector<const vector<unique_ptr<Expression>> *> &projection_stack,
     idx_t projection_stack_offset, const Expression &expr, string &out,
     unordered_set<idx_t> &out_col_idxs) {
-  auto projection_exprs =
-      projection_stack_offset < projection_stack.size()
-          ? projection_stack[projection_stack_offset]
-          : nullptr;
+  auto projection_exprs = projection_stack_offset < projection_stack.size()
+                              ? projection_stack[projection_stack_offset]
+                              : nullptr;
   switch (expr.GetExpressionClass()) {
   case ExpressionClass::BOUND_COLUMN_REF: {
     auto &colref = expr.Cast<BoundColumnRefExpression>();
@@ -396,10 +396,9 @@ static bool TryEncodeExecExpr(
           !(*projection_exprs)[colref.binding.column_index]) {
         return false;
       }
-      return TryEncodeExecExpr(scan_get, scan_bind, projection_stack,
-                               projection_stack_offset + 1,
-                               *(*projection_exprs)[colref.binding.column_index],
-                               out, out_col_idxs);
+      return TryEncodeExecExpr(
+          scan_get, scan_bind, projection_stack, projection_stack_offset + 1,
+          *(*projection_exprs)[colref.binding.column_index], out, out_col_idxs);
     }
     auto &column_ids = scan_get.GetColumnIds();
     if (colref.binding.column_index >= column_ids.size()) {
@@ -457,10 +456,9 @@ static bool TryEncodeExecExpr(
     if (projection_exprs && ref.index < projection_exprs->size() &&
         (*projection_exprs)[ref.index] &&
         (*projection_exprs)[ref.index].get() != &expr) {
-      return TryEncodeExecExpr(scan_get, scan_bind, projection_stack,
-                               projection_stack_offset + 1,
-                               *(*projection_exprs)[ref.index], out,
-                               out_col_idxs);
+      return TryEncodeExecExpr(
+          scan_get, scan_bind, projection_stack, projection_stack_offset + 1,
+          *(*projection_exprs)[ref.index], out, out_col_idxs);
     }
 
     auto &column_ids = scan_get.GetColumnIds();
@@ -554,7 +552,8 @@ static bool TryEncodeExecExpr(
     WriteU8(out, static_cast<uint8_t>(bop));
 
     const LogicalType *decimal_type = nullptr;
-    if (op.children[0] && op.children[0]->return_type.id() == LogicalTypeId::DECIMAL) {
+    if (op.children[0] &&
+        op.children[0]->return_type.id() == LogicalTypeId::DECIMAL) {
       decimal_type = &op.children[0]->return_type;
     } else if (op.children[1] &&
                op.children[1]->return_type.id() == LogicalTypeId::DECIMAL) {
@@ -697,7 +696,8 @@ bool TryEncodeLanceExecIRv1(
     if (!TryEncodeExecExpr(scan_get, scan_bind, projection_stack, 0, *expr,
                            expr_buf, tmp_idxs)) {
       if (ExecIrFailfast()) {
-        throw IOException("ExecIR group expr encode failed: " + expr->ToString());
+        throw IOException("ExecIR group expr encode failed: " +
+                          expr->ToString());
       }
       return false;
     }
@@ -707,7 +707,8 @@ bool TryEncodeLanceExecIRv1(
     g.encoded_expr = std::move(expr_buf);
     if (!TryEncodeOutputTypeHint(expr->return_type, g.output_type_hint)) {
       if (ExecIrFailfast()) {
-        throw IOException("ExecIR group output type unsupported: " + expr->return_type.ToString());
+        throw IOException("ExecIR group output type unsupported: " +
+                          expr->return_type.ToString());
       }
       return false;
     }
@@ -741,7 +742,8 @@ bool TryEncodeLanceExecIRv1(
       }
       if (!TryMapAggFunc(agg, func)) {
         if (ExecIrFailfast()) {
-          throw IOException("ExecIR unsupported aggregate: " + agg.function.name);
+          throw IOException("ExecIR unsupported aggregate: " +
+                            agg.function.name);
         }
         return false;
       }
@@ -813,7 +815,8 @@ bool TryEncodeLanceExecIRv1(
     enc.output_name = expr->GetName();
     if (!TryEncodeOutputTypeHint(expr->return_type, enc.output_type_hint)) {
       if (ExecIrFailfast()) {
-        throw IOException("ExecIR aggregate output type unsupported: " + expr->return_type.ToString());
+        throw IOException("ExecIR aggregate output type unsupported: " +
+                          expr->return_type.ToString());
       }
       return false;
     }
@@ -828,10 +831,11 @@ bool TryEncodeLanceExecIRv1(
       if (!arg_expr) {
         return false;
       }
-      if (!TryEncodeExecExpr(scan_get, scan_bind, projection_stack, 0, *arg_expr,
-                             args_buf, tmp_idxs)) {
+      if (!TryEncodeExecExpr(scan_get, scan_bind, projection_stack, 0,
+                             *arg_expr, args_buf, tmp_idxs)) {
         if (ExecIrFailfast()) {
-          throw IOException("ExecIR aggregate arg encode failed: " + arg_expr->ToString());
+          throw IOException("ExecIR aggregate arg encode failed: " +
+                            arg_expr->ToString());
         }
         return false;
       }
@@ -874,8 +878,7 @@ bool TryEncodeLanceExecIRv1(
 
   out_exec_ir.clear();
   out_exec_ir.reserve(64 + filter_ir_msg.size() + scan_projection.size() * 16 +
-                      groups.size() * 16 +
-                      aggregate.expressions.size() * 32);
+                      groups.size() * 16 + aggregate.expressions.size() * 32);
 
   WriteBytes(out_exec_ir, reinterpret_cast<const_data_ptr_t>("LEX1"), 4);
   WriteU32(out_exec_ir, 4); // version
@@ -911,10 +914,9 @@ bool TryEncodeLanceExecIRv1(
                  g.encoded_expr.size());
     }
     if (!g.output_type_hint.empty()) {
-      WriteBytes(
-          out_exec_ir,
-          reinterpret_cast<const_data_ptr_t>(g.output_type_hint.data()),
-          g.output_type_hint.size());
+      WriteBytes(out_exec_ir,
+                 reinterpret_cast<const_data_ptr_t>(g.output_type_hint.data()),
+                 g.output_type_hint.size());
     }
   }
 
@@ -952,7 +954,8 @@ bool TryEncodeLanceExecIRv1(
   // selection) so we can replace ORDER BY / PROJECTION roots without changing
   // user-visible column names.
   if (post_projection) {
-    if (post_projection->children.size() != 1 || !post_projection->children[0]) {
+    if (post_projection->children.size() != 1 ||
+        !post_projection->children[0]) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR post projection child shape not supported");
       }
@@ -969,7 +972,8 @@ bool TryEncodeLanceExecIRv1(
       if (!expr_ptr || expr_ptr->HasParameter() || expr_ptr->IsVolatile() ||
           expr_ptr->CanThrow()) {
         if (ExecIrFailfast()) {
-          throw IOException("ExecIR post projection expression not pushdownable");
+          throw IOException(
+              "ExecIR post projection expression not pushdownable");
         }
         return false;
       }
@@ -990,18 +994,21 @@ bool TryEncodeLanceExecIRv1(
       if (base->GetExpressionClass() == ExpressionClass::BOUND_REF) {
         auto &ref = base->Cast<BoundReferenceExpression>();
         out_idx = NumericCast<idx_t>(ref.index);
-      } else if (base->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+      } else if (base->GetExpressionClass() ==
+                 ExpressionClass::BOUND_COLUMN_REF) {
         auto &colref = base->Cast<BoundColumnRefExpression>();
         if (colref.binding.table_index == aggregate.group_index) {
           out_idx = NumericCast<idx_t>(colref.binding.column_index);
         } else if (colref.binding.table_index == aggregate.aggregate_index) {
-          out_idx = groups.size() + NumericCast<idx_t>(colref.binding.column_index);
+          out_idx =
+              groups.size() + NumericCast<idx_t>(colref.binding.column_index);
         }
       }
       if (out_idx == DConstants::INVALID_INDEX || out_idx != i ||
           out_idx >= output_names.size()) {
         if (ExecIrFailfast()) {
-          throw IOException("ExecIR post projection is not an identity mapping");
+          throw IOException(
+              "ExecIR post projection is not an identity mapping");
         }
         return false;
       }
@@ -1059,7 +1066,8 @@ bool TryEncodeLanceExecIRv1(
         } else if (colref.binding.table_index == aggregate.aggregate_index) {
           if (colref.binding.column_index >= aggs.size()) {
             if (ExecIrFailfast()) {
-              throw IOException("ExecIR order by aggregate column out of bounds");
+              throw IOException(
+                  "ExecIR order by aggregate column out of bounds");
             }
             return false;
           }
@@ -1069,22 +1077,24 @@ bool TryEncodeLanceExecIRv1(
           auto idx = NumericCast<idx_t>(colref.binding.column_index);
           if (idx >= output_names.size()) {
             if (ExecIrFailfast()) {
-              throw IOException("ExecIR order by post projection column out of bounds");
+              throw IOException(
+                  "ExecIR order by post projection column out of bounds");
             }
             return false;
           }
           name = output_names[idx];
         } else {
           if (ExecIrFailfast()) {
-            throw IOException("ExecIR order by column ref uses unexpected binding");
+            throw IOException(
+                "ExecIR order by column ref uses unexpected binding");
           }
           return false;
         }
       } else {
         if (ExecIrFailfast()) {
-          throw IOException("ExecIR order by expression class not supported: " +
-                            ExpressionClassToString(
-                                node.expression->GetExpressionClass()));
+          throw IOException(
+              "ExecIR order by expression class not supported: " +
+              ExpressionClassToString(node.expression->GetExpressionClass()));
         }
         return false;
       }

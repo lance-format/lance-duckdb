@@ -60,6 +60,8 @@ This repository is configured with `uv`, so you can run formatting via:
 uv run make format
 ```
 
+PR requirement: Before submitting a PR, run `uv run make format` and commit any resulting formatting changes (as a separate commit if it helps review).
+
 ### Testing
 
 The `release` build can be slow. For fast iteration, prefer `test_debug` when available.

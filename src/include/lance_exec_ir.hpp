@@ -22,7 +22,8 @@ struct LanceScanBindData;
 // - scan_projection (by physical column name)
 // - filter_ir bytes (reuses existing FilterIR message)
 // - group keys: ColumnRef only
-// - aggregates: sum/min/max/avg/count/count(*) (no DISTINCT, FILTER, ORDER BY-in-agg)
+// - aggregates: sum/min/max/avg/count/count(*) (no DISTINCT, FILTER, ORDER
+// BY-in-agg)
 // - ORDER BY on output columns (group keys / aggregates)
 // - expressions: ColumnRef, Constant, Binary(+,-,*,/), Cast(type_hint, expr)
 //
