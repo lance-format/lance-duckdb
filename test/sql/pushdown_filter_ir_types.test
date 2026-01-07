@@ -61,16 +61,16 @@ SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a IS NULL;
 ----
 1
 
-# Verify we emit a non-empty Filter IR for these supported types.
+# Verify we can encode these predicates into ExecIR (and avoid scanning into DuckDB).
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE ts_us >= TIMESTAMP '2020-01-02 00:00:00';
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE d_small > CAST('10.00' AS DECIMAL(9,2));
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/filter_ir_types.lance' WHERE s.a = 2;

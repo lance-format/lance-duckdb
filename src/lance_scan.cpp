@@ -11,10 +11,12 @@
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -40,6 +42,7 @@
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_exec_ir.hpp"
+#include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
 
@@ -1953,216 +1956,281 @@ LanceLimitOffsetPushdownOptimizer(OptimizerExtensionInput &,
 }
 
 static unique_ptr<LogicalOperator>
-LanceExecPushdown(ClientContext &context, unique_ptr<LogicalOperator> op) {
+LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
+                  unique_ptr<LogicalOperator> op) {
+  auto failfast = []() {
+    return std::getenv("LANCE_EXEC_PUSHDOWN_FAILFAST") != nullptr;
+  };
+
+  auto try_rewrite =
+      [&](LogicalAggregate &agg_op, const LogicalOrder *order_op,
+          const LogicalProjection *post_projection,
+          const vector<LogicalType> &expected_types,
+          idx_t estimated_cardinality) -> unique_ptr<LogicalOperator> {
+    auto bail = [&](const string &msg) -> unique_ptr<LogicalOperator> {
+      if (failfast()) {
+        throw IOException(msg);
+      }
+      return nullptr;
+    };
+
+    if (agg_op.children.size() != 1 || !agg_op.children[0]) {
+      return bail("Lance exec pushdown: aggregate child shape not supported");
+    }
+
+    vector<const vector<unique_ptr<Expression>> *> projection_stack;
+    projection_stack.reserve(2);
+    vector<unique_ptr<Expression>> *filter_exprs = nullptr;
+
+    auto *child = agg_op.children[0].get();
+    while (child) {
+      if (child->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        auto &proj = child->Cast<LogicalProjection>();
+        projection_stack.push_back(&proj.expressions);
+        if (child->children.size() != 1 || !child->children[0]) {
+          return bail("Lance exec pushdown: projection child shape not supported");
+        }
+        child = child->children[0].get();
+        continue;
+      }
+      if (child->type == LogicalOperatorType::LOGICAL_FILTER) {
+        if (filter_exprs) {
+          return bail("Lance exec pushdown: multiple filters not supported");
+        }
+        auto &filter_op = child->Cast<LogicalFilter>();
+        filter_exprs = &filter_op.expressions;
+        if (child->children.size() != 1 || !child->children[0]) {
+          return bail("Lance exec pushdown: filter child shape not supported");
+        }
+        child = child->children[0].get();
+        continue;
+      }
+      break;
+    }
+
+    if (!child || child->type != LogicalOperatorType::LOGICAL_GET) {
+      return bail("Lance exec pushdown: expected LogicalGet child");
+    }
+    auto &scan_get = child->Cast<LogicalGet>();
+    if (!IsLanceScanTableFunction(scan_get.function) || !scan_get.bind_data) {
+      return bail("Lance exec pushdown: expected Lance scan LogicalGet");
+    }
+    auto &scan_bind = scan_get.bind_data->Cast<LanceScanBindData>();
+
+    vector<string> filter_parts;
+    string filter_ir_msg;
+    vector<idx_t> extra_scan_col_ids;
+    extra_scan_col_ids.reserve(scan_get.table_filters.filters.size());
+
+    if (!scan_get.table_filters.filters.empty()) {
+      idx_t max_col_id = 0;
+      for (auto &it : scan_get.table_filters.filters) {
+        auto col_id = NumericCast<idx_t>(it.first);
+        if (col_id >= scan_bind.names.size() || col_id >= scan_bind.types.size()) {
+          return bail("Lance exec pushdown: table_filters column out of bounds");
+        }
+        if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
+            IsLanceVirtualRowIdColumnId(col_id)) {
+          return bail("Lance exec pushdown: rowid filters not supported");
+        }
+        max_col_id = MaxValue(max_col_id, col_id);
+      }
+
+      vector<column_t> column_ids;
+      column_ids.reserve(max_col_id + 1);
+      for (idx_t i = 0; i <= max_col_id; i++) {
+        column_ids.push_back(NumericCast<column_t>(i));
+      }
+
+      vector<idx_t> projection_ids;
+      TableFunctionInitInput init_input(scan_get.bind_data.get(),
+                                        std::move(column_ids), projection_ids,
+                                        &scan_get.table_filters);
+      auto table_filters = BuildLanceTableFilterIRParts(
+          scan_bind.names, scan_bind.types, init_input, false);
+      if (!table_filters.all_filters_pushed) {
+        return bail("Lance exec pushdown: table_filters not fully pushable");
+      }
+      filter_parts = std::move(table_filters.parts);
+
+      for (auto &it : scan_get.table_filters.filters) {
+        auto col_id = NumericCast<idx_t>(it.first);
+        extra_scan_col_ids.push_back(col_id);
+      }
+    }
+
+    if (filter_exprs && !filter_exprs->empty()) {
+      filter_parts.reserve(filter_parts.size() + filter_exprs->size());
+      for (auto &expr : *filter_exprs) {
+        if (!expr || expr->HasParameter() || expr->IsVolatile() ||
+            expr->CanThrow()) {
+          return bail("Lance exec pushdown: filter expression not pushable");
+        }
+        string part;
+        if (!TryBuildLanceExprFilterIR(scan_get, scan_bind.names, scan_bind.types,
+                                       false, *expr, part)) {
+          return bail("Lance exec pushdown: filter IR encode failed");
+        }
+        filter_parts.push_back(std::move(part));
+      }
+    }
+
+    if (!scan_bind.lance_pushed_filter_ir_parts.empty()) {
+      filter_parts.reserve(filter_parts.size() +
+                           scan_bind.lance_pushed_filter_ir_parts.size());
+      for (auto &part : scan_bind.lance_pushed_filter_ir_parts) {
+        filter_parts.push_back(part);
+      }
+    }
+
+    if (!filter_parts.empty()) {
+      if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
+        return bail("Lance exec pushdown: filter message encode failed");
+      }
+    }
+
+    string exec_ir;
+    if (!TryEncodeLanceExecIRv1(scan_get, scan_bind, filter_ir_msg,
+                                extra_scan_col_ids, projection_stack, agg_op,
+                                order_op, post_projection, exec_ir)) {
+      if (failfast()) {
+        throw IOException("Lance exec pushdown: ExecIR encode failed");
+      }
+      return nullptr;
+    }
+
+    vector<LogicalType> exec_types;
+    vector<string> exec_names;
+    unique_ptr<LanceExecBindData> exec_bind;
+    try {
+      exec_bind = make_uniq<LanceExecBindData>();
+      exec_bind->file_path = scan_bind.file_path;
+      exec_bind->exec_ir = exec_ir;
+      exec_bind->dataset = LanceOpenDataset(context, exec_bind->file_path);
+      if (!exec_bind->dataset) {
+        throw IOException("Failed to open Lance dataset for exec pushdown: " +
+                          exec_bind->file_path + LanceFormatErrorSuffix());
+      }
+
+      auto *schema_handle = lance_get_exec_schema(
+          exec_bind->dataset,
+          exec_bind->exec_ir.empty()
+              ? nullptr
+              : reinterpret_cast<const uint8_t *>(exec_bind->exec_ir.data()),
+          exec_bind->exec_ir.size());
+      if (!schema_handle) {
+        throw IOException("Failed to validate Lance exec IR: " +
+                          LanceConsumeLastError());
+      }
+      memset(&exec_bind->schema_root.arrow_schema, 0,
+             sizeof(exec_bind->schema_root.arrow_schema));
+      if (lance_schema_to_arrow(schema_handle,
+                                &exec_bind->schema_root.arrow_schema) != 0) {
+        lance_free_schema(schema_handle);
+        throw IOException(
+            "Failed to export exec schema to Arrow C interface: " +
+            LanceFormatErrorSuffix());
+      }
+      lance_free_schema(schema_handle);
+
+      auto &config = DBConfig::GetConfig(context);
+      ArrowTableFunction::PopulateArrowTableSchema(
+          config, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
+      exec_names = exec_bind->arrow_table.GetNames();
+      exec_types = exec_bind->arrow_table.GetTypes();
+    } catch (...) {
+      if (failfast()) {
+        throw;
+      }
+      return nullptr;
+    }
+
+    if (exec_types.size() != expected_types.size()) {
+      if (failfast()) {
+        throw IOException("Lance exec pushdown: type count mismatch");
+      }
+      return nullptr;
+    }
+    for (idx_t i = 0; i < exec_types.size(); i++) {
+      if (exec_types[i] != expected_types[i]) {
+        if (failfast()) {
+          throw IOException("Lance exec pushdown: type mismatch at column " +
+                            to_string(i) + ": expected " +
+                            expected_types[i].ToString() + ", got " +
+                            exec_types[i].ToString());
+        }
+        return nullptr;
+      }
+    }
+
+    // The child LogicalGet is used for physical planning/execution only. We
+    // wrap it in LogicalLanceExec to preserve the original grouped aggregate
+    // column bindings (group_index/aggregate_index) for upstream operators.
+    auto exec_get = make_uniq<LogicalGet>(optimizer.binder.GenerateTableIndex(),
+                                          LanceExecFunction(),
+                                          std::move(exec_bind), exec_types,
+                                          exec_names);
+    exec_get->parameters.push_back(
+        Value(exec_get->bind_data->Cast<LanceExecBindData>().file_path));
+    exec_get->parameters.push_back(Value::BLOB_RAW(exec_ir));
+
+    vector<ColumnIndex> column_ids;
+    column_ids.reserve(exec_types.size());
+    for (idx_t i = 0; i < exec_types.size(); i++) {
+      column_ids.emplace_back(NumericCast<column_t>(i));
+    }
+    exec_get->SetColumnIds(std::move(column_ids));
+    exec_get->SetEstimatedCardinality(estimated_cardinality);
+
+    auto exec = make_uniq<LogicalLanceExec>(
+        agg_op.group_index, agg_op.aggregate_index, agg_op.groups.size(),
+        expected_types, std::move(exec_get));
+    exec->SetEstimatedCardinality(estimated_cardinality);
+    return exec;
+  };
+
+  if (op->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
+    auto &order = op->Cast<LogicalOrder>();
+    if (op->children.size() == 1 && op->children[0]) {
+      auto *child = op->children[0].get();
+      const LogicalProjection *post_projection = nullptr;
+      if (child->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        post_projection = &child->Cast<LogicalProjection>();
+        if (child->children.size() != 1 || !child->children[0]) {
+          return op;
+        }
+        child = child->children[0].get();
+      }
+      if (child && child->type ==
+                       LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+        auto &agg = child->Cast<LogicalAggregate>();
+        if (auto rewritten =
+                try_rewrite(agg, &order, post_projection, op->types,
+                            child->estimated_cardinality)) {
+          return rewritten;
+        }
+      }
+    }
+  }
+
   for (auto &child : op->children) {
-    child = LanceExecPushdown(context, std::move(child));
+    child = LanceExecPushdown(context, optimizer, std::move(child));
   }
 
   if (op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
     return op;
   }
-
-  auto &agg_op = op->Cast<LogicalAggregate>();
-  if (!agg_op.groups.empty()) {
-    return op;
+  auto &agg = op->Cast<LogicalAggregate>();
+  if (auto rewritten =
+          try_rewrite(agg, nullptr, nullptr, op->types, op->estimated_cardinality)) {
+    return rewritten;
   }
-  if (op->children.size() != 1 || !op->children[0]) {
-    return op;
-  }
-
-  const vector<unique_ptr<Expression>> *projection_exprs = nullptr;
-  vector<unique_ptr<Expression>> *filter_exprs = nullptr;
-
-  auto *child = op->children[0].get();
-  while (child) {
-    if (child->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-      if (projection_exprs) {
-        return op;
-      }
-      auto &proj = child->Cast<LogicalProjection>();
-      projection_exprs = &proj.expressions;
-      if (child->children.size() != 1 || !child->children[0]) {
-        return op;
-      }
-      child = child->children[0].get();
-      continue;
-    }
-    if (child->type == LogicalOperatorType::LOGICAL_FILTER) {
-      if (filter_exprs) {
-        return op;
-      }
-      auto &filter_op = child->Cast<LogicalFilter>();
-      filter_exprs = &filter_op.expressions;
-      if (child->children.size() != 1 || !child->children[0]) {
-        return op;
-      }
-      child = child->children[0].get();
-      continue;
-    }
-    break;
-  }
-
-  if (!child || child->type != LogicalOperatorType::LOGICAL_GET) {
-    return op;
-  }
-  auto &scan_get = child->Cast<LogicalGet>();
-  if (!IsLanceScanTableFunction(scan_get.function) || !scan_get.bind_data) {
-    return op;
-  }
-  auto &scan_bind = scan_get.bind_data->Cast<LanceScanBindData>();
-
-  vector<string> filter_parts;
-  string filter_ir_msg;
-  vector<idx_t> extra_scan_col_ids;
-  extra_scan_col_ids.reserve(scan_get.table_filters.filters.size());
-
-  if (!scan_get.table_filters.filters.empty()) {
-    idx_t max_col_id = 0;
-    for (auto &it : scan_get.table_filters.filters) {
-      auto col_id = NumericCast<idx_t>(it.first);
-      if (col_id >= scan_bind.names.size() || col_id >= scan_bind.types.size()) {
-        return op;
-      }
-      if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-          IsLanceVirtualRowIdColumnId(col_id)) {
-        return op;
-      }
-      max_col_id = MaxValue(max_col_id, col_id);
-    }
-
-    vector<column_t> column_ids;
-    column_ids.reserve(max_col_id + 1);
-    for (idx_t i = 0; i <= max_col_id; i++) {
-      column_ids.push_back(NumericCast<column_t>(i));
-    }
-
-    vector<idx_t> projection_ids;
-    TableFunctionInitInput init_input(scan_get.bind_data.get(),
-                                      std::move(column_ids), projection_ids,
-                                      &scan_get.table_filters);
-    auto table_filters = BuildLanceTableFilterIRParts(
-        scan_bind.names, scan_bind.types, init_input, false);
-    if (!table_filters.all_filters_pushed) {
-      return op;
-    }
-    filter_parts = std::move(table_filters.parts);
-
-    for (auto &it : scan_get.table_filters.filters) {
-      auto col_id = NumericCast<idx_t>(it.first);
-      extra_scan_col_ids.push_back(col_id);
-    }
-  }
-
-  if (filter_exprs && !filter_exprs->empty()) {
-    filter_parts.reserve(filter_parts.size() + filter_exprs->size());
-    for (auto &expr : *filter_exprs) {
-      if (!expr || expr->HasParameter() || expr->IsVolatile() ||
-          expr->CanThrow()) {
-        return op;
-      }
-      string part;
-      if (!TryBuildLanceExprFilterIR(scan_get, scan_bind.names, scan_bind.types,
-                                     false, *expr, part)) {
-        return op;
-      }
-      filter_parts.push_back(std::move(part));
-    }
-  }
-
-  if (!scan_bind.lance_pushed_filter_ir_parts.empty()) {
-    filter_parts.reserve(filter_parts.size() +
-                         scan_bind.lance_pushed_filter_ir_parts.size());
-    for (auto &part : scan_bind.lance_pushed_filter_ir_parts) {
-      filter_parts.push_back(part);
-    }
-  }
-
-  if (!filter_parts.empty()) {
-    if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
-      return op;
-    }
-  }
-
-  string exec_ir;
-  if (!TryEncodeLanceExecIRv1(scan_get, scan_bind, filter_ir_msg,
-                              extra_scan_col_ids, projection_exprs, agg_op,
-                              exec_ir)) {
-    return op;
-  }
-
-  vector<LogicalType> exec_types;
-  vector<string> exec_names;
-  unique_ptr<LanceExecBindData> exec_bind;
-  try {
-    exec_bind = make_uniq<LanceExecBindData>();
-    exec_bind->file_path = scan_bind.file_path;
-    exec_bind->exec_ir = exec_ir;
-    exec_bind->dataset = LanceOpenDataset(context, exec_bind->file_path);
-    if (!exec_bind->dataset) {
-      throw IOException("Failed to open Lance dataset for exec pushdown: " +
-                        exec_bind->file_path + LanceFormatErrorSuffix());
-    }
-
-    auto *schema_handle = lance_get_exec_schema(
-        exec_bind->dataset,
-        exec_bind->exec_ir.empty()
-            ? nullptr
-            : reinterpret_cast<const uint8_t *>(exec_bind->exec_ir.data()),
-        exec_bind->exec_ir.size());
-    if (!schema_handle) {
-      throw IOException("Failed to validate Lance exec IR: " +
-                        LanceConsumeLastError());
-    }
-    memset(&exec_bind->schema_root.arrow_schema, 0,
-           sizeof(exec_bind->schema_root.arrow_schema));
-    if (lance_schema_to_arrow(schema_handle,
-                              &exec_bind->schema_root.arrow_schema) != 0) {
-      lance_free_schema(schema_handle);
-      throw IOException("Failed to export exec schema to Arrow C interface: " +
-                        LanceFormatErrorSuffix());
-    }
-    lance_free_schema(schema_handle);
-
-    auto &config = DBConfig::GetConfig(context);
-    ArrowTableFunction::PopulateArrowTableSchema(
-        config, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
-    exec_names = exec_bind->arrow_table.GetNames();
-    exec_types = exec_bind->arrow_table.GetTypes();
-  } catch (...) {
-    return op;
-  }
-
-  if (exec_types.size() != agg_op.types.size()) {
-    return op;
-  }
-  for (idx_t i = 0; i < exec_types.size(); i++) {
-    if (exec_types[i] != agg_op.types[i]) {
-      return op;
-    }
-  }
-
-  auto exec_get =
-      make_uniq<LogicalGet>(agg_op.aggregate_index, LanceExecFunction(),
-                            std::move(exec_bind), exec_types, exec_names);
-  exec_get->parameters.push_back(
-      Value(exec_get->bind_data->Cast<LanceExecBindData>().file_path));
-  exec_get->parameters.push_back(Value::BLOB_RAW(exec_ir));
-
-  vector<ColumnIndex> column_ids;
-  column_ids.reserve(exec_types.size());
-  for (idx_t i = 0; i < exec_types.size(); i++) {
-    column_ids.emplace_back(NumericCast<column_t>(i));
-  }
-  exec_get->SetColumnIds(std::move(column_ids));
-  exec_get->types = agg_op.types;
-  exec_get->SetEstimatedCardinality(1);
-
-  return exec_get;
+  return op;
 }
 
 static void LanceExecPushdownOptimizer(OptimizerExtensionInput &input,
                                        unique_ptr<LogicalOperator> &plan) {
-  plan = LanceExecPushdown(input.context, std::move(plan));
+  plan = LanceExecPushdown(input.context, input.optimizer, std::move(plan));
 }
 
 static void LanceRowIdInRewriteOptimizer(OptimizerExtensionInput &,

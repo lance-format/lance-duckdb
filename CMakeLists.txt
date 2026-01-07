@@ -14,6 +14,7 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_secrets.cpp
                       src/lance_filter_ir.cpp
                       src/lance_exec_ir.cpp
+                      src/lance_logical_exec.cpp
                       src/lance_storage.cpp
                       src/lance_metadata.cpp
                       src/lance_replacement.cpp

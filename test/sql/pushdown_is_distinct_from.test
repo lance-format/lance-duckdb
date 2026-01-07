@@ -143,10 +143,10 @@ query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "0"[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*

@@ -7,7 +7,16 @@ use datafusion_expr::{Expr, Operator};
 pub struct ExecIr {
     pub filter_ir: Vec<u8>,
     pub scan_projection: Vec<String>,
+    pub groups: Vec<GroupIr>,
     pub aggs: Vec<AggIr>,
+    pub order_by: Vec<OrderByIr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupIr {
+    pub output_name: String,
+    pub expr: ExprIr,
+    pub output_type: Option<OutputTypeHint>,
 }
 
 #[derive(Debug, Clone)]
@@ -16,6 +25,13 @@ pub struct AggIr {
     pub output_name: String,
     pub args: Vec<ExprIr>,
     pub output_type: Option<OutputTypeHint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderByIr {
+    pub column: String,
+    pub asc: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +73,11 @@ pub enum LiteralIr {
     Double(f64),
     Bool(bool),
     String(String),
+    Decimal128 {
+        value: i128,
+        precision: u8,
+        scale: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +95,7 @@ pub fn parse_exec_ir_v1(bytes: &[u8]) -> Result<ExecIr, String> {
         return Err("invalid ExecIR magic".to_string());
     }
     let version = c.read_u32()?;
-    if version != 1 && version != 2 {
+    if version != 1 && version != 2 && version != 3 {
         return Err(format!("unsupported ExecIR version: {version}"));
     }
     let _flags = c.read_u32()?;
@@ -86,6 +107,22 @@ pub fn parse_exec_ir_v1(bytes: &[u8]) -> Result<ExecIr, String> {
     let mut scan_projection = Vec::with_capacity(proj_len);
     for _ in 0..proj_len {
         scan_projection.push(c.read_string()?);
+    }
+
+    let mut groups = Vec::new();
+    if version >= 3 {
+        let group_len = c.read_u32()? as usize;
+        groups = Vec::with_capacity(group_len);
+        for _ in 0..group_len {
+            let output_name = c.read_string()?;
+            let expr = parse_expr_ir(&mut c)?;
+            let output_type = Some(parse_output_type_hint(&mut c)?);
+            groups.push(GroupIr {
+                output_name,
+                expr,
+                output_type,
+            });
+        }
     }
 
     let agg_len = c.read_u32()? as usize;
@@ -119,6 +156,22 @@ pub fn parse_exec_ir_v1(bytes: &[u8]) -> Result<ExecIr, String> {
         });
     }
 
+    let mut order_by = Vec::new();
+    if version >= 3 {
+        let order_len = c.read_u32()? as usize;
+        order_by = Vec::with_capacity(order_len);
+        for _ in 0..order_len {
+            let column = c.read_string()?;
+            let asc = c.read_u8()? != 0;
+            let nulls_first = c.read_u8()? != 0;
+            order_by.push(OrderByIr {
+                column,
+                asc,
+                nulls_first,
+            });
+        }
+    }
+
     if !c.is_eof() {
         return Err("trailing bytes in ExecIR".to_string());
     }
@@ -126,7 +179,9 @@ pub fn parse_exec_ir_v1(bytes: &[u8]) -> Result<ExecIr, String> {
     Ok(ExecIr {
         filter_ir,
         scan_projection,
+        groups,
         aggs,
+        order_by,
     })
 }
 
@@ -158,6 +213,19 @@ fn parse_expr_ir(c: &mut Cursor<'_>) -> Result<ExprIr, String> {
                 2 => LiteralIr::Double(c.read_f64()?),
                 3 => LiteralIr::Bool(c.read_u8()? != 0),
                 4 => LiteralIr::String(c.read_string()?),
+                5 => {
+                    let precision = c.read_u8()?;
+                    let scale = c.read_u8()?;
+                    let bytes = c.read_bytes(16)?;
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(bytes);
+                    let value = i128::from_le_bytes(buf);
+                    LiteralIr::Decimal128 {
+                        value,
+                        precision,
+                        scale,
+                    }
+                }
                 v => return Err(format!("invalid Literal tag: {v}")),
             };
             Ok(ExprIr::Literal(lit))
@@ -274,6 +342,15 @@ fn literal_ir_to_scalar(lit: &LiteralIr) -> Result<ScalarValue, String> {
         LiteralIr::Double(v) => Ok(ScalarValue::Float64(Some(*v))),
         LiteralIr::Bool(v) => Ok(ScalarValue::Boolean(Some(*v))),
         LiteralIr::String(v) => Ok(ScalarValue::Utf8(Some(v.clone()))),
+        LiteralIr::Decimal128 {
+            value,
+            precision,
+            scale,
+        } => Ok(ScalarValue::Decimal128(
+            Some(*value),
+            *precision as u8,
+            *scale as i8,
+        )),
     }
 }
 

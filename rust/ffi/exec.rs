@@ -183,15 +183,38 @@ async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFra
         .map_err(|e| e.to_string())?;
     let df = ctx.table("t").await.map_err(|e| e.to_string())?;
 
+    let group_exprs = exec_ir
+        .groups
+        .iter()
+        .map(|g| crate::exec_ir::expr_ir_to_df_expr(&g.expr).map(|e| e.alias(&g.output_name)))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let agg_exprs = exec_ir
         .aggs
         .iter()
         .map(agg_ir_to_df_expr)
         .collect::<Result<Vec<_>, _>>()?;
 
-    let df = df.aggregate(vec![], agg_exprs).map_err(|e| e.to_string())?;
+    let df = df
+        .aggregate(group_exprs, agg_exprs)
+        .map_err(|e| e.to_string())?;
 
-    let mut select_exprs = Vec::with_capacity(exec_ir.aggs.len());
+    let mut select_exprs = Vec::with_capacity(exec_ir.groups.len() + exec_ir.aggs.len());
+
+    for g in exec_ir.groups.iter() {
+        let name = g.output_name.as_str();
+        let expr = if let Some(hint) = &g.output_type {
+            let dtype = output_type_to_arrow(hint)?;
+            Expr::Cast(datafusion_expr::Cast::new(
+                Box::new(datafusion::prelude::col(name)),
+                dtype,
+            ))
+            .alias(name)
+        } else {
+            datafusion::prelude::col(name)
+        };
+        select_exprs.push(expr);
+    }
     for agg in exec_ir.aggs.iter() {
         let name = agg.output_name.as_str();
         let expr = if let Some(hint) = &agg.output_type {
@@ -204,7 +227,19 @@ async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFra
         select_exprs.push(expr);
     }
 
-    df.select(select_exprs).map_err(|e| e.to_string())
+    let df = df.select(select_exprs).map_err(|e| e.to_string())?;
+
+    if exec_ir.order_by.is_empty() {
+        return Ok(df);
+    }
+
+    let sort_exprs = exec_ir
+        .order_by
+        .iter()
+        .map(|o| datafusion::prelude::col(&o.column).sort(o.asc, o.nulls_first))
+        .collect();
+
+    df.sort(sort_exprs).map_err(|e| e.to_string())
 }
 
 #[no_mangle]

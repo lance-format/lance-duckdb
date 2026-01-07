@@ -45,10 +45,9 @@ SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE upper(s) 
 query II
 EXPLAIN (FORMAT JSON) SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE starts_with(s, 'Al');
 ----
-physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*starts_with[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM 'test/.tmp/string_functions_pushdown.lance' WHERE starts_with(s, 'Al');
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*
-
+analyzed_plan	<REGEX>:[\s\S]*"Lance Rows Out"[\s\S]*

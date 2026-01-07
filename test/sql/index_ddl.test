@@ -184,7 +184,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label = 1;
 ----
-physical_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "1"[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (FORMAT JSON)
