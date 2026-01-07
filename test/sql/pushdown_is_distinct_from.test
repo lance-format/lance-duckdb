@@ -91,20 +91,21 @@ SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS DISTIN
 # Verify we emit a non-empty Filter IR for these operators.
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b;
+SELECT a FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b;
+SELECT a FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
-WHERE f1 IS NOT DISTINCT FROM f2;
+SELECT f1 FROM 'test/.tmp/distinct_from_pushdown.lance'
+WHERE f1 IS NOT DISTINCT FROM f2
+LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
