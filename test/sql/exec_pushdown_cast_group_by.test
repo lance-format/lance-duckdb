@@ -1,0 +1,38 @@
+# name: test/sql/exec_pushdown_cast_group_by.test
+# description: Exec pushdown preserves CAST semantics in GROUP BY
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT
+    TIMESTAMP '2020-01-01 00:00:00' AS ts,
+    1.0::DOUBLE AS v
+  UNION ALL
+  SELECT
+    TIMESTAMP '2020-01-01 12:00:00' AS ts,
+    2.0::DOUBLE AS v
+  UNION ALL
+  SELECT
+    TIMESTAMP '2020-01-02 00:00:00' AS ts,
+    3.0::DOUBLE AS v
+) TO 'test/.tmp/exec_pushdown_cast_group_by.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT CAST(ts AS DATE) AS d, sum(v) AS s
+FROM 'test/.tmp/exec_pushdown_cast_group_by.lance'
+GROUP BY d
+ORDER BY d;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query TR
+SELECT CAST(ts AS DATE) AS d, sum(v) AS s
+FROM 'test/.tmp/exec_pushdown_cast_group_by.lance'
+GROUP BY d
+ORDER BY d;
+----
+2020-01-01	3.0
+2020-01-02	3.0

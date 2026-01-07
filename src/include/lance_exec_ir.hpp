@@ -24,7 +24,7 @@ struct LanceScanBindData;
 // - group keys: ColumnRef only
 // - aggregates: sum/min/max/avg/count/count(*) (no DISTINCT, FILTER, ORDER BY-in-agg)
 // - ORDER BY on output columns (group keys / aggregates)
-// - expressions: ColumnRef, Constant, Binary(+,-,*,/)
+// - expressions: ColumnRef, Constant, Binary(+,-,*,/), Cast(type_hint, expr)
 //
 bool TryEncodeLanceExecIRv1(
     const LogicalGet &scan_get, const LanceScanBindData &scan_bind,

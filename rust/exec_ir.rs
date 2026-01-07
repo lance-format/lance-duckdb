@@ -64,6 +64,10 @@ pub enum ExprIr {
         lhs: Box<ExprIr>,
         rhs: Box<ExprIr>,
     },
+    Cast {
+        to: OutputTypeHint,
+        expr: Box<ExprIr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +99,7 @@ pub fn parse_exec_ir_v1(bytes: &[u8]) -> Result<ExecIr, String> {
         return Err("invalid ExecIR magic".to_string());
     }
     let version = c.read_u32()?;
-    if version != 1 && version != 2 && version != 3 {
+    if version != 1 && version != 2 && version != 3 && version != 4 {
         return Err(format!("unsupported ExecIR version: {version}"));
     }
     let _flags = c.read_u32()?;
@@ -246,6 +250,14 @@ fn parse_expr_ir(c: &mut Cursor<'_>) -> Result<ExprIr, String> {
                 rhs: Box::new(rhs),
             })
         }
+        4 => {
+            let to = parse_output_type_hint(c)?;
+            let expr = parse_expr_ir(c)?;
+            Ok(ExprIr::Cast {
+                to,
+                expr: Box::new(expr),
+            })
+        }
         v => Err(format!("invalid ExprIR tag: {v}")),
     }
 }
@@ -267,6 +279,14 @@ pub fn expr_ir_to_df_expr(expr: &ExprIr) -> Result<Expr, String> {
                 Box::new(lhs),
                 op,
                 Box::new(rhs),
+            )))
+        }
+        ExprIr::Cast { to, expr } => {
+            let dtype = output_type_to_arrow(to)?;
+            let child = expr_ir_to_df_expr(expr)?;
+            Ok(Expr::Cast(datafusion_expr::Cast::new(
+                Box::new(child),
+                dtype,
             )))
         }
     }

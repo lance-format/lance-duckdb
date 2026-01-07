@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <tuple>
 #include <unordered_set>
 
@@ -99,6 +100,7 @@ enum class ExecIrExprTag : uint8_t {
   COLUMN_REF = 1,
   LITERAL = 2,
   BINARY = 3,
+  CAST = 4,
 };
 
 enum class ExecIrLiteralTag : uint8_t {
@@ -305,6 +307,77 @@ static bool TryEncodeLiteral(const Value &v, string &out) {
   }
 }
 
+static bool IsExecIrSafeCast(const LogicalType &from, const LogicalType &to) {
+  if (from == to) {
+    return true;
+  }
+  // Timestamp <-> Date casts are truncation/extension and should not fail.
+  if (from.id() == LogicalTypeId::TIMESTAMP && to.id() == LogicalTypeId::DATE) {
+    return true;
+  }
+  if (from.id() == LogicalTypeId::DATE && to.id() == LogicalTypeId::TIMESTAMP) {
+    return true;
+  }
+
+  // Safe widening decimal cast: allow only if target width is at least the
+  // source width. Narrowing may overflow.
+  if (from.id() == LogicalTypeId::DECIMAL && to.id() == LogicalTypeId::DECIMAL) {
+    auto from_width = DecimalType::GetWidth(from);
+    auto to_width = DecimalType::GetWidth(to);
+    return to_width >= from_width;
+  }
+
+  // Safe integer widening (signed only): allow upcast to BIGINT.
+  if (to.id() == LogicalTypeId::BIGINT) {
+    switch (from.id()) {
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+      return true;
+    default:
+      break;
+    }
+  }
+
+  // Numeric to DOUBLE is safe.
+  if (to.id() == LogicalTypeId::DOUBLE) {
+    switch (from.id()) {
+    case LogicalTypeId::TINYINT:
+    case LogicalTypeId::SMALLINT:
+    case LogicalTypeId::INTEGER:
+    case LogicalTypeId::BIGINT:
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE:
+      return true;
+    default:
+      break;
+    }
+  }
+
+  return false;
+}
+
+static bool IsExecIrPushdownableExpr(const Expression &expr) {
+  if (expr.HasParameter() || expr.IsVolatile()) {
+    return false;
+  }
+  if (!expr.CanThrow()) {
+    return true;
+  }
+  if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+    return false;
+  }
+  auto &cast = expr.Cast<BoundCastExpression>();
+  if (!cast.child) {
+    return false;
+  }
+  if (!IsExecIrSafeCast(cast.child->return_type, cast.return_type)) {
+    return false;
+  }
+  return IsExecIrPushdownableExpr(*cast.child);
+}
+
 static bool TryEncodeExecExpr(
     const LogicalGet &scan_get, const LanceScanBindData &scan_bind,
     const vector<const vector<unique_ptr<Expression>> *> &projection_stack,
@@ -368,6 +441,13 @@ static bool TryEncodeExecExpr(
       }
       return TryEncodeLiteral(v, out);
     }
+    string type_hint;
+    if (!TryEncodeOutputTypeHint(cast.return_type, type_hint)) {
+      return false;
+    }
+    WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::CAST));
+    WriteBytes(out, reinterpret_cast<const_data_ptr_t>(type_hint.data()),
+               type_hint.size());
     return TryEncodeExecExpr(scan_get, scan_bind, projection_stack,
                              projection_stack_offset, *cast.child, out,
                              out_col_idxs);
@@ -578,12 +658,36 @@ bool TryEncodeLanceExecIRv1(
     uint32_t arg_count;
   };
 
+  std::function<bool(const Expression &)> is_supported_group_expr;
+  is_supported_group_expr = [&](const Expression &expr) -> bool {
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
+        expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+      return true;
+    }
+    if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+      return false;
+    }
+    auto &cast = expr.Cast<BoundCastExpression>();
+    if (!cast.child) {
+      return false;
+    }
+    // Allow nested CASTs but require the leaf to be a direct column reference.
+    return is_supported_group_expr(*cast.child);
+  };
+
   vector<EncodedGroup> groups;
   groups.reserve(aggregate.groups.size());
   for (auto &expr : aggregate.groups) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile() || expr->CanThrow()) {
+    if (!expr || !IsExecIrPushdownableExpr(*expr)) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR group expression is not pushdownable");
+      }
+      return false;
+    }
+    if (!is_supported_group_expr(*expr)) {
+      if (ExecIrFailfast()) {
+        throw IOException("ExecIR group expression not supported: " +
+                          expr->ToString());
       }
       return false;
     }
@@ -594,14 +698,6 @@ bool TryEncodeLanceExecIRv1(
                            expr_buf, tmp_idxs)) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR group expr encode failed: " + expr->ToString());
-      }
-      return false;
-    }
-    if (expr_buf.empty() ||
-        static_cast<uint8_t>(expr_buf[0]) !=
-            static_cast<uint8_t>(ExecIrExprTag::COLUMN_REF)) {
-      if (ExecIrFailfast()) {
-        throw IOException("ExecIR group expr is not ColumnRef: " + expr->ToString());
       }
       return false;
     }
@@ -782,7 +878,7 @@ bool TryEncodeLanceExecIRv1(
                       aggregate.expressions.size() * 32);
 
   WriteBytes(out_exec_ir, reinterpret_cast<const_data_ptr_t>("LEX1"), 4);
-  WriteU32(out_exec_ir, 3); // version
+  WriteU32(out_exec_ir, 4); // version
   WriteU32(out_exec_ir, 0); // reserved flags
 
   if (filter_ir_msg.size() >
