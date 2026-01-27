@@ -47,6 +47,7 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,
                                  const string &bearer_token,
                                  const string &api_key, const string &delimiter,
+                                 const string &headers_tsv,
                                  vector<string> &out_tables, string &out_error);
 
 bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
@@ -57,25 +58,27 @@ void *
 LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &table_id, const string &bearer_token,
                             const string &api_key, const string &delimiter,
-                            string &out_table_uri);
+                            const string &headers_tsv, string &out_table_uri);
 
 bool TryLanceNamespaceDescribeTable(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
-    string &out_location, vector<string> &out_option_keys,
-    vector<string> &out_option_values, string &out_error);
+    const string &headers_tsv, string &out_location,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_error);
 
 bool TryLanceNamespaceCreateEmptyTable(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
-    string &out_location, vector<string> &out_option_keys,
-    vector<string> &out_option_values, string &out_error);
+    const string &headers_tsv, string &out_location,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_error);
 
 bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
                                 const string &table_id,
                                 const string &bearer_token,
                                 const string &api_key, const string &delimiter,
-                                string &out_error);
+                                const string &headers_tsv, string &out_error);
 
 class LanceTableEntry;
 

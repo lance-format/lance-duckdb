@@ -59,6 +59,7 @@ struct LanceRestNamespaceConfig {
   string delimiter;
   string bearer_token_override;
   string api_key_override;
+  string headers_tsv;  // Tab-separated key\tvalue pairs for custom headers
 };
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -86,6 +87,52 @@ static string GetLanceNamespaceDelimiter(const AttachInfo &info) {
     return delimiter;
   }
   return "";
+}
+
+// Parse HEADER options from ATTACH command
+// Options like HEADER 'x-lancedb-database=lance_ns;x-api-key=sk_123' are parsed
+// Multiple headers can be separated by semicolons within a single HEADER option
+// Returns a TSV string with key\tvalue pairs separated by newlines
+static string GetLanceNamespaceHeaders(const AttachInfo &info) {
+  string headers_tsv;
+  for (auto &kv : info.options) {
+    // Handle 'HEADER' option with 'key=value' format
+    if (StringUtil::CIEquals(kv.first, "header") && !kv.second.IsNull()) {
+      auto header_str =
+          kv.second.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+      // Split by semicolon to support multiple headers
+      vector<string> header_parts;
+      size_t pos = 0;
+      while (pos < header_str.size()) {
+        auto next_semi = header_str.find(';', pos);
+        if (next_semi == string::npos) {
+          header_parts.push_back(header_str.substr(pos));
+          break;
+        }
+        header_parts.push_back(header_str.substr(pos, next_semi - pos));
+        pos = next_semi + 1;
+      }
+      for (auto &part : header_parts) {
+        // Trim whitespace
+        while (!part.empty() && isspace(part.front())) {
+          part.erase(part.begin());
+        }
+        while (!part.empty() && isspace(part.back())) {
+          part.pop_back();
+        }
+        auto eq_pos = part.find('=');
+        if (eq_pos != string::npos && eq_pos > 0) {
+          auto key = part.substr(0, eq_pos);
+          auto value = part.substr(eq_pos + 1);
+          if (!headers_tsv.empty()) {
+            headers_tsv += "\n";
+          }
+          headers_tsv += key + "\t" + value;
+        }
+      }
+    }
+  }
+  return headers_tsv;
 }
 
 static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
@@ -166,15 +213,17 @@ static vector<string> ListRestNamespaceTables(const string &endpoint,
                                               const string &namespace_id,
                                               const string &bearer_token,
                                               const string &api_key,
-                                              const string &delimiter) {
+                                              const string &delimiter,
+                                              const string &headers_tsv) {
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr =
-      lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
-                                  bearer_ptr, api_key_ptr, delimiter_ptr);
+  auto *ptr = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                          bearer_ptr, api_key_ptr, delimiter_ptr,
+                                          headers_ptr);
   if (!ptr) {
     throw IOException("Failed to list tables from Lance namespace: " +
                       endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
@@ -275,13 +324,15 @@ public:
   LanceRestNamespaceDefaultGenerator(
       Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
       string namespace_id, string bearer_token, string api_key,
-      string delimiter, string bearer_token_override, string api_key_override)
+      string delimiter, string bearer_token_override, string api_key_override,
+      string headers_tsv)
       : DefaultGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
         bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
         delimiter(std::move(delimiter)),
         bearer_token_override(std::move(bearer_token_override)),
-        api_key_override(std::move(api_key_override)) {}
+        api_key_override(std::move(api_key_override)),
+        headers_tsv(std::move(headers_tsv)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
@@ -319,12 +370,12 @@ public:
     string table_uri;
     auto *dataset = LanceOpenDatasetInNamespace(
         context, endpoint, candidate_table_id, resolved_bearer,
-        resolved_api_key, delimiter, table_uri);
+        resolved_api_key, delimiter, headers_tsv, table_uri);
     if (!dataset && !fallback_table_id.empty()) {
       table_id = fallback_table_id;
       dataset = LanceOpenDatasetInNamespace(context, endpoint, table_id,
                                             resolved_bearer, resolved_api_key,
-                                            delimiter, table_uri);
+                                            delimiter, headers_tsv, table_uri);
     }
     if (!dataset) {
       return nullptr;
@@ -347,13 +398,14 @@ public:
     cfg.delimiter = delimiter;
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
+    cfg.headers_tsv = headers_tsv;
     return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
                                                          std::move(cfg));
   }
 
   vector<string> GetDefaultEntries() override {
     auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
-                                          api_key, delimiter);
+                                          api_key, delimiter, headers_tsv);
     if (namespace_id.empty()) {
       return tables;
     }
@@ -376,6 +428,7 @@ private:
   string delimiter;
   string bearer_token_override;
   string api_key_override;
+  string headers_tsv;
 };
 
 static string GetDatasetDirName(const string &table_name) {
@@ -527,7 +580,8 @@ public:
       string list_error;
       if (!TryLanceNamespaceListTables(
               context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, discovered, list_error)) {
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
+              list_error)) {
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
@@ -546,7 +600,8 @@ public:
       string drop_error;
       if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
                                       table_id_for_ops, bearer_token, api_key,
-                                      rest_ns->delimiter, drop_error)) {
+                                      rest_ns->delimiter, rest_ns->headers_tsv,
+                                      drop_error)) {
         throw IOException("Failed to drop Lance table via namespace: " +
                           (drop_error.empty() ? "unknown error" : drop_error));
       }
@@ -648,7 +703,8 @@ public:
       string list_error;
       if (!TryLanceNamespaceListTables(
               context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, discovered, list_error)) {
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
+              list_error)) {
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
@@ -681,7 +737,8 @@ public:
         string drop_error;
         if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
                                         table_id_for_ops, bearer_token, api_key,
-                                        rest_ns->delimiter, drop_error)) {
+                                        rest_ns->delimiter, rest_ns->headers_tsv,
+                                        drop_error)) {
           throw IOException(
               "Failed to drop Lance table via namespace: " +
               (drop_error.empty() ? "unknown error" : drop_error));
@@ -691,8 +748,8 @@ public:
       string create_error;
       if (!TryLanceNamespaceCreateEmptyTable(
               context, rest_ns->endpoint, table_id_for_ops, bearer_token,
-              api_key, rest_ns->delimiter, dataset_path, option_keys,
-              option_values, create_error)) {
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
+              option_keys, option_values, create_error)) {
         // Best-effort fallback for namespace implementations that do not use
         // a qualified object identifier for tables in ListTables.
         if (!prefixed_id.empty() && table_id_for_ops == prefixed_id) {
@@ -702,8 +759,8 @@ public:
           create_error.clear();
           if (!TryLanceNamespaceCreateEmptyTable(
                   context, rest_ns->endpoint, leaf_id, bearer_token, api_key,
-                  rest_ns->delimiter, dataset_path, option_keys, option_values,
-                  create_error)) {
+                  rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
+                  option_keys, option_values, create_error)) {
             throw IOException(
                 "Failed to create Lance table via namespace: " +
                 (create_error.empty() ? "unknown error" : create_error));
@@ -872,8 +929,8 @@ public:
                                    vector<LogicalType> types_p, string endpoint,
                                    string namespace_id, string delimiter,
                                    string bearer_token_override,
-                                   string api_key_override, string table_name,
-                                   string writer_mode,
+                                   string api_key_override, string headers_tsv,
+                                   string table_name, string writer_mode,
                                    vector<string> column_names_p,
                                    vector<LogicalType> column_types_p,
                                    idx_t estimated_cardinality)
@@ -884,6 +941,7 @@ public:
               delimiter(std::move(delimiter)),
               bearer_token_override(std::move(bearer_token_override)),
               api_key_override(std::move(api_key_override)),
+              headers_tsv(std::move(headers_tsv)),
               table_name(std::move(table_name)),
               writer_mode(std::move(writer_mode)),
               column_names(std::move(column_names_p)),
@@ -902,6 +960,7 @@ public:
           string delimiter;
           string bearer_token_override;
           string api_key_override;
+          string headers_tsv;
           string table_name;
           string writer_mode;
 
@@ -919,14 +978,16 @@ public:
 
           explicit GlobalState(string endpoint_p, string namespace_id_p,
                                string delimiter_p, string bearer_override_p,
-                               string api_override_p, string table_name_p,
-                               string writer_mode_p, vector<string> col_names_p,
+                               string api_override_p, string headers_tsv_p,
+                               string table_name_p, string writer_mode_p,
+                               vector<string> col_names_p,
                                vector<LogicalType> col_types_p)
               : endpoint(std::move(endpoint_p)),
                 namespace_id(std::move(namespace_id_p)),
                 delimiter(std::move(delimiter_p)),
                 bearer_token_override(std::move(bearer_override_p)),
                 api_key_override(std::move(api_override_p)),
+                headers_tsv(std::move(headers_tsv_p)),
                 table_name(std::move(table_name_p)),
                 writer_mode(std::move(writer_mode_p)),
                 column_names(std::move(col_names_p)),
@@ -944,8 +1005,8 @@ public:
         GetGlobalSinkState(ClientContext &context) const override {
           auto state = make_uniq<GlobalState>(
               endpoint, namespace_id, delimiter, bearer_token_override,
-              api_key_override, table_name, writer_mode, column_names,
-              column_types);
+              api_key_override, headers_tsv, table_name, writer_mode,
+              column_names, column_types);
 
           auto props = context.GetClientProperties();
           memset(&state->schema_root.arrow_schema, 0,
@@ -981,7 +1042,8 @@ public:
           string list_error;
           if (!TryLanceNamespaceListTables(
                   context, state->endpoint, state->namespace_id, bearer_token,
-                  api_key, state->delimiter, discovered, list_error)) {
+                  api_key, state->delimiter, state->headers_tsv, discovered,
+                  list_error)) {
             throw IOException(
                 "Failed to list tables from Lance namespace: " +
                 (list_error.empty() ? "unknown error" : list_error));
@@ -1004,7 +1066,7 @@ public:
             string drop_error;
             if (!TryLanceNamespaceDropTable(
                     context, state->endpoint, state->table_id, bearer_token,
-                    api_key, state->delimiter, drop_error)) {
+                    api_key, state->delimiter, state->headers_tsv, drop_error)) {
               throw IOException(
                   "Failed to drop Lance table via namespace: " +
                   (drop_error.empty() ? "unknown error" : drop_error));
@@ -1014,7 +1076,7 @@ public:
           string create_error;
           if (!TryLanceNamespaceCreateEmptyTable(
                   context, state->endpoint, state->table_id, bearer_token,
-                  api_key, state->delimiter, state->open_path,
+                  api_key, state->delimiter, state->headers_tsv, state->open_path,
                   state->option_keys, state->option_values, create_error)) {
             if (!prefixed_id.empty() && state->table_id == prefixed_id) {
               state->table_id = leaf_id;
@@ -1024,8 +1086,9 @@ public:
               create_error.clear();
               if (!TryLanceNamespaceCreateEmptyTable(
                       context, state->endpoint, state->table_id, bearer_token,
-                      api_key, state->delimiter, state->open_path,
-                      state->option_keys, state->option_values, create_error)) {
+                      api_key, state->delimiter, state->headers_tsv,
+                      state->open_path, state->option_keys, state->option_values,
+                      create_error)) {
                 throw IOException(
                     "Failed to create Lance table via namespace: " +
                     (create_error.empty() ? "unknown error" : create_error));
@@ -1157,6 +1220,7 @@ public:
         string delimiter;
         string bearer_token_override;
         string api_key_override;
+        string headers_tsv;
         string table_name;
         string writer_mode;
         vector<string> column_names;
@@ -1181,7 +1245,8 @@ public:
       string list_error;
       if (!TryLanceNamespaceListTables(
               context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, discovered, list_error)) {
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
+              list_error)) {
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
@@ -1227,8 +1292,8 @@ public:
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
           op.types, rest_ns->endpoint, rest_ns->namespace_id,
           rest_ns->delimiter, rest_ns->bearer_token_override,
-          rest_ns->api_key_override, create_info.table, mode, std::move(names),
-          std::move(types), op.estimated_cardinality);
+          rest_ns->api_key_override, rest_ns->headers_tsv, create_info.table,
+          mode, std::move(names), std::move(types), op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
@@ -1378,10 +1443,19 @@ PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
 static unique_ptr<Catalog>
 LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                    AttachedDatabase &db, const string &name, AttachInfo &info,
-                   AttachOptions &) {
+                   AttachOptions &attach_options) {
+  // Consume Lance-specific options from attach_options.options so that
+  // DuckDB doesn't complain about unrecognized options when creating storage.
+  attach_options.options.erase("endpoint");
+  attach_options.options.erase("delimiter");
+  attach_options.options.erase("header");
+  attach_options.options.erase("bearer_token");
+  attach_options.options.erase("api_key");
+
   auto attach_path = info.path;
   auto endpoint = GetLanceNamespaceEndpoint(info);
   auto delimiter = GetLanceNamespaceDelimiter(info);
+  auto headers_tsv = GetLanceNamespaceHeaders(info);
 
   unique_ptr<DefaultGenerator> generator;
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
@@ -1430,7 +1504,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     // Validate the namespace during ATTACH.
     if (!TryLanceNamespaceListTables(context, endpoint, namespace_id,
                                      bearer_token, api_key, delimiter,
-                                     discovered_tables, list_error)) {
+                                     headers_tsv, discovered_tables,
+                                     list_error)) {
       throw IOException("Failed to list tables from Lance namespace: " +
                         list_error);
     }
@@ -1441,6 +1516,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     rest_ns->delimiter = delimiter;
     rest_ns->bearer_token_override = bearer_token_override;
     rest_ns->api_key_override = api_key_override;
+    rest_ns->headers_tsv = headers_tsv;
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
@@ -1464,7 +1540,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
         *catalog, schema, endpoint, namespace_id, std::move(bearer_token),
-        std::move(api_key), delimiter, bearer_token_override, api_key_override);
+        std::move(api_key), delimiter, bearer_token_override, api_key_override,
+        headers_tsv);
   }
   catalog_set.SetDefaultGenerator(std::move(generator));
 

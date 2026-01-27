@@ -210,6 +210,7 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,
                                  const string &bearer_token,
                                  const string &api_key, const string &delimiter,
+                                 const string &headers_tsv,
                                  vector<string> &out_tables,
                                  string &out_error) {
   out_tables.clear();
@@ -219,10 +220,11 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr =
-      lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
-                                  bearer_ptr, api_key_ptr, delimiter_ptr);
+  auto *ptr = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                          bearer_ptr, api_key_ptr, delimiter_ptr,
+                                          headers_ptr);
   if (!ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -268,8 +270,9 @@ static void ParseStorageOptionsTsv(const char *ptr, vector<string> &out_keys,
 bool TryLanceNamespaceDescribeTable(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
-    string &out_location, vector<string> &out_option_keys,
-    vector<string> &out_option_values, string &out_error) {
+    const string &headers_tsv, string &out_location,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_error) {
   (void)context;
   out_location.clear();
   out_option_keys.clear();
@@ -280,12 +283,13 @@ bool TryLanceNamespaceDescribeTable(
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *location_ptr = nullptr;
   const char *options_ptr = nullptr;
   auto rc = lance_namespace_describe_table(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, &location_ptr, &options_ptr);
+      delimiter_ptr, headers_ptr, &location_ptr, &options_ptr);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -304,8 +308,9 @@ bool TryLanceNamespaceDescribeTable(
 bool TryLanceNamespaceCreateEmptyTable(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
-    string &out_location, vector<string> &out_option_keys,
-    vector<string> &out_option_values, string &out_error) {
+    const string &headers_tsv, string &out_location,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_error) {
   (void)context;
   out_location.clear();
   out_option_keys.clear();
@@ -316,12 +321,13 @@ bool TryLanceNamespaceCreateEmptyTable(
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *location_ptr = nullptr;
   const char *options_ptr = nullptr;
   auto rc = lance_namespace_create_empty_table(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, &location_ptr, &options_ptr);
+      delimiter_ptr, headers_ptr, &location_ptr, &options_ptr);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -341,7 +347,7 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
                                 const string &table_id,
                                 const string &bearer_token,
                                 const string &api_key, const string &delimiter,
-                                string &out_error) {
+                                const string &headers_tsv, string &out_error) {
   (void)context;
   out_error.clear();
 
@@ -349,9 +355,11 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   auto rc = lance_namespace_drop_table(endpoint.c_str(), table_id.c_str(),
-                                       bearer_ptr, api_key_ptr, delimiter_ptr);
+                                       bearer_ptr, api_key_ptr, delimiter_ptr,
+                                       headers_ptr);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -406,18 +414,19 @@ void *
 LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &table_id, const string &bearer_token,
                             const string &api_key, const string &delimiter,
-                            string &out_table_uri) {
+                            const string &headers_tsv, string &out_table_uri) {
   (void)context;
   out_table_uri.clear();
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+  const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *uri_ptr = nullptr;
   auto *dataset = lance_open_dataset_in_namespace(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, &uri_ptr);
+      delimiter_ptr, headers_ptr, &uri_ptr);
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -477,7 +486,7 @@ void *LanceOpenDatasetForTable(ClientContext &context,
   string table_uri;
   auto *dataset = LanceOpenDatasetInNamespace(
       context, cfg.endpoint, cfg.table_id, bearer_token, api_key, cfg.delimiter,
-      table_uri);
+      cfg.headers_tsv, table_uri);
   if (!table_uri.empty()) {
     out_display_uri = table_uri;
   } else {
@@ -513,7 +522,8 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
   vector<string> option_values;
   if (!TryLanceNamespaceDescribeTable(
           context, cfg.endpoint, cfg.table_id, bearer_token, api_key,
-          cfg.delimiter, location, option_keys, option_values, error)) {
+          cfg.delimiter, cfg.headers_tsv, location, option_keys, option_values,
+          error)) {
     throw IOException("Failed to describe Lance table via namespace: " +
                       (error.empty() ? "unknown error" : error));
   }

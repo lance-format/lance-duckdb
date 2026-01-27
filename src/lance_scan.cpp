@@ -846,8 +846,10 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
                             bearer_token, api_key);
 
   string table_uri;
+  string headers_tsv; // TODO: Add support for headers in table function
   result->dataset = LanceOpenDatasetInNamespace(
-      context, endpoint, table_id, bearer_token, api_key, delimiter, table_uri);
+      context, endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv,
+      table_uri);
   if (!table_uri.empty()) {
     result->file_path = table_uri;
   }

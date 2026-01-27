@@ -26,22 +26,26 @@ const char *lance_namespace_list_tables(const char *endpoint,
                                         const char *namespace_id,
                                         const char *bearer_token,
                                         const char *api_key,
-                                        const char *delimiter);
+                                        const char *delimiter,
+                                        const char *headers_tsv);
 int32_t
 lance_namespace_describe_table(const char *endpoint, const char *table_id,
                                const char *bearer_token, const char *api_key,
-                               const char *delimiter, const char **out_location,
+                               const char *delimiter, const char *headers_tsv,
+                               const char **out_location,
                                const char **out_storage_options_tsv);
 int32_t lance_namespace_create_empty_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
-    const char *api_key, const char *delimiter, const char **out_location,
-    const char **out_storage_options_tsv);
+    const char *api_key, const char *delimiter, const char *headers_tsv,
+    const char **out_location, const char **out_storage_options_tsv);
 int32_t lance_namespace_drop_table(const char *endpoint, const char *table_id,
                                    const char *bearer_token,
-                                   const char *api_key, const char *delimiter);
+                                   const char *api_key, const char *delimiter,
+                                   const char *headers_tsv);
 void *lance_open_dataset_in_namespace(
     const char *endpoint, const char *table_id, const char *bearer_token,
-    const char *api_key, const char *delimiter, const char **out_table_uri);
+    const char *api_key, const char *delimiter, const char *headers_tsv,
+    const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
 void *lance_get_schema(void *dataset);

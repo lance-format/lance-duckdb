@@ -16,6 +16,7 @@ struct LanceNamespaceTableConfig {
   string delimiter;
   string bearer_token_override;
   string api_key_override;
+  string headers_tsv;
 };
 
 // LanceTableEntry represents a Lance dataset as a DuckDB base table entry.

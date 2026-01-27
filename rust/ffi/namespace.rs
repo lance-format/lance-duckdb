@@ -31,10 +31,27 @@ unsafe fn optional_cstr_to_string(
     Ok(Some(s.to_string()))
 }
 
+fn parse_headers_tsv(headers_tsv: Option<&str>) -> Vec<(String, String)> {
+    headers_tsv
+        .map(|tsv| {
+            tsv.lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, '\t');
+                    match (parts.next(), parts.next()) {
+                        (Some(k), Some(v)) if !k.is_empty() => Some((k.to_string(), v.to_string())),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn build_config(
     endpoint: &str,
     bearer_token: Option<&str>,
     api_key: Option<&str>,
+    headers_tsv: Option<&str>,
 ) -> RestNamespaceBuilder {
     let mut builder = RestNamespaceBuilder::new(endpoint);
     if let Some(token) = bearer_token {
@@ -42,6 +59,10 @@ fn build_config(
     }
     if let Some(key) = api_key {
         builder = builder.header("x-api-key", key.to_string());
+    }
+    // Add custom headers from TSV
+    for (key, value) in parse_headers_tsv(headers_tsv) {
+        builder = builder.header(key, value);
     }
     builder
 }
@@ -65,17 +86,24 @@ fn list_tables_inner(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> FfiResult<Vec<String>> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
-        .delimiter(delimiter)
-        .build();
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
 
     let tables = runtime::block_on(async move {
         let mut out = Vec::new();
@@ -115,8 +143,9 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> *const c_char {
-    match list_tables_inner(endpoint, namespace_id, bearer_token, api_key, delimiter) {
+    match list_tables_inner(endpoint, namespace_id, bearer_token, api_key, delimiter, headers_tsv) {
         Ok(tables) => {
             clear_last_error();
             let joined = tables.join("\n");
@@ -135,17 +164,24 @@ fn describe_table_info_inner(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> FfiResult<(String, String)> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
-        .delimiter(delimiter)
-        .build();
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
 
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
@@ -177,6 +213,7 @@ pub unsafe extern "C" fn lance_namespace_describe_table(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
     out_location: *mut *const c_char,
     out_storage_options_tsv: *mut *const c_char,
 ) -> i32 {
@@ -191,7 +228,7 @@ pub unsafe extern "C" fn lance_namespace_describe_table(
         }
     }
 
-    match describe_table_info_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+    match describe_table_info_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
         Ok((location, storage_options_tsv)) => {
             clear_last_error();
             if !out_location.is_null() {
@@ -225,17 +262,24 @@ fn create_empty_table_inner(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> FfiResult<(String, String)> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
-        .delimiter(delimiter)
-        .build();
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
 
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = CreateEmptyTableRequest::new();
@@ -267,6 +311,7 @@ pub unsafe extern "C" fn lance_namespace_create_empty_table(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
     out_location: *mut *const c_char,
     out_storage_options_tsv: *mut *const c_char,
 ) -> i32 {
@@ -281,7 +326,7 @@ pub unsafe extern "C" fn lance_namespace_create_empty_table(
         }
     }
 
-    match create_empty_table_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+    match create_empty_table_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
         Ok((location, storage_options_tsv)) => {
             clear_last_error();
             if !out_location.is_null() {
@@ -315,17 +360,24 @@ fn drop_table_inner(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> FfiResult<()> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
-        .delimiter(delimiter)
-        .build();
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
 
     runtime::block_on(async move {
         let mut req = DropTableRequest::new();
@@ -349,8 +401,9 @@ pub unsafe extern "C" fn lance_namespace_drop_table(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> i32 {
-    match drop_table_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+    match drop_table_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
         Ok(()) => {
             clear_last_error();
             0
@@ -368,17 +421,24 @@ fn open_dataset_in_namespace_inner(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
 ) -> FfiResult<(DatasetHandle, String)> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(endpoint, bearer_token.as_deref(), api_key.as_deref())
-        .delimiter(delimiter)
-        .build();
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
 
     let (dataset, table_uri) = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
@@ -422,6 +482,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
+    headers_tsv: *const c_char,
     out_table_uri: *mut *const c_char,
 ) -> *mut c_void {
     if !out_table_uri.is_null() {
@@ -430,7 +491,7 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
         }
     }
 
-    match open_dataset_in_namespace_inner(endpoint, table_id, bearer_token, api_key, delimiter) {
+    match open_dataset_in_namespace_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
         Ok((handle, table_uri)) => {
             clear_last_error();
             if !out_table_uri.is_null() {
