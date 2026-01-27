@@ -6,6 +6,22 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-01-27
+
+### Added
+
+- Support custom HTTP headers when attaching a REST namespace via `ATTACH ... (TYPE LANCE, HEADER 'k=v;...')`.
+- Exec pushdown for aggregate queries, including global aggregates and `GROUP BY` (with CAST support).
+- Added a REST namespace connection guide (`docs/rest.md`).
+
+### Changed
+
+- Build and CI now target DuckDB `v1.4.4`.
+
+### Fixed
+
+- Fixed `rows_scanned` reporting for Lance point lookups in DuckDB profiling output.
+
 ## [0.4.1] - 2026-01-04
 
 ### Added
