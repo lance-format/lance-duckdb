@@ -206,13 +206,10 @@ void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
   }
 }
 
-bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
-                                 const string &namespace_id,
-                                 const string &bearer_token,
-                                 const string &api_key, const string &delimiter,
-                                 const string &headers_tsv,
-                                 vector<string> &out_tables,
-                                 string &out_error) {
+bool TryLanceNamespaceListTables(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, vector<string> &out_tables, string &out_error) {
   out_tables.clear();
   out_error.clear();
 
@@ -222,9 +219,9 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
-                                          bearer_ptr, api_key_ptr, delimiter_ptr,
-                                          headers_ptr);
+  auto *ptr = lance_namespace_list_tables(
+      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
+      delimiter_ptr, headers_ptr);
   if (!ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -357,9 +354,9 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto rc = lance_namespace_drop_table(endpoint.c_str(), table_id.c_str(),
-                                       bearer_ptr, api_key_ptr, delimiter_ptr,
-                                       headers_ptr);
+  auto rc =
+      lance_namespace_drop_table(endpoint.c_str(), table_id.c_str(), bearer_ptr,
+                                 api_key_ptr, delimiter_ptr, headers_ptr);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -520,10 +517,10 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
   string error;
   vector<string> option_keys;
   vector<string> option_values;
-  if (!TryLanceNamespaceDescribeTable(
-          context, cfg.endpoint, cfg.table_id, bearer_token, api_key,
-          cfg.delimiter, cfg.headers_tsv, location, option_keys, option_values,
-          error)) {
+  if (!TryLanceNamespaceDescribeTable(context, cfg.endpoint, cfg.table_id,
+                                      bearer_token, api_key, cfg.delimiter,
+                                      cfg.headers_tsv, location, option_keys,
+                                      option_values, error)) {
     throw IOException("Failed to describe Lance table via namespace: " +
                       (error.empty() ? "unknown error" : error));
   }

@@ -59,7 +59,7 @@ struct LanceRestNamespaceConfig {
   string delimiter;
   string bearer_token_override;
   string api_key_override;
-  string headers_tsv;  // Tab-separated key\tvalue pairs for custom headers
+  string headers_tsv; // Tab-separated key\tvalue pairs for custom headers
 };
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -209,21 +209,19 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   return out;
 }
 
-static vector<string> ListRestNamespaceTables(const string &endpoint,
-                                              const string &namespace_id,
-                                              const string &bearer_token,
-                                              const string &api_key,
-                                              const string &delimiter,
-                                              const string &headers_tsv) {
+static vector<string>
+ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
+                        const string &bearer_token, const string &api_key,
+                        const string &delimiter, const string &headers_tsv) {
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
-                                          bearer_ptr, api_key_ptr, delimiter_ptr,
-                                          headers_ptr);
+  auto *ptr = lance_namespace_list_tables(
+      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
+      delimiter_ptr, headers_ptr);
   if (!ptr) {
     throw IOException("Failed to list tables from Lance namespace: " +
                       endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
@@ -598,10 +596,9 @@ public:
       }
 
       string drop_error;
-      if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
-                                      table_id_for_ops, bearer_token, api_key,
-                                      rest_ns->delimiter, rest_ns->headers_tsv,
-                                      drop_error)) {
+      if (!TryLanceNamespaceDropTable(
+              context, rest_ns->endpoint, table_id_for_ops, bearer_token,
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv, drop_error)) {
         throw IOException("Failed to drop Lance table via namespace: " +
                           (drop_error.empty() ? "unknown error" : drop_error));
       }
@@ -737,8 +734,8 @@ public:
         string drop_error;
         if (!TryLanceNamespaceDropTable(context, rest_ns->endpoint,
                                         table_id_for_ops, bearer_token, api_key,
-                                        rest_ns->delimiter, rest_ns->headers_tsv,
-                                        drop_error)) {
+                                        rest_ns->delimiter,
+                                        rest_ns->headers_tsv, drop_error)) {
           throw IOException(
               "Failed to drop Lance table via namespace: " +
               (drop_error.empty() ? "unknown error" : drop_error));
@@ -1064,9 +1061,10 @@ public:
           // If overwriting, drop any existing table first.
           if (state->writer_mode == "overwrite") {
             string drop_error;
-            if (!TryLanceNamespaceDropTable(
-                    context, state->endpoint, state->table_id, bearer_token,
-                    api_key, state->delimiter, state->headers_tsv, drop_error)) {
+            if (!TryLanceNamespaceDropTable(context, state->endpoint,
+                                            state->table_id, bearer_token,
+                                            api_key, state->delimiter,
+                                            state->headers_tsv, drop_error)) {
               throw IOException(
                   "Failed to drop Lance table via namespace: " +
                   (drop_error.empty() ? "unknown error" : drop_error));
@@ -1076,8 +1074,9 @@ public:
           string create_error;
           if (!TryLanceNamespaceCreateEmptyTable(
                   context, state->endpoint, state->table_id, bearer_token,
-                  api_key, state->delimiter, state->headers_tsv, state->open_path,
-                  state->option_keys, state->option_values, create_error)) {
+                  api_key, state->delimiter, state->headers_tsv,
+                  state->open_path, state->option_keys, state->option_values,
+                  create_error)) {
             if (!prefixed_id.empty() && state->table_id == prefixed_id) {
               state->table_id = leaf_id;
               state->open_path.clear();
@@ -1087,8 +1086,8 @@ public:
               if (!TryLanceNamespaceCreateEmptyTable(
                       context, state->endpoint, state->table_id, bearer_token,
                       api_key, state->delimiter, state->headers_tsv,
-                      state->open_path, state->option_keys, state->option_values,
-                      create_error)) {
+                      state->open_path, state->option_keys,
+                      state->option_values, create_error)) {
                 throw IOException(
                     "Failed to create Lance table via namespace: " +
                     (create_error.empty() ? "unknown error" : create_error));
@@ -1502,10 +1501,9 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     string list_error;
     vector<string> discovered_tables;
     // Validate the namespace during ATTACH.
-    if (!TryLanceNamespaceListTables(context, endpoint, namespace_id,
-                                     bearer_token, api_key, delimiter,
-                                     headers_tsv, discovered_tables,
-                                     list_error)) {
+    if (!TryLanceNamespaceListTables(
+            context, endpoint, namespace_id, bearer_token, api_key, delimiter,
+            headers_tsv, discovered_tables, list_error)) {
       throw IOException("Failed to list tables from Lance namespace: " +
                         list_error);
     }
