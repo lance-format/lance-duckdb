@@ -3,8 +3,8 @@
 mod constants;
 mod datafusion_stream;
 mod error;
-mod ffi;
 mod exec_ir;
+mod ffi;
 mod filter_ir;
 mod runtime;
 mod scanner;

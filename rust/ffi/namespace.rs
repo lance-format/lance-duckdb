@@ -145,7 +145,14 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     delimiter: *const c_char,
     headers_tsv: *const c_char,
 ) -> *const c_char {
-    match list_tables_inner(endpoint, namespace_id, bearer_token, api_key, delimiter, headers_tsv) {
+    match list_tables_inner(
+        endpoint,
+        namespace_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
         Ok(tables) => {
             clear_last_error();
             let joined = tables.join("\n");
@@ -228,7 +235,14 @@ pub unsafe extern "C" fn lance_namespace_describe_table(
         }
     }
 
-    match describe_table_info_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
+    match describe_table_info_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
         Ok((location, storage_options_tsv)) => {
             clear_last_error();
             if !out_location.is_null() {
@@ -326,7 +340,14 @@ pub unsafe extern "C" fn lance_namespace_create_empty_table(
         }
     }
 
-    match create_empty_table_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
+    match create_empty_table_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
         Ok((location, storage_options_tsv)) => {
             clear_last_error();
             if !out_location.is_null() {
@@ -403,7 +424,14 @@ pub unsafe extern "C" fn lance_namespace_drop_table(
     delimiter: *const c_char,
     headers_tsv: *const c_char,
 ) -> i32 {
-    match drop_table_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
+    match drop_table_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -491,7 +519,14 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
         }
     }
 
-    match open_dataset_in_namespace_inner(endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv) {
+    match open_dataset_in_namespace_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+    ) {
         Ok((handle, table_uri)) => {
             clear_last_error();
             if !out_table_uri.is_null() {

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::dataframe::DataFrame;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_expr::Expr;
-use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
-use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -40,8 +40,9 @@ impl PartitionStream for LanceExecPartition {
                 let stream = futures::stream::iter(vec![Err(DataFusionError::Execution(format!(
                     "runtime: {err}"
                 )))]);
-                let adapter =
-                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream);
+                let adapter = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema, stream,
+                );
                 return Box::pin(adapter);
             }
         };
@@ -219,8 +220,11 @@ async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFra
         let name = agg.output_name.as_str();
         let expr = if let Some(hint) = &agg.output_type {
             let dtype = output_type_to_arrow(hint)?;
-            Expr::Cast(datafusion_expr::Cast::new(Box::new(datafusion::prelude::col(name)), dtype))
-                .alias(name)
+            Expr::Cast(datafusion_expr::Cast::new(
+                Box::new(datafusion::prelude::col(name)),
+                dtype,
+            ))
+            .alias(name)
         } else {
             datafusion::prelude::col(name)
         };
@@ -270,16 +274,13 @@ fn get_exec_schema_inner(
 
     let schema_res = runtime::block_on(async {
         let df = build_exec_df(&handle, bytes).await?;
-        let plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| e.to_string())?;
+        let plan = df.create_physical_plan().await.map_err(|e| e.to_string())?;
         Ok::<_, String>(plan.schema())
     })
     .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;
 
-    let schema = schema_res
-        .map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec validate: {e}")))?;
+    let schema =
+        schema_res.map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec validate: {e}")))?;
     Ok(Arc::new(Schema::new(schema.fields().clone())))
 }
 
@@ -315,8 +316,8 @@ fn create_dataset_exec_stream_ir_inner(
     })
     .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;
 
-    let stream = stream_res
-        .map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec stream: {e}")))?;
+    let stream =
+        stream_res.map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec stream: {e}")))?;
 
     let df_stream = crate::datafusion_stream::DataFusionStream::try_new(stream)
         .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;

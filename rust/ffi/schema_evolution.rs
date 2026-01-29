@@ -873,7 +873,7 @@ fn dataset_create_scalar_index_inner(
         &ScalarIndexParams::default(),
         replace,
     )) {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(_)) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetCreateScalarIndex,
             format!("dataset create_index(scalar): {err}"),
