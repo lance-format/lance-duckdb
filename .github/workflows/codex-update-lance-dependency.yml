@@ -1,0 +1,122 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Codex Update Lance Dependency
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag name from Lance (e.g., v2.0.0)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name from Lance (e.g., v2.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show inputs
+        run: |
+          echo "tag = ${{ inputs.tag }}"
+
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Configure git user
+        run: |
+          git config user.name "lance-community"
+          git config user.email "community@lance.org"
+
+      - name: Run Codex to update Lance dependency
+        env:
+          TAG: ${{ inputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+          GH_TOKEN: ${{ secrets.LANCE_RELEASE_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.CODEX_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#refs/tags/}"
+          VERSION="${VERSION#v}"
+          BRANCH_NAME="codex/update-lance-${VERSION//[^a-zA-Z0-9]/-}"
+
+          cat <<EOF >/tmp/codex-prompt.txt
+          You are running inside the lance-duckdb repository on a GitHub Actions runner.
+          Update the Lance Rust dependencies to version ${VERSION} (semver format) and prepare a pull request for maintainers to review.
+
+          Follow these steps exactly:
+          1. Update versions in Cargo.toml:
+             - In the [dependencies] section, update the versions for these crates to "${VERSION}":
+               lance, lance-arrow, lance-core, lance-index, lance-linalg, lance-namespace, lance-namespace-impls, lance-table.
+             - Keep existing features/flags unchanged.
+          2. Update Cargo.lock to match the new versions.
+             - Prefer precise updates like:
+               cargo update -p lance --precise ${VERSION}
+               cargo update -p lance-arrow --precise ${VERSION}
+               ... (repeat for each of the crates above)
+             - If Cargo complains about incompatible Arrow/DataFusion versions, update the pinned Arrow/DataFusion versions in Cargo.toml to match the Lance ${VERSION} dependency requirements, then update Cargo.lock again.
+          3. Run these checks:
+             - cargo fmt --all
+             - cargo check --manifest-path Cargo.toml
+             - cargo clippy --manifest-path Cargo.toml --all-targets
+          4. Inspect "git status --short" and "git diff" to confirm the dependency update and any required fixes.
+          5. Create and switch to a new branch named "${BRANCH_NAME}" (replace any duplicated hyphens if necessary).
+          6. Stage all relevant files with "git add -A". Commit using the message "chore: update lance dependency to v${VERSION}".
+          7. Push the branch to origin. If the branch already exists, force-push your changes.
+          8. env "GH_TOKEN" is available; use "gh" tools for GitHub operations like creating pull requests.
+          9. Create a pull request targeting "main" with title "chore: update lance dependency to v${VERSION}".
+             - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'EOF' > /tmp/pr-body.md).
+             - The body should summarize the dependency bump, key resolver changes (if any), the commands run in step 3, and link the triggering tag (${TAG}).
+             - Then run "gh pr create --body-file /tmp/pr-body.md".
+          10. Display the PR URL, "git status --short", and a concise summary of the commands run and their results.
+
+          Constraints:
+          - Use bash commands.
+          - Do not merge the PR.
+          - If any command fails, diagnose and fix the issue instead of aborting.
+          - For compatibility issues, consult lance-format/lance at tag v${VERSION} for the expected Rust dependency versions.
+          EOF
+
+          printenv OPENAI_API_KEY | codex login --with-api-key
+          codex --config shell_environment_policy.ignore_default_excludes=true exec --dangerously-bypass-approvals-and-sandbox "$(cat /tmp/codex-prompt.txt)"
+

@@ -174,6 +174,18 @@ See the SQL reference for full parameter documentation: [docs/sql.md#search](doc
 
 Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.
 
+### Automation: Lance dependency bumps
+
+This repository includes a GitHub Actions workflow pair that opens a PR when a newer tag is detected in `lance-format/lance`:
+
+- `.github/workflows/lance-release-timer.yml`: polls for a newer Lance tag and triggers the Codex workflow.
+- `.github/workflows/codex-update-lance-dependency.yml`: uses Codex CLI to update `Cargo.toml` / `Cargo.lock`, run basic Rust checks, and open a PR.
+
+Required repository secrets:
+
+- `LANCE_RELEASE_TOKEN`: a GitHub token that can read tags and create PRs in this repository.
+- `CODEX_TOKEN`: an OpenAI API key used by Codex CLI.
+
 ## License
 
 Apache License 2.0.
