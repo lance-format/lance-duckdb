@@ -565,7 +565,7 @@ fn delete_transaction_with_storage_options_inner(
             .filter(&predicate)
             .map_err(|e| e.to_string())?;
 
-        let Some(filter_expr) = scanner.get_filter().map_err(|e| e.to_string())? else {
+        let Some(filter_expr) = scanner.get_expr_filter().map_err(|e| e.to_string())? else {
             return Ok::<_, String>((None, 0_i64));
         };
 

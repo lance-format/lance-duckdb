@@ -19,24 +19,24 @@ panic = "abort"
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
-lance = { version = "1.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
-lance-arrow = "1.0.0"
-lance-core = "1.0.0"
-lance-index = "1.0.0"
-lance-linalg = "1.0.0"
-lance-namespace = "1.0.0"
-lance-namespace-impls = { version = "1.0.0", features = ["rest"] }
-lance-table = "1.0.0"
+lance = { version = "2.0.0-rc.4", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
+lance-arrow = "2.0.0-rc.4"
+lance-core = "2.0.0-rc.4"
+lance-index = "2.0.0-rc.4"
+lance-linalg = "2.0.0-rc.4"
+lance-namespace = "2.0.0-rc.4"
+lance-namespace-impls = { version = "2.0.0-rc.4", features = ["rest"] }
+lance-table = "2.0.0-rc.4"
 
-arrow = { version = "56.2.0", features = ["ffi"] }
-arrow-array = "56.2.0"
-arrow-schema = "56.2.0"
+arrow = { version = "57.0.0", features = ["ffi"] }
+arrow-array = "57.0.0"
+arrow-schema = "57.0.0"
 
-datafusion = "50.3.0"
-datafusion-common = "50.3.0"
-datafusion-expr = "50.3.0"
-datafusion-functions = "50.3.0"
-datafusion-sql = "50.3.0"
+datafusion = "51.0.0"
+datafusion-common = "51.0.0"
+datafusion-expr = "51.0.0"
+datafusion-functions = "51.0.0"
+datafusion-sql = "51.0.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -48,3 +48,13 @@ serde_json = "1.0"
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
+
+[patch.crates-io]
+lance = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-core = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance-table = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }

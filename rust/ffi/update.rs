@@ -14,7 +14,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance::io::exec::Planner;
-use lance::io::ObjectStoreParams;
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID;
@@ -255,7 +255,9 @@ fn rewrite_rows_update_transaction_inner(
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
-        store_params.storage_options = Some(storage_options.clone());
+        store_params.storage_options_accessor = Some(Arc::new(
+            StorageOptionsAccessor::with_static_options(storage_options.clone()),
+        ));
     }
 
     let (maybe_txn, rows_updated) = match runtime::block_on(async {
@@ -467,9 +469,10 @@ fn rewrite_rows_update_transaction_inner(
             updated_fragments,
             new_fragments,
             fields_modified: vec![],
-            mem_wal_to_merge: None,
+            merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: None,
         };
 
         let txn = Transaction::new(dataset.manifest.version, operation, None);

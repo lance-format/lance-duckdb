@@ -286,7 +286,7 @@ fn dataset_create_index_inner(
             }
             builder.replace(replace).train(train).await
         }) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(_)) => Ok(()),
             Ok(Err(err)) => Err(FfiError::new(
                 ErrorCode::DatasetCreateIndex,
                 format!("dataset create_index: {err}"),

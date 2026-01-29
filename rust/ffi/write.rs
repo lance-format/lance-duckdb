@@ -14,7 +14,7 @@ use arrow_array::{
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
-use lance::io::ObjectStoreParams;
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -117,7 +117,10 @@ struct WriterState {
 impl Drop for WriterHandle {
     fn drop(&mut self) {
         let (sender, join) = {
-            let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             (guard.output_sender.take(), guard.output_join.take())
         };
         drop(sender);
@@ -264,9 +267,7 @@ fn convert_list_array_to_fixed_size(
                 }
                 let len = list.value_length(i) as usize;
                 if len != dim {
-                    return Err(format!(
-                        "vector dim mismatch: expected {dim} got {len}"
-                    ));
+                    return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
                 let start = offsets[i] as usize;
                 for j in 0..dim {
@@ -313,9 +314,7 @@ fn convert_list_array_to_fixed_size(
                 }
                 let len = list.value_length(i) as usize;
                 if len != dim {
-                    return Err(format!(
-                        "vector dim mismatch: expected {dim} got {len}"
-                    ));
+                    return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
                 let start = offsets[i] as usize;
                 for j in 0..dim {
@@ -362,9 +361,7 @@ fn convert_list_array_to_fixed_size(
                 }
                 let len = list.value_length(i) as usize;
                 if len != dim {
-                    return Err(format!(
-                        "vector dim mismatch: expected {dim} got {len}"
-                    ));
+                    return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
                 let start = offsets[i] as usize;
                 for j in 0..dim {
@@ -411,9 +408,7 @@ fn convert_list_array_to_fixed_size(
                 }
                 let len = list.value_length(i) as usize;
                 if len != dim {
-                    return Err(format!(
-                        "vector dim mismatch: expected {dim} got {len}"
-                    ));
+                    return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
                 let start = offsets[i] as usize;
                 for j in 0..dim {
@@ -457,8 +452,7 @@ fn build_output_schema(
             DataType::List(field) | DataType::LargeList(field) => field.clone(),
             _ => return Err("vector column has unexpected data type".to_string()),
         };
-        let dim_i32 =
-            i32::try_from(conv.dim).map_err(|_| "vector dim is too large".to_string())?;
+        let dim_i32 = i32::try_from(conv.dim).map_err(|_| "vector dim is too large".to_string())?;
         fields[idx] = Arc::new(Field::new(
             original.name(),
             DataType::FixedSizeList(child_field, dim_i32),
@@ -474,8 +468,10 @@ fn convert_record_batch(
     conversions: &[VectorConversion],
 ) -> Result<RecordBatch, String> {
     if conversions.is_empty() {
-        return Ok(RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
-            .map_err(|e| e.to_string())?);
+        return Ok(
+            RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
+                .map_err(|e| e.to_string())?,
+        );
     }
     let mut cols = input_batch.columns().to_vec();
     for conv in conversions {
@@ -484,7 +480,8 @@ fn convert_record_batch(
             .ok_or_else(|| "vector column index is out of bounds".to_string())?
             .as_ref();
         validate_list_vector_dim(arr, conv.list_kind, conv.dim)?;
-        let fixed = convert_list_array_to_fixed_size(arr, conv.list_kind, conv.element_type, conv.dim)?;
+        let fixed =
+            convert_list_array_to_fixed_size(arr, conv.list_kind, conv.element_type, conv.dim)?;
         cols[conv.col_idx] = Arc::new(fixed);
     }
     RecordBatch::try_new(output_schema.clone(), cols).map_err(|e| e.to_string())
@@ -683,7 +680,9 @@ fn open_uncommitted_writer_inner(
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
-        store_params.storage_options = Some(storage_options);
+        store_params.storage_options_accessor = Some(Arc::new(
+            StorageOptionsAccessor::with_static_options(storage_options),
+        ));
     }
 
     let params = WriteParams {
@@ -816,7 +815,9 @@ fn open_writer_inner(
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
-        store_params.storage_options = Some(storage_options);
+        store_params.storage_options_accessor = Some(Arc::new(
+            StorageOptionsAccessor::with_static_options(storage_options),
+        ));
     }
 
     let params = WriteParams {
@@ -899,13 +900,17 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
         .downcast_ref::<StructArray>()
         .ok_or_else(|| FfiError::new(ErrorCode::DatasetWriteBatch, "array is not a struct"))?;
 
-    let input_batch = RecordBatch::try_new(handle.input_schema.clone(), struct_array.columns().to_vec())
-        .map_err(|err| {
-            FfiError::new(ErrorCode::DatasetWriteBatch, format!("record batch: {err}"))
-        })?;
+    let input_batch =
+        RecordBatch::try_new(handle.input_schema.clone(), struct_array.columns().to_vec())
+            .map_err(|err| {
+                FfiError::new(ErrorCode::DatasetWriteBatch, format!("record batch: {err}"))
+            })?;
 
     let (sender, to_send) = {
-        let mut guard = handle.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if guard.output_sender.is_none() {
             guard.buffered_batches.push(input_batch);
@@ -917,9 +922,7 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
                         continue;
                     }
                     for batch in batches.iter() {
-                        let arr = batch
-                            .column(cand.col_idx)
-                            .as_ref();
+                        let arr = batch.column(cand.col_idx).as_ref();
                         match infer_vector_dim_from_array(arr, cand.list_kind) {
                             Some(Ok(dim)) => {
                                 cand.dim = dim;
@@ -988,7 +991,9 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
             let schema = guard
                 .output_schema
                 .as_ref()
-                .ok_or_else(|| FfiError::new(ErrorCode::DatasetWriteBatch, "writer is not initialized"))?
+                .ok_or_else(|| {
+                    FfiError::new(ErrorCode::DatasetWriteBatch, "writer is not initialized")
+                })?
                 .clone();
             let conversions: Vec<VectorConversion> = guard
                 .vector_candidates
@@ -1039,7 +1044,10 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
     let (sender, join, to_send) = {
-        let mut guard = handle.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.output_sender.is_none() {
             let conversions: Vec<VectorConversion> = guard
                 .vector_candidates
@@ -1073,15 +1081,12 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
             guard.buffered_batches = out_batches;
         }
 
-        let sender = guard
-            .output_sender
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| FfiError::new(ErrorCode::DatasetWriteFinish, "writer is not initialized"))?;
-        let join = guard
-            .output_join
-            .take()
-            .ok_or_else(|| FfiError::new(ErrorCode::DatasetWriteFinish, "writer is already finished"))?;
+        let sender = guard.output_sender.as_ref().cloned().ok_or_else(|| {
+            FfiError::new(ErrorCode::DatasetWriteFinish, "writer is not initialized")
+        })?;
+        let join = guard.output_join.take().ok_or_else(|| {
+            FfiError::new(ErrorCode::DatasetWriteFinish, "writer is already finished")
+        })?;
         let to_send = std::mem::take(&mut guard.buffered_batches);
         guard.output_sender = None;
         (sender, join, to_send)
@@ -1144,7 +1149,10 @@ fn writer_finish_uncommitted_inner(
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
     let (sender, join, to_send) = {
-        let mut guard = handle.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.output_sender.is_none() {
             let conversions: Vec<VectorConversion> = guard
                 .vector_candidates
@@ -1178,16 +1186,12 @@ fn writer_finish_uncommitted_inner(
             guard.buffered_batches = out_batches;
         }
 
-        let sender = guard
-            .output_sender
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                FfiError::new(
-                    ErrorCode::DatasetWriteFinishUncommitted,
-                    "writer is not initialized",
-                )
-            })?;
+        let sender = guard.output_sender.as_ref().cloned().ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::DatasetWriteFinishUncommitted,
+                "writer is not initialized",
+            )
+        })?;
         let join = guard.output_join.take().ok_or_else(|| {
             FfiError::new(
                 ErrorCode::DatasetWriteFinishUncommitted,
@@ -1321,7 +1325,9 @@ fn commit_transaction_inner(
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
-        store_params.storage_options = Some(storage_options);
+        store_params.storage_options_accessor = Some(Arc::new(
+            StorageOptionsAccessor::with_static_options(storage_options),
+        ));
     }
 
     let txn =

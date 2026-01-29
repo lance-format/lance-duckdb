@@ -83,10 +83,7 @@ fn get_knn_schema_inner(
     }
     if refine_factor != 0 {
         let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
-            FfiError::new(
-                ErrorCode::InvalidArgument,
-                "refine_factor must fit in u32",
-            )
+            FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
         })?;
         scan.refine(refine_factor_u32);
     }
@@ -194,10 +191,7 @@ fn create_knn_stream_ir_inner(
     }
     if refine_factor != 0 {
         let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
-            FfiError::new(
-                ErrorCode::InvalidArgument,
-                "refine_factor must fit in u32",
-            )
+            FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
         })?;
         scan.refine(refine_factor_u32);
     }
@@ -310,10 +304,7 @@ fn explain_knn_scan_ir_inner(
     }
     if refine_factor != 0 {
         let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
-            FfiError::new(
-                ErrorCode::InvalidArgument,
-                "refine_factor must fit in u32",
-            )
+            FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
         })?;
         scan.refine(refine_factor_u32);
     }

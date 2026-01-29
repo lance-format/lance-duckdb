@@ -348,10 +348,9 @@ pub fn output_type_to_arrow(hint: &OutputTypeHint) -> Result<arrow::datatypes::D
         OutputTypeHint::Date => Ok(DataType::Date32),
         OutputTypeHint::TimestampUs => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         OutputTypeHint::Utf8 => Ok(DataType::Utf8),
-        OutputTypeHint::Decimal { precision, scale } => Ok(DataType::Decimal128(
-            *precision as u8,
-            *scale as i8,
-        )),
+        OutputTypeHint::Decimal { precision, scale } => {
+            Ok(DataType::Decimal128(*precision as u8, *scale as i8))
+        }
     }
 }
 
