@@ -469,6 +469,10 @@ public:
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
 
+  void SetTableDefaultGenerator(DefaultGenerator *generator) {
+    table_default_generator = generator;
+  }
+
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
     auto &set = GetCatalogSet(info.GetCatalogType());
     auto entry = set.GetEntry(transaction, info.name);
@@ -654,6 +658,16 @@ public:
       throw InternalException(
           "Could not drop element because of an internal error");
     }
+
+    // DropEntry with a system (committed) CatalogTransaction leaves a committed
+    // tombstone behind. This blocks subsequent lazy discovery of a recreated
+    // dataset with the same name, because CatalogSet::GetEntryDetailed will
+    // find the tombstone and never consult the default generator. Since ATTACH
+    // TYPE LANCE catalogs are ephemeral, we can eagerly clean up the entry
+    // chain (old entry + tombstone).
+    set.CleanupEntry(*existing_entry);
+
+    InvalidateTableDefaults();
   }
 
   optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction,
@@ -723,6 +737,7 @@ public:
           exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
+        InvalidateTableDefaults();
         return nullptr;
       }
       if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
@@ -790,6 +805,7 @@ public:
           DirectoryNamespaceTableExists(*directory_ns, create_info.table);
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
+        InvalidateTableDefaults();
         return nullptr;
       }
       if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
@@ -866,12 +882,21 @@ public:
       }
     }
 
+    InvalidateTableDefaults();
     return nullptr;
   }
 
 private:
+  void InvalidateTableDefaults() {
+    if (!table_default_generator) {
+      return;
+    }
+    table_default_generator->created_all_entries = false;
+  }
+
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
+  DefaultGenerator *table_default_generator = nullptr;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
@@ -1529,6 +1554,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   catalog->ReplaceDefaultSchemaWithLanceSchema(system_transaction);
   auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
 
+  auto &lance_schema = schema.Cast<LanceSchemaEntry>();
   auto &duck_schema = schema.Cast<DuckSchemaEntry>();
   auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
 
@@ -1541,7 +1567,9 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
         std::move(api_key), delimiter, bearer_token_override, api_key_override,
         headers_tsv);
   }
+  auto *generator_ptr = generator.get();
   catalog_set.SetDefaultGenerator(std::move(generator));
+  lance_schema.SetTableDefaultGenerator(generator_ptr);
 
   (void)name;
   return std::move(catalog);

@@ -5,10 +5,10 @@
 require lance
 
 statement ok
-COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
+COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/nsroot_create_table_125/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH 'test/.tmp/nsroot_create_table_125' AS ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_empty (id BIGINT, s VARCHAR);
@@ -30,7 +30,7 @@ SELECT count(*) FROM ns.main.attach_create_table_ctas
 2
 
 query I
-SELECT count(*) FROM 'test/.tmp/attach_create_table_ctas.lance'
+SELECT count(*) FROM 'test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance'
 ----
 2
 
@@ -51,6 +51,27 @@ query I
 SELECT sum(id) FROM ns.main.attach_create_table_ctas
 ----
 3
+
+statement ok
+DROP TABLE IF EXISTS ns.main.attach_create_table_after_show;
+
+query T
+SHOW TABLES FROM ns.main
+----
+attach_create_table_ctas
+attach_create_table_empty
+attach_create_table_seed
+
+statement ok
+CREATE TABLE ns.main.attach_create_table_after_show (id BIGINT);
+
+statement ok
+INSERT INTO ns.main.attach_create_table_after_show VALUES (1), (2);
+
+query I
+SELECT count(*) FROM ns.main.attach_create_table_after_show
+----
+2
 
 statement ok
 DETACH ns;
