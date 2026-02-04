@@ -19,14 +19,14 @@ panic = "abort"
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
-lance = { version = "2.0.0-rc.4", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
-lance-arrow = "2.0.0-rc.4"
-lance-core = "2.0.0-rc.4"
-lance-index = "2.0.0-rc.4"
-lance-linalg = "2.0.0-rc.4"
-lance-namespace = "2.0.0-rc.4"
-lance-namespace-impls = { version = "2.0.0-rc.4", features = ["rest"] }
-lance-table = "2.0.0-rc.4"
+lance = { version = "3.0.0-beta.1", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
+lance-arrow = "3.0.0-beta.1"
+lance-core = "3.0.0-beta.1"
+lance-index = "3.0.0-beta.1"
+lance-linalg = "3.0.0-beta.1"
+lance-namespace = "3.0.0-beta.1"
+lance-namespace-impls = { version = "3.0.0-beta.1", features = ["rest"] }
+lance-table = "3.0.0-beta.1"
 
 arrow = { version = "57.0.0", features = ["ffi"] }
 arrow-array = "57.0.0"
@@ -50,11 +50,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
 
 [patch.crates-io]
-lance = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-core = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-index = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
-lance-table = { git = "https://github.com/lance-format/lance", tag = "v2.0.0-rc.4" }
+lance = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-arrow = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-core = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-index = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-linalg = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-namespace = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-namespace-impls = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
+lance-table = { git = "https://github.com/lance-format/lance", tag = "v3.0.0-beta.1" }
