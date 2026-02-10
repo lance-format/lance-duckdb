@@ -6,6 +6,23 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-02-10
+
+### Added
+
+- Added automation to detect new Lance releases and trigger dependency bump PRs (`ci/check_lance_release.py` and `lance-release-timer` workflow).
+
+### Changed
+
+- Upgraded Lance Rust dependencies to stable `v2.0.0` and aligned Cargo resolution to crates.io stable releases only.
+- Updated release automation to track stable tags only.
+
+### Fixed
+
+- Fixed Lance `ATTACH` table discovery after `SHOW TABLES` when recreating datasets with the same table name.
+- Fixed C++ move-return build errors in scan/storage paths.
+- Fixed Codex dependency bump workflow git safety handling (no force-push).
+
 ## [0.5.0] - 2026-01-27
 
 ### Added
