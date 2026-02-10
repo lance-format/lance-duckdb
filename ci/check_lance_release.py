@@ -121,6 +121,10 @@ def fetch_remote_tags() -> list[TagInfo]:
     return tags
 
 
+def stable_release_tags(tags: Iterable[TagInfo]) -> list[TagInfo]:
+    return [tag for tag in tags if not tag.semver.prerelease]
+
+
 def normalize_cargo_version(raw: str) -> str:
     trimmed = raw.strip()
     for prefix in ("^", "~", "="):
@@ -186,7 +190,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     current_semver = parse_semver(current_version)
 
     tags = fetch_remote_tags()
-    latest = determine_latest_tag(tags)
+    stable_tags = stable_release_tags(tags)
+    if not stable_tags:
+        raise RuntimeError("No stable Lance tags were found from GitHub API output")
+    latest = determine_latest_tag(stable_tags)
     needs_update = latest.semver > current_semver
 
     payload = {
@@ -204,4 +211,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

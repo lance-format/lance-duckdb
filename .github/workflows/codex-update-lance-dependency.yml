@@ -63,6 +63,18 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Validate stable release tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#refs/tags/}"
+          VERSION="${VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Only stable Lance versions are allowed (got: ${TAG})" >&2
+            exit 1
+          fi
+
       - name: Configure git user
         run: |
           git config user.name "lance-community"
@@ -89,6 +101,7 @@ jobs:
              - In the [dependencies] section, update the versions for these crates to "${VERSION}":
                lance, lance-arrow, lance-core, lance-index, lance-linalg, lance-namespace, lance-namespace-impls, lance-table.
              - Keep existing features/flags unchanged.
+             - Do not add or keep a [patch.crates-io] section for Lance crates; dependencies must come from crates.io stable releases only.
           2. Update Cargo.lock to match the new versions.
              - Prefer precise updates like:
                cargo update -p lance --precise ${VERSION}
@@ -119,4 +132,3 @@ jobs:
 
           printenv OPENAI_API_KEY | codex login --with-api-key
           codex --config shell_environment_policy.ignore_default_excludes=true exec --dangerously-bypass-approvals-and-sandbox "$(cat /tmp/codex-prompt.txt)"
-
