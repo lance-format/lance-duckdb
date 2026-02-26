@@ -102,15 +102,21 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
           kv.second.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
       // Split by semicolon to support multiple headers
       vector<string> header_parts;
-      size_t pos = 0;
-      while (pos < header_str.size()) {
-        auto next_semi = header_str.find(';', pos);
+      idx_t pos = 0;
+      auto header_str_size = NumericCast<idx_t>(header_str.size());
+      while (pos < header_str_size) {
+        auto next_semi =
+            header_str.find(';', NumericCast<string::size_type>(pos));
         if (next_semi == string::npos) {
-          header_parts.push_back(header_str.substr(pos));
+          header_parts.push_back(
+              header_str.substr(NumericCast<string::size_type>(pos)));
           break;
         }
-        header_parts.push_back(header_str.substr(pos, next_semi - pos));
-        pos = next_semi + 1;
+        auto next_semi_idx = NumericCast<idx_t>(next_semi);
+        header_parts.push_back(header_str.substr(
+            NumericCast<string::size_type>(pos),
+            NumericCast<string::size_type>(next_semi_idx - pos)));
+        pos = next_semi_idx + 1;
       }
       for (auto &part : header_parts) {
         // Trim whitespace
@@ -1607,8 +1613,8 @@ public:
       }
     }
 
-    for (idx_t i = 0; i < appends.size(); i++) {
-      auto &pending = appends[i];
+    for (idx_t append_idx = 0; append_idx < appends.size(); append_idx++) {
+      auto &pending = appends[append_idx];
       vector<const char *> key_ptrs;
       vector<const char *> value_ptrs;
       BuildStorageOptionPointerArrays(
@@ -1622,8 +1628,9 @@ public:
         // Best-effort cleanup of any remaining pending transactions.
         // Note: the transaction pointer is consumed by the commit call, even on
         // error.
-        for (idx_t k = i + 1; k < appends.size(); k++) {
-          lance_free_transaction(appends[k].transaction);
+        for (idx_t cleanup_idx = append_idx + 1; cleanup_idx < appends.size();
+             cleanup_idx++) {
+          lance_free_transaction(appends[cleanup_idx].transaction);
         }
         DuckTransactionManager::RollbackTransaction(transaction_p);
         return ErrorData(ExceptionType::TRANSACTION,

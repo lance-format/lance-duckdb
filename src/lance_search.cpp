@@ -57,16 +57,16 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
   }
 
   const uint8_t *filter_ptr = nullptr;
-  size_t filter_len = 0;
+  idx_t filter_len = 0;
   if (filter_ir && !filter_ir->empty()) {
     filter_ptr = reinterpret_cast<const uint8_t *>(filter_ir->data());
-    filter_len = filter_ir->size();
+    filter_len = NumericCast<idx_t>(filter_ir->size());
   }
 
   auto *plan_ptr = lance_explain_knn_scan_ir(
       dataset, vector_column.c_str(), query.data(), query.size(), k, nprobes,
-      refine_factor, filter_ptr, filter_len, prefilter ? 1 : 0,
-      use_index ? 1 : 0, verbose ? 1 : 0);
+      refine_factor, filter_ptr, NumericCast<size_t>(filter_len),
+      prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -82,15 +82,29 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
 
 static LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
                                                   const string &input) {
-  try {
-    auto qname = QualifiedName::Parse(input);
-    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
-                                    qname.catalog, qname.schema, qname.name);
-    auto &table_entry = entry.Cast<TableCatalogEntry>();
-    return dynamic_cast<LanceTableEntry *>(&table_entry);
-  } catch (Exception &) {
+  if (input.empty() || input.find('/') != string::npos ||
+      input.find('\\') != string::npos || input.find("://") != string::npos) {
     return nullptr;
   }
+
+  QualifiedName qname;
+  try {
+    qname = QualifiedName::Parse(input);
+  } catch (ParserException &) {
+    return nullptr;
+  }
+
+  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
+  auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema,
+                                 lookup_info, OnEntryNotFound::RETURN_NULL);
+  if (!entry) {
+    return nullptr;
+  }
+  auto *table_entry = dynamic_cast<TableCatalogEntry *>(entry.get());
+  if (!table_entry) {
+    return nullptr;
+  }
+  return dynamic_cast<LanceTableEntry *>(table_entry);
 }
 
 static void *OpenSearchDataset(ClientContext &context, const Value &input,
@@ -848,20 +862,21 @@ static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
         global.lance_filter_ir.empty()
             ? nullptr
             : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
-    auto filter_ir_len = global.lance_filter_ir.size();
+    auto filter_ir_len = NumericCast<idx_t>(global.lance_filter_ir.size());
 
-    auto create_stream = [&](const uint8_t *ir, size_t ir_len) -> void * {
+    auto create_stream = [&](const uint8_t *ir, idx_t ir_len) -> void * {
       if (bind_data.mode == LanceSearchMode::Fts) {
         return lance_create_fts_stream_ir(
             bind_data.dataset, bind_data.text_column.c_str(),
-            bind_data.query.c_str(), bind_data.k, ir, ir_len,
-            bind_data.prefilter ? 1 : 0);
+            bind_data.query.c_str(), bind_data.k, ir,
+            NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0);
       }
       return lance_create_hybrid_stream_ir(
           bind_data.dataset, bind_data.vector_column.c_str(),
           bind_data.vector_query.data(), bind_data.vector_query.size(),
           bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-          bind_data.k, ir, ir_len, bind_data.prefilter ? 1 : 0, bind_data.alpha,
+          bind_data.k, ir, NumericCast<size_t>(ir_len),
+          bind_data.prefilter ? 1 : 0, bind_data.alpha,
           bind_data.oversample_factor);
     };
 

@@ -250,10 +250,10 @@ static bool TryLanceExplainDatasetScan(void *dataset,
   }
 
   const uint8_t *filter_ptr = nullptr;
-  size_t filter_len = 0;
+  idx_t filter_len = 0;
   if (filter_ir && !filter_ir->empty()) {
     filter_ptr = reinterpret_cast<const uint8_t *>(filter_ir->data()); // NOLINT
-    filter_len = filter_ir->size();
+    filter_len = NumericCast<idx_t>(filter_ir->size());
   }
 
   auto limit_i64 = pushed_limit.IsValid()
@@ -263,7 +263,8 @@ static bool TryLanceExplainDatasetScan(void *dataset,
 
   auto *plan_ptr = lance_explain_dataset_scan_ir(
       dataset, col_ptrs.empty() ? nullptr : col_ptrs.data(), col_ptrs.size(),
-      filter_ptr, filter_len, limit_i64, offset_i64, verbose ? 1 : 0);
+      filter_ptr, NumericCast<size_t>(filter_len), limit_i64, offset_i64,
+      verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -1122,15 +1123,17 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
-  size_t fragment_count = 0;
+  size_t ffi_fragment_count = 0;
   auto fragments_ptr =
-      lance_dataset_list_fragments(bind_data.dataset, &fragment_count);
+      lance_dataset_list_fragments(bind_data.dataset, &ffi_fragment_count);
   if (!fragments_ptr) {
     throw IOException("Failed to list Lance fragments" +
                       LanceFormatErrorSuffix());
   }
-  scan_state.fragment_ids.assign(fragments_ptr, fragments_ptr + fragment_count);
-  lance_free_fragment_list(fragments_ptr, fragment_count);
+  auto fragment_count = NumericCast<idx_t>(ffi_fragment_count);
+  scan_state.fragment_ids.assign(
+      fragments_ptr, fragments_ptr + NumericCast<size_t>(fragment_count));
+  lance_free_fragment_list(fragments_ptr, ffi_fragment_count);
 
   auto threads = context.db->NumberOfThreads();
   scan_state.max_threads = MaxValue<idx_t>(

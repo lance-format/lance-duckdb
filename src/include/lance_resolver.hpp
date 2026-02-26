@@ -79,7 +79,7 @@ public:
 
   //! Register a custom resolver
   //! Resolvers are sorted by priority (descending) after registration
-  void RegisterResolver(shared_ptr<ILanceDatasetResolver> resolver);
+  void RegisterResolver(unique_ptr<ILanceDatasetResolver> resolver);
 
   //! Unregister a resolver by name
   //! Returns true if a resolver was removed
@@ -111,7 +111,7 @@ private:
   void SortResolvers();
 
   mutable mutex lock_;
-  vector<shared_ptr<ILanceDatasetResolver>> resolvers_;
+  vector<unique_ptr<ILanceDatasetResolver>> resolvers_;
 };
 
 //===--------------------------------------------------------------------===//

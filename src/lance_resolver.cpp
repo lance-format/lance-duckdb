@@ -48,11 +48,11 @@ LanceDatasetResolverRegistry &LanceDatasetResolverRegistry::Get() {
 
 LanceDatasetResolverRegistry::LanceDatasetResolverRegistry() {
   // Register default resolver
-  resolvers_.push_back(make_shared_ptr<DefaultCatalogResolver>());
+  resolvers_.push_back(make_uniq<DefaultCatalogResolver>());
 }
 
 void LanceDatasetResolverRegistry::RegisterResolver(
-    shared_ptr<ILanceDatasetResolver> resolver) {
+    unique_ptr<ILanceDatasetResolver> resolver) {
   if (!resolver) {
     return;
   }
@@ -78,7 +78,7 @@ bool LanceDatasetResolverRegistry::UnregisterResolver(const string &name) {
   lock_guard<mutex> guard(lock_);
 
   auto it = std::remove_if(resolvers_.begin(), resolvers_.end(),
-                           [&name](const shared_ptr<ILanceDatasetResolver> &r) {
+                           [&name](const unique_ptr<ILanceDatasetResolver> &r) {
                              return r->Name() == name;
                            });
 
@@ -102,8 +102,8 @@ vector<string> LanceDatasetResolverRegistry::GetResolverNames() const {
 void LanceDatasetResolverRegistry::SortResolvers() {
   // Sort by priority (descending) - higher priority runs first
   std::sort(resolvers_.begin(), resolvers_.end(),
-            [](const shared_ptr<ILanceDatasetResolver> &a,
-               const shared_ptr<ILanceDatasetResolver> &b) {
+            [](const unique_ptr<ILanceDatasetResolver> &a,
+               const unique_ptr<ILanceDatasetResolver> &b) {
               return a->Priority() > b->Priority();
             });
 }
