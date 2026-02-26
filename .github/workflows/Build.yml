@@ -4,8 +4,6 @@ on:
     paths-ignore:
       - "**.md"
   push:
-    branches:
-      - "main"
     paths-ignore:
       - "**.md"
   workflow_dispatch:
