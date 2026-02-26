@@ -1,4 +1,6 @@
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -8,6 +10,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -24,6 +27,7 @@
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_resolver.hpp"
+#include "lance_table_entry.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -74,6 +78,34 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
   out_plan = plan_ptr;
   lance_free_string(plan_ptr);
   return true;
+}
+
+static LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
+                                                  const string &input) {
+  try {
+    auto qname = QualifiedName::Parse(input);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    qname.catalog, qname.schema, qname.name);
+    auto &table_entry = entry.Cast<TableCatalogEntry>();
+    return dynamic_cast<LanceTableEntry *>(&table_entry);
+  } catch (Exception &) {
+    return nullptr;
+  }
+}
+
+static void *OpenSearchDataset(ClientContext &context, const Value &input,
+                               const string &function_name,
+                               string &out_display_uri) {
+  out_display_uri = ResolveLanceDatasetUri(
+      context, input, LanceResolvePolicy::FALLBACK_TO_PATH, function_name);
+  auto input_str = input.GetValue<string>();
+  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
+    if (StringUtil::CIEquals(out_display_uri, table->DatasetUri())) {
+      return LanceOpenDatasetForTable(context, *table, out_display_uri);
+    }
+  }
+
+  return LanceOpenDataset(context, out_display_uri);
 }
 
 static vector<float> ParseQueryVector(const Value &value,
@@ -302,9 +334,9 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   auto result = make_uniq<LanceKnnBindData>();
-  result->file_path = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
-      "lance_vector_search");
+  result->file_path.clear();
+  result->dataset = OpenSearchDataset(context, input.inputs[0],
+                                      "lance_vector_search", result->file_path);
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
   result->prefilter = false;
@@ -373,7 +405,6 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -910,9 +941,9 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Fts;
-  result->file_path =
-      ResolveLanceDatasetUri(context, input.inputs[0],
-                             LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
+  result->file_path.clear();
+  result->dataset = OpenSearchDataset(context, input.inputs[0], "lance_fts",
+                                      result->file_path);
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
 
@@ -935,7 +966,6 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
             .GetValue<bool>();
   }
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -1000,9 +1030,9 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
-  result->file_path = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
-      "lance_hybrid_search");
+  result->file_path.clear();
+  result->dataset = OpenSearchDataset(context, input.inputs[0],
+                                      "lance_hybrid_search", result->file_path);
   result->vector_column = input.inputs[1].GetValue<string>();
   result->vector_query =
       ParseQueryVector(input.inputs[2], "lance_hybrid_search");
@@ -1044,7 +1074,6 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
     }
   }
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
