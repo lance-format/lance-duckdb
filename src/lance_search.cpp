@@ -335,9 +335,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceKnnBindData>();
   result->file_path.clear();
-  result->dataset =
-      OpenSearchDataset(context, input.inputs[0], "lance_vector_search",
-                        result->file_path);
+  result->dataset = OpenSearchDataset(context, input.inputs[0],
+                                      "lance_vector_search", result->file_path);
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
   result->prefilter = false;
@@ -943,9 +942,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Fts;
   result->file_path.clear();
-  result->dataset =
-      OpenSearchDataset(context, input.inputs[0], "lance_fts",
-                        result->file_path);
+  result->dataset = OpenSearchDataset(context, input.inputs[0], "lance_fts",
+                                      result->file_path);
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
 
@@ -1033,9 +1031,8 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
   result->file_path.clear();
-  result->dataset =
-      OpenSearchDataset(context, input.inputs[0], "lance_hybrid_search",
-                        result->file_path);
+  result->dataset = OpenSearchDataset(context, input.inputs[0],
+                                      "lance_hybrid_search", result->file_path);
   result->vector_column = input.inputs[1].GetValue<string>();
   result->vector_query =
       ParseQueryVector(input.inputs[2], "lance_hybrid_search");
