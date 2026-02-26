@@ -154,9 +154,8 @@ static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
   }
   lance_free_schema(schema_handle);
 
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
@@ -1221,8 +1220,9 @@ public:
           return make_uniq<SourceState>();
         }
 
-        SourceResultType GetData(ExecutionContext &, DataChunk &chunk,
-                                 OperatorSourceInput &input) const override {
+        SourceResultType
+        GetDataInternal(ExecutionContext &, DataChunk &chunk,
+                        OperatorSourceInput &input) const override {
           auto &state = input.global_state.Cast<SourceState>();
           if (state.emitted) {
             return SourceResultType::FINISHED;
@@ -1667,7 +1667,7 @@ void RegisterLanceStorage(DBConfig &config) {
   auto ext = make_uniq<StorageExtension>();
   ext->attach = LanceStorageAttach;
   ext->create_transaction_manager = LanceStorageTransactionManager;
-  config.storage_extensions["lance"] = std::move(ext);
+  StorageExtension::Register(config, "lance", std::move(ext));
 }
 
 void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,

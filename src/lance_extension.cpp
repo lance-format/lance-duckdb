@@ -18,7 +18,7 @@ void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
-void RegisterLanceTruncate(DBConfig &config);
+void RegisterLanceTruncate(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceScanOptimizer(DBConfig &config);
 
@@ -40,7 +40,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
-  RegisterLanceTruncate(config);
+  RegisterLanceTruncate(config, loader);
   RegisterLanceIndex(config, loader);
 }
 

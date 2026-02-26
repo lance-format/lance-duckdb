@@ -574,10 +574,8 @@ LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -645,10 +643,8 @@ LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -749,13 +745,13 @@ static void LanceIndexListFunc(ClientContext &context, TableFunctionInput &data,
     auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
                      local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-    auto start = global_state.lines_read.fetch_add(output_size);
+    global_state.lines_read.fetch_add(output_size);
 
     output.SetCardinality(output_size);
     // The Lance index list stream always returns all columns (no projection
     // pushdown), so we must map DuckDB projection column ids to Arrow children.
     ArrowTableFunction::ArrowToDuckDB(
-        local_state, bind_data.arrow_table.GetColumns(), output, start,
+        local_state, bind_data.arrow_table.GetColumns(), output,
         /*arrow_scan_is_projected=*/false);
     local_state.chunk_offset += output_size;
 
@@ -1178,8 +1174,8 @@ public:
         params_json(std::move(params_json_p)), replace(replace_p),
         train(train_p) {}
 
-  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
-                           OperatorSourceInput &input) const override {
+  SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                   OperatorSourceInput &input) const override {
     (void)input;
     auto &client_context = context.client;
 
@@ -1653,7 +1649,7 @@ void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader) {
   extension.parse_function = LanceIndexParse;
   extension.plan_function = LanceIndexPlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
-  config.parser_extensions.push_back(std::move(extension));
+  ParserExtension::Register(config, std::move(extension));
 
   // Register DuckDB index types that should route to Lance index DDL when used
   // on tables in ATTACH TYPE LANCE namespaces.

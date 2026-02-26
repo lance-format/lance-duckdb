@@ -398,10 +398,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -573,14 +571,14 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
     auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
                      local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-    auto start = global_state.lines_read.fetch_add(output_size);
+    global_state.lines_read.fetch_add(output_size);
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
-                                        local_state.all_columns, start, false);
+                                        local_state.all_columns, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -591,9 +589,8 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
       output.SetCardinality(local_state.all_columns);
     } else {
       output.SetCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
-                                        output, start, false);
+      ArrowTableFunction::ArrowToDuckDB(
+          local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -959,10 +956,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -1066,10 +1061,8 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -1162,14 +1155,14 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
     auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
                      local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-    auto start = global_state.lines_read.fetch_add(output_size);
+    global_state.lines_read.fetch_add(output_size);
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
-                                        local_state.all_columns, start, false);
+                                        local_state.all_columns, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -1180,9 +1173,8 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
       output.SetCardinality(local_state.all_columns);
     } else {
       output.SetCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state,
-                                        bind_data.arrow_table.GetColumns(),
-                                        output, start, false);
+      ArrowTableFunction::ArrowToDuckDB(
+          local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,

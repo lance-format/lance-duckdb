@@ -157,8 +157,8 @@ public:
     return make_uniq<LanceDeleteSourceState>();
   }
 
-  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
-                           OperatorSourceInput &input) const override {
+  SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                   OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<LanceDeleteSourceState>();
     if (state.emitted) {
       return SourceResultType::FINISHED;

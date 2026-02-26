@@ -781,10 +781,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -804,7 +802,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
   }
   lance_free_schema(scan_schema_handle);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -875,10 +873,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -899,7 +895,7 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
   }
   lance_free_schema(scan_schema_handle);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -1387,12 +1383,12 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
                      local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-    auto start = global_state.lines_read.fetch_add(output_size);
+    global_state.lines_read.fetch_add(output_size);
 
     local_state.scan_converted.Reset();
     local_state.scan_converted.SetCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                      local_state.scan_converted, start);
+                                      local_state.scan_converted);
 
     auto fill_output_from_converted = [&](DataChunk &target) {
       if (target.ColumnCount() !=
@@ -1577,6 +1573,12 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   }
 
   return result;
+}
+
+static idx_t LanceScanRowsScanned(GlobalTableFunctionState &global_state,
+                                  LocalTableFunctionState &) {
+  auto &scan_state = global_state.Cast<LanceScanGlobalState>();
+  return scan_state.lines_read.load();
 }
 
 static bool TryParseConstantLimitOffset(const LogicalLimit &limit_op,
@@ -2137,10 +2139,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
             LanceFormatErrorSuffix());
       }
       lance_free_schema(schema_handle);
-
-      auto &config = DBConfig::GetConfig(context);
       ArrowTableFunction::PopulateArrowTableSchema(
-          config, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
+          context, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
       exec_names = exec_bind->arrow_table.GetNames();
       exec_types = exec_bind->arrow_table.GetTypes();
     } catch (...) {
@@ -2360,23 +2360,23 @@ static void LanceCardinalityFixupOptimizer(OptimizerExtensionInput &input,
 void RegisterLanceScanOptimizer(DBConfig &config) {
   OptimizerExtension exec_ext;
   exec_ext.optimize_function = LanceExecPushdownOptimizer;
-  config.optimizer_extensions.push_back(std::move(exec_ext));
+  OptimizerExtension::Register(config, std::move(exec_ext));
 
   OptimizerExtension rowid_take_ext;
   rowid_take_ext.optimize_function = LanceRowIdInRewriteOptimizer;
-  config.optimizer_extensions.push_back(std::move(rowid_take_ext));
+  OptimizerExtension::Register(config, std::move(rowid_take_ext));
 
   OptimizerExtension like_ext;
   like_ext.optimize_function = LanceLikePushdownOptimizer;
-  config.optimizer_extensions.push_back(std::move(like_ext));
+  OptimizerExtension::Register(config, std::move(like_ext));
 
   OptimizerExtension limit_ext;
   limit_ext.optimize_function = LanceLimitOffsetPushdownOptimizer;
-  config.optimizer_extensions.push_back(std::move(limit_ext));
+  OptimizerExtension::Register(config, std::move(limit_ext));
 
   OptimizerExtension cardinality_ext;
   cardinality_ext.optimize_function = LanceCardinalityFixupOptimizer;
-  config.optimizer_extensions.push_back(std::move(cardinality_ext));
+  OptimizerExtension::Register(config, std::move(cardinality_ext));
 }
 
 // ---- __lance_exec (internal-only) ----
@@ -2447,10 +2447,8 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -2555,11 +2553,11 @@ static void LanceExecFunc(ClientContext &context, TableFunctionInput &data,
     auto remaining = NumericCast<idx_t>(local_state.chunk->arrow_array.length) -
                      local_state.chunk_offset;
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
-    auto start = global_state.lines_read.fetch_add(output_size);
+    global_state.lines_read.fetch_add(output_size);
 
     output.SetCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(
-        local_state, bind_data.arrow_table.GetColumns(), output, start, false);
+        local_state, bind_data.arrow_table.GetColumns(), output, false);
     local_state.chunk_offset += output_size;
 
     if (output.size() == 0) {
@@ -2619,6 +2617,14 @@ static TableFunction LanceTableScanFunction() {
   function.get_virtual_columns = LanceGetVirtualColumns;
   function.to_string = LanceScanToString;
   function.dynamic_to_string = LanceScanDynamicToString;
+  function.rows_scanned = LanceScanRowsScanned;
+  function.get_bind_info = [](const optional_ptr<FunctionData> bind_data) {
+    auto *scan_bind = dynamic_cast<const LanceScanBindData *>(bind_data.get());
+    if (scan_bind && scan_bind->table_entry) {
+      return BindInfo(const_cast<TableCatalogEntry &>(*scan_bind->table_entry));
+    }
+    return BindInfo(ScanType::EXTERNAL);
+  };
   function.init_global = LanceScanInitGlobal;
   function.init_local = LanceScanLocalInit;
   return function;
@@ -2678,9 +2684,8 @@ static void PopulateLanceTableSchemaFromDataset(
   }
   lance_free_schema(schema_handle);
 
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
@@ -3037,6 +3042,7 @@ TableFunction
 LanceTableEntry::GetScanFunction(ClientContext &context,
                                  unique_ptr<FunctionData> &bind_data) {
   auto result = make_uniq<LanceScanBindData>();
+  result->table_entry = this;
   result->file_path = dataset_uri;
 
   string display_uri;
@@ -3063,10 +3069,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  auto &config = DBConfig::GetConfig(context);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->arrow_table, result->schema_root.arrow_schema);
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -3086,7 +3090,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   }
   lance_free_schema(scan_schema_handle);
   ArrowTableFunction::PopulateArrowTableSchema(
-      config, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 
   bind_data = std::move(result);
   return LanceTableScanFunction();
@@ -3111,6 +3115,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_scan.get_virtual_columns = LanceGetVirtualColumns;
   internal_scan.to_string = LanceScanToString;
   internal_scan.dynamic_to_string = LanceScanDynamicToString;
+  internal_scan.rows_scanned = LanceScanRowsScanned;
 
   CreateTableFunctionInfo scan_info(std::move(internal_scan));
   scan_info.internal = true;
@@ -3141,6 +3146,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.get_virtual_columns = LanceGetVirtualColumns;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.dynamic_to_string = LanceScanDynamicToString;
+  internal_namespace_scan.rows_scanned = LanceScanRowsScanned;
 
   CreateTableFunctionInfo internal_info(std::move(internal_namespace_scan));
   internal_info.internal = true;

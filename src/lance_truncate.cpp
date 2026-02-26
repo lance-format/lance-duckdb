@@ -3,6 +3,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 
@@ -210,18 +212,24 @@ LanceTruncatePlan(ParserExtensionInfo *, ClientContext &context,
 
   auto &catalog = table_entry.ParentCatalog();
   result.modified_databases[catalog.GetName()] =
-      StatementProperties::CatalogIdentity{catalog.GetOid(),
-                                           catalog.GetCatalogVersion(context)};
+      StatementProperties::ModificationInfo{
+          StatementProperties::CatalogIdentity{
+              catalog.GetOid(), catalog.GetCatalogVersion(context)},
+          DatabaseModificationType::DELETE_DATA};
   result.return_type = StatementReturnType::CHANGED_ROWS;
   return result;
 }
 
-void RegisterLanceTruncate(DBConfig &config) {
+void RegisterLanceTruncate(DBConfig &config, ExtensionLoader &loader) {
+  CreateTableFunctionInfo func_info(LanceTruncateTableFunction());
+  func_info.internal = true;
+  loader.RegisterFunction(std::move(func_info));
+
   ParserExtension extension;
   extension.parse_function = LanceTruncateParse;
   extension.plan_function = LanceTruncatePlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
-  config.parser_extensions.push_back(std::move(extension));
+  ParserExtension::Register(config, std::move(extension));
 }
 
 } // namespace duckdb
