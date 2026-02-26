@@ -25,5 +25,17 @@ SELECT count(*) FROM ns.main."${LANCE_NAMESPACE_TABLE}"
 ----
 <REGEX>:[0-9]+
 
+statement error
+SELECT count(*)
+FROM lance_vector_search(
+  'ns.main."${LANCE_NAMESPACE_TABLE}"',
+  '__lance_nonexistent_vector_column_for_namespace_search_test__',
+  [0.0]::FLOAT[1],
+  k = 1,
+  use_index = false
+)
+----
+IO Error: Failed to get Lance KNN schema:
+
 statement ok
 DETACH ns;
