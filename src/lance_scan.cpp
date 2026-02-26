@@ -2800,17 +2800,33 @@ static void ValidateAlterColumnTypeTarget(const LogicalType &type) {
 static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
                                           const string &column_name,
                                           const LogicalType &target_type) {
-  auto *cast_expr = dynamic_cast<const CastExpression *>(&expr);
-  if (!cast_expr || cast_expr->try_cast ||
-      cast_expr->cast_type != target_type) {
+  if (expr.GetExpressionClass() != ExpressionClass::CAST) {
     return false;
   }
-  auto *col_ref =
-      dynamic_cast<const ColumnRefExpression *>(cast_expr->child.get());
-  if (!col_ref || col_ref->column_names.size() != 1) {
+  auto &cast_expr = expr.Cast<CastExpression>();
+  if (cast_expr.try_cast) {
     return false;
   }
-  return StringUtil::CIEquals(col_ref->column_names[0], column_name);
+
+  LogicalType expression_cast_type;
+  try {
+    expression_cast_type = UnboundType::TryDefaultBind(cast_expr.cast_type);
+  } catch (...) {
+    return false;
+  }
+  if (expression_cast_type != target_type) {
+    return false;
+  }
+  if (!cast_expr.child ||
+      cast_expr.child->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+    return false;
+  }
+  auto &col_ref = cast_expr.child->Cast<ColumnRefExpression>();
+  if (col_ref.column_names.empty()) {
+    return false;
+  }
+  // Accept qualified references and match the leaf name against target column.
+  return StringUtil::CIEquals(col_ref.column_names.back(), column_name);
 }
 
 unique_ptr<CatalogEntry>
