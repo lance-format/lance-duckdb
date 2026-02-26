@@ -179,8 +179,8 @@ public:
     return make_uniq<LanceInsertSourceState>();
   }
 
-  SourceResultType GetData(ExecutionContext &, DataChunk &chunk,
-                           OperatorSourceInput &input) const override {
+  SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
+                                   OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<LanceInsertSourceState>();
     if (state.emitted) {
       return SourceResultType::FINISHED;

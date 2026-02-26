@@ -8,6 +8,7 @@
 #include <cstdint>
 
 namespace duckdb {
+class TableCatalogEntry;
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
@@ -21,6 +22,7 @@ struct LanceScanBindData : public TableFunctionData {
   vector<LogicalType> types;
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
+  optional_ptr<TableCatalogEntry> table_entry = nullptr;
 
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;

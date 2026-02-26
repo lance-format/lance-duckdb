@@ -333,8 +333,8 @@ public:
     return make_uniq<UpdateSourceState>();
   }
 
-  SourceResultType GetData(ExecutionContext &context, DataChunk &chunk,
-                           OperatorSourceInput &input) const override {
+  SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                   OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<UpdateSourceState>();
     if (state.emitted) {
       return SourceResultType::FINISHED;

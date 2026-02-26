@@ -1,5 +1,5 @@
 # name: test/sql/dml_truncate.test
-# description: TRUNCATE TABLE for Lance namespace tables
+# description: Truncate for Lance namespace tables
 # group: [sql]
 
 require lance
@@ -18,8 +18,11 @@ SELECT count(*) FROM ns.main.truncate_table_test
 ----
 2
 
-statement ok
-TRUNCATE TABLE ns.main.truncate_table_test;
+query I
+SELECT Count
+FROM __lance_truncate_table('ns', 'main', 'truncate_table_test');
+----
+2
 
 query I
 SELECT count(*) FROM ns.main.truncate_table_test

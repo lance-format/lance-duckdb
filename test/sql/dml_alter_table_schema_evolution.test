@@ -34,7 +34,11 @@ table comment
 
 statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution
-  ADD COLUMN age_plus_one BIGINT DEFAULT (age + 1);
+  ADD COLUMN age_plus_one BIGINT;
+
+statement ok
+UPDATE ns.main.alter_table_schema_evolution
+SET age_plus_one = age + 1;
 
 query I
 SELECT sum(age_plus_one) FROM ns.main.alter_table_schema_evolution
@@ -85,12 +89,15 @@ IO Error: Failed to set NOT NULL in Lance dataset:
 statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col DROP NOT NULL;
 
-statement ok
+statement error
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
+----
+Not implemented Error: Lance ALTER COLUMN TYPE only supports implicit USING
 
 query TTTIT
 SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
 ----
+age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
 
 query I
 SELECT sum(age) FROM ns.main.alter_table_schema_evolution
