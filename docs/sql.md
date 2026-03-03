@@ -254,6 +254,40 @@ DELETE FROM ns.main.my_table; -- delete all rows
 DETACH ns;
 ```
 
+### `MERGE INTO`
+
+`MERGE` is supported on Lance tables, including:
+- `WHEN MATCHED` with `UPDATE` / `DELETE` / `DO NOTHING` / `ERROR`
+- `WHEN NOT MATCHED` (`BY TARGET`) with `INSERT` / `DO NOTHING`
+- `WHEN NOT MATCHED BY SOURCE` with `UPDATE` / `DELETE` / `DO NOTHING`
+- `RETURNING` (including DuckDB's `merge_action` virtual column)
+
+```sql
+ATTACH 'path/to/dir' AS ns (TYPE LANCE);
+
+MERGE INTO ns.main.my_table AS t
+USING (
+  SELECT 2::BIGINT AS id, 'bb'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
+
+MERGE INTO ns.main.my_table AS t
+USING (SELECT 3::BIGINT AS id) AS src
+ON t.id = src.id
+WHEN MATCHED THEN DELETE
+RETURNING merge_action, id, s;
+
+DETACH ns;
+```
+
+Notes:
+- Mutating the same target row more than once in a single `MERGE` raises a constraint error.
+- `MERGE` uses a single Lance transaction per statement.
+
 ### `TRUNCATE TABLE`
 
 ```sql

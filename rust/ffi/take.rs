@@ -17,7 +17,41 @@ pub unsafe extern "C" fn lance_create_dataset_take_stream(
     columns: *const *const c_char,
     columns_len: usize,
 ) -> *mut c_void {
-    match create_dataset_take_stream_inner(dataset, row_ids, row_ids_len, columns, columns_len) {
+    match create_dataset_take_stream_inner(
+        dataset,
+        row_ids,
+        row_ids_len,
+        columns,
+        columns_len,
+        true,
+    ) {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_dataset_take_stream_unfiltered(
+    dataset: *mut c_void,
+    row_ids: *const u64,
+    row_ids_len: usize,
+    columns: *const *const c_char,
+    columns_len: usize,
+) -> *mut c_void {
+    match create_dataset_take_stream_inner(
+        dataset,
+        row_ids,
+        row_ids_len,
+        columns,
+        columns_len,
+        false,
+    ) {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -35,6 +69,7 @@ fn create_dataset_take_stream_inner(
     row_ids_len: usize,
     columns: *const *const c_char,
     columns_len: usize,
+    filter_out_of_range: bool,
 ) -> FfiResult<StreamHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
@@ -44,7 +79,7 @@ fn create_dataset_take_stream_inner(
         unsafe { slice_from_ptr(row_ids, row_ids_len, "row_ids")? }
     };
     let row_ids_filtered;
-    let row_ids = if row_ids.is_empty() {
+    let row_ids = if !filter_out_of_range || row_ids.is_empty() {
         row_ids
     } else {
         let max_row_id = if handle.dataset.manifest.uses_stable_row_ids() {

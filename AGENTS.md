@@ -1,7 +1,5 @@
 # AGENTS.md
 
-This file provides guidance to coding agents working in this repository, including a project overview, common commands, and key architecture notes.
-
 ## Project Overview
 
 This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
@@ -10,28 +8,34 @@ This repository contains a DuckDB extension for querying Lance format datasets (
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
 
+## Constraint Hierarchy (Highest Priority)
+
+For any planning, implementation, review, or refactor work in this repository:
+
+- The only hard constraints are upstream DuckDB requirements and upstream Lance requirements.
+- If any repository-local guidance conflicts with DuckDB or Lance behavior/contracts, follow DuckDB/Lance.
+- Any decision made inside `lance-duckdb` (APIs/ABIs, FFI boundaries, internal formats, module boundaries, naming, testing conventions, or implementation strategies) is mutable and may be changed when a better design is found.
+- Treat repository-local rules in this document as default guidance, not immutable policy.
+
 ## Deliverable & Compatibility Policy
 
-This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). All APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
+This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). Low-level APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
 
 - They are not intended to be directly consumed by end users.
 - There are no external downstream users that depend on them.
-- When planning/implementing/refactoring, prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
+- Prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
+- Compatibility commitments are driven by DuckDB/Lance behavior, not by historical repository-local decisions.
+- User-facing contracts should be defined at the SQL surface.
 
-## SQL Export Policy (Release Requirement)
+## Public Surface Policy (SQL-First)
 
-For releases, keep the exported function surface minimal. Only the search table functions and the `COPY ... (FORMAT lance)` writer should be user-visible:
+Expose user-facing capabilities primarily through SQL, not internal helper functions.
 
-- Exported (user-facing):
-  - `lance_vector_search`
-  - `lance_fts`
-  - `lance_hybrid_search`
-  - `COPY ... TO ... (FORMAT lance, ...)` (registered as the `lance` copy format)
-- Not exported (must be internal-only), including but not limited to:
-  - `lance_scan` (and any scan/namespace helper table functions)
-  - all metadata/maintenance table functions (e.g. `lance_*metadata`, `lance_*config`, `lance_*indices`, compaction/cleanup)
+- Default: expose features via DuckDB SQL mechanisms (replacement scan, `ATTACH ... (TYPE LANCE)`, standard DDL/DML, and `COPY ... (FORMAT lance)`).
+- Internal functions may exist for implementation/composition, but should not be the primary user-facing entry points.
+- Narrow exceptions are allowed when a dedicated function is the clearest SQL contract (for example, `lance_fts` and similar search entry points).
 
-Prefer exposing capabilities via DuckDB standard SQL mechanisms (replacement scan, `ATTACH ... (TYPE LANCE)`, standard DDL/DML) rather than new user-facing functions.
+When in doubt, prefer SQL surface area that matches DuckDB idioms over extension-specific internal entry points.
 
 ## Essential Commands
 
@@ -62,6 +66,19 @@ uv run make format
 
 PR requirement: Before submitting a PR, run `uv run make format` and commit any resulting formatting changes (as a separate commit if it helps review).
 
+### Commit & PR Conventions
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+type[(scope)]: short description
+```
+
+- **Common types**: `feat`, `fix`, `refactor`, `docs`, `ci`, `test`, `chore`.
+- **Scope** is optional. When present, use the affected module (e.g. `search`, `resolver`, `scan`).
+- Use `!` suffix for breaking changes (e.g. `refactor!: ...`).
+- PR numbers are appended automatically by GitHub on merge (e.g. `(#153)`).
+
 ### Testing
 
 The `release` build can be slow. For fast iteration, prefer `test_debug` when available.
@@ -81,105 +98,43 @@ GEN=ninja make test_release   # Test with release build
 duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
 ```
 
-### Development Iteration
-```bash
-# Fast iteration cycle
-GEN=ninja make debug && GEN=ninja make test_debug
-
-# Check for issues without full build
-cargo clippy --manifest-path Cargo.toml --all-targets
-```
-
 ## Architecture & Key Design Decisions
 
-#### Naming Strategy
+### Data Flow & FFI Boundary
 
-The project uses different names to avoid conflicts:
-- **Extension name**: `lance` (user-facing)
-- **Rust crate/staticlib**: `lance_duckdb_ffi` (linked into the extension)
+C++ and Rust communicate through the Arrow C Data Interface:
 
-## Test Data & Testing Conventions
-
-### Test Format
-
-Uses DuckDB's `sqllogictest` format in `test/sql/`:
-- `statement ok/error`: Test statement execution
-- `query <types>`: Test queries with expected results (`I`=int, `T`=text, `R`=real)
-- `require lance`: Load the extension
-
-Key test files:
-- `test/sql/scan_smoke.test` (scan smoke + replacement scan + error handling)
-- `test/sql/scan_limit_offset_sampling.test` (LIMIT/OFFSET and TABLESAMPLE pushdown)
-- `test/sql/scan_filter_pushdown.test` (filter/projection pushdown + explain diagnostics)
-- `test/sql/search_functions.test` (vector/FTS/hybrid search surface)
-- `test/sql/index_ddl.test` (index DDL + index-backed query paths)
-- `test/sql/s3_scan_minio.test` (S3 scan/search via DuckDB secrets, gated by `LANCE_TEST_S3=1`)
-
-## Common Issues
-
-### Extension Loading
-```sql
--- Always use -unsigned flag for local builds
-duckdb -unsigned
-LOAD 'build/release/extension/lance/lance.duckdb_extension';
+```
+DuckDB SQL → C++ Extension (src/) → FFI calls → Rust (rust/) → Lance crate
+                                   ← Arrow C Data Interface (schema + batches) ←
 ```
 
-## DuckDB C++ Implementation Guidelines
+See [docs/rust_guidelines.md](docs/rust_guidelines.md) for the FFI function patterns, error propagation, and memory ownership conventions.
 
-### C++ Guidelines
+### Key Concepts: Filter IR & Exec IR
 
-- Do not use `malloc`, prefer the use of smart pointers. Keywords `new` and `delete` are a code smell.
-- Strongly prefer the use of `unique_ptr` over `shared_ptr`, only use `shared_ptr` if you absolutely have to.
-- Use `const` whenever possible.
-- Do not import namespaces (e.g. `using std`).
-- All functions in source files in the core (`src` directory) should be part of the `duckdb` namespace.
-- When overriding a virtual method, avoid repeating `virtual` and always use `override` or `final`.
-- Use `[u]int(8|16|32|64)_t` instead of `int`, `long`, `uint` etc. Use `idx_t` instead of `size_t` for offsets/indices/counts of any kind.
-- Prefer using references over pointers as arguments.
-- Use `const` references for arguments of non-trivial objects (e.g. `std::vector`, ...).
-- Use C++11 for loops when possible: `for (const auto& item : items) {...}`.
-- Use braces for `if` statements and loops. Avoid single-line `if` statements and loops, especially nested ones.
-- Class layout should follow this structure:
+The extension uses two custom binary wire formats to push work from C++ into Rust:
 
-```cpp
-class MyClass {
-public:
-	MyClass();
+- **Filter IR** (magic `LFT1`): Serializes DuckDB bound filter expressions into a compact binary format that Rust deserializes into DataFusion `Expr`. This avoids passing expression trees through C function signatures.
+- **Exec IR** (magic `LEX1`): Encodes aggregate/projection plans so that Rust can execute them entirely inside Lance/DataFusion, returning only pre-aggregated results to C++.
 
-	int my_public_variable;
+When modifying filter or aggregate pushdown, changes typically span both sides: C++ serialization (`lance_filter_ir.cpp` / `lance_exec_ir.cpp`) and Rust deserialization (`rust/filter_ir.rs` / `rust/exec_ir.rs`). The magic bytes and version numbers must stay in sync.
 
-public:
-	void MyFunction();
+### Namespace & Catalog Architecture
 
-private:
-	void MyPrivateFunction();
+`ATTACH ... (TYPE LANCE)` supports two namespace backends (directory for local, REST for remote LanceDB). Both lazily discover tables and auto-create catalog entries on first access.
 
-private:
-	int my_private_variable;
-};
-```
+## Testing Conventions
 
-- Avoid unnamed magic numbers. Use named variables stored in a `constexpr`.
-- Return early and avoid deep nested branches.
-- Do not include commented-out code blocks in pull requests.
+Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
 
-### Error Handling
+## Common Gotchas
 
-- Use exceptions only when an error terminates a query (e.g. parser error, table not found).
-- For expected/non-fatal errors, prefer return values over exceptions.
-- Try to add test cases that trigger exceptions. If an exception cannot be easily triggered by tests, it may be an assertion instead.
-- Use `D_ASSERT` to assert. Use `assert` only for programmer errors.
-- Assertions should never be triggerable by user input.
-- Avoid assertions without context like `D_ASSERT(a > b + 3);` unless accompanied by clear context/comments.
-- Assert liberally, and make clear (with concise comments when needed) what invariant failed.
+- **Extension loading**: Local builds are unsigned. Always use `duckdb -unsigned` when loading the extension manually.
+- **Debug vs release**: `D_ASSERT` checks are stripped in release builds. A test that passes in one configuration but fails in the other usually indicates an assertion violation or uninitialized-variable issue.
+- **Rust build diagnostics**: When Cargo fails inside the CMake build, error output is hard to read. Run `cargo check --manifest-path Cargo.toml` in isolation for clearer diagnostics.
 
-### Naming Conventions
+## Implementation Guidelines
 
-- Choose descriptive names. Avoid single-letter variable names.
-- Files: lowercase with underscores, e.g. `abstract_operator.cpp`.
-- Types (classes, structs, enums, typedefs, `using`): `CamelCase` starting with uppercase, e.g. `BaseColumn`.
-- Variables: lowercase with underscores, e.g. `chunk_size`.
-- Functions: `CamelCase` starting with uppercase, e.g. `GetChunk`.
-- Avoid `i`, `j`, etc. in nested loops. Prefer names like `column_idx`, `check_idx`.
-- In non-nested loops, `i` is permissible as iterator index.
-- These rules are partially enforced by `clang-tidy`.
+- **C++**: See [docs/cpp_guidelines.md](docs/cpp_guidelines.md) for coding style, error handling, and naming conventions.
+- **Rust**: See [docs/rust_guidelines.md](docs/rust_guidelines.md) for unsafe/FFI conventions and error handling.
