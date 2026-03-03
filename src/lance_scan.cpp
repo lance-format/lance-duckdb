@@ -782,8 +782,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->arrow_table, result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->arrow_table,
+                                 result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -802,8 +802,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
+                                 result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -874,8 +874,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->arrow_table, result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->arrow_table,
+                                 result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -895,8 +895,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
+                                 result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -2142,8 +2142,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
             LanceFormatErrorSuffix());
       }
       lance_free_schema(schema_handle);
-      PopulateArrowTableSchemaCompat(
-          context, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
+      PopulateArrowTableSchemaCompat(context, exec_bind->arrow_table,
+                                     exec_bind->schema_root.arrow_schema);
       exec_names = exec_bind->arrow_table.GetNames();
       exec_types = exec_bind->arrow_table.GetTypes();
     } catch (...) {
@@ -2450,8 +2450,8 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->arrow_table, result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->arrow_table,
+                                 result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -2689,7 +2689,7 @@ static void PopulateLanceTableSchemaFromDataset(
 
   ArrowTableSchema arrow_table;
   PopulateArrowTableSchemaCompat(context, arrow_table,
-                                               schema_root.arrow_schema);
+                                 schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
   if (names.size() != types.size()) {
@@ -3088,8 +3088,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->arrow_table, result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->arrow_table,
+                                 result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -3108,8 +3108,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(
-      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
+                                 result->scan_schema_root.arrow_schema);
 
   bind_data = std::move(result);
   return LanceTableScanFunction();
