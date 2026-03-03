@@ -161,7 +161,7 @@ static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
   lance_free_schema(schema_handle);
 
   ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+  PopulateArrowTableSchemaCompat(context, arrow_table,
                                                schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
