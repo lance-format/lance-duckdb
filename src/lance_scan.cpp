@@ -2803,13 +2803,7 @@ static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
     return false;
   }
 
-  LogicalType expression_cast_type;
-  try {
-    expression_cast_type = UnboundType::TryDefaultBind(cast_expr.cast_type);
-  } catch (...) {
-    return false;
-  }
-  if (expression_cast_type != target_type) {
+  if (cast_expr.cast_type != target_type) {
     return false;
   }
   if (!cast_expr.child ||
