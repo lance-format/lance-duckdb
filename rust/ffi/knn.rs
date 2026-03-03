@@ -70,7 +70,7 @@ fn get_knn_schema_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let projection = projection::build_knn_projection(&handle.base_projection, vector_column);
+    let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -170,7 +170,7 @@ fn create_knn_stream_ir_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let projection = projection::build_knn_projection(&handle.base_projection, vector_column);
+    let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -288,7 +288,7 @@ fn explain_knn_scan_ir_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let projection = projection::build_knn_projection(&handle.base_projection, vector_column);
+    let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
