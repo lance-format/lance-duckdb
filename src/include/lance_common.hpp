@@ -102,23 +102,20 @@ int64_t LanceTruncateDatasetWithStorageOptions(
 int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
 
 template <typename ContextType>
-inline auto PopulateArrowTableSchemaCompatImpl(ContextType &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               int)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(context,
-                                                             arrow_table,
-                                                             arrow_schema),
+inline auto PopulateArrowTableSchemaCompatImpl(
+    ContextType &context, ArrowTableSchema &arrow_table,
+    const ArrowSchema &arrow_schema, int)
+    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
+                    context, arrow_table, arrow_schema),
                 void()) {
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                arrow_schema);
 }
 
 template <typename ContextType>
-inline auto PopulateArrowTableSchemaCompatImpl(ContextType &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               long)
+inline auto PopulateArrowTableSchemaCompatImpl(
+    ContextType &context, ArrowTableSchema &arrow_table,
+    const ArrowSchema &arrow_schema, long)
     -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
                     DBConfig::GetConfig(context), arrow_table, arrow_schema),
                 void()) {

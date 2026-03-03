@@ -574,8 +574,8 @@ LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -643,8 +643,8 @@ LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  PopulateArrowTableSchemaCompat(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;

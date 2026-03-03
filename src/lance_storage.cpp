@@ -162,7 +162,7 @@ static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
 
   ArrowTableSchema arrow_table;
   PopulateArrowTableSchemaCompat(context, arrow_table,
-                                 schema_root.arrow_schema);
+                                               schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
   if (names.size() != types.size()) {
