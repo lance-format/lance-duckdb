@@ -1,0 +1,48 @@
+# name: test/sql/maintenance_internal_metrics.test
+# description: Internal maintenance functions return structured metrics JSON
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_internal_metrics.lance' (FORMAT lance, mode 'overwrite');
+
+query TTT
+SELECT Operation, Target, MetricsJSON
+FROM __lance_compact_files(
+  'test/.tmp/maintenance_internal_metrics.lance',
+  '{"target_rows_per_fragment": 1024}'
+);
+----
+compact	test/.tmp/maintenance_internal_metrics.lance	<REGEX>:\{.*"fragments_removed".*"files_added".*\}
+
+query TTT
+SELECT Operation, Target, MetricsJSON
+FROM __lance_cleanup_old_versions(
+  'test/.tmp/maintenance_internal_metrics.lance',
+  '{"older_than_seconds":0,"delete_unverified":false,"error_if_tagged_old_versions":true}'
+);
+----
+cleanup	test/.tmp/maintenance_internal_metrics.lance	<REGEX>:\{.*"bytes_removed".*"old_versions".*\}
+
+statement ok
+ATTACH 'test/.tmp' AS maintenance_internal_ns (TYPE LANCE);
+
+statement ok
+CREATE INDEX id_btree
+ON maintenance_internal_ns.main.maintenance_internal_metrics (id)
+USING BTREE;
+
+query TTT
+SELECT Operation, Target, MetricsJSON
+FROM __lance_optimize_index(
+  'test/.tmp/maintenance_internal_metrics.lance',
+  'id_btree',
+  '{"mode":"append"}'
+);
+----
+optimize_index	test/.tmp/maintenance_internal_metrics.lance	<REGEX>:\{.*"index_name":"id_btree".*"mode":"append".*\}
+
+statement ok
+DETACH maintenance_internal_ns;

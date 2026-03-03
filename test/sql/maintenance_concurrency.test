@@ -1,0 +1,107 @@
+# name: test/sql/maintenance_concurrency.test
+# description: Concurrent maintenance operations with concurrent writes
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS maintenance_cc (TYPE LANCE);
+
+statement ok
+CREATE INDEX id_idx_cc
+ON maintenance_cc.main.maintenance_concurrency (id)
+USING BTREE;
+
+concurrentloop threadid 0 4
+
+loop i 0 8
+
+statement maybe
+INSERT INTO maintenance_cc.main.maintenance_concurrency VALUES (
+  100000 + ${threadid} * 1000 + ${i},
+  'worker',
+  ${i},
+  ${i}::DOUBLE
+)
+----
+<REGEX>:.*
+
+statement maybe
+OPTIMIZE maintenance_cc.main.maintenance_concurrency
+WITH (target_rows_per_fragment = 64)
+----
+<REGEX>:.*
+
+endloop
+
+endloop
+
+concurrentloop threadid 0 4
+
+loop i 0 8
+
+statement maybe
+UPDATE maintenance_cc.main.maintenance_concurrency
+SET age = age + 1
+WHERE id % 8 = ${i}
+----
+<REGEX>:.*
+
+statement maybe
+DELETE FROM maintenance_cc.main.maintenance_concurrency
+WHERE id = 100000 + ${threadid} * 1000 + ${i}
+----
+<REGEX>:.*
+
+statement maybe
+VACUUM LANCE maintenance_cc.main.maintenance_concurrency
+WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true,
+  retain_n_versions = 2
+)
+----
+<REGEX>:.*
+
+endloop
+
+endloop
+
+concurrentloop threadid 0 4
+
+loop i 0 8
+
+statement maybe
+ALTER INDEX id_idx_cc
+ON maintenance_cc.main.maintenance_concurrency
+OPTIMIZE WITH (mode = 'append')
+----
+<REGEX>:.*
+
+statement maybe
+OPTIMIZE maintenance_cc.main.maintenance_concurrency
+WITH (target_rows_per_fragment = 128)
+----
+<REGEX>:.*
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) > 0 FROM maintenance_cc.main.maintenance_concurrency;
+----
+1
+
+query TTTIT
+SHOW INDEXES ON maintenance_cc.main.maintenance_concurrency;
+----
+id_idx_cc	<REGEX>:.*	id	<REGEX>:.*	<REGEX>:.*
+
+statement ok
+DETACH maintenance_cc;

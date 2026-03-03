@@ -3717,6 +3717,7 @@ dependencies = [
  "lance-table",
  "rand 0.8.5",
  "roaring",
+ "serde",
  "serde_json",
  "snafu",
  "tokio",
