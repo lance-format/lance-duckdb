@@ -15,8 +15,8 @@ concurrency:
 jobs:
   code-quality:
     name: Code Quality
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.4-andium
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
       extension_name: lance
-      duckdb_version: v1.4.4
-      ci_tools_version: v1.4-andium
+      duckdb_version: v1.5-variegata
+      ci_tools_version: v1.5-variegata
