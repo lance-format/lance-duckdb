@@ -529,6 +529,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_writer_inner(
@@ -540,6 +541,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
         schema,
     ) {
         Ok(handle) => {
@@ -563,6 +565,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_uncommitted_writer_inner(
@@ -574,6 +577,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
         schema,
     ) {
         Ok(handle) => {
@@ -587,6 +591,32 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     }
 }
 
+fn parse_data_storage_version_arg(
+    data_storage_version: *const c_char,
+) -> FfiResult<Option<String>> {
+    if data_storage_version.is_null() {
+        return Ok(None);
+    }
+
+    let raw = unsafe { cstr_to_str(data_storage_version, "data_storage_version")? };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::DatasetWriteOpen,
+            "data_storage_version cannot be empty",
+        ));
+    }
+
+    let lower = token.to_ascii_lowercase();
+    let normalized = match lower.as_str() {
+        "v2_0" | "v2.0" | "2_0" => "2.0".to_string(),
+        "v2_1" | "v2.1" | "2_1" => "2.1".to_string(),
+        "v2_2" | "v2.2" | "2_2" => "2.2".to_string(),
+        _ => lower,
+    };
+    Ok(Some(normalized))
+}
+
 fn open_uncommitted_writer_inner(
     path: *const c_char,
     mode: *const c_char,
@@ -596,6 +626,7 @@ fn open_uncommitted_writer_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -677,6 +708,16 @@ fn open_uncommitted_writer_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let data_storage_version = parse_data_storage_version_arg(data_storage_version)?
+        .map(|value| {
+            value.parse().map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetWriteOpen,
+                    format!("invalid data_storage_version '{value}': {err}"),
+                )
+            })
+        })
+        .transpose()?;
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -690,6 +731,7 @@ fn open_uncommitted_writer_inner(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
         store_params: Some(store_params),
         ..Default::default()
     };
@@ -731,6 +773,7 @@ fn open_writer_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -812,6 +855,16 @@ fn open_writer_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let data_storage_version = parse_data_storage_version_arg(data_storage_version)?
+        .map(|value| {
+            value.parse().map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetWriteOpen,
+                    format!("invalid data_storage_version '{value}': {err}"),
+                )
+            })
+        })
+        .transpose()?;
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -825,6 +878,7 @@ fn open_writer_inner(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
         store_params: Some(store_params),
         ..Default::default()
     };

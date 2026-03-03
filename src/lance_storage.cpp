@@ -26,6 +26,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -468,6 +469,33 @@ static string CreateTableModeFromConflict(OnCreateConflict on_conflict) {
   return "overwrite";
 }
 
+static string
+GetCreateTableDataStorageVersionOption(const CreateTableInfo &create_info) {
+  auto it = create_info.options.find("data_storage_version");
+  if (it == create_info.options.end()) {
+    return "";
+  }
+  if (!it->second) {
+    throw BinderException("data_storage_version option cannot be NULL");
+  }
+  auto &expr = *it->second;
+  if (expr.expression_class != ExpressionClass::CONSTANT) {
+    throw BinderException(
+        "data_storage_version option must be a constant string");
+  }
+  auto &constant = expr.Cast<ConstantExpression>();
+  if (constant.value.IsNull()) {
+    throw BinderException("data_storage_version option cannot be NULL");
+  }
+  auto value =
+      constant.value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  StringUtil::Trim(value);
+  if (value.empty()) {
+    throw BinderException("data_storage_version option cannot be empty");
+  }
+  return value;
+}
+
 class LanceSchemaEntry final : public DuckSchemaEntry {
 public:
   LanceSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
@@ -689,6 +717,8 @@ public:
           "Lance CREATE TABLE does not support constraints");
     }
     auto &context = transaction.GetContext();
+    auto data_storage_version =
+        GetCreateTableDataStorageVersionOption(create_info);
     string dataset_path;
     vector<string> option_keys;
     vector<string> option_values;
@@ -844,13 +874,16 @@ public:
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                     value_ptrs);
+    const char *data_storage_version_ptr =
+        data_storage_version.empty() ? nullptr : data_storage_version.c_str();
 
     auto *writer = lance_open_writer_with_storage_options(
         dataset_path.c_str(), mode.c_str(),
         key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
+        &schema_root.arrow_schema);
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
                         LanceFormatErrorSuffix());
@@ -919,6 +952,31 @@ public:
 
   using DuckCatalog::PlanUpdate;
 
+  ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
+    auto &base = info.Base().Cast<CreateTableInfo>();
+    if (!base.partition_keys.empty()) {
+      return ErrorData(ExceptionType::CATALOG,
+                       StringUtil::Format("PARTITIONED BY is not supported "
+                                          "for tables in a %s catalog",
+                                          GetCatalogType()));
+    }
+    if (!base.sort_keys.empty()) {
+      return ErrorData(
+          ExceptionType::CATALOG,
+          StringUtil::Format("SORTED BY is not supported for tables in a %s "
+                             "catalog",
+                             GetCatalogType()));
+    }
+    for (auto &entry : base.options) {
+      if (!StringUtil::CIEquals(entry.first, "data_storage_version")) {
+        return ErrorData(ExceptionType::CATALOG,
+                         "Only data_storage_version is supported in WITH "
+                         "clause for Lance tables");
+      }
+    }
+    return ErrorData();
+  }
+
   PhysicalOperator &PlanUpdate(ClientContext &context,
                                PhysicalPlanGenerator &planner,
                                LogicalUpdate &op) override {
@@ -958,6 +1016,8 @@ public:
                                       LogicalCreateTable &op,
                                       PhysicalOperator &plan) override {
     auto &create_info = op.info->Base();
+    auto data_storage_version =
+        GetCreateTableDataStorageVersionOption(create_info);
     if (create_info.temporary) {
       throw NotImplementedException(
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
@@ -965,15 +1025,13 @@ public:
     if (rest_ns) {
       class PhysicalLanceCreateTableAs final : public PhysicalOperator {
       public:
-        PhysicalLanceCreateTableAs(PhysicalPlan &physical_plan,
-                                   vector<LogicalType> types_p, string endpoint,
-                                   string namespace_id, string delimiter,
-                                   string bearer_token_override,
-                                   string api_key_override, string headers_tsv,
-                                   string table_name, string writer_mode,
-                                   vector<string> column_names_p,
-                                   vector<LogicalType> column_types_p,
-                                   idx_t estimated_cardinality)
+        PhysicalLanceCreateTableAs(
+            PhysicalPlan &physical_plan, vector<LogicalType> types_p,
+            string endpoint, string namespace_id, string delimiter,
+            string bearer_token_override, string api_key_override,
+            string headers_tsv, string table_name, string writer_mode,
+            string data_storage_version, vector<string> column_names_p,
+            vector<LogicalType> column_types_p, idx_t estimated_cardinality)
             : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                                std::move(types_p), estimated_cardinality),
               endpoint(std::move(endpoint)),
@@ -984,6 +1042,7 @@ public:
               headers_tsv(std::move(headers_tsv)),
               table_name(std::move(table_name)),
               writer_mode(std::move(writer_mode)),
+              data_storage_version(std::move(data_storage_version)),
               column_names(std::move(column_names_p)),
               column_types(std::move(column_types_p)) {}
 
@@ -1003,6 +1062,7 @@ public:
           string headers_tsv;
           string table_name;
           string writer_mode;
+          string data_storage_version;
 
           string table_id;
           string open_path;
@@ -1020,6 +1080,7 @@ public:
                                string delimiter_p, string bearer_override_p,
                                string api_override_p, string headers_tsv_p,
                                string table_name_p, string writer_mode_p,
+                               string data_storage_version_p,
                                vector<string> col_names_p,
                                vector<LogicalType> col_types_p)
               : endpoint(std::move(endpoint_p)),
@@ -1030,6 +1091,7 @@ public:
                 headers_tsv(std::move(headers_tsv_p)),
                 table_name(std::move(table_name_p)),
                 writer_mode(std::move(writer_mode_p)),
+                data_storage_version(std::move(data_storage_version_p)),
                 column_names(std::move(col_names_p)),
                 column_types(std::move(col_types_p)) {}
 
@@ -1046,7 +1108,7 @@ public:
           auto state = make_uniq<GlobalState>(
               endpoint, namespace_id, delimiter, bearer_token_override,
               api_key_override, headers_tsv, table_name, writer_mode,
-              column_names, column_types);
+              data_storage_version, column_names, column_types);
 
           auto props = context.GetClientProperties();
           memset(&state->schema_root.arrow_schema, 0,
@@ -1152,13 +1214,17 @@ public:
           BuildStorageOptionPointerArrays(
               state->option_keys, state->option_values, key_ptrs, value_ptrs);
 
+          const char *data_storage_version_ptr =
+              state->data_storage_version.empty()
+                  ? nullptr
+                  : state->data_storage_version.c_str();
           state->writer = lance_open_writer_with_storage_options(
               state->open_path.c_str(), state->writer_mode.c_str(),
               key_ptrs.empty() ? nullptr : key_ptrs.data(),
               value_ptrs.empty() ? nullptr : value_ptrs.data(),
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-              LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+              LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
               &state->schema_root.arrow_schema);
           if (!state->writer) {
             throw IOException("Failed to open Lance writer: " +
@@ -1266,6 +1332,7 @@ public:
         string headers_tsv;
         string table_name;
         string writer_mode;
+        string data_storage_version;
         vector<string> column_names;
         vector<LogicalType> column_types;
       };
@@ -1336,7 +1403,8 @@ public:
           op.types, rest_ns->endpoint, rest_ns->namespace_id,
           rest_ns->delimiter, rest_ns->bearer_token_override,
           rest_ns->api_key_override, rest_ns->headers_tsv, create_info.table,
-          mode, std::move(names), std::move(types), op.estimated_cardinality);
+          mode, data_storage_version, std::move(names), std::move(types),
+          op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
@@ -1372,6 +1440,9 @@ public:
     copy_info.format = "lance";
     copy_info.file_path = dataset_path;
     copy_info.options["mode"] = {Value(mode)};
+    if (!data_storage_version.empty()) {
+      copy_info.options["data_storage_version"] = {Value(data_storage_version)};
+    }
 
     auto &system_catalog = Catalog::GetSystemCatalog(context);
     auto entry = system_catalog.GetEntry(

@@ -14,6 +14,7 @@ namespace duckdb {
 
 struct LanceWriteBindData : public FunctionData {
   string mode = "create";
+  string data_storage_version;
   uint64_t max_rows_per_file = LANCE_DEFAULT_MAX_ROWS_PER_FILE;
   uint64_t max_rows_per_group = LANCE_DEFAULT_MAX_ROWS_PER_GROUP;
   uint64_t max_bytes_per_file = LANCE_DEFAULT_MAX_BYTES_PER_FILE;
@@ -24,6 +25,7 @@ struct LanceWriteBindData : public FunctionData {
   unique_ptr<FunctionData> Copy() const override {
     auto result = make_uniq<LanceWriteBindData>();
     result->mode = mode;
+    result->data_storage_version = data_storage_version;
     result->max_rows_per_file = max_rows_per_file;
     result->max_rows_per_group = max_rows_per_group;
     result->max_bytes_per_file = max_bytes_per_file;
@@ -34,7 +36,9 @@ struct LanceWriteBindData : public FunctionData {
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceWriteBindData>();
-    return mode == other.mode && max_rows_per_file == other.max_rows_per_file &&
+    return mode == other.mode &&
+           data_storage_version == other.data_storage_version &&
+           max_rows_per_file == other.max_rows_per_file &&
            max_rows_per_group == other.max_rows_per_group &&
            max_bytes_per_file == other.max_bytes_per_file &&
            names == other.names && types == other.types;
@@ -60,6 +64,8 @@ struct LanceWriteLocalState : public LocalFunctionData {};
 static void LanceWriteCopyOptions(ClientContext &, CopyOptionsInput &input) {
   auto &options = input.options;
   options["mode"] =
+      CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
+  options["data_storage_version"] =
       CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
   options["max_rows_per_file"] =
       CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
@@ -95,6 +101,14 @@ LanceWriteBind(ClientContext &, CopyFunctionBindInput &input,
             "mode must be one of [create, append, overwrite]");
       }
       bind_data->mode = std::move(mode);
+    } else if (key == "data_storage_version") {
+      if (value.IsNull()) {
+        throw BinderException("data_storage_version cannot be NULL");
+      }
+      bind_data->data_storage_version = value.GetValue<string>();
+      if (bind_data->data_storage_version.empty()) {
+        throw BinderException("data_storage_version cannot be empty");
+      }
     } else if (key == "max_rows_per_file") {
       bind_data->max_rows_per_file = value.GetValue<uint64_t>();
     } else if (key == "max_rows_per_group") {
@@ -130,12 +144,17 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
 
+  const char *data_storage_version_ptr =
+      bind_data.data_storage_version.empty()
+          ? nullptr
+          : bind_data.data_storage_version.c_str();
   state->writer = lance_open_writer_with_storage_options(
       open_path.c_str(), bind_data.mode.c_str(),
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       bind_data.max_rows_per_file, bind_data.max_rows_per_group,
-      bind_data.max_bytes_per_file, &state->schema_root.arrow_schema);
+      bind_data.max_bytes_per_file, data_storage_version_ptr,
+      &state->schema_root.arrow_schema);
   if (!state->writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());

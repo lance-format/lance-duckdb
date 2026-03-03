@@ -592,7 +592,7 @@ int64_t LanceTruncateDatasetWithStorageOptions(
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, &schema_root.arrow_schema);
   if (!writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());

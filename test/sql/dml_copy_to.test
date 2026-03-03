@@ -60,3 +60,60 @@ query I
 SELECT count(*) FROM 'test/.tmp/lance_write_parallel.lance';
 ----
 10000
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'v'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_20.lance' (FORMAT lance, mode 'overwrite', data_storage_version '2.0');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_with_version_20.lance';
+----
+1
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'v'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_21.lance' (FORMAT lance, mode 'overwrite', data_storage_version '2.1');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_with_version_21.lance';
+----
+1
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'v'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_22.lance' (FORMAT lance, mode 'overwrite', data_storage_version '2.2');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_with_version_22.lance';
+----
+1
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'v'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_stable.lance' (FORMAT lance, mode 'overwrite', data_storage_version 'stable');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_with_version_stable.lance';
+----
+1
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'v'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_next.lance' (FORMAT lance, mode 'overwrite', data_storage_version 'next');
+
+query I
+SELECT count(*) FROM 'test/.tmp/lance_write_with_version_next.lance';
+----
+1
+
+statement error
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_bad_version.lance' (FORMAT lance, mode 'overwrite', data_storage_version 'bad_version');
+----
+IO Error: Failed to open Lance writer:
