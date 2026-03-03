@@ -349,6 +349,34 @@ ORDER BY _distance
 2
 3
 
+# Vector search output remains usable without selecting vector column (issue #160)
+query I
+SELECT id
+FROM lance_vector_search(
+  'search_ns.main.search_test_data',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance
+----
+1
+
+# Vector search output includes vector column for namespace-backed table names (issue #160)
+query T
+SELECT CAST(vec AS VARCHAR)
+FROM lance_vector_search(
+  'search_ns.main.search_test_data',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance
+----
+[0.0, 0.0, 0.0, 0.0]
+
 # Vector search using simple table name
 query I
 SELECT id
