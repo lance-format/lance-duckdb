@@ -10,28 +10,34 @@ This repository contains a DuckDB extension for querying Lance format datasets (
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
 
+## Constraint Hierarchy (Highest Priority)
+
+For any planning, implementation, review, or refactor work in this repository:
+
+- The only hard constraints are upstream DuckDB requirements and upstream Lance requirements.
+- If any repository-local guidance conflicts with DuckDB or Lance behavior/contracts, follow DuckDB/Lance.
+- Any decision made inside `lance-duckdb` (APIs/ABIs, FFI boundaries, internal formats, module boundaries, naming, testing conventions, or implementation strategies) is mutable and may be changed when a better design is found.
+- Treat repository-local rules in this document as default guidance, not immutable policy.
+
 ## Deliverable & Compatibility Policy
 
-This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). All APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
+This project is delivered as a fully self-contained DuckDB extension artifact (statically linked in our distribution). Low-level APIs/ABIs/formats in this repository (C++/Rust FFI boundaries, internal encodings, file/IPC formats, etc.) are strictly internal implementation details:
 
 - They are not intended to be directly consumed by end users.
 - There are no external downstream users that depend on them.
-- When planning/implementing/refactoring, prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
+- Prioritize first principles and the most direct correct design; do not optimize for migrations or compatibility unless explicitly requested.
+- Compatibility commitments are driven by DuckDB/Lance behavior, not by historical repository-local decisions.
+- User-facing contracts should be defined at the SQL surface.
 
-## SQL Export Policy (Release Requirement)
+## Public Surface Policy (SQL-First)
 
-For releases, keep the exported function surface minimal. Only the search table functions and the `COPY ... (FORMAT lance)` writer should be user-visible:
+Expose user-facing capabilities primarily through SQL, not internal helper functions.
 
-- Exported (user-facing):
-  - `lance_vector_search`
-  - `lance_fts`
-  - `lance_hybrid_search`
-  - `COPY ... TO ... (FORMAT lance, ...)` (registered as the `lance` copy format)
-- Not exported (must be internal-only), including but not limited to:
-  - `lance_scan` (and any scan/namespace helper table functions)
-  - all metadata/maintenance table functions (e.g. `lance_*metadata`, `lance_*config`, `lance_*indices`, compaction/cleanup)
+- Default: expose features via DuckDB SQL mechanisms (replacement scan, `ATTACH ... (TYPE LANCE)`, standard DDL/DML, and `COPY ... (FORMAT lance)`).
+- Internal functions may exist for implementation/composition, but should not be the primary user-facing entry points.
+- Narrow exceptions are allowed when a dedicated function is the clearest SQL contract (for example, `lance_fts` and similar search entry points).
 
-Prefer exposing capabilities via DuckDB standard SQL mechanisms (replacement scan, `ATTACH ... (TYPE LANCE)`, standard DDL/DML) rather than new user-facing functions.
+When in doubt, prefer SQL surface area that matches DuckDB idioms over extension-specific internal entry points.
 
 ## Essential Commands
 
@@ -125,6 +131,8 @@ LOAD 'build/release/extension/lance/lance.duckdb_extension';
 ```
 
 ## DuckDB C++ Implementation Guidelines
+
+Unless DuckDB/Lance requirements dictate otherwise, follow the defaults below. These are guidelines, not immutable constraints.
 
 ### C++ Guidelines
 
