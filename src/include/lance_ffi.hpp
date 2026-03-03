@@ -144,6 +144,11 @@ void *lance_create_dataset_sample_stream_ir(void *dataset, const char **columns,
 void *lance_create_dataset_take_stream(void *dataset, const uint64_t *row_ids,
                                        size_t row_ids_len, const char **columns,
                                        size_t columns_len);
+void *lance_create_dataset_take_stream_unfiltered(void *dataset,
+                                                  const uint64_t *row_ids,
+                                                  size_t row_ids_len,
+                                                  const char **columns,
+                                                  size_t columns_len);
 
 void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
@@ -171,6 +176,18 @@ int32_t lance_overwrite_update_transaction_with_storage_options(
     const char **set_expressions, size_t set_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     void **out_transaction, uint64_t *out_rows_updated);
+
+int32_t lance_merge_begin_with_storage_options(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
+    uint64_t max_bytes_per_file, void **out_merge_handle);
+int32_t lance_merge_add_delete_rowids(void *merge_handle,
+                                      const uint64_t *row_ids,
+                                      size_t row_ids_len);
+int32_t lance_merge_add_insert_batch(void *merge_handle, void *array);
+int32_t lance_merge_finish_uncommitted(void *merge_handle,
+                                       void **out_transaction);
+void lance_merge_abort(void *merge_handle);
 
 const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
                                           size_t columns_len,

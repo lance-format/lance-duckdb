@@ -4,6 +4,7 @@ mod dir_namespace;
 mod exec;
 mod index;
 mod knn;
+mod merge;
 mod namespace;
 mod projection;
 mod scan;

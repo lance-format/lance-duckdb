@@ -66,6 +66,7 @@ pub enum ErrorCode {
     NamespaceCreateEmptyTable = 50,
     NamespaceDropTable = 51,
     Exec = 52,
+    DatasetMerge = 53,
 }
 
 struct LastError {

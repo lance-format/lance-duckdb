@@ -1,0 +1,63 @@
+# name: test/sql/dml_merge_returning.test
+# description: MERGE INTO RETURNING (including merge_action) on Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+ATTACH 'test/.tmp' AS merge_ret_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE merge_ret_ns.main.lance_merge_returning AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+UNION ALL
+SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+query TIT
+MERGE INTO merge_ret_ns.main.lance_merge_returning AS t
+USING (SELECT 2::BIGINT AS id, 'bb'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+RETURNING merge_action, id, s;
+----
+UPDATE	2	bb
+
+query TIT
+MERGE INTO merge_ret_ns.main.lance_merge_returning AS t
+USING (SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s)
+RETURNING merge_action, id, s;
+----
+INSERT	3	c
+
+query TIT
+MERGE INTO merge_ret_ns.main.lance_merge_returning AS t
+USING (SELECT 1::BIGINT AS id) AS src
+ON t.id = src.id
+WHEN MATCHED THEN DELETE
+RETURNING merge_action, id, s;
+----
+DELETE	1	a
+
+query ITT
+MERGE INTO merge_ret_ns.main.lance_merge_returning AS t
+USING (SELECT 10::BIGINT AS id, 'x'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s)
+RETURNING id, s, merge_action;
+----
+10	x	INSERT
+
+query IT
+SELECT id, s FROM merge_ret_ns.main.lance_merge_returning ORDER BY id;
+----
+2	bb
+3	c
+10	x
+
+statement ok
+DETACH merge_ret_ns;
