@@ -1,0 +1,76 @@
+# name: test/sql/maintenance_auto_cleanup.test
+# description: Auto cleanup configuration SQL surface and validation
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_auto_cleanup.lance' (FORMAT lance, mode 'overwrite');
+
+query TTT
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance' UNSET AUTO_CLEANUP;
+----
+unset_auto_cleanup	test/.tmp/maintenance_auto_cleanup.lance	{"enabled":false}
+
+query TT
+SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';
+----
+enabled	false
+
+query TTT
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
+SET AUTO_CLEANUP WITH (
+  interval = 1,
+  older_than = '1s',
+  retain_versions = 2
+);
+----
+set_auto_cleanup	test/.tmp/maintenance_auto_cleanup.lance	<REGEX>:\{.*"enabled":true.*"interval":1.*"older_than":"1s".*"retain_versions":2.*\}
+
+query TT
+SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';
+----
+enabled	true
+interval	1
+older_than	1s
+retain_versions	2
+
+query TTT
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance' UNSET AUTO_CLEANUP;
+----
+unset_auto_cleanup	test/.tmp/maintenance_auto_cleanup.lance	{"enabled":false}
+
+query TT
+SHOW MAINTENANCE ON 'test/.tmp/maintenance_auto_cleanup.lance';
+----
+enabled	false
+
+statement ok
+ATTACH 'test/.tmp' AS maintenance_ac_ns (TYPE LANCE);
+
+query TT
+SHOW MAINTENANCE ON maintenance_ac_ns.main.maintenance_auto_cleanup;
+----
+enabled	false
+
+statement ok
+DETACH maintenance_ac_ns;
+
+statement error
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
+SET AUTO_CLEANUP WITH (interval = 0, older_than = '1s');
+----
+AUTO_CLEANUP interval must be > 0
+
+statement error
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
+SET AUTO_CLEANUP WITH (interval = 1);
+----
+AUTO_CLEANUP requires interval and older_than
+
+statement error
+ALTER TABLE 'test/.tmp/maintenance_auto_cleanup.lance'
+SET AUTO_CLEANUP WITH (interval = 1, older_than = '1s', retain_versions = 0);
+----
+AUTO_CLEANUP retain_versions must be > 0

@@ -45,6 +45,7 @@ chrono = "0.4"
 futures = "0.3"
 roaring = "0.10.12"
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 snafu = "0.8.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"

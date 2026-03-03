@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
 
@@ -12,12 +12,39 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::DistanceType;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::{SchemaHandle, StreamHandle};
-use super::util::{cstr_to_str, dataset_handle, FfiError, FfiResult};
+use super::util::{cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult};
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OptimizeIndexOptionsInput {
+    mode: Option<String>,
+    retrain: Option<bool>,
+    num_indices_to_merge: Option<usize>,
+}
+
+impl Default for OptimizeIndexOptionsInput {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            retrain: None,
+            num_indices_to_merge: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OptimizeIndexMetricsOutput {
+    index_name: String,
+    mode: String,
+    retrain: bool,
+    num_indices_to_merge: Option<usize>,
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_index_list_schema(dataset: *mut c_void) -> *mut c_void {
@@ -340,7 +367,13 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     index_name: *const c_char,
     retrain: u8,
 ) -> i32 {
-    match dataset_optimize_index_inner(dataset, index_name, retrain) {
+    match dataset_optimize_index_with_options_inner(
+        dataset,
+        index_name,
+        ptr::null(),
+        ptr::null_mut(),
+        retrain != 0,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -352,10 +385,112 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     }
 }
 
-fn dataset_optimize_index_inner(
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_optimize_index_with_options(
     dataset: *mut c_void,
     index_name: *const c_char,
-    retrain: u8,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+) -> i32 {
+    if !out_metrics_json.is_null() {
+        unsafe {
+            ptr::write_unaligned(out_metrics_json, ptr::null());
+        }
+    }
+    match dataset_optimize_index_with_options_inner(
+        dataset,
+        index_name,
+        options_json,
+        out_metrics_json,
+        false,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn parse_optimize_index_options_json(
+    options_json: *const c_char,
+    legacy_retrain: bool,
+) -> FfiResult<(OptimizeOptions, String, bool, Option<usize>)> {
+    let input = if options_json.is_null() {
+        OptimizeIndexOptionsInput::default()
+    } else {
+        let text = unsafe { CStr::from_ptr(options_json) }
+            .to_str()
+            .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("options_json utf8: {err}")))?;
+        if text.trim().is_empty() {
+            OptimizeIndexOptionsInput::default()
+        } else {
+            serde_json::from_str(text).map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("optimize_index options_json parse: {err}"),
+                )
+            })?
+        }
+    };
+
+    let mode = if let Some(mode) = input.mode.as_ref() {
+        mode.trim().to_ascii_lowercase()
+    } else if input.retrain.unwrap_or(false) || legacy_retrain {
+        String::from("retrain")
+    } else {
+        String::from("append")
+    };
+
+    let (options, retrain, num_indices_to_merge) = match mode.as_str() {
+        "append" => {
+            if input.num_indices_to_merge.is_some() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge is only valid for mode='merge'",
+                ));
+            }
+            (OptimizeOptions::append(), false, Some(0))
+        }
+        "merge" => {
+            let num = input.num_indices_to_merge.unwrap_or(1);
+            if num == 0 {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge must be > 0 for mode='merge'",
+                ));
+            }
+            (OptimizeOptions::merge(num), false, Some(num))
+        }
+        "retrain" => {
+            if input.num_indices_to_merge.is_some() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge is invalid for mode='retrain'",
+                ));
+            }
+            (OptimizeOptions::retrain(), true, None)
+        }
+        other => {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("unsupported optimize mode: {other}"),
+            ))
+        }
+    };
+
+    Ok((options, mode, retrain, num_indices_to_merge))
+}
+
+fn dataset_optimize_index_with_options_inner(
+    dataset: *mut c_void,
+    index_name: *const c_char,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+    legacy_retrain: bool,
 ) -> FfiResult<()> {
     let handle = unsafe { dataset_handle(dataset)? };
     let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
@@ -365,25 +500,41 @@ fn dataset_optimize_index_inner(
             "index_name must be non-empty",
         ));
     }
+    let index_name_owned = index_name.to_string();
 
-    let mut options = if retrain != 0 {
-        OptimizeOptions::retrain()
-    } else {
-        OptimizeOptions::append()
-    };
-    options = options.index_names(vec![index_name.to_string()]);
+    let (mut options, mode, retrain, num_indices_to_merge) =
+        parse_optimize_index_options_json(options_json, legacy_retrain)?;
+    options = options.index_names(vec![index_name_owned.clone()]);
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
-    run_with_large_stack(move || {
+    let metrics = run_with_large_stack(move || {
         match runtime::block_on(async { ds.optimize_indices(&options).await }) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(OptimizeIndexMetricsOutput {
+                index_name: index_name_owned,
+                mode,
+                retrain,
+                num_indices_to_merge,
+            }),
             Ok(Err(err)) => Err(FfiError::new(
                 ErrorCode::DatasetOptimizeIndices,
                 format!("dataset optimize_indices: {err}"),
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
-    })?
+    })??;
+
+    if !out_metrics_json.is_null() {
+        let payload = serde_json::to_string(&metrics).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOptimizeIndices,
+                format!("optimize_index metrics_json serialize: {err}"),
+            )
+        })?;
+        unsafe {
+            ptr::write_unaligned(out_metrics_json, to_c_string(payload).into_raw() as *const c_char);
+        }
+    }
+    Ok(())
 }
 
 fn normalize_index_type(index_type: &str) -> String {

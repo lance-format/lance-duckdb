@@ -374,7 +374,6 @@ USING INVERTED;
 
 Notes:
 - `CREATE INDEX` currently supports a single column.
-- Use `REINDEX ... RETRAIN` to retrain an untrained index (if created with training disabled).
 
 ### `SHOW INDEXES`
 
@@ -387,3 +386,96 @@ SHOW INDEXES ON 'path/to/dataset.lance';
 ```sql
 DROP INDEX vec_idx ON 'path/to/dataset.lance';
 ```
+
+### `ALTER INDEX ... OPTIMIZE`
+
+```sql
+ALTER INDEX vec_idx
+ON 'path/to/dataset.lance'
+OPTIMIZE WITH (mode = 'append');
+```
+
+Supported `mode` values:
+- `append`
+- `merge` (`num_indices_to_merge` is supported)
+- `retrain`
+
+## Maintenance SQL
+
+Maintenance statements accept either:
+- A dataset path string literal (for example `'path/to/dataset.lance'`)
+- An attached Lance table name (for example `ns.main.my_table`)
+
+### `OPTIMIZE`
+
+```sql
+OPTIMIZE 'path/to/dataset.lance' WITH (
+  target_rows_per_fragment = 1048576,
+  max_rows_per_group = 1024,
+  max_bytes_per_file = 0,
+  materialize_deletions = true,
+  materialize_deletions_threshold = 0.1,
+  num_threads = 0,
+  batch_size = 0,
+  defer_index_remap = false
+);
+```
+
+Returns:
+- `Operation` (`compact`)
+- `Target`
+- `MetricsJSON` (compaction metrics)
+
+### `VACUUM LANCE`
+
+```sql
+VACUUM LANCE 'path/to/dataset.lance' WITH (
+  older_than_seconds = 1209600,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true,
+  retain_n_versions = 3
+);
+```
+
+Returns:
+- `Operation` (`cleanup`)
+- `Target`
+- `MetricsJSON` (cleanup metrics such as removed bytes / versions)
+
+### `ALTER INDEX ... OPTIMIZE`
+
+```sql
+ALTER INDEX vec_idx
+ON 'path/to/dataset.lance'
+OPTIMIZE WITH (
+  mode = 'merge',
+  num_indices_to_merge = 4
+);
+```
+
+Supported `mode` values:
+- `append`
+- `merge` (`num_indices_to_merge` is supported)
+- `retrain`
+
+Returns:
+- `Operation` (`optimize_index`)
+- `Target`
+- `MetricsJSON`
+
+### Auto cleanup configuration
+
+```sql
+ALTER TABLE 'path/to/dataset.lance'
+SET AUTO_CLEANUP WITH (interval = 1, older_than = '1h', retain_versions = 3);
+
+ALTER TABLE 'path/to/dataset.lance' UNSET AUTO_CLEANUP;
+
+SHOW MAINTENANCE ON 'path/to/dataset.lance';
+```
+
+`SHOW MAINTENANCE` returns key/value rows including:
+- `enabled`
+- `interval` (if configured)
+- `older_than` (if configured)
+- `retain_versions` (if configured)

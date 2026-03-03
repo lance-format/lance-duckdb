@@ -12,7 +12,8 @@
 namespace duckdb {
 
 // Forward declaration
-void RegisterLanceMetadata(ExtensionLoader &loader);
+void RegisterLanceMaintenance(ExtensionLoader &loader);
+void RegisterLanceMaintenanceParser(DBConfig &config);
 void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
@@ -27,7 +28,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
   RegisterLanceWrite(loader);
-  RegisterLanceMetadata(loader);
+  RegisterLanceMaintenance(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {
@@ -42,6 +43,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   RegisterLanceReplacement(config);
   RegisterLanceTruncate(config, loader);
   RegisterLanceIndex(config, loader);
+  RegisterLanceMaintenanceParser(config);
 }
 
 std::string LanceExtension::Name() { return "lance"; }
