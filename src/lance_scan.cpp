@@ -73,75 +73,6 @@ namespace duckdb {
 
 static TableFunction LanceExecFunction();
 
-template <typename CONTEXT>
-static auto PopulateArrowTableSchemaCompatImpl(CONTEXT &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               int)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(context,
-                                                             arrow_table,
-                                                             arrow_schema),
-                void()) {
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               arrow_schema);
-}
-
-template <typename CONTEXT>
-static auto PopulateArrowTableSchemaCompatImpl(CONTEXT &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               long)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
-                    DBConfig::GetConfig(context), arrow_table, arrow_schema),
-                void()) {
-  auto &config = DBConfig::GetConfig(context);
-  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
-                                               arrow_schema);
-}
-
-static void PopulateArrowTableSchemaCompat(ClientContext &context,
-                                           ArrowTableSchema &arrow_table,
-                                           const ArrowSchema &arrow_schema) {
-  PopulateArrowTableSchemaCompatImpl(context, arrow_table, arrow_schema, 0);
-}
-
-template <typename CONFIG>
-static auto RegisterOptimizerExtensionCompatImpl(CONFIG &config,
-                                                 OptimizerExtension extension,
-                                                 int)
-    -> decltype(OptimizerExtension::Register(config, std::move(extension)),
-                void()) {
-  OptimizerExtension::Register(config, std::move(extension));
-}
-
-template <typename CONFIG>
-static auto RegisterOptimizerExtensionCompatImpl(CONFIG &config,
-                                                 OptimizerExtension extension,
-                                                 long)
-    -> decltype(config.GetCallbackManager().Register(std::move(extension)),
-                void()) {
-  config.GetCallbackManager().Register(std::move(extension));
-}
-
-static void RegisterOptimizerExtensionCompat(DBConfig &config,
-                                             OptimizerExtension extension) {
-  RegisterOptimizerExtensionCompatImpl(config, std::move(extension), 0);
-}
-
-template <typename FUNCTION, typename CALLBACK>
-static auto SetRowsScannedCompatImpl(FUNCTION &function, CALLBACK callback, int)
-    -> decltype(function.rows_scanned = callback, void()) {
-  function.rows_scanned = callback;
-}
-
-template <typename FUNCTION, typename CALLBACK>
-static void SetRowsScannedCompatImpl(FUNCTION &, CALLBACK, long) {}
-
-template <typename FUNCTION, typename CALLBACK>
-static void SetRowsScannedCompat(FUNCTION &function, CALLBACK callback) {
-  SetRowsScannedCompatImpl(function, callback, 0);
-}
-
 static unique_ptr<BaseStatistics>
 LanceScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
                     column_t column_id) {
@@ -851,8 +782,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -871,8 +802,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
-                                 result->scan_schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -943,8 +874,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -964,8 +895,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
-                                 result->scan_schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
   return_types = result->types;
   return std::move(result);
@@ -1460,8 +1391,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     local_state.scan_converted.Reset();
     local_state.scan_converted.SetCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                      local_state.scan_converted, true,
-                                      DConstants::INVALID_INDEX);
+                                      local_state.scan_converted);
 
     auto fill_output_from_converted = [&](DataChunk &target) {
       if (target.ColumnCount() !=
@@ -2212,8 +2142,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
             LanceFormatErrorSuffix());
       }
       lance_free_schema(schema_handle);
-      PopulateArrowTableSchemaCompat(context, exec_bind->arrow_table,
-                                     exec_bind->schema_root.arrow_schema);
+      ArrowTableFunction::PopulateArrowTableSchema(
+          context, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
       exec_names = exec_bind->arrow_table.GetNames();
       exec_types = exec_bind->arrow_table.GetTypes();
     } catch (...) {
@@ -2433,23 +2363,23 @@ static void LanceCardinalityFixupOptimizer(OptimizerExtensionInput &input,
 void RegisterLanceScanOptimizer(DBConfig &config) {
   OptimizerExtension exec_ext;
   exec_ext.optimize_function = LanceExecPushdownOptimizer;
-  RegisterOptimizerExtensionCompat(config, std::move(exec_ext));
+  OptimizerExtension::Register(config, std::move(exec_ext));
 
   OptimizerExtension rowid_take_ext;
   rowid_take_ext.optimize_function = LanceRowIdInRewriteOptimizer;
-  RegisterOptimizerExtensionCompat(config, std::move(rowid_take_ext));
+  OptimizerExtension::Register(config, std::move(rowid_take_ext));
 
   OptimizerExtension like_ext;
   like_ext.optimize_function = LanceLikePushdownOptimizer;
-  RegisterOptimizerExtensionCompat(config, std::move(like_ext));
+  OptimizerExtension::Register(config, std::move(like_ext));
 
   OptimizerExtension limit_ext;
   limit_ext.optimize_function = LanceLimitOffsetPushdownOptimizer;
-  RegisterOptimizerExtensionCompat(config, std::move(limit_ext));
+  OptimizerExtension::Register(config, std::move(limit_ext));
 
   OptimizerExtension cardinality_ext;
   cardinality_ext.optimize_function = LanceCardinalityFixupOptimizer;
-  RegisterOptimizerExtensionCompat(config, std::move(cardinality_ext));
+  OptimizerExtension::Register(config, std::move(cardinality_ext));
 }
 
 // ---- __lance_exec (internal-only) ----
@@ -2520,8 +2450,8 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -2690,7 +2620,7 @@ static TableFunction LanceTableScanFunction() {
   function.get_virtual_columns = LanceGetVirtualColumns;
   function.to_string = LanceScanToString;
   function.dynamic_to_string = LanceScanDynamicToString;
-  SetRowsScannedCompat(function, LanceScanRowsScanned);
+  function.rows_scanned = LanceScanRowsScanned;
   function.get_bind_info = [](const optional_ptr<FunctionData> bind_data) {
     auto *scan_bind = dynamic_cast<const LanceScanBindData *>(bind_data.get());
     if (scan_bind && scan_bind->table_entry) {
@@ -2758,8 +2688,8 @@ static void PopulateLanceTableSchemaFromDataset(
   lance_free_schema(schema_handle);
 
   ArrowTableSchema arrow_table;
-  PopulateArrowTableSchemaCompat(context, arrow_table,
-                                 schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+                                               schema_root.arrow_schema);
   const auto names = arrow_table.GetNames();
   const auto types = arrow_table.GetTypes();
   if (names.size() != types.size()) {
@@ -2870,8 +2800,7 @@ static void ValidateAlterColumnTypeTarget(const LogicalType &type) {
       "(BOOLEAN, integer/floating, DATE/TIME/TIMESTAMP, VARCHAR, BLOB).");
 }
 
-static bool IsImplicitCastUsingExpression(ClientContext &context,
-                                          const ParsedExpression &expr,
+static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
                                           const string &column_name,
                                           const LogicalType &target_type) {
   if (expr.GetExpressionClass() != ExpressionClass::CAST) {
@@ -2884,8 +2813,7 @@ static bool IsImplicitCastUsingExpression(ClientContext &context,
 
   LogicalType expression_cast_type;
   try {
-    expression_cast_type =
-        TransformStringToLogicalType(cast_expr.cast_type.ToString(), context);
+    expression_cast_type = UnboundType::TryDefaultBind(cast_expr.cast_type);
   } catch (...) {
     return false;
   }
@@ -3020,8 +2948,8 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto &cast = info.Cast<ChangeColumnTypeInfo>();
       ValidateAlterColumnTypeTarget(cast.target_type);
       if (!cast.expression ||
-          !IsImplicitCastUsingExpression(context, *cast.expression,
-                                         cast.column_name, cast.target_type)) {
+          !IsImplicitCastUsingExpression(*cast.expression, cast.column_name,
+                                         cast.target_type)) {
         lance_close_dataset(dataset);
         throw NotImplementedException(
             "Lance ALTER COLUMN TYPE only supports implicit USING (i.e., a "
@@ -3160,8 +3088,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
@@ -3180,8 +3108,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->scan_arrow_table,
-                                 result->scan_schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 
   bind_data = std::move(result);
   return LanceTableScanFunction();
@@ -3206,7 +3134,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_scan.get_virtual_columns = LanceGetVirtualColumns;
   internal_scan.to_string = LanceScanToString;
   internal_scan.dynamic_to_string = LanceScanDynamicToString;
-  SetRowsScannedCompat(internal_scan, LanceScanRowsScanned);
+  internal_scan.rows_scanned = LanceScanRowsScanned;
 
   CreateTableFunctionInfo scan_info(std::move(internal_scan));
   scan_info.internal = true;
@@ -3237,7 +3165,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.get_virtual_columns = LanceGetVirtualColumns;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.dynamic_to_string = LanceScanDynamicToString;
-  SetRowsScannedCompat(internal_namespace_scan, LanceScanRowsScanned);
+  internal_namespace_scan.rows_scanned = LanceScanRowsScanned;
 
   CreateTableFunctionInfo internal_info(std::move(internal_namespace_scan));
   internal_info.internal = true;

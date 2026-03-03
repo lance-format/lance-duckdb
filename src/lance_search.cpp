@@ -38,38 +38,6 @@
 
 namespace duckdb {
 
-template <typename CONTEXT>
-static auto PopulateArrowTableSchemaCompatImpl(CONTEXT &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               int)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(context,
-                                                             arrow_table,
-                                                             arrow_schema),
-                void()) {
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               arrow_schema);
-}
-
-template <typename CONTEXT>
-static auto PopulateArrowTableSchemaCompatImpl(CONTEXT &context,
-                                               ArrowTableSchema &arrow_table,
-                                               const ArrowSchema &arrow_schema,
-                                               long)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
-                    DBConfig::GetConfig(context), arrow_table, arrow_schema),
-                void()) {
-  auto &config = DBConfig::GetConfig(context);
-  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
-                                               arrow_schema);
-}
-
-static void PopulateArrowTableSchemaCompat(ClientContext &context,
-                                           ArrowTableSchema &arrow_table,
-                                           const ArrowSchema &arrow_schema) {
-  PopulateArrowTableSchemaCompatImpl(context, arrow_table, arrow_schema, 0);
-}
-
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
                                uint64_t nprobes, uint64_t refine_factor,
@@ -475,8 +443,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -1033,8 +1001,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
@@ -1137,8 +1105,8 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  PopulateArrowTableSchemaCompat(context, result->arrow_table,
-                                 result->schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
   names = result->names;
