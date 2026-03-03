@@ -1,8 +1,6 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "duckdb/function/table/arrow.hpp"
-#include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
@@ -100,35 +98,5 @@ int64_t LanceTruncateDatasetWithStorageOptions(
     const vector<string> &option_values, const string &display_uri);
 
 int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
-
-template <typename ContextType>
-inline auto PopulateArrowTableSchemaCompatImpl(
-    ContextType &context, ArrowTableSchema &arrow_table,
-    const ArrowSchema &arrow_schema, int)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
-                    context, arrow_table, arrow_schema),
-                void()) {
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               arrow_schema);
-}
-
-template <typename ContextType>
-inline auto PopulateArrowTableSchemaCompatImpl(
-    ContextType &context, ArrowTableSchema &arrow_table,
-    const ArrowSchema &arrow_schema, long)
-    -> decltype(ArrowTableFunction::PopulateArrowTableSchema(
-                    DBConfig::GetConfig(context), arrow_table, arrow_schema),
-                void()) {
-  auto &config = DBConfig::GetConfig(context);
-  ArrowTableFunction::PopulateArrowTableSchema(config, arrow_table,
-                                               arrow_schema);
-}
-
-template <typename ContextType>
-inline void PopulateArrowTableSchemaCompat(ContextType &context,
-                                           ArrowTableSchema &arrow_table,
-                                           const ArrowSchema &arrow_schema) {
-  PopulateArrowTableSchemaCompatImpl(context, arrow_table, arrow_schema, 0);
-}
 
 } // namespace duckdb
