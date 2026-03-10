@@ -160,6 +160,31 @@ endif()
 if(DEFINED VCPKG_TARGET_TRIPLET)
   list(APPEND RUST_CARGO_ENV VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET})
 endif()
+# prost-build needs an explicit PROTOC in DuckDB core extension builds because
+# the helper script that populates CI env vars is not part of that path.
+if(NOT "$ENV{PROTOC}" STREQUAL "")
+  list(APPEND RUST_CARGO_ENV "PROTOC=$ENV{PROTOC}")
+elseif(DEFINED VCPKG_TARGET_TRIPLET)
+  if(DEFINED VCPKG_INSTALLED_DIR)
+    set(RUST_PROTOC_ROOT "${VCPKG_INSTALLED_DIR}")
+  elseif(DEFINED _VCPKG_INSTALLED_DIR)
+    set(RUST_PROTOC_ROOT "${_VCPKG_INSTALLED_DIR}")
+  else()
+    set(RUST_PROTOC_ROOT "${CMAKE_BINARY_DIR}/vcpkg_installed")
+  endif()
+
+  if(WIN32)
+    set(RUST_PROTOC_NAME "protoc.exe")
+  else()
+    set(RUST_PROTOC_NAME "protoc")
+  endif()
+
+  set(RUST_PROTOC_PATH
+      "${RUST_PROTOC_ROOT}/${VCPKG_TARGET_TRIPLET}/tools/protobuf/${RUST_PROTOC_NAME}")
+  if(EXISTS "${RUST_PROTOC_PATH}")
+    list(APPEND RUST_CARGO_ENV "PROTOC=${RUST_PROTOC_PATH}")
+  endif()
+endif()
 
 # Building both debug and release Rust artifacts is expensive and can trigger OOMs in CI.
 # For single-config generators (Ninja/Makefiles), only build the active configuration's artifact.
