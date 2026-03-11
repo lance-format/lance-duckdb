@@ -1145,7 +1145,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
           bind_data.dataset, &indexed_cols_len);
       bool has_indexed_filter = false;
       for (size_t i = 0; i < indexed_cols_len; i++) {
-        if (indexed_cols_ptr[i] && filtered_columns.count(indexed_cols_ptr[i])) {
+        if (indexed_cols_ptr[i] &&
+            filtered_columns.count(indexed_cols_ptr[i])) {
           has_indexed_filter = true;
           break;
         }
