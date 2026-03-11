@@ -1,0 +1,61 @@
+# name: test/sql/scan_index_aware_scanner.test
+# description: Index-aware scanner selection uses dataset scanner when scalar index exists
+# group: [sql]
+
+require lance
+
+# Setup: copy test data and create a scalar index on the 'name' column
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/scan_index_limit.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+statement ok
+CREATE INDEX name_idx ON ns.main.scan_index_limit (name) USING BTREE;
+
+# Filter on indexed column + LIMIT should use dataset scanner
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM ns.main.scan_index_limit WHERE name = 'Alice' LIMIT 1;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+# Correctness: WHERE + LIMIT returns expected row count
+query I
+SELECT count(*) FROM (SELECT * FROM ns.main.scan_index_limit WHERE name = 'Alice' LIMIT 1);
+----
+1
+
+# WHERE + LIMIT + OFFSET correctness on non-indexed column
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/.tmp/scan_index_limit.lance' WHERE age > 30 LIMIT 2 OFFSET 1);
+----
+2
+
+# Filter on indexed column should use dataset scanner
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM ns.main.scan_index_limit WHERE name = 'Alice';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+# Filter on non-indexed column should use fragment scanner
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM ns.main.scan_index_limit WHERE age > 30;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "fragment"[\s\S]*
+
+# No filter should use fragment scanner
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM ns.main.scan_index_limit;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "fragment"[\s\S]*
+
+# Correctness: indexed column filter returns correct results
+query I
+SELECT count(*) FROM ns.main.scan_index_limit WHERE name = 'Alice';
+----
+1
+
+statement ok
+DETACH ns;

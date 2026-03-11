@@ -250,6 +250,8 @@ lance_dataset_optimize_index_with_options(void *dataset, const char *index_name,
                                           const char **out_metrics_json);
 void *lance_get_index_list_schema(void *dataset);
 void *lance_create_index_list_stream(void *dataset);
+char **lance_dataset_list_scalar_indexed_columns(void *dataset, size_t *out_len);
+void lance_free_scalar_indexed_columns(char **ptr, size_t len);
 
 void lance_free_batch(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,

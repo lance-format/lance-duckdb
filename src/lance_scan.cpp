@@ -1123,6 +1123,42 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
+  // Index-aware scanner selection: if any filtered column has a scalar index,
+  // use the dataset scanner so Lance can leverage the index (e.g. BTree skip).
+  if (!scan_state.lance_filter_ir.empty()) {
+    unordered_set<string> filtered_columns;
+    if (input.filters) {
+      for (auto &it : input.filters->filters) {
+        auto scan_col_idx = it.first;
+        if (scan_col_idx < input.column_ids.size()) {
+          auto col_id = input.column_ids[scan_col_idx];
+          if (col_id < bind_data.names.size()) {
+            filtered_columns.insert(bind_data.names[col_id]);
+          }
+        }
+      }
+    }
+
+    if (!filtered_columns.empty()) {
+      size_t indexed_cols_len = 0;
+      auto indexed_cols_ptr = lance_dataset_list_scalar_indexed_columns(
+          bind_data.dataset, &indexed_cols_len);
+      bool has_indexed_filter = false;
+      for (size_t i = 0; i < indexed_cols_len; i++) {
+        if (indexed_cols_ptr[i] && filtered_columns.count(indexed_cols_ptr[i])) {
+          has_indexed_filter = true;
+          break;
+        }
+      }
+      lance_free_scalar_indexed_columns(indexed_cols_ptr, indexed_cols_len);
+      if (has_indexed_filter) {
+        scan_state.use_dataset_scanner = true;
+        scan_state.max_threads = 1;
+        return state;
+      }
+    }
+  }
+
   size_t ffi_fragment_count = 0;
   auto fragments_ptr =
       lance_dataset_list_fragments(bind_data.dataset, &ffi_fragment_count);
@@ -1910,7 +1946,12 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
   }
 
   auto *node = op->children[0].get();
-  while (node && node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+  vector<LogicalFilter *> intermediate_filters;
+  while (node && (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+                  node->type == LogicalOperatorType::LOGICAL_FILTER)) {
+    if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+      intermediate_filters.push_back(&node->Cast<LogicalFilter>());
+    }
     if (node->children.empty() || !node->children[0]) {
       return op;
     }
@@ -1927,6 +1968,29 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
   if (get.extra_info.sample_options) {
     // Sampling must occur before limiting, so do not remove the LIMIT node.
     return op;
+  }
+
+  // If we traversed through FILTER nodes, verify ALL filter expressions can be
+  // handled by Lance. pushdown_complex_filter already pushed these into
+  // lance_pushed_filter_ir_parts, so Lance will execute filter-then-limit
+  // internally. The LOGICAL_FILTER stays in the plan as a safety fallback.
+  // If any expression is not pushable, Lance would apply limit before the
+  // residual DuckDB filter, producing wrong results — so bail out.
+  if (!intermediate_filters.empty()) {
+    auto &scan_bind_check = get.bind_data->Cast<LanceScanBindData>();
+    for (auto *filter_node : intermediate_filters) {
+      for (auto &expr : filter_node->expressions) {
+        if (!expr) {
+          continue;
+        }
+        string discard_ir;
+        if (!TryBuildLanceExprFilterIR(get, scan_bind_check.names,
+                                       scan_bind_check.types, false, *expr,
+                                       discard_ir)) {
+          return op;
+        }
+      }
+    }
   }
 
   auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
