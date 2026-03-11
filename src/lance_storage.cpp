@@ -300,9 +300,12 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+    } catch (std::exception &e) {
+      lance_close_dataset(dataset);
+      return nullptr;
     } catch (...) {
       lance_close_dataset(dataset);
-      throw;
+      return nullptr;
     }
     lance_close_dataset(dataset);
 
@@ -392,9 +395,12 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+    } catch (std::exception &e) {
+      lance_close_dataset(dataset);
+      return nullptr;
     } catch (...) {
       lance_close_dataset(dataset);
-      throw;
+      return nullptr;
     }
     lance_close_dataset(dataset);
 
