@@ -108,6 +108,7 @@ impl CapturedRowIds {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_rows_update_transaction_inner(
     path: *const c_char,
     option_keys: *const *const c_char,

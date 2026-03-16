@@ -273,7 +273,7 @@ fn get_exec_schema_inner(
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
 
     let schema_res = runtime::block_on(async {
-        let df = build_exec_df(&handle, bytes).await?;
+        let df = build_exec_df(handle, bytes).await?;
         let plan = df.create_physical_plan().await.map_err(|e| e.to_string())?;
         Ok::<_, String>(plan.schema())
     })
@@ -311,7 +311,7 @@ fn create_dataset_exec_stream_ir_inner(
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
 
     let stream_res = runtime::block_on(async {
-        let df = build_exec_df(&handle, bytes).await?;
+        let df = build_exec_df(handle, bytes).await?;
         df.execute_stream().await.map_err(|e| e.to_string())
     })
     .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;

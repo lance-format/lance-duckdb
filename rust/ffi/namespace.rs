@@ -6,7 +6,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
-    CreateEmptyTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
+    DeclareTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
 };
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::RestNamespaceBuilder;
@@ -296,18 +296,18 @@ fn create_empty_table_inner(
     .build();
 
     let (location, storage_options_tsv) = runtime::block_on(async move {
-        let mut req = CreateEmptyTableRequest::new();
+        let mut req = DeclareTableRequest::new();
         req.id = Some(vec![table_id.to_string()]);
-        let resp = namespace.create_empty_table(req).await.map_err(|err| {
+        let resp = namespace.declare_table(req).await.map_err(|err| {
             FfiError::new(
                 ErrorCode::NamespaceCreateEmptyTable,
-                format!("namespace create_empty_table: {err}"),
+                format!("namespace declare_table: {err}"),
             )
         })?;
         let location = resp.location.ok_or_else(|| {
             FfiError::new(
                 ErrorCode::NamespaceCreateEmptyTable,
-                "namespace create_empty_table: missing location",
+                "namespace declare_table: missing location",
             )
         })?;
         let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());

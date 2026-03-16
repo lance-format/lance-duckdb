@@ -349,7 +349,7 @@ pub fn output_type_to_arrow(hint: &OutputTypeHint) -> Result<arrow::datatypes::D
         OutputTypeHint::TimestampUs => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         OutputTypeHint::Utf8 => Ok(DataType::Utf8),
         OutputTypeHint::Decimal { precision, scale } => {
-            Ok(DataType::Decimal128(*precision as u8, *scale as i8))
+            Ok(DataType::Decimal128(*precision, *scale as i8))
         }
     }
 }
@@ -367,7 +367,7 @@ fn literal_ir_to_scalar(lit: &LiteralIr) -> Result<ScalarValue, String> {
             scale,
         } => Ok(ScalarValue::Decimal128(
             Some(*value),
-            *precision as u8,
+            *precision,
             *scale as i8,
         )),
     }

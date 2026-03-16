@@ -3,6 +3,8 @@ use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
 
+use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::runtime;
 use arrow::compute;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -15,10 +17,6 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::DatasetIndexExt;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
-use snafu::location;
-
-use crate::error::{clear_last_error, set_last_error, ErrorCode};
-use crate::runtime;
 
 use super::util::{cstr_to_str, optional_cstr_array, to_c_string, FfiError, FfiResult};
 
@@ -148,7 +146,10 @@ fn write_metrics_json<T: Serialize>(
     let payload = serde_json::to_string(value)
         .map_err(|err| FfiError::new(code, format!("{context} serialize: {err}")))?;
     unsafe {
-        ptr::write_unaligned(out_metrics_json, to_c_string(payload).into_raw() as *const c_char);
+        ptr::write_unaligned(
+            out_metrics_json,
+            to_c_string(payload).into_raw() as *const c_char,
+        );
     }
     Ok(())
 }
@@ -304,33 +305,23 @@ fn dataset_add_columns_inner(
                 let arr = expr
                     .evaluate(batch)
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] evaluate: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] evaluate: {err}"))
                     })?
                     .into_array(num_rows)
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] into_array: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] into_array: {err}"))
                     })?;
                 let arr = if arr.data_type() != field.data_type() {
                     compute::cast(&arr, field.data_type()).map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] cast: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] cast: {err}"))
                     })?
                 } else {
                     arr
                 };
                 arrays.push(arr);
             }
-            RecordBatch::try_new(schema_ref.clone(), arrays).map_err(|err| {
-                lance::Error::invalid_input(format!("output batch: {err}"), location!())
-            })
+            RecordBatch::try_new(schema_ref.clone(), arrays)
+                .map_err(|err| lance::Error::invalid_input(format!("output batch: {err}")))
         };
 
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
@@ -797,11 +788,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
         delete_unverified: delete_unverified != 0,
         ..Default::default()
     };
-    match dataset_cleanup_old_versions_with_options_struct(
-        dataset,
-        options,
-        ptr::null_mut(),
-    ) {
+    match dataset_cleanup_old_versions_with_options_struct(dataset, options, ptr::null_mut()) {
         Ok(()) => {
             clear_last_error();
             0
@@ -878,12 +865,7 @@ fn dataset_cleanup_old_versions_with_options_struct(
                     format!("cleanup_old_versions retain_n_versions: {err}"),
                 ))
             }
-            Err(err) => {
-                return Err(FfiError::new(
-                    ErrorCode::Runtime,
-                    format!("runtime: {err}"),
-                ))
-            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         };
     }
 

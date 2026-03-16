@@ -44,7 +44,6 @@ pub enum ErrorCode {
     DatasetDropIndex = 30,
     DatasetDescribeIndices = 31,
     DatasetOptimizeIndices = 32,
-    IndexSchema = 33,
     IndexStreamCreate = 34,
 
     DatasetAddColumns = 35,

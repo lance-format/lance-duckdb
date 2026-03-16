@@ -473,6 +473,7 @@ pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delete_transaction_with_storage_options_inner(
     path: *const c_char,
     option_keys: *const *const c_char,
@@ -705,19 +706,8 @@ fn dataset_delete_inner(
 
     let mut ds = (*handle.dataset).clone();
 
-    let before_rows = match runtime::block_on(ds.count_rows(None)) {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(err)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetDelete,
-                format!("dataset count_rows(before): {err}"),
-            ))
-        }
-        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    };
-
-    match runtime::block_on(ds.delete(&predicate)) {
-        Ok(Ok(())) => {}
+    let deleted_rows = match runtime::block_on(ds.delete(&predicate)) {
+        Ok(Ok(result)) => result.num_deleted_rows,
         Ok(Err(err)) => {
             return Err(FfiError::new(
                 ErrorCode::DatasetDelete,
@@ -726,19 +716,6 @@ fn dataset_delete_inner(
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
-
-    let after_rows = match runtime::block_on(ds.count_rows(None)) {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(err)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetDelete,
-                format!("dataset count_rows(after): {err}"),
-            ))
-        }
-        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    };
-
-    let deleted_rows = before_rows.saturating_sub(after_rows);
     let deleted_rows_i64 = i64::try_from(deleted_rows)
         .map_err(|_| FfiError::new(ErrorCode::DatasetDelete, "deleted row count overflow"))?;
 

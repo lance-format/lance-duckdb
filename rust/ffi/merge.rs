@@ -78,6 +78,7 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_begin_with_storage_options_inner(
     path: *const c_char,
     option_keys: *const *const c_char,
@@ -278,10 +279,11 @@ fn merge_add_insert_batch_inner(merge_handle: *mut c_void, array: *mut c_void) -
     }
     let ffi_array: arrow::ffi::FFI_ArrowArray = unsafe { std::mem::transmute(raw_array) };
 
-    let array_data = unsafe {
-        arrow_array::ffi::from_ffi_and_data_type(ffi_array, handle.data_type.clone())
-    }
-    .map_err(|err| FfiError::new(ErrorCode::DatasetMerge, format!("array import: {err}")))?;
+    let array_data =
+        unsafe { arrow_array::ffi::from_ffi_and_data_type(ffi_array, handle.data_type.clone()) }
+            .map_err(|err| {
+                FfiError::new(ErrorCode::DatasetMerge, format!("array import: {err}"))
+            })?;
 
     let array = make_array(array_data);
     let struct_array = array
@@ -345,9 +347,7 @@ fn merge_finish_uncommitted_inner(
             let mut store_params = ObjectStoreParams::default();
             if !handle.storage_options.is_empty() {
                 store_params.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(
-                        handle.storage_options.clone(),
-                    ),
+                    StorageOptionsAccessor::with_static_options(handle.storage_options.clone()),
                 ));
             }
 
@@ -361,8 +361,10 @@ fn merge_finish_uncommitted_inner(
             };
 
             let stream = futures::stream::iter(handle.insert_batches.into_iter().map(Ok)).boxed();
-            let stream: SendableRecordBatchStream =
-                Box::pin(RecordBatchStreamAdapter::new(handle.input_schema.clone(), stream));
+            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                handle.input_schema.clone(),
+                stream,
+            ));
 
             let append_txn = InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
@@ -401,7 +403,10 @@ fn merge_finish_uncommitted_inner(
                 .map_err(|e| e.to_string())?
         };
 
-        if new_fragments.is_empty() && updated_fragments.is_empty() && removed_fragment_ids.is_empty() {
+        if new_fragments.is_empty()
+            && updated_fragments.is_empty()
+            && removed_fragment_ids.is_empty()
+        {
             return Ok::<_, String>(None);
         }
 
