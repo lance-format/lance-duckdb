@@ -437,8 +437,7 @@ public:
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    return MakeNamespaceEntry(entry_name, candidates.front(),
-                              std::move(info));
+    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info));
   }
 
   vector<string> GetDefaultEntries() override {
