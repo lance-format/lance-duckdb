@@ -145,8 +145,8 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
 }
 
 static void PopulateColumnsFromArrowSchema(ClientContext &context,
-                                            ArrowSchema &arrow_schema,
-                                            ColumnList &out_columns) {
+                                           ArrowSchema &arrow_schema,
+                                           ColumnList &out_columns) {
   ArrowTableSchema arrow_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                arrow_schema);
@@ -296,16 +296,8 @@ public:
       dataset_uri = uri_ptr;
       lance_free_string(uri_ptr);
     }
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     if (!dataset) {
-      // Return an empty entry to prevent DuckDB crash on nullptr.
-      CreateTableInfo info(schema, entry_name);
-      info.internal = true;
-      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-      return make_uniq_base<CatalogEntry, LanceTableEntry>(
-          catalog, schema, info, std::move(dataset_uri));
+      return nullptr;
     }
 
     CreateTableInfo info(schema, entry_name);
@@ -315,14 +307,13 @@ public:
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
     } catch (...) {
       lance_close_dataset(dataset);
-      CreateTableInfo empty_info(schema, entry_name);
-      empty_info.internal = true;
-      empty_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-      return make_uniq_base<CatalogEntry, LanceTableEntry>(
-          catalog, schema, empty_info, std::move(dataset_uri));
+      throw;
     }
     lance_close_dataset(dataset);
 
+    if (dataset_uri.empty()) {
+      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+    }
     return make_uniq_base<CatalogEntry, LanceTableEntry>(
         catalog, schema, info, std::move(dataset_uri));
   }
@@ -340,12 +331,12 @@ private:
 };
 
 static void PopulateLanceTableColumnsFromJsonSchema(ClientContext &context,
-                                                     const string &schema_json,
-                                                     ColumnList &out_columns) {
+                                                    const string &schema_json,
+                                                    ColumnList &out_columns) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_json_arrow_schema_to_c(schema_json.c_str(),
-                                    &schema_root.arrow_schema) != 0) {
+                                   &schema_root.arrow_schema) != 0) {
     throw IOException("Failed to convert JSON Arrow schema to C Data "
                       "Interface" +
                       LanceFormatErrorSuffix());
@@ -467,9 +458,9 @@ public:
   }
 
 private:
-  unique_ptr<CatalogEntry>
-  MakeNamespaceEntry(const string &entry_name, const string &table_id,
-                     CreateTableInfo info) {
+  unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
+                                              const string &table_id,
+                                              CreateTableInfo info) {
     LanceNamespaceTableConfig cfg;
     cfg.endpoint = endpoint;
     cfg.table_id = table_id;
@@ -482,15 +473,14 @@ private:
   }
 
   bool TryDescribeTableWithSchema(const string &table_id,
-                                   const string &resolved_bearer,
-                                   const string &resolved_api_key,
-                                   string &out_schema_json) {
+                                  const string &resolved_bearer,
+                                  const string &resolved_api_key,
+                                  string &out_schema_json) {
     const char *bearer_ptr =
         resolved_bearer.empty() ? nullptr : resolved_bearer.c_str();
     const char *api_key_ptr =
         resolved_api_key.empty() ? nullptr : resolved_api_key.c_str();
-    const char *delimiter_ptr =
-        delimiter.empty() ? nullptr : delimiter.c_str();
+    const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
     const char *headers_ptr =
         headers_tsv.empty() ? nullptr : headers_tsv.c_str();
     const char *schema_ptr = nullptr;
