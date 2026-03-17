@@ -296,16 +296,8 @@ public:
       dataset_uri = uri_ptr;
       lance_free_string(uri_ptr);
     }
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     if (!dataset) {
-      // Return an empty entry so CreateDefaultEntries does not crash.
-      CreateTableInfo info(schema, entry_name);
-      info.internal = true;
-      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-      return make_uniq_base<CatalogEntry, LanceTableEntry>(
-          catalog, schema, info, std::move(dataset_uri));
+      return nullptr;
     }
 
     CreateTableInfo info(schema, entry_name);
@@ -315,12 +307,13 @@ public:
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
     } catch (...) {
       lance_close_dataset(dataset);
-      // Return an empty entry so CreateDefaultEntries does not crash.
-      return make_uniq_base<CatalogEntry, LanceTableEntry>(
-          catalog, schema, info, std::move(dataset_uri));
+      return nullptr;
     }
     lance_close_dataset(dataset);
 
+    if (dataset_uri.empty()) {
+      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+    }
     return make_uniq_base<CatalogEntry, LanceTableEntry>(
         catalog, schema, info, std::move(dataset_uri));
   }
@@ -329,7 +322,33 @@ public:
     if (!ns) {
       return {};
     }
-    return ListDirectoryNamespaceTables(*ns);
+    auto all = ListDirectoryNamespaceTables(*ns);
+    // Filter out tables whose datasets cannot be opened (e.g. corrupt
+    // manifests). CreateDefaultEntries requires every entry to produce
+    // a non-null CatalogEntry, but CreateDefaultEntry must return
+    // nullptr for datasets that are not yet written (CTAS planning
+    // phase). Filtering here avoids the conflict.
+    vector<string> valid;
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
+                                    key_ptrs, value_ptrs);
+    for (auto &name : all) {
+      const char *uri_ptr = nullptr;
+      auto *ds = lance_open_dataset_in_dir_namespace(
+          ns->root.c_str(), name.c_str(),
+          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(),
+          ns->option_keys.size(), &uri_ptr);
+      if (uri_ptr) {
+        lance_free_string(uri_ptr);
+      }
+      if (ds) {
+        lance_close_dataset(ds);
+        valid.push_back(std::move(name));
+      }
+    }
+    return valid;
   }
 
 private:
