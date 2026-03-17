@@ -1,11 +1,8 @@
 #include "lance_filter_ir.hpp"
 
 #include "lance_common.hpp"
+#include "lance_expr_ir.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/hugeint.hpp"
-#include "duckdb/common/types/decimal.hpp"
-#include "duckdb/common/types/date.hpp"
-#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -23,160 +20,27 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <functional>
-#include <limits>
 
 namespace duckdb {
 
 bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
-  switch (type.id()) {
-  case LogicalTypeId::BOOLEAN:
-  case LogicalTypeId::TINYINT:
-  case LogicalTypeId::SMALLINT:
-  case LogicalTypeId::INTEGER:
-  case LogicalTypeId::BIGINT:
-  case LogicalTypeId::UTINYINT:
-  case LogicalTypeId::USMALLINT:
-  case LogicalTypeId::UINTEGER:
-  case LogicalTypeId::UBIGINT:
-  case LogicalTypeId::FLOAT:
-  case LogicalTypeId::DOUBLE:
-  case LogicalTypeId::VARCHAR:
-  case LogicalTypeId::DATE:
-  case LogicalTypeId::TIMESTAMP:
-  case LogicalTypeId::TIMESTAMP_SEC:
-  case LogicalTypeId::TIMESTAMP_MS:
-  case LogicalTypeId::TIMESTAMP_NS:
-  case LogicalTypeId::TIMESTAMP_TZ:
-  case LogicalTypeId::DECIMAL:
-  case LogicalTypeId::STRUCT:
-    return true;
-  default:
-    return false;
-  }
+  return LanceExprIRSupportsLogicalType(type);
 }
 
 static constexpr char LANCE_FILTER_IR_MAGIC[] = {'L', 'F', 'T', '1'};
 
 enum class LanceFilterIRTag : uint8_t {
-  COLUMN_REF = 1,
-  LITERAL = 2,
   AND = 3,
   OR = 4,
   NOT = 5,
-  COMPARISON = 6,
   IS_NULL = 7,
   IS_NOT_NULL = 8,
-  IN_LIST = 9,
-  LIKE = 10,
-  REGEXP = 11,
-  SCALAR_FUNCTION = 12,
 };
-
-enum class LanceFilterIRLiteralTag : uint8_t {
-  NULL_VALUE = 0,
-  BOOL = 1,
-  I64 = 2,
-  U64 = 3,
-  F32 = 4,
-  F64 = 5,
-  STRING = 6,
-  DATE32 = 7,
-  TIMESTAMP = 8,
-  DECIMAL128 = 9,
-};
-
-enum class LanceFilterIRTimestampUnit : uint8_t {
-  SECOND = 0,
-  MILLISECOND = 1,
-  MICROSECOND = 2,
-  NANOSECOND = 3,
-};
-
-enum class LanceFilterIRComparisonOp : uint8_t {
-  EQ = 0,
-  NOT_EQ = 1,
-  LT = 2,
-  LT_EQ = 3,
-  GT = 4,
-  GT_EQ = 5,
-  DISTINCT_FROM = 6,
-  NOT_DISTINCT_FROM = 7,
-};
-
-static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE = 1;
-static constexpr uint8_t LANCE_FILTER_IR_LIKE_FLAG_HAS_ESCAPE = 2;
 
 static constexpr uint8_t LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH = 0;
 static constexpr uint8_t LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH = 1;
-
-static void LanceFilterIRAppendU8(string &out, uint8_t v) {
-  out.push_back(static_cast<char>(v));
-}
-
-static void LanceFilterIRAppendU32(string &out, uint32_t v) {
-  uint8_t buf[4];
-  buf[0] = static_cast<uint8_t>(v & 0xFF);
-  buf[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-  buf[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
-  buf[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
-  out.append(reinterpret_cast<const char *>(buf), sizeof(buf));
-}
-
-static void LanceFilterIRAppendI32(string &out, int32_t v) {
-  LanceFilterIRAppendU32(out, static_cast<uint32_t>(v));
-}
-
-static void LanceFilterIRAppendU64(string &out, uint64_t v) {
-  uint8_t buf[8];
-  for (idx_t i = 0; i < 8; i++) {
-    buf[i] = static_cast<uint8_t>((v >> (8 * i)) & 0xFF);
-  }
-  out.append(reinterpret_cast<const char *>(buf), sizeof(buf));
-}
-
-static void LanceFilterIRAppendI64(string &out, int64_t v) {
-  LanceFilterIRAppendU64(out, static_cast<uint64_t>(v));
-}
-
-static void LanceFilterIRAppendI128(string &out, hugeint_t v) {
-  LanceFilterIRAppendU64(out, v.lower);
-  LanceFilterIRAppendU64(out, static_cast<uint64_t>(v.upper));
-}
-
-static void LanceFilterIRAppendF32(string &out, float v) {
-  uint32_t bits = 0;
-  memcpy(&bits, &v, sizeof(bits));
-  LanceFilterIRAppendU32(out, bits);
-}
-
-static void LanceFilterIRAppendF64(string &out, double v) {
-  uint64_t bits = 0;
-  memcpy(&bits, &v, sizeof(bits));
-  LanceFilterIRAppendU64(out, bits);
-}
-
-static bool LanceFilterIRAppendLenPrefixed(string &out, const string &bytes) {
-  if (bytes.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-  LanceFilterIRAppendU32(out, static_cast<uint32_t>(bytes.size()));
-  out.append(bytes);
-  return true;
-}
-
-static bool LanceFilterIRAppendLenPrefixedString(string &out,
-                                                 const string &value) {
-  if (value.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-  LanceFilterIRAppendU32(out, static_cast<uint32_t>(value.size()));
-  out.append(value);
-  return true;
-}
 
 static string LanceFilterIREncodeMessage(const string &root_node) {
   string out;
@@ -185,368 +49,82 @@ static string LanceFilterIREncodeMessage(const string &root_node) {
   return out;
 }
 
-static bool SplitLanceColumnPath(const string &name, vector<string> &segments) {
-  segments.clear();
-  idx_t start = 0;
-  for (idx_t i = 0; i <= name.size(); i++) {
-    if (i == name.size() || name[i] == '.') {
-      if (i == start) {
-        return false;
-      }
-      segments.push_back(name.substr(start, i - start));
-      start = i + 1;
-    }
-  }
-  return !segments.empty();
-}
-
 static bool TryEncodeLanceFilterIRColumnRef(const vector<string> &segments,
                                             string &out_ir) {
-  if (segments.empty()) {
-    return false;
-  }
-  for (auto &segment : segments) {
-    if (segment.empty()) {
-      return false;
-    }
-  }
-
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir,
-                        static_cast<uint8_t>(LanceFilterIRTag::COLUMN_REF));
-  if (segments.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(segments.size()));
-  for (auto &segment : segments) {
-    if (!LanceFilterIRAppendLenPrefixedString(out_ir, segment)) {
-      return false;
-    }
-  }
-  return true;
+  return TryEncodeLanceExprIRColumnRef(segments, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRColumnRef(const string &name,
                                             string &out_ir) {
-  vector<string> segments;
-  if (!SplitLanceColumnPath(name, segments)) {
-    return false;
-  }
-  return TryEncodeLanceFilterIRColumnRef(segments, out_ir);
+  return TryEncodeLanceExprIRColumnRef(name, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir,
-                        static_cast<uint8_t>(LanceFilterIRTag::LITERAL));
-
-  if (value.IsNull()) {
-    LanceFilterIRAppendU8(
-        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::NULL_VALUE));
-    return true;
-  }
-
-  switch (value.type().id()) {
-  case LogicalTypeId::BOOLEAN:
-    LanceFilterIRAppendU8(out_ir,
-                          static_cast<uint8_t>(LanceFilterIRLiteralTag::BOOL));
-    LanceFilterIRAppendU8(out_ir, value.GetValue<bool>() ? 1 : 0);
-    return true;
-  case LogicalTypeId::TINYINT:
-  case LogicalTypeId::SMALLINT:
-  case LogicalTypeId::INTEGER:
-  case LogicalTypeId::BIGINT:
-    LanceFilterIRAppendU8(out_ir,
-                          static_cast<uint8_t>(LanceFilterIRLiteralTag::I64));
-    LanceFilterIRAppendI64(out_ir, value.GetValue<int64_t>());
-    return true;
-  case LogicalTypeId::UTINYINT:
-  case LogicalTypeId::USMALLINT:
-  case LogicalTypeId::UINTEGER:
-  case LogicalTypeId::UBIGINT:
-    LanceFilterIRAppendU8(out_ir,
-                          static_cast<uint8_t>(LanceFilterIRLiteralTag::U64));
-    LanceFilterIRAppendU64(out_ir, value.GetValue<uint64_t>());
-    return true;
-  case LogicalTypeId::FLOAT: {
-    auto v = value.GetValue<float>();
-    LanceFilterIRAppendU8(out_ir,
-                          static_cast<uint8_t>(LanceFilterIRLiteralTag::F32));
-    LanceFilterIRAppendF32(out_ir, v);
-    return true;
-  }
-  case LogicalTypeId::DOUBLE: {
-    auto v = value.GetValue<double>();
-    LanceFilterIRAppendU8(out_ir,
-                          static_cast<uint8_t>(LanceFilterIRLiteralTag::F64));
-    LanceFilterIRAppendF64(out_ir, v);
-    return true;
-  }
-  case LogicalTypeId::VARCHAR: {
-    auto v = value.GetValue<string>();
-    LanceFilterIRAppendU8(
-        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::STRING));
-    return LanceFilterIRAppendLenPrefixedString(out_ir, v);
-  }
-  case LogicalTypeId::DATE: {
-    auto d = value.GetValue<date_t>();
-    if (!Date::IsFinite(d)) {
-      return false;
-    }
-    LanceFilterIRAppendU8(
-        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::DATE32));
-    LanceFilterIRAppendI32(out_ir, d.days);
-    return true;
-  }
-  case LogicalTypeId::TIMESTAMP:
-  case LogicalTypeId::TIMESTAMP_SEC:
-  case LogicalTypeId::TIMESTAMP_MS:
-  case LogicalTypeId::TIMESTAMP_NS:
-  case LogicalTypeId::TIMESTAMP_TZ: {
-    auto v = value.GetValue<int64_t>();
-    if (!Timestamp::IsFinite(timestamp_t(v))) {
-      return false;
-    }
-    LanceFilterIRAppendU8(
-        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::TIMESTAMP));
-    LanceFilterIRTimestampUnit unit;
-    switch (value.type().id()) {
-    case LogicalTypeId::TIMESTAMP_SEC:
-      unit = LanceFilterIRTimestampUnit::SECOND;
-      break;
-    case LogicalTypeId::TIMESTAMP_MS:
-      unit = LanceFilterIRTimestampUnit::MILLISECOND;
-      break;
-    case LogicalTypeId::TIMESTAMP_NS:
-      unit = LanceFilterIRTimestampUnit::NANOSECOND;
-      break;
-    case LogicalTypeId::TIMESTAMP:
-    case LogicalTypeId::TIMESTAMP_TZ:
-    default:
-      unit = LanceFilterIRTimestampUnit::MICROSECOND;
-      break;
-    }
-    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(unit));
-    LanceFilterIRAppendI64(out_ir, v);
-    return true;
-  }
-  case LogicalTypeId::DECIMAL: {
-    auto precision = DecimalType::GetWidth(value.type());
-    auto scale_u8 = DecimalType::GetScale(value.type());
-    if (scale_u8 > static_cast<uint8_t>(std::numeric_limits<int8_t>::max())) {
-      return false;
-    }
-    auto scale = static_cast<int8_t>(scale_u8);
-    auto str = value.ToString();
-    hugeint_t v(0);
-    {
-      idx_t pos = 0;
-      bool neg = false;
-      if (pos < str.size() && (str[pos] == '-' || str[pos] == '+')) {
-        neg = (str[pos] == '-');
-        pos++;
-      }
-
-      hugeint_t acc(0);
-      bool seen_dot = false;
-      uint8_t frac_digits = 0;
-      for (; pos < str.size(); pos++) {
-        auto c = str[pos];
-        if (c == '.') {
-          if (seen_dot) {
-            return false;
-          }
-          seen_dot = true;
-          continue;
-        }
-        if (c < '0' || c > '9') {
-          return false;
-        }
-        acc = acc * hugeint_t(10) + hugeint_t(static_cast<int64_t>(c - '0'));
-        if (seen_dot) {
-          if (frac_digits >= scale_u8) {
-            return false;
-          }
-          frac_digits++;
-        }
-      }
-      // Pad missing fractional digits (or scale an integer).
-      while (frac_digits < scale_u8) {
-        acc = acc * hugeint_t(10);
-        frac_digits++;
-      }
-      v = neg ? -acc : acc;
-    }
-    LanceFilterIRAppendU8(
-        out_ir, static_cast<uint8_t>(LanceFilterIRLiteralTag::DECIMAL128));
-    LanceFilterIRAppendU8(out_ir, precision);
-    LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(scale));
-    LanceFilterIRAppendI128(out_ir, v);
-    return true;
-  }
-  default:
-    return false;
-  }
+  return TryEncodeLanceExprIRLiteral(value, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRComparisonOp(ExpressionType type,
                                                uint8_t &out_op) {
-  switch (type) {
-  case ExpressionType::COMPARE_EQUAL:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::EQ);
-    return true;
-  case ExpressionType::COMPARE_NOTEQUAL:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::NOT_EQ);
-    return true;
-  case ExpressionType::COMPARE_DISTINCT_FROM:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::DISTINCT_FROM);
-    return true;
-  case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::NOT_DISTINCT_FROM);
-    return true;
-  case ExpressionType::COMPARE_LESSTHAN:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::LT);
-    return true;
-  case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::LT_EQ);
-    return true;
-  case ExpressionType::COMPARE_GREATERTHAN:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::GT);
-    return true;
-  case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-    out_op = static_cast<uint8_t>(LanceFilterIRComparisonOp::GT_EQ);
-    return true;
-  default:
-    return false;
-  }
+  return TryEncodeLanceExprIRComparisonOp(type, out_op);
 }
 
 static bool TryEncodeLanceFilterIRConjunction(LanceFilterIRTag tag,
                                               const vector<string> &children,
                                               string &out_ir) {
-  if (children.empty()) {
-    return false;
+  if (tag == LanceFilterIRTag::AND) {
+    return TryEncodeLanceExprIRAnd(children, out_ir);
   }
-  if (children.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
+  if (tag == LanceFilterIRTag::OR) {
+    return TryEncodeLanceExprIROr(children, out_ir);
   }
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(tag));
-  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(children.size()));
-  for (auto &child : children) {
-    if (!LanceFilterIRAppendLenPrefixed(out_ir, child)) {
-      return false;
-    }
-  }
-  return true;
+  return false;
 }
 
 static bool TryEncodeLanceFilterIRUnary(LanceFilterIRTag tag,
                                         const string &child, string &out_ir) {
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(tag));
-  return LanceFilterIRAppendLenPrefixed(out_ir, child);
+  if (tag == LanceFilterIRTag::NOT) {
+    return TryEncodeLanceExprIRNot(child, out_ir);
+  }
+  if (tag == LanceFilterIRTag::IS_NULL) {
+    return TryEncodeLanceExprIRIsNull(child, out_ir);
+  }
+  if (tag == LanceFilterIRTag::IS_NOT_NULL) {
+    return TryEncodeLanceExprIRIsNotNull(child, out_ir);
+  }
+  return false;
 }
 
 static bool TryEncodeLanceFilterIRComparison(uint8_t op, const string &left,
                                              const string &right,
                                              string &out_ir) {
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir,
-                        static_cast<uint8_t>(LanceFilterIRTag::COMPARISON));
-  LanceFilterIRAppendU8(out_ir, op);
-  return LanceFilterIRAppendLenPrefixed(out_ir, left) &&
-         LanceFilterIRAppendLenPrefixed(out_ir, right);
+  return TryEncodeLanceExprIRComparison(op, left, right, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRInList(bool negated, const string &expr,
                                          const vector<string> &list,
                                          string &out_ir) {
-  if (list.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir,
-                        static_cast<uint8_t>(LanceFilterIRTag::IN_LIST));
-  LanceFilterIRAppendU8(out_ir, negated ? 1 : 0);
-  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr)) {
-    return false;
-  }
-  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(list.size()));
-  for (auto &item : list) {
-    if (!LanceFilterIRAppendLenPrefixed(out_ir, item)) {
-      return false;
-    }
-  }
-  return true;
+  return TryEncodeLanceExprIRInList(negated, expr, list, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRLike(bool case_insensitive, bool has_escape,
                                        uint8_t escape_char, const string &expr,
                                        const string &pattern, string &out_ir) {
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRTag::LIKE));
-  uint8_t flags = 0;
-  if (case_insensitive) {
-    flags |= LANCE_FILTER_IR_LIKE_FLAG_CASE_INSENSITIVE;
-  }
-  if (has_escape) {
-    flags |= LANCE_FILTER_IR_LIKE_FLAG_HAS_ESCAPE;
-  }
-  LanceFilterIRAppendU8(out_ir, flags);
-  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr) ||
-      !LanceFilterIRAppendLenPrefixed(out_ir, pattern)) {
-    return false;
-  }
-  if (has_escape) {
-    LanceFilterIRAppendU8(out_ir, escape_char);
-  }
-  return true;
+  return TryEncodeLanceExprIRLike(case_insensitive, has_escape, escape_char,
+                                  expr, pattern, out_ir);
 }
 
 static bool TryEncodeLanceFilterIRRegexp(uint8_t mode, bool has_flags,
                                          const string &expr,
                                          const string &pattern,
                                          const string &flags, string &out_ir) {
-  if (mode != LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH &&
-      mode != LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH) {
-    return false;
-  }
-
-  out_ir.clear();
-  LanceFilterIRAppendU8(out_ir, static_cast<uint8_t>(LanceFilterIRTag::REGEXP));
-  LanceFilterIRAppendU8(out_ir, mode);
-  LanceFilterIRAppendU8(out_ir, has_flags ? 1 : 0);
-  if (!LanceFilterIRAppendLenPrefixed(out_ir, expr) ||
-      !LanceFilterIRAppendLenPrefixed(out_ir, pattern)) {
-    return false;
-  }
-  if (has_flags) {
-    return LanceFilterIRAppendLenPrefixed(out_ir, flags);
-  }
-  return true;
+  return TryEncodeLanceExprIRRegexp(mode, has_flags, expr, pattern, flags,
+                                    out_ir);
 }
 
 static bool TryEncodeLanceFilterIRScalarFunction(const string &name,
                                                  const vector<string> &args,
                                                  string &out_ir) {
-  if (args.size() > std::numeric_limits<uint32_t>::max()) {
-    return false;
-  }
-
-  out_ir.clear();
-  LanceFilterIRAppendU8(
-      out_ir, static_cast<uint8_t>(LanceFilterIRTag::SCALAR_FUNCTION));
-  if (!LanceFilterIRAppendLenPrefixedString(out_ir, name)) {
-    return false;
-  }
-  LanceFilterIRAppendU32(out_ir, static_cast<uint32_t>(args.size()));
-  for (auto &arg : args) {
-    if (!LanceFilterIRAppendLenPrefixed(out_ir, arg)) {
-      return false;
-    }
-  }
-  return true;
+  return TryEncodeLanceExprIRScalarFunction(name, args, out_ir);
 }
 
 static bool TryGetNonNullVarcharConstant(const Expression &expr,
@@ -1463,6 +1041,52 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   default:
     return false;
   }
+}
+
+bool TryBuildLanceTableFilterIRParts(const vector<string> &names,
+                                     const vector<LogicalType> &types,
+                                     const TableFilterSet &filters,
+                                     vector<string> &out_parts) {
+  out_parts.clear();
+  out_parts.reserve(filters.filters.size());
+  for (auto &entry : filters.filters) {
+    auto col_id = entry.first;
+    auto *filter = entry.second.get();
+    if (!filter) {
+      continue;
+    }
+    if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
+        col_id == COLUMN_IDENTIFIER_EMPTY) {
+      return false;
+    }
+    if (col_id >= names.size() || col_id >= types.size()) {
+      return false;
+    }
+    if (!LanceFilterIRSupportsLogicalType(types[col_id])) {
+      return false;
+    }
+    string col_ref_ir;
+    if (!TryEncodeLanceFilterIRColumnRef(names[col_id], col_ref_ir)) {
+      return false;
+    }
+    string part_ir;
+    if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *filter, part_ir)) {
+      return false;
+    }
+    out_parts.push_back(std::move(part_ir));
+  }
+  return true;
+}
+
+bool TryBuildLanceTableFilterIRMessage(const vector<string> &names,
+                                       const vector<LogicalType> &types,
+                                       const TableFilterSet &filters,
+                                       string &out_msg) {
+  vector<string> parts;
+  if (!TryBuildLanceTableFilterIRParts(names, types, filters, parts)) {
+    return false;
+  }
+  return TryEncodeLanceFilterIRMessage(parts, out_msg);
 }
 
 bool TryEncodeLanceFilterIRMessage(const vector<string> &parts,

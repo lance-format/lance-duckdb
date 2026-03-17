@@ -175,10 +175,11 @@ int32_t lance_commit_transaction_with_storage_options(
     size_t options_len, void *transaction);
 void lance_free_transaction(void *transaction);
 
-int32_t lance_overwrite_update_transaction_with_storage_options(
+int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     const char *path, const char **option_keys, const char **option_values,
-    size_t options_len, const char *predicate, const char **set_columns,
-    const char **set_expressions, size_t set_len, uint64_t max_rows_per_file,
+    size_t options_len, const uint8_t *predicate_ir, size_t predicate_ir_len,
+    const char **set_columns, const uint8_t **set_expr_irs,
+    const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
     void **out_transaction, uint64_t *out_rows_updated);
 

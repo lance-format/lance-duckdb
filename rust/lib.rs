@@ -5,6 +5,7 @@ mod datafusion_stream;
 mod error;
 mod exec_ir;
 mod ffi;
+mod expr_ir;
 mod filter_ir;
 mod runtime;
 mod scanner;

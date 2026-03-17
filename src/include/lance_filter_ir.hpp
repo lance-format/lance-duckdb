@@ -26,6 +26,16 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                bool exclude_computed_columns,
                                const Expression &expr, string &out_ir);
 
+bool TryBuildLanceTableFilterIRParts(const vector<string> &names,
+                                     const vector<LogicalType> &types,
+                                     const TableFilterSet &filters,
+                                     vector<string> &out_parts);
+
+bool TryBuildLanceTableFilterIRMessage(const vector<string> &names,
+                                       const vector<LogicalType> &types,
+                                       const TableFilterSet &filters,
+                                       string &out_msg);
+
 bool TryEncodeLanceFilterIRMessage(const vector<string> &parts,
                                    string &out_msg);
 

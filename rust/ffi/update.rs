@@ -13,7 +13,6 @@ use datafusion_common::{DataFusionError, Result as DFResult};
 use futures::{StreamExt, TryStreamExt};
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
-use lance::io::exec::Planner;
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::deletion::DeletionVector;
@@ -25,19 +24,23 @@ use lance_table::rowids::{
 use roaring::RoaringTreemap;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::expr_ir::parse_expr_ir;
+use crate::filter_ir::parse_filter_ir;
 use crate::runtime;
 
 use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_overwrite_update_transaction_with_storage_options(
+pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage_options(
     path: *const c_char,
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
-    predicate: *const c_char,
+    predicate_ir: *const u8,
+    predicate_ir_len: usize,
     set_columns: *const *const c_char,
-    set_expressions: *const *const c_char,
+    set_expr_irs: *const *const u8,
+    set_expr_ir_lens: *const usize,
     set_len: usize,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
@@ -50,9 +53,11 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_storage_options
         option_keys,
         option_values,
         options_len,
-        predicate,
+        predicate_ir,
+        predicate_ir_len,
         set_columns,
-        set_expressions,
+        set_expr_irs,
+        set_expr_ir_lens,
         set_len,
         max_rows_per_file,
         max_rows_per_group,
@@ -113,9 +118,11 @@ fn rewrite_rows_update_transaction_inner(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
-    predicate: *const c_char,
+    predicate_ir: *const u8,
+    predicate_ir_len: usize,
     set_columns: *const *const c_char,
-    set_expressions: *const *const c_char,
+    set_expr_irs: *const *const u8,
+    set_expr_ir_lens: *const usize,
     set_len: usize,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
@@ -137,17 +144,16 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-    let predicate = if predicate.is_null() {
-        None
-    } else {
-        let predicate = unsafe { cstr_to_str(predicate, "predicate")? }.to_string();
-        if predicate.trim().is_empty() {
+    let predicate_ir = if predicate_ir.is_null() {
+        if predicate_ir_len != 0 {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
-                "predicate cannot be empty (pass NULL for full-table update)",
+                "predicate_ir is null but predicate_ir_len != 0",
             ));
         }
-        Some(predicate)
+        None
+    } else {
+        Some(unsafe { slice_from_ptr(predicate_ir, predicate_ir_len, "predicate_ir")? }.to_vec())
     };
 
     if set_len == 0 {
@@ -156,10 +162,10 @@ fn rewrite_rows_update_transaction_inner(
             "set_len must be > 0",
         ));
     }
-    if set_columns.is_null() || set_expressions.is_null() {
+    if set_columns.is_null() || set_expr_irs.is_null() || set_expr_ir_lens.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
-            "set_columns/set_expressions is null with non-zero length",
+            "set_columns/set_expr_irs/set_expr_ir_lens is null with non-zero length",
         ));
     }
 
@@ -199,12 +205,16 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let set_cols_slice = unsafe { slice_from_ptr(set_columns, set_len, "set_columns")? };
-    let set_exprs_slice = unsafe { slice_from_ptr(set_expressions, set_len, "set_expressions")? };
+    let set_expr_ir_ptrs = unsafe { slice_from_ptr(set_expr_irs, set_len, "set_expr_irs")? };
+    let set_expr_ir_lens =
+        unsafe { slice_from_ptr(set_expr_ir_lens, set_len, "set_expr_ir_lens")? };
 
-    let mut set_pairs = Vec::with_capacity(set_len);
-    for (idx, (&col_ptr, &expr_ptr)) in set_cols_slice
+    let mut set_columns_vec = Vec::with_capacity(set_len);
+    let mut set_expr_ir_vec = Vec::with_capacity(set_len);
+    for (idx, ((&col_ptr, &expr_ir_ptr), &expr_ir_len)) in set_cols_slice
         .iter()
-        .zip(set_exprs_slice.iter())
+        .zip(set_expr_ir_ptrs.iter())
+        .zip(set_expr_ir_lens.iter())
         .enumerate()
     {
         if col_ptr.is_null() {
@@ -213,25 +223,20 @@ fn rewrite_rows_update_transaction_inner(
                 format!("set_columns[{idx}] is null"),
             ));
         }
-        if expr_ptr.is_null() {
+        if expr_ir_ptr.is_null() {
             return Err(FfiError::new(
                 ErrorCode::InvalidArgument,
-                format!("set_expressions[{idx}] is null"),
+                format!("set_expr_irs[{idx}] is null"),
             ));
         }
 
         let col = unsafe { CStr::from_ptr(col_ptr) }.to_str().map_err(|err| {
             FfiError::new(ErrorCode::Utf8, format!("set_columns[{idx}] utf8: {err}"))
         })?;
-        let expr = unsafe { CStr::from_ptr(expr_ptr) }
-            .to_str()
-            .map_err(|err| {
-                FfiError::new(
-                    ErrorCode::Utf8,
-                    format!("set_expressions[{idx}] utf8: {err}"),
-                )
-            })?;
-        set_pairs.push((col.to_string(), expr.to_string()));
+        let expr_ir =
+            unsafe { slice_from_ptr(expr_ir_ptr, expr_ir_len, "set_expr_ir_item")? }.to_vec();
+        set_columns_vec.push(col.to_string());
+        set_expr_ir_vec.push(expr_ir);
     }
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
@@ -269,13 +274,11 @@ fn rewrite_rows_update_transaction_inner(
         let dataset = Arc::new(dataset);
 
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
-        let planner = Planner::new(arrow_schema.clone());
-        let predicate_expr = if let Some(predicate) = predicate.as_deref() {
-            let predicate_expr = planner.parse_filter(predicate).map_err(|e| e.to_string())?;
-            let predicate_expr = planner
-                .optimize_expr(predicate_expr)
-                .map_err(|e| e.to_string())?;
-            Some(predicate_expr)
+        let predicate_expr = if let Some(predicate_ir) = predicate_ir.as_deref() {
+            Some(
+                parse_filter_ir(predicate_ir)
+                    .map_err(|e| format!("predicate_ir parse: {e}"))?,
+            )
         } else {
             None
         };
@@ -286,7 +289,7 @@ fn rewrite_rows_update_transaction_inner(
         let mut update_exprs =
             HashMap::<String, Arc<dyn datafusion::physical_expr::PhysicalExpr>>::new();
 
-        for (column, value_sql) in &set_pairs {
+        for (column, value_ir) in set_columns_vec.iter().zip(set_expr_ir_vec.iter()) {
             if column.contains('.') {
                 return Err(format!(
                     "nested column references are not supported: {}",
@@ -299,17 +302,8 @@ fn rewrite_rows_update_transaction_inner(
                 .field(column.as_str())
                 .ok_or_else(|| format!("column does not exist: {}", column))?;
 
-            let value_sql = if value_sql.trim().eq_ignore_ascii_case("DEFAULT") {
-                field
-                    .metadata
-                    .get("duckdb_default_expr")
-                    .map(|s| s.as_str())
-                    .unwrap_or("NULL")
-            } else {
-                value_sql.as_str()
-            };
-
-            let mut value_expr = planner.parse_expr(value_sql).map_err(|e| e.to_string())?;
+            let mut value_expr =
+                parse_expr_ir(value_ir, Some(&session_ctx)).map_err(|e| e.to_string())?;
 
             let dest_type = field.data_type();
             let src_type = value_expr.get_type(&df_schema).map_err(|e| e.to_string())?;
@@ -319,9 +313,6 @@ fn rewrite_rows_update_transaction_inner(
                     .map_err(|e| e.to_string())?;
             }
 
-            let value_expr = planner
-                .optimize_expr(value_expr)
-                .map_err(|e| e.to_string())?;
             let physical_expr = session_ctx
                 .create_physical_expr(value_expr, &df_schema)
                 .map_err(|e| e.to_string())?;
@@ -458,7 +449,7 @@ fn rewrite_rows_update_transaction_inner(
                 .map_err(|e| e.to_string())?;
 
         let mut fields_for_preserving_frag_bitmap = Vec::new();
-        for (column_name, _) in set_pairs {
+        for column_name in set_columns_vec.iter() {
             if let Ok(field_id) = dataset.schema().field_id(column_name.as_str()) {
                 fields_for_preserving_frag_bitmap.push(field_id as u32);
             }

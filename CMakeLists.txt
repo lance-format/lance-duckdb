@@ -23,6 +23,7 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_merge.cpp
                       src/lance_delete.cpp
                       src/lance_update.cpp
+                      src/lance_expr_ir.cpp
                       src/lance_write.cpp
                       src/lance_truncate.cpp
                       src/lance_index.cpp
@@ -143,6 +144,7 @@ set(RUST_FFI_DEPENDS
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
 	    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
 
 set(RUST_CARGO_ENV
