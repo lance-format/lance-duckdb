@@ -81,13 +81,35 @@ SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
 ----
 age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
 
-statement error
+statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col SET NOT NULL;
+
+query TT
+SELECT column_name, is_nullable FROM duckdb_columns()
+WHERE database_name = 'ns'
+  AND schema_name = 'main'
+  AND table_name = 'alter_table_schema_evolution'
+  AND column_name = 'const_col';
 ----
-IO Error: Failed to set NOT NULL in Lance dataset:
+const_col	false
+
+statement error
+INSERT INTO ns.main.alter_table_schema_evolution(id, age, score2, age_plus_one, const_col)
+VALUES (4, 40, 42.5, 41, NULL);
+----
+IO Error: Failed to finalize Lance append transaction
 
 statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col DROP NOT NULL;
+
+query TT
+SELECT column_name, is_nullable FROM duckdb_columns()
+WHERE database_name = 'ns'
+  AND schema_name = 'main'
+  AND table_name = 'alter_table_schema_evolution'
+  AND column_name = 'const_col';
+----
+const_col	true
 
 statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
