@@ -307,7 +307,7 @@ public:
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
     } catch (...) {
       lance_close_dataset(dataset);
-      throw;
+      return nullptr;
     }
     lance_close_dataset(dataset);
 
