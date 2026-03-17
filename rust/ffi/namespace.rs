@@ -2,12 +2,14 @@ use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::Arc;
 
+use arrow::ffi::FFI_ArrowSchema;
 use lance::dataset::builder::DatasetBuilder;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
     CreateEmptyTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
 };
+use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::RestNamespaceBuilder;
 
@@ -15,7 +17,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::DatasetHandle;
-use super::util::{cstr_to_str, to_c_string, FfiError, FfiResult};
+use super::util::{cstr_to_str, schema_to_ffi_arrow_schema, to_c_string, FfiError, FfiResult};
 
 unsafe fn optional_cstr_to_string(
     ptr: *const c_char,
@@ -193,18 +195,22 @@ fn describe_table_info_inner(
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
         req.id = Some(vec![table_id.to_string()]);
+        req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
                 ErrorCode::NamespaceDescribeTableInfo,
                 format!("namespace describe_table: {err}"),
             )
         })?;
-        let location = resp.location.ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::NamespaceDescribeTableInfo,
-                "namespace describe_table: missing location",
-            )
-        })?;
+        let location = resp
+            .table_uri
+            .or(resp.location)
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceDescribeTableInfo,
+                    "namespace describe_table: missing location and table_uri",
+                )
+            })?;
         let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());
         Ok::<_, FfiError>((location, storage_options_tsv))
     })
@@ -443,6 +449,101 @@ pub unsafe extern "C" fn lance_namespace_drop_table(
     }
 }
 
+/// Describe a table with `load_detailed_metadata=true` and return the schema
+/// as a JSON string. This avoids opening the dataset from S3.
+fn describe_table_with_schema_inner(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> FfiResult<String> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
+
+    let schema_json = runtime::block_on(async move {
+        let mut req = DescribeTableRequest::new();
+        req.id = Some(vec![table_id.to_string()]);
+        req.with_table_uri = Some(true);
+        req.load_detailed_metadata = Some(true);
+        let resp = namespace.describe_table(req).await.map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTable,
+                format!("namespace describe_table: {err}"),
+            )
+        })?;
+
+        let schema = resp.schema.ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTable,
+                "namespace describe_table: missing schema in response",
+            )
+        })?;
+
+        serde_json::to_string(&schema).map_err(|err| {
+            FfiError::new(
+                ErrorCode::SchemaExport,
+                format!("failed to serialize schema: {err}"),
+            )
+        })
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+
+    Ok(schema_json)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    out_schema_json: *mut *const c_char,
+) -> i32 {
+    if !out_schema_json.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_schema_json, ptr::null());
+        }
+    }
+
+    match describe_table_with_schema_inner(
+        endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv,
+    ) {
+        Ok(schema_json) => {
+            clear_last_error();
+            if !out_schema_json.is_null() {
+                let c = CString::new(schema_json)
+                    .unwrap_or_else(|_| to_c_string("invalid schema json"));
+                unsafe {
+                    std::ptr::write_unaligned(out_schema_json, c.into_raw() as *const c_char);
+                }
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 fn open_dataset_in_namespace_inner(
     endpoint: *const c_char,
     table_id: *const c_char,
@@ -471,6 +572,7 @@ fn open_dataset_in_namespace_inner(
     let (dataset, table_uri) = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
         req.id = Some(vec![table_id.to_string()]);
+        req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
                 ErrorCode::NamespaceDescribeTable,
@@ -478,12 +580,15 @@ fn open_dataset_in_namespace_inner(
             )
         })?;
 
-        let table_uri = resp.location.ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
-                "namespace describe_table: missing location",
-            )
-        })?;
+        let table_uri = resp
+            .table_uri
+            .or(resp.location)
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceDescribeTable,
+                    "namespace describe_table: missing location and table_uri",
+                )
+            })?;
         let storage_options = resp.storage_options.unwrap_or_default();
 
         let dataset = DatasetBuilder::from_uri(&table_uri)
@@ -540,6 +645,46 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
         Err(err) => {
             set_last_error(err.code, err.message);
             ptr::null_mut()
+        }
+    }
+}
+
+/// Convert a JSON Arrow schema string to Arrow C Data Interface ArrowSchema.
+#[no_mangle]
+pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
+    json_schema: *const c_char,
+    out_schema: *mut FFI_ArrowSchema,
+) -> i32 {
+    let result = (|| -> FfiResult<()> {
+        let json_str = unsafe { cstr_to_str(json_schema, "json_schema")? };
+        let json_arrow: lance_namespace::models::JsonArrowSchema =
+            serde_json::from_str(json_str).map_err(|err| {
+                FfiError::new(
+                    ErrorCode::SchemaExport,
+                    format!("failed to parse JSON arrow schema: {err}"),
+                )
+            })?;
+        let arrow_schema = convert_json_arrow_schema(&json_arrow).map_err(|err| {
+            FfiError::new(
+                ErrorCode::SchemaExport,
+                format!("failed to convert JSON arrow schema: {err}"),
+            )
+        })?;
+        let ffi_schema = schema_to_ffi_arrow_schema(&arrow_schema)?;
+        unsafe {
+            std::ptr::write_unaligned(out_schema, ffi_schema);
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
         }
     }
 }

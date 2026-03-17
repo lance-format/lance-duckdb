@@ -26,6 +26,12 @@ const char *
 lance_namespace_list_tables(const char *endpoint, const char *namespace_id,
                             const char *bearer_token, const char *api_key,
                             const char *delimiter, const char *headers_tsv);
+int32_t lance_json_arrow_schema_to_c(const char *json_schema,
+                                      ArrowSchema *out_schema);
+int32_t lance_namespace_describe_table_with_schema(
+    const char *endpoint, const char *table_id, const char *bearer_token,
+    const char *api_key, const char *delimiter, const char *headers_tsv,
+    const char **out_schema_json);
 int32_t lance_namespace_describe_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,

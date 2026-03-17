@@ -144,6 +144,23 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
   return headers_tsv;
 }
 
+static void PopulateColumnsFromArrowSchema(ClientContext &context,
+                                            ArrowSchema &arrow_schema,
+                                            ColumnList &out_columns) {
+  ArrowTableSchema arrow_table;
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+                                               arrow_schema);
+  const auto names = arrow_table.GetNames();
+  const auto types = arrow_table.GetTypes();
+  if (names.size() != types.size()) {
+    throw InternalException(
+        "Arrow table schema returned mismatched names/types sizes");
+  }
+  for (idx_t i = 0; i < names.size(); i++) {
+    out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
+  }
+}
+
 static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
                                                  void *dataset,
                                                  ColumnList &out_columns) {
@@ -162,20 +179,8 @@ static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-
-  ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               schema_root.arrow_schema);
-  const auto names = arrow_table.GetNames();
-  const auto types = arrow_table.GetTypes();
-  if (names.size() != types.size()) {
-    throw InternalException(
-        "Arrow table schema returned mismatched names/types sizes");
-  }
-
-  for (idx_t i = 0; i < names.size(); i++) {
-    out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
-  }
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
+                                 out_columns);
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -291,8 +296,16 @@ public:
       dataset_uri = uri_ptr;
       lance_free_string(uri_ptr);
     }
+    if (dataset_uri.empty()) {
+      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+    }
     if (!dataset) {
-      return nullptr;
+      // Return an empty entry to prevent DuckDB crash on nullptr.
+      CreateTableInfo info(schema, entry_name);
+      info.internal = true;
+      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      return make_uniq_base<CatalogEntry, LanceTableEntry>(
+          catalog, schema, info, std::move(dataset_uri));
     }
 
     CreateTableInfo info(schema, entry_name);
@@ -302,13 +315,14 @@ public:
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
     } catch (...) {
       lance_close_dataset(dataset);
-      throw;
+      CreateTableInfo empty_info(schema, entry_name);
+      empty_info.internal = true;
+      empty_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      return make_uniq_base<CatalogEntry, LanceTableEntry>(
+          catalog, schema, empty_info, std::move(dataset_uri));
     }
     lance_close_dataset(dataset);
 
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     return make_uniq_base<CatalogEntry, LanceTableEntry>(
         catalog, schema, info, std::move(dataset_uri));
   }
@@ -324,6 +338,21 @@ private:
   SchemaCatalogEntry &schema;
   shared_ptr<LanceDirectoryNamespaceConfig> ns;
 };
+
+static void PopulateLanceTableColumnsFromJsonSchema(ClientContext &context,
+                                                     const string &schema_json,
+                                                     ColumnList &out_columns) {
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_json_arrow_schema_to_c(schema_json.c_str(),
+                                    &schema_root.arrow_schema) != 0) {
+    throw IOException("Failed to convert JSON Arrow schema to C Data "
+                      "Interface" +
+                      LanceFormatErrorSuffix());
+  }
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
+                                 out_columns);
+}
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
 public:
@@ -362,51 +391,63 @@ public:
       resolved_api_key = api_key;
     }
 
-    auto candidate_table_id = entry_name;
-    string fallback_table_id;
+    // Build candidate table IDs (bare name + optional namespace-prefixed).
+    vector<string> candidates = {entry_name};
     if (!namespace_id.empty()) {
       auto delim = delimiter.empty() ? "$" : delimiter;
       auto prefix = namespace_id + delim;
       if (!StringUtil::StartsWith(entry_name, prefix)) {
-        fallback_table_id = prefix + entry_name;
+        candidates.push_back(prefix + entry_name);
       }
     }
 
-    string table_id = candidate_table_id;
-    string table_uri;
-    auto *dataset = LanceOpenDatasetInNamespace(
-        context, endpoint, candidate_table_id, resolved_bearer,
-        resolved_api_key, delimiter, headers_tsv, table_uri);
-    if (!dataset && !fallback_table_id.empty()) {
-      table_id = fallback_table_id;
-      dataset = LanceOpenDatasetInNamespace(context, endpoint, table_id,
-                                            resolved_bearer, resolved_api_key,
-                                            delimiter, headers_tsv, table_uri);
-    }
-    if (!dataset) {
-      return nullptr;
+    // Fast path: describe_table with schema from REST API (skips S3 open).
+    for (auto &table_id : candidates) {
+      string schema_json;
+      if (!TryDescribeTableWithSchema(table_id, resolved_bearer,
+                                      resolved_api_key, schema_json)) {
+        continue;
+      }
+      CreateTableInfo info(schema, entry_name);
+      info.internal = true;
+      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      try {
+        PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
+                                                info.columns);
+      } catch (...) {
+        continue; // Schema conversion failed, try next candidate.
+      }
+      return MakeNamespaceEntry(entry_name, table_id, std::move(info));
     }
 
+    // Slow fallback: open dataset from S3.
+    for (auto &table_id : candidates) {
+      string table_uri;
+      auto *dataset = LanceOpenDatasetInNamespace(
+          context, endpoint, table_id, resolved_bearer, resolved_api_key,
+          delimiter, headers_tsv, table_uri);
+      if (!dataset) {
+        continue;
+      }
+      CreateTableInfo info(schema, entry_name);
+      info.internal = true;
+      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      try {
+        PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+      } catch (...) {
+        lance_close_dataset(dataset);
+        continue;
+      }
+      lance_close_dataset(dataset);
+      return MakeNamespaceEntry(entry_name, table_id, std::move(info));
+    }
+
+    // All paths failed — return an empty entry to prevent DuckDB crash.
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    try {
-      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
-    } catch (...) {
-      lance_close_dataset(dataset);
-      throw;
-    }
-    lance_close_dataset(dataset);
-
-    LanceNamespaceTableConfig cfg;
-    cfg.endpoint = endpoint;
-    cfg.table_id = table_id;
-    cfg.delimiter = delimiter;
-    cfg.bearer_token_override = bearer_token_override;
-    cfg.api_key_override = api_key_override;
-    cfg.headers_tsv = headers_tsv;
-    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
-                                                         std::move(cfg));
+    return MakeNamespaceEntry(entry_name, candidates.front(),
+                              std::move(info));
   }
 
   vector<string> GetDefaultEntries() override {
@@ -426,6 +467,45 @@ public:
   }
 
 private:
+  unique_ptr<CatalogEntry>
+  MakeNamespaceEntry(const string &entry_name, const string &table_id,
+                     CreateTableInfo info) {
+    LanceNamespaceTableConfig cfg;
+    cfg.endpoint = endpoint;
+    cfg.table_id = table_id;
+    cfg.delimiter = delimiter;
+    cfg.bearer_token_override = bearer_token_override;
+    cfg.api_key_override = api_key_override;
+    cfg.headers_tsv = headers_tsv;
+    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
+                                                         std::move(cfg));
+  }
+
+  bool TryDescribeTableWithSchema(const string &table_id,
+                                   const string &resolved_bearer,
+                                   const string &resolved_api_key,
+                                   string &out_schema_json) {
+    const char *bearer_ptr =
+        resolved_bearer.empty() ? nullptr : resolved_bearer.c_str();
+    const char *api_key_ptr =
+        resolved_api_key.empty() ? nullptr : resolved_api_key.c_str();
+    const char *delimiter_ptr =
+        delimiter.empty() ? nullptr : delimiter.c_str();
+    const char *headers_ptr =
+        headers_tsv.empty() ? nullptr : headers_tsv.c_str();
+    const char *schema_ptr = nullptr;
+
+    auto rc = lance_namespace_describe_table_with_schema(
+        endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+        delimiter_ptr, headers_ptr, &schema_ptr);
+    if (rc != 0 || !schema_ptr) {
+      return false;
+    }
+    out_schema_json = schema_ptr;
+    lance_free_string(schema_ptr);
+    return !out_schema_json.empty();
+  }
+
   SchemaCatalogEntry &schema;
   string endpoint;
   string namespace_id;
