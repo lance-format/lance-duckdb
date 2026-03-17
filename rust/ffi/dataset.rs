@@ -371,6 +371,33 @@ pub unsafe extern "C" fn lance_dataset_list_field_stats(
     }
 }
 
+/// Transfer a boxed slice to C, writing its length to `out_len`.
+unsafe fn boxed_slice_to_c<T>(items: Vec<T>, out_len: *mut usize) -> *mut T {
+    let mut boxed = items.into_boxed_slice();
+    let len = boxed.len();
+    let data = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    std::ptr::write_unaligned(out_len, len);
+    data
+}
+
+macro_rules! fetch_data_stats {
+    ($handle:expr) => {
+        match runtime::block_on($handle.dataset.calculate_data_stats()) {
+            Ok(Ok(stats)) => stats,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetCalculateDataStats,
+                    format!("dataset calculate_data_stats: {err}"),
+                ))
+            }
+            Err(err) => {
+                return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
+            }
+        }
+    };
+}
+
 fn dataset_list_field_stats_inner(
     dataset: *mut c_void,
     out_len: *mut usize,
@@ -380,35 +407,18 @@ fn dataset_list_field_stats_inner(
     }
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let stats = fetch_data_stats!(handle);
 
-    let stats = match runtime::block_on(handle.dataset.calculate_data_stats()) {
-        Ok(Ok(stats)) => stats,
-        Ok(Err(err)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetCalculateDataStats,
-                format!("dataset calculate_data_stats: {err}"),
-            ))
-        }
-        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    };
-
-    let mut out: Vec<LanceFieldStats> = Vec::with_capacity(stats.fields.len());
-    for field in stats.fields {
-        out.push(LanceFieldStats {
+    let out: Vec<LanceFieldStats> = stats
+        .fields
+        .into_iter()
+        .map(|field| LanceFieldStats {
             field_id: field.id,
             bytes_on_disk: field.bytes_on_disk,
-        });
-    }
+        })
+        .collect();
 
-    let mut boxed = out.into_boxed_slice();
-    let len = boxed.len();
-    let data = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-
-    unsafe {
-        std::ptr::write_unaligned(out_len, len);
-    }
-    Ok(data)
+    Ok(unsafe { boxed_slice_to_c(out, out_len) })
 }
 
 #[no_mangle]
@@ -419,6 +429,89 @@ pub unsafe extern "C" fn lance_free_field_stats_list(ptr: *mut LanceFieldStats, 
     unsafe {
         let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
         let _ = Box::<[LanceFieldStats]>::from_raw(slice);
+    }
+}
+
+#[repr(C)]
+pub struct LanceNamedFieldStats {
+    pub name: *const c_char,
+    pub bytes_on_disk: u64,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_named_field_stats(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut LanceNamedFieldStats {
+    match dataset_list_named_field_stats_inner(dataset, out_len) {
+        Ok(ptr) => {
+            clear_last_error();
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn dataset_list_named_field_stats_inner(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> FfiResult<*mut LanceNamedFieldStats> {
+    if out_len.is_null() {
+        return Err(FfiError::new(ErrorCode::InvalidArgument, "out_len is null"));
+    }
+
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let stats = fetch_data_stats!(handle);
+
+    // Build field_id → name map from lance schema.
+    let lance_schema = handle.dataset.schema();
+    let mut id_to_name: HashMap<i32, String> = HashMap::new();
+    fn collect_field_names(
+        fields: &[lance_core::datatypes::Field],
+        map: &mut HashMap<i32, String>,
+    ) {
+        for f in fields {
+            map.insert(f.id, f.name.clone());
+            collect_field_names(&f.children, map);
+        }
+    }
+    collect_field_names(&lance_schema.fields, &mut id_to_name);
+
+    let out: Vec<LanceNamedFieldStats> = stats
+        .fields
+        .into_iter()
+        .filter_map(|field| {
+            let name = id_to_name.get(&(field.id as i32))?;
+            Some(LanceNamedFieldStats {
+                name: super::util::to_c_string(name).into_raw(),
+                bytes_on_disk: field.bytes_on_disk,
+            })
+        })
+        .collect();
+
+    Ok(unsafe { boxed_slice_to_c(out, out_len) })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_named_field_stats_list(
+    ptr: *mut LanceNamedFieldStats,
+    len: usize,
+) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(ptr, len);
+        for item in slice.iter() {
+            if !item.name.is_null() {
+                let _ = std::ffi::CString::from_raw(item.name as *mut c_char);
+            }
+        }
+        let boxed = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+        drop(boxed);
     }
 }
 

@@ -38,6 +38,10 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   auto &instance = loader.GetDatabaseInstance();
   RegisterLanceSecrets(instance);
   auto &config = DBConfig::GetConfig(instance);
+  config.AddExtensionOption("lance_deferred_materialization",
+                            "Enable deferred materialization for heavy columns "
+                            "when filter pushdown fails",
+                            LogicalType::BOOLEAN, Value::BOOLEAN(true));
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
