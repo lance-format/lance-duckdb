@@ -140,7 +140,7 @@ typedef struct LanceNamedFieldStats {
 } LanceNamedFieldStats;
 
 LanceNamedFieldStats *lance_dataset_list_named_field_stats(void *dataset,
-                                                            size_t *out_len);
+                                                           size_t *out_len);
 void lance_free_named_field_stats_list(LanceNamedFieldStats *ptr, size_t len);
 void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const char **columns, size_t columns_len,

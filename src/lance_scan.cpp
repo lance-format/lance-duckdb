@@ -210,7 +210,8 @@ static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
     UINT64_C(9223372036854775900);
 
 static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
-static constexpr const char *LANCE_DEFERRED_SETTING = "lance_deferred_materialization";
+static constexpr const char *LANCE_DEFERRED_SETTING =
+    "lance_deferred_materialization";
 static constexpr uint64_t DEFERRED_AVG_BYTES_THRESHOLD = 1024;
 
 static bool IsLanceVirtualRowIdColumnId(column_t col_id) {
@@ -1167,10 +1168,9 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   // meaning DuckDB will filter post-scan. We defer heavy columns to avoid
   // reading them for rows that will be filtered out.
   // (When filter IS pushed, Lance SDK handles late materialization internally.)
-  if (!scan_state.sampling_pushed_down &&
-      !scan_state.filter_pushed_down &&
-      !scan_state.scan_column_names.empty() &&
-      input.filters && !input.filters->filters.empty() &&
+  if (!scan_state.sampling_pushed_down && !scan_state.filter_pushed_down &&
+      !scan_state.scan_column_names.empty() && input.filters &&
+      !input.filters->filters.empty() &&
       LanceDeferredMaterializationEnabled(context)) {
     // Collect columns referenced by DuckDB-side filters.
     unordered_set<string> filter_referenced_columns;
@@ -1189,8 +1189,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     auto total_rows = lance_dataset_count_rows(bind_data.dataset);
     if (total_rows > 0) {
       size_t stats_len = 0;
-      auto stats = lance_dataset_list_named_field_stats(bind_data.dataset,
-                                                        &stats_len);
+      auto stats =
+          lance_dataset_list_named_field_stats(bind_data.dataset, &stats_len);
       unordered_set<string> stats_covered;
       if (stats) {
         for (size_t i = 0; i < stats_len; i++) {
@@ -1199,8 +1199,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
           }
           string col_name = stats[i].name;
           stats_covered.insert(col_name);
-          auto avg_bytes = stats[i].bytes_on_disk /
-                           static_cast<uint64_t>(total_rows);
+          auto avg_bytes =
+              stats[i].bytes_on_disk / static_cast<uint64_t>(total_rows);
           if (avg_bytes > DEFERRED_AVG_BYTES_THRESHOLD) {
             heavy_columns.insert(col_name);
           }
@@ -1253,8 +1253,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         old_to_new_scan_idx[i] = new_idx;
         new_scan_column_ids.push_back(scan_state.scan_column_ids[i]);
         new_scan_column_names.push_back(scan_state.scan_column_names[i]);
-        new_scan_converted_types.push_back(
-            scan_state.scan_converted_types[i]);
+        new_scan_converted_types.push_back(scan_state.scan_converted_types[i]);
       }
 
       // Ensure _rowid is in the light scan.
@@ -1268,8 +1267,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       }
       if (!has_rowid) {
         scan_state.rowid_scan_converted_idx = new_scan_column_names.size();
-        auto rowid_col_id =
-            NumericCast<column_t>(bind_data.types.size());
+        auto rowid_col_id = NumericCast<column_t>(bind_data.types.size());
         new_scan_column_ids.push_back(rowid_col_id);
         new_scan_column_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
         new_scan_converted_types.push_back(LogicalType::UBIGINT);
@@ -1284,8 +1282,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.output_to_deferred_idx.resize(
           scan_state.output_to_scan_converted_idx.size(),
           DConstants::INVALID_INDEX);
-      for (idx_t i = 0;
-           i < scan_state.output_to_scan_converted_idx.size(); i++) {
+      for (idx_t i = 0; i < scan_state.output_to_scan_converted_idx.size();
+           i++) {
         auto old_idx = scan_state.output_to_scan_converted_idx[i];
         if (old_idx == DConstants::INVALID_INDEX) {
           continue;
@@ -1580,10 +1578,11 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   return true;
 }
 
-static void LanceFillDeferredColumns(
-    ClientContext &context, const LanceScanBindData &bind_data,
-    LanceScanGlobalState &global_state, LanceScanLocalState &local_state,
-    DataChunk &target, idx_t pre_filter_size) {
+static void LanceFillDeferredColumns(ClientContext &context,
+                                     const LanceScanBindData &bind_data,
+                                     LanceScanGlobalState &global_state,
+                                     LanceScanLocalState &local_state,
+                                     DataChunk &target, idx_t pre_filter_size) {
   auto surviving_count = target.size();
   if (surviving_count == 0) {
     return;
@@ -1597,9 +1596,8 @@ static void LanceFillDeferredColumns(
   bool filter_sliced =
       !local_state.filter_pushed_down && surviving_count < pre_filter_size;
   for (idx_t i = 0; i < surviving_count; i++) {
-    row_ids[i] = filter_sliced
-                     ? rowid_data[local_state.filter_sel.get_index(i)]
-                     : rowid_data[i];
+    row_ids[i] = filter_sliced ? rowid_data[local_state.filter_sel.get_index(i)]
+                               : rowid_data[i];
   }
 
   vector<const char *> col_ptrs;
@@ -1619,11 +1617,10 @@ static void LanceFillDeferredColumns(
   auto rc = lance_stream_next(take_stream, &batch);
   if (rc != 0 || !batch) {
     lance_close_stream(take_stream);
-    throw IOException(
-        rc == 1 ? "Deferred take returned no data for " +
-                      to_string(surviving_count) + " row IDs"
-                : "Failed to read deferred take batch" +
-                      LanceFormatErrorSuffix());
+    throw IOException(rc == 1 ? "Deferred take returned no data for " +
+                                    to_string(surviving_count) + " row IDs"
+                              : "Failed to read deferred take batch" +
+                                    LanceFormatErrorSuffix());
   }
 
   auto take_arrow = make_shared_ptr<ArrowArrayWrapper>();
@@ -1639,7 +1636,8 @@ static void LanceFillDeferredColumns(
   }
   lance_free_batch(batch);
 
-  // Verify take stream is exhausted (take_rows should return exactly one batch).
+  // Verify take stream is exhausted (take_rows should return exactly one
+  // batch).
   void *extra_batch = nullptr;
   auto extra_rc = lance_stream_next(take_stream, &extra_batch);
   if (extra_rc == 0 && extra_batch) {
@@ -1699,8 +1697,7 @@ static void LanceFillDeferredColumns(
     if (deferred_idx >= local_state.deferred_converted.ColumnCount()) {
       throw InternalException("Deferred column index out of range");
     }
-    target.data[i].Reference(
-        local_state.deferred_converted.data[deferred_idx]);
+    target.data[i].Reference(local_state.deferred_converted.data[deferred_idx]);
   }
 }
 
