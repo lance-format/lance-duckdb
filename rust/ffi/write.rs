@@ -72,7 +72,7 @@ struct WriterHandle {
 
 enum WriterResult {
     Committed,
-    Uncommitted(lance::dataset::transaction::Transaction),
+    Uncommitted(Box<lance::dataset::transaction::Transaction>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +257,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -269,7 +269,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -304,7 +304,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float64Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -316,7 +316,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -351,7 +351,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -363,7 +363,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -398,7 +398,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float64Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -410,7 +410,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -468,10 +468,8 @@ fn convert_record_batch(
     conversions: &[VectorConversion],
 ) -> Result<RecordBatch, String> {
     if conversions.is_empty() {
-        return Ok(
-            RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
-                .map_err(|e| e.to_string())?,
-        );
+        return RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
+            .map_err(|e| e.to_string());
     }
     let mut cols = input_batch.columns().to_vec();
     for conv in conversions {
@@ -510,7 +508,7 @@ fn spawn_writer_thread(
                 let builder = InsertBuilder::new(path.as_str()).with_params(&params);
                 let fut = builder.execute_uncommitted_stream(source);
                 match runtime::block_on(fut) {
-                    Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(txn)),
+                    Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(Box::new(txn))),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(err) => Err(format!("runtime: {err}")),
                 }
@@ -617,6 +615,7 @@ fn parse_data_storage_version_arg(
     Ok(Some(normalized))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_uncommitted_writer_inner(
     path: *const c_char,
     mode: *const c_char,
@@ -764,6 +763,7 @@ fn open_uncommitted_writer_inner(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_writer_inner(
     path: *const c_char,
     mode: *const c_char,
@@ -1289,9 +1289,8 @@ fn writer_finish_uncommitted_inner(
         }
     };
 
-    let boxed = Box::new(txn);
     unsafe {
-        *out_transaction = Box::into_raw(boxed) as *mut c_void;
+        *out_transaction = Box::into_raw(txn) as *mut c_void;
     }
 
     Ok(())

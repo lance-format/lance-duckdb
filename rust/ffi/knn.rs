@@ -48,6 +48,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn get_knn_schema_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,

@@ -20,22 +20,12 @@ use crate::runtime;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct OptimizeIndexOptionsInput {
     mode: Option<String>,
     retrain: Option<bool>,
     num_indices_to_merge: Option<usize>,
-}
-
-impl Default for OptimizeIndexOptionsInput {
-    fn default() -> Self {
-        Self {
-            mode: None,
-            retrain: None,
-            num_indices_to_merge: None,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -194,10 +184,7 @@ pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_free_scalar_indexed_columns(
-    ptr: *mut *mut c_char,
-    len: usize,
-) {
+pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char, len: usize) {
     if ptr.is_null() {
         return;
     }
@@ -612,7 +599,10 @@ fn dataset_optimize_index_with_options_inner(
             )
         })?;
         unsafe {
-            ptr::write_unaligned(out_metrics_json, to_c_string(payload).into_raw() as *const c_char);
+            ptr::write_unaligned(
+                out_metrics_json,
+                to_c_string(payload).into_raw() as *const c_char,
+            );
         }
     }
     Ok(())
@@ -622,8 +612,7 @@ fn normalize_index_type(index_type: &str) -> String {
     index_type
         .trim()
         .to_ascii_uppercase()
-        .replace('-', "_")
-        .replace(' ', "_")
+        .replace(['-', ' '], "_")
 }
 
 fn build_index_params(
