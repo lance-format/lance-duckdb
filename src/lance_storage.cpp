@@ -296,8 +296,16 @@ public:
       dataset_uri = uri_ptr;
       lance_free_string(uri_ptr);
     }
+    if (dataset_uri.empty()) {
+      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+    }
     if (!dataset) {
-      return nullptr;
+      // Return an empty entry so CreateDefaultEntries does not crash.
+      CreateTableInfo info(schema, entry_name);
+      info.internal = true;
+      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      return make_uniq_base<CatalogEntry, LanceTableEntry>(
+          catalog, schema, info, std::move(dataset_uri));
     }
 
     CreateTableInfo info(schema, entry_name);
@@ -307,13 +315,12 @@ public:
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
     } catch (...) {
       lance_close_dataset(dataset);
-      return nullptr;
+      // Return an empty entry so CreateDefaultEntries does not crash.
+      return make_uniq_base<CatalogEntry, LanceTableEntry>(
+          catalog, schema, info, std::move(dataset_uri));
     }
     lance_close_dataset(dataset);
 
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     return make_uniq_base<CatalogEntry, LanceTableEntry>(
         catalog, schema, info, std::move(dataset_uri));
   }
