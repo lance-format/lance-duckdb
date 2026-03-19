@@ -276,10 +276,7 @@ fn rewrite_rows_update_transaction_inner(
 
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
         let predicate_expr = if let Some(predicate_ir) = predicate_ir.as_deref() {
-            Some(
-                parse_filter_ir(predicate_ir)
-                    .map_err(|e| format!("predicate_ir parse: {e}"))?,
-            )
+            Some(parse_filter_ir(predicate_ir).map_err(|e| format!("predicate_ir parse: {e}"))?)
         } else {
             None
         };

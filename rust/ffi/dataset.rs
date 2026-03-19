@@ -391,9 +391,7 @@ macro_rules! fetch_data_stats {
                     format!("dataset calculate_data_stats: {err}"),
                 ))
             }
-            Err(err) => {
-                return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
-            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
     };
 }

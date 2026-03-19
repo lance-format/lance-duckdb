@@ -200,7 +200,9 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_i128(&mut self) -> Result<i128, String> {
-        Ok(i128::from_le_bytes(self.read_bytes(16)?.try_into().unwrap()))
+        Ok(i128::from_le_bytes(
+            self.read_bytes(16)?.try_into().unwrap(),
+        ))
     }
 
     fn read_f32(&mut self) -> Result<f32, String> {
@@ -307,11 +309,7 @@ fn parse_node(cursor: &mut Cursor<'_>, ctx: Option<&SessionContext>) -> Result<E
             let mut expr = first;
             for _ in 1..child_count {
                 let rhs = parse_subexpr(cursor.read_len_prefixed_bytes()?, ctx)?;
-                expr = Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(expr),
-                    op,
-                    Box::new(rhs),
-                ));
+                expr = Expr::BinaryExpr(BinaryExpr::new(Box::new(expr), op, Box::new(rhs)));
             }
             Ok(expr)
         }
@@ -342,7 +340,10 @@ fn parse_node(cursor: &mut Cursor<'_>, ctx: Option<&SessionContext>) -> Result<E
             }
             let has_else = cursor.read_u8()? != 0;
             let else_expr = if has_else {
-                Some(Box::new(parse_subexpr(cursor.read_len_prefixed_bytes()?, ctx)?))
+                Some(Box::new(parse_subexpr(
+                    cursor.read_len_prefixed_bytes()?,
+                    ctx,
+                )?))
             } else {
                 None
             };
@@ -432,10 +433,7 @@ fn parse_like(cursor: &mut Cursor<'_>, ctx: Option<&SessionContext>) -> Result<E
     )))
 }
 
-fn parse_regexp(
-    cursor: &mut Cursor<'_>,
-    ctx: Option<&SessionContext>,
-) -> Result<Expr, String> {
+fn parse_regexp(cursor: &mut Cursor<'_>, ctx: Option<&SessionContext>) -> Result<Expr, String> {
     let mode = cursor.read_u8()?;
     let has_flags = cursor.read_u8()? != 0;
     let value = parse_subexpr(cursor.read_len_prefixed_bytes()?, ctx)?;
@@ -531,12 +529,8 @@ fn parse_literal(cursor: &mut Cursor<'_>) -> Result<Expr, String> {
             let value = cursor.read_i64()?;
             match unit {
                 TS_UNIT_SECOND => ScalarValue::TimestampSecond(Some(value), None),
-                TS_UNIT_MILLISECOND => {
-                    ScalarValue::TimestampMillisecond(Some(value), None)
-                }
-                TS_UNIT_MICROSECOND => {
-                    ScalarValue::TimestampMicrosecond(Some(value), None)
-                }
+                TS_UNIT_MILLISECOND => ScalarValue::TimestampMillisecond(Some(value), None),
+                TS_UNIT_MICROSECOND => ScalarValue::TimestampMicrosecond(Some(value), None),
                 TS_UNIT_NANOSECOND => ScalarValue::TimestampNanosecond(Some(value), None),
                 other => return Err(format!("invalid expr_ir timestamp unit: {other}")),
             }

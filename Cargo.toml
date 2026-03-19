@@ -19,14 +19,14 @@ panic = "abort"
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
-lance = { version = "3.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
-lance-arrow = "3.0.0"
-lance-core = "3.0.0"
-lance-index = "3.0.0"
-lance-linalg = "3.0.0"
-lance-namespace = "3.0.0"
-lance-namespace-impls = { version = "3.0.0", features = ["rest"] }
-lance-table = "3.0.0"
+lance = { version = "3.0.1", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
+lance-arrow = "3.0.1"
+lance-core = "3.0.1"
+lance-index = "3.0.1"
+lance-linalg = "3.0.1"
+lance-namespace = "3.0.1"
+lance-namespace-impls = { version = "3.0.1", features = ["rest"] }
+lance-table = "3.0.1"
 
 arrow = { version = "57.0.0", features = ["ffi"] }
 arrow-array = "57.0.0"
