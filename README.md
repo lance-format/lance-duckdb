@@ -4,12 +4,12 @@
 
 ## Install
 
-### Install from DuckDB Community Extensions (recommended)
+### Install from DuckDB (recommended)
 
 If you just want to use the extension, install it directly from DuckDB's community extensions repository:
 
 ```sql
-INSTALL lance FROM community;
+INSTALL lance;
 LOAD lance;
 
 SELECT *
