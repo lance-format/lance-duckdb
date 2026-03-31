@@ -207,15 +207,12 @@ fn describe_table_info_inner(
                 format!("namespace describe_table: {err}"),
             )
         })?;
-        let location = resp
-            .table_uri
-            .or(resp.location)
-            .ok_or_else(|| {
-                FfiError::new(
-                    ErrorCode::NamespaceDescribeTableInfo,
-                    "namespace describe_table: missing location and table_uri",
-                )
-            })?;
+        let location = resp.table_uri.or(resp.location).ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::NamespaceDescribeTableInfo,
+                "namespace describe_table: missing location and table_uri",
+            )
+        })?;
         let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());
         Ok::<_, FfiError>((location, storage_options_tsv))
     })
@@ -529,7 +526,12 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
     }
 
     match describe_table_with_schema_inner(
-        endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv,
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
     ) {
         Ok(schema_json) => {
             clear_last_error();
@@ -697,13 +699,13 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
 ) -> i32 {
     let result = (|| -> FfiResult<()> {
         let json_str = unsafe { cstr_to_str(json_schema, "json_schema")? };
-        let json_arrow: lance_namespace::models::JsonArrowSchema =
-            serde_json::from_str(json_str).map_err(|err| {
-                FfiError::new(
-                    ErrorCode::SchemaExport,
-                    format!("failed to parse JSON arrow schema: {err}"),
-                )
-            })?;
+        let json_arrow: lance_namespace::models::JsonArrowSchema = serde_json::from_str(json_str)
+            .map_err(|err| {
+            FfiError::new(
+                ErrorCode::SchemaExport,
+                format!("failed to parse JSON arrow schema: {err}"),
+            )
+        })?;
         let arrow_schema = convert_json_arrow_schema(&json_arrow).map_err(|err| {
             FfiError::new(
                 ErrorCode::SchemaExport,
