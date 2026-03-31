@@ -16,8 +16,12 @@ use lance_namespace_impls::RestNamespaceBuilder;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::session::{record_dataset_open, record_namespace_describe};
 use super::types::DatasetHandle;
-use super::util::{cstr_to_str, schema_to_ffi_arrow_schema, to_c_string, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
+    FfiResult,
+};
 
 unsafe fn optional_cstr_to_string(
     ptr: *const c_char,
@@ -193,6 +197,7 @@ fn describe_table_info_inner(
     .build();
 
     let (location, storage_options_tsv) = runtime::block_on(async move {
+        record_namespace_describe();
         let mut req = DescribeTableRequest::new();
         req.id = Some(vec![table_id.to_string()]);
         req.with_table_uri = Some(true);
@@ -551,6 +556,7 @@ fn open_dataset_in_namespace_inner(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
+    session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
@@ -568,43 +574,33 @@ fn open_dataset_in_namespace_inner(
     )
     .delimiter(delimiter)
     .build();
+    let session = unsafe { optional_session_handle(session)? };
 
     let (dataset, table_uri) = runtime::block_on(async move {
-        let mut req = DescribeTableRequest::new();
-        req.id = Some(vec![table_id.to_string()]);
-        req.with_table_uri = Some(true);
-        let resp = namespace.describe_table(req).await.map_err(|err| {
-            FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
-                format!("namespace describe_table: {err}"),
-            )
-        })?;
-
-        let table_uri = resp
-            .table_uri
-            .or(resp.location)
-            .ok_or_else(|| {
-                FfiError::new(
-                    ErrorCode::NamespaceDescribeTable,
-                    "namespace describe_table: missing location and table_uri",
-                )
-            })?;
-        let storage_options = resp.storage_options.unwrap_or_default();
-
-        let dataset = DatasetBuilder::from_uri(&table_uri)
-            .with_storage_options(storage_options)
-            .load()
+        record_namespace_describe();
+        let mut builder = DatasetBuilder::from_namespace(
+            Arc::new(namespace),
+            vec![table_id.to_string()],
+        )
             .await
             .map_err(|err| {
                 FfiError::new(
-                    ErrorCode::DatasetOpen,
-                    format!("dataset open '{table_uri}': {err}"),
+                    ErrorCode::NamespaceDescribeTable,
+                    format!("namespace describe_table: {err}"),
                 )
             })?;
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        let dataset = builder.load().await.map_err(|err| {
+            FfiError::new(ErrorCode::DatasetOpen, format!("namespace dataset open: {err}"))
+        })?;
+        let table_uri = dataset.uri().to_string();
         Ok::<_, FfiError>((Arc::new(dataset), table_uri))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
+    record_dataset_open();
     Ok((DatasetHandle::new(dataset), table_uri))
 }
 
@@ -631,6 +627,50 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
         api_key,
         delimiter,
         headers_tsv,
+        ptr::null_mut(),
+    ) {
+        Ok((handle, table_uri)) => {
+            clear_last_error();
+            if !out_table_uri.is_null() {
+                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
+                unsafe {
+                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
+                }
+            }
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    session: *mut c_void,
+    out_table_uri: *mut *const c_char,
+) -> *mut c_void {
+    if !out_table_uri.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_table_uri, ptr::null());
+        }
+    }
+
+    match open_dataset_in_namespace_inner(
+        endpoint,
+        table_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+        session,
     ) {
         Ok((handle, table_uri)) => {
             clear_last_error();

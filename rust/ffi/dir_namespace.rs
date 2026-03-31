@@ -12,8 +12,11 @@ use lance_namespace_impls::DirectoryNamespaceBuilder;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::session::record_dataset_open;
 use super::types::DatasetHandle;
-use super::util::{cstr_to_str, slice_from_ptr, to_c_string, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
+};
 
 fn parse_storage_options(
     option_keys: *const *const c_char,
@@ -119,28 +122,48 @@ fn open_dataset_in_dir_namespace_inner(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
     let root = unsafe { cstr_to_str(root, "root")? }
         .trim_end_matches('/')
         .to_string();
     let table_name = unsafe { cstr_to_str(table_name, "table_name")? };
     let storage_options = parse_storage_options(option_keys, option_values, options_len)?;
+    let session = unsafe { optional_session_handle(session)? };
 
-    let table_uri = format!("{root}/{table_name}.lance");
     let dataset = runtime::block_on(async {
-        let mut builder = DatasetBuilder::from_uri(&table_uri);
+        let mut ns_builder = DirectoryNamespaceBuilder::new(&root).manifest_enabled(false);
         if !storage_options.is_empty() {
-            builder = builder.with_storage_options(storage_options);
+            ns_builder = ns_builder.storage_options(storage_options);
         }
-        builder.load().await.map_err(|err| {
+        let namespace = ns_builder.build().await.map_err(|err| {
             FfiError::new(
                 ErrorCode::DatasetOpen,
-                format!("dataset open '{table_uri}': {err}"),
+                format!("dir namespace build '{root}': {err}"),
             )
+        })?;
+        let mut builder = DatasetBuilder::from_namespace(
+            Arc::new(namespace),
+            vec![table_name.to_string()],
+        )
+            .await
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetOpen,
+                    format!("dir namespace describe '{root}/{table_name}': {err}"),
+                )
+            })?;
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        builder.load().await.map_err(|err| {
+            FfiError::new(ErrorCode::DatasetOpen, format!("dir namespace dataset open: {err}"))
         })
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
+    let table_uri = dataset.uri().to_string();
+    record_dataset_open();
     Ok((DatasetHandle::new(Arc::new(dataset)), table_uri))
 }
 
@@ -165,6 +188,48 @@ pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace(
         option_keys,
         option_values,
         options_len,
+        ptr::null_mut(),
+    ) {
+        Ok((handle, table_uri)) => {
+            clear_last_error();
+            if !out_table_uri.is_null() {
+                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
+                unsafe {
+                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
+                }
+            }
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_in_dir_namespace_with_session(
+    root: *const c_char,
+    table_name: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+    out_table_uri: *mut *const c_char,
+) -> *mut c_void {
+    if !out_table_uri.is_null() {
+        unsafe {
+            std::ptr::write_unaligned(out_table_uri, ptr::null());
+        }
+    }
+
+    match open_dataset_in_dir_namespace_inner(
+        root,
+        table_name,
+        option_keys,
+        option_values,
+        options_len,
+        session,
     ) {
         Ok((handle, table_uri)) => {
             clear_last_error();

@@ -1,13 +1,15 @@
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
+use lance::session::Session;
 
 use crate::error::ErrorCode;
 
-use super::types::{DatasetHandle, SchemaHandle, StreamHandle};
+use super::types::{DatasetHandle, SchemaHandle, SessionHandle, StreamHandle};
 
 #[derive(Debug)]
 pub(crate) struct FfiError {
@@ -153,6 +155,16 @@ pub(crate) unsafe fn dataset_handle<'a>(dataset: *mut c_void) -> FfiResult<&'a D
     }
     // SAFETY: Caller guarantees dataset points to a valid DatasetHandle.
     Ok(unsafe { &*(dataset as *const DatasetHandle) })
+}
+
+pub(crate) unsafe fn optional_session_handle(
+    session: *mut c_void,
+) -> FfiResult<Option<Arc<Session>>> {
+    if session.is_null() {
+        return Ok(None);
+    }
+    let handle = unsafe { &*(session as *const SessionHandle) };
+    Ok(Some(handle.session.clone()))
 }
 
 pub(crate) unsafe fn stream_handle_mut<'a>(stream: *mut c_void) -> FfiResult<&'a mut StreamHandle> {

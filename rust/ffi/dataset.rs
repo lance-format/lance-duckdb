@@ -14,16 +14,19 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::Dataset;
 use roaring::RoaringTreemap;
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
-use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
+    FfiResult,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -44,7 +47,7 @@ pub struct LanceFragmentStats {
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void {
-    match open_dataset_inner(path) {
+    match open_dataset_inner(path, ptr::null_mut()) {
         Ok(handle) => {
             clear_last_error();
             Box::into_raw(Box::new(handle)) as *mut c_void
@@ -56,9 +59,33 @@ pub unsafe extern "C" fn lance_open_dataset(path: *const c_char) -> *mut c_void 
     }
 }
 
-fn open_dataset_inner(path: *const c_char) -> FfiResult<DatasetHandle> {
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_with_session(
+    path: *const c_char,
+    session: *mut c_void,
+) -> *mut c_void {
+    match open_dataset_inner(path, session) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<DatasetHandle> {
     let path_str = unsafe { cstr_to_str(path, "path")? };
-    let dataset = match runtime::block_on(Dataset::open(path_str)) {
+    let session = unsafe { optional_session_handle(session)? };
+    let dataset = match runtime::block_on(async {
+        let mut builder = DatasetBuilder::from_uri(path_str);
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        builder.load().await
+    }) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
             return Err(FfiError::new(
@@ -68,6 +95,7 @@ fn open_dataset_inner(path: *const c_char) -> FfiResult<DatasetHandle> {
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
+    record_dataset_open();
     Ok(DatasetHandle::new(dataset))
 }
 
@@ -78,7 +106,39 @@ pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
     option_values: *const *const c_char,
     options_len: usize,
 ) -> *mut c_void {
-    match open_dataset_with_storage_options_inner(path, option_keys, option_values, options_len) {
+    match open_dataset_with_storage_options_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        ptr::null_mut(),
+    ) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_with_storage_options_and_session(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+) -> *mut c_void {
+    match open_dataset_with_storage_options_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        session,
+    ) {
         Ok(handle) => {
             clear_last_error();
             Box::into_raw(Box::new(handle)) as *mut c_void
@@ -95,8 +155,10 @@ fn open_dataset_with_storage_options_inner(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
 ) -> FfiResult<DatasetHandle> {
     let path_str = unsafe { cstr_to_str(path, "path")? };
+    let session = unsafe { optional_session_handle(session)? };
 
     if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
         return Err(FfiError::new(
@@ -134,10 +196,11 @@ fn open_dataset_with_storage_options_inner(
     }
 
     let dataset = match runtime::block_on(async {
-        DatasetBuilder::from_uri(path_str)
-            .with_storage_options(storage_options)
-            .load()
-            .await
+        let mut builder = DatasetBuilder::from_uri(path_str).with_storage_options(storage_options);
+        if let Some(session) = session {
+            builder = builder.with_session(session);
+        }
+        builder.load().await
     }) {
         Ok(Ok(ds)) => Arc::new(ds),
         Ok(Err(err)) => {
@@ -149,6 +212,7 @@ fn open_dataset_with_storage_options_inner(
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
 
+    record_dataset_open();
     Ok(DatasetHandle::new(dataset))
 }
 

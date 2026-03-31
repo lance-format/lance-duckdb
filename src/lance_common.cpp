@@ -1,6 +1,7 @@
 #include "lance_common.hpp"
 
 #include "lance_ffi.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -412,8 +413,8 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &table_id, const string &bearer_token,
                             const string &api_key, const string &delimiter,
                             const string &headers_tsv, string &out_table_uri) {
-  (void)context;
   out_table_uri.clear();
+  auto *session = LanceGetSessionHandle(context);
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
@@ -421,9 +422,9 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *uri_ptr = nullptr;
-  auto *dataset = lance_open_dataset_in_namespace(
+  auto *dataset = lance_open_dataset_in_namespace_with_session(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr, &uri_ptr);
+      delimiter_ptr, headers_ptr, session, &uri_ptr);
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -437,18 +438,19 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
+  auto *session = LanceGetSessionHandle(context);
 
   if (option_keys.empty()) {
-    return lance_open_dataset(open_path.c_str());
+    return lance_open_dataset_with_session(open_path.c_str(), session);
   }
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
-  return lance_open_dataset_with_storage_options(
-      open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
-      option_keys.size());
+  return lance_open_dataset_with_storage_options_and_session(
+      open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
+      session);
 }
 
 static unordered_map<string, Value>

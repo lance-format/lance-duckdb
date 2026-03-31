@@ -19,6 +19,7 @@ use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::session::record_commit;
 use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
 
 #[repr(C)]
@@ -1389,7 +1390,10 @@ fn commit_transaction_inner(
         .with_store_params(store_params)
         .execute(*txn);
     match runtime::block_on(fut) {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => {
+            record_commit();
+            Ok(())
+        }
         Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetCommitTransaction,
             err.to_string(),

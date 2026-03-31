@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use lance::Dataset;
+use lance::session::Session;
 
 use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
@@ -10,6 +11,10 @@ use crate::scanner::{LanceStream, LanceTakeStream};
 use super::projection;
 
 pub(crate) type SchemaHandle = Arc<Schema>;
+
+pub(crate) struct SessionHandle {
+    pub(crate) session: Arc<Session>,
+}
 
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,

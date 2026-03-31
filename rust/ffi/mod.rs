@@ -10,6 +10,7 @@ mod projection;
 mod scan;
 mod schema_evolution;
 mod search;
+mod session;
 mod stream;
 mod take;
 mod types;
