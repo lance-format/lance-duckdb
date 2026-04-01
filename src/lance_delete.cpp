@@ -207,11 +207,14 @@ public:
         throw IOException("Failed to commit Lance DELETE transaction for '" +
                           open_path + "'" + LanceFormatErrorSuffix());
       }
-      LanceInvalidateDatasetCache(context.client);
+      LanceInvalidateDatasetCacheForTable(context.client, table);
     } else {
+      auto cache_key =
+          LanceBuildDatasetCacheKeyForTable(context.client, table);
       RegisterLancePendingAppend(context.client, table.catalog,
                                  std::move(open_path), std::move(option_keys),
-                                 std::move(option_values), txn);
+                                 std::move(option_values),
+                                 std::move(cache_key), txn);
     }
 
     chunk.SetCardinality(1);

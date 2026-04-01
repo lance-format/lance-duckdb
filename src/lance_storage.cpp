@@ -648,7 +648,7 @@ public:
         throw IOException("Failed to update table comment in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *lance_entry);
     }
 
     auto system_tx =
@@ -683,6 +683,11 @@ public:
     if (!existing_entry) {
       throw InternalException(
           "Failed to drop entry \"%s\" - entry could not be found", info.name);
+    }
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(existing_entry.get());
+    if (!lance_entry) {
+      DuckSchemaEntry::DropEntry(context, info);
+      return;
     }
     auto existing_type = existing_entry->type;
 
@@ -799,7 +804,7 @@ public:
     // chain (old entry + tombstone).
     set.CleanupEntry(*existing_entry);
 
-    LanceInvalidateDatasetCache(context);
+    LanceInvalidateDatasetCacheForTable(context, *lance_entry);
     InvalidateTableDefaults();
   }
 
@@ -1767,6 +1772,7 @@ struct LancePendingAppend {
   string path;
   vector<string> option_keys;
   vector<string> option_values;
+  string cache_key;
   void *transaction = nullptr;
 };
 
@@ -1824,7 +1830,9 @@ public:
     auto result =
         DuckTransactionManager::CommitTransaction(context, transaction_p);
     if (!result.HasError() && !appends.empty()) {
-      LanceInvalidateDatasetCache(context);
+      for (auto &pending : appends) {
+        LanceInvalidateDatasetCache(context, pending.cache_key);
+      }
     }
     return result;
   }
@@ -1867,6 +1875,7 @@ void RegisterLanceStorage(DBConfig &config) {
 void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
                                 string dataset_uri, vector<string> option_keys,
                                 vector<string> option_values,
+                                string cache_key,
                                 void *lance_transaction) {
   auto &txn = Transaction::Get(context, catalog);
   auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
@@ -1879,6 +1888,7 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.path = std::move(dataset_uri);
   pending.option_keys = std::move(option_keys);
   pending.option_values = std::move(option_values);
+  pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
   tm->RegisterPendingAppend(txn, std::move(pending));
 }

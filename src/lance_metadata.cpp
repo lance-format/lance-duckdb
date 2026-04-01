@@ -159,7 +159,7 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
     throw IOException("Failed to update Lance dataset: " +
                       bind_data.dataset_uri + LanceFormatErrorSuffix());
   }
-  LanceInvalidateDatasetCache(context);
+  LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(1));
