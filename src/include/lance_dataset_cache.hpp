@@ -23,18 +23,17 @@ shared_ptr<LanceDatasetCacheEntry>
 LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
                            bool *out_cache_hit = nullptr);
 
-string LanceBuildResolvedPathDatasetCacheKey(
-    const string &open_path, const vector<string> &option_keys,
-    const vector<string> &option_values);
+string
+LanceBuildResolvedPathDatasetCacheKey(const string &open_path,
+                                      const vector<string> &option_keys,
+                                      const vector<string> &option_values);
 
-string LanceBuildPathDatasetCacheKey(ClientContext &context, const string &path);
+string LanceBuildPathDatasetCacheKey(ClientContext &context,
+                                     const string &path);
 
-string LanceBuildNamespaceDatasetCacheKey(const string &endpoint,
-                                          const string &table_id,
-                                          const string &bearer_token,
-                                          const string &api_key,
-                                          const string &delimiter,
-                                          const string &headers_tsv);
+string LanceBuildNamespaceDatasetCacheKey(
+    const string &endpoint, const string &table_id, const string &bearer_token,
+    const string &api_key, const string &delimiter, const string &headers_tsv);
 
 string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
                                          const LanceTableEntry &table);

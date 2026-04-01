@@ -96,9 +96,10 @@ static string FingerprintCacheKeyPart(const string &value) {
   return to_string(Hash(value.c_str(), value.size()));
 }
 
-string LanceBuildResolvedPathDatasetCacheKey(
-    const string &open_path, const vector<string> &option_keys,
-    const vector<string> &option_values) {
+string
+LanceBuildResolvedPathDatasetCacheKey(const string &open_path,
+                                      const vector<string> &option_keys,
+                                      const vector<string> &option_values) {
   if (option_keys.size() != option_values.size()) {
     throw InternalException(
         "Storage option keys/values size mismatch for Lance dataset cache");
@@ -125,12 +126,9 @@ string LanceBuildPathDatasetCacheKey(ClientContext &context,
                                                option_values);
 }
 
-string LanceBuildNamespaceDatasetCacheKey(const string &endpoint,
-                                          const string &table_id,
-                                          const string &bearer_token,
-                                          const string &api_key,
-                                          const string &delimiter,
-                                          const string &headers_tsv) {
+string LanceBuildNamespaceDatasetCacheKey(
+    const string &endpoint, const string &table_id, const string &bearer_token,
+    const string &api_key, const string &delimiter, const string &headers_tsv) {
   string key = "namespace|";
   AppendCacheKeyPart(key, endpoint);
   AppendCacheKeyPart(key, table_id);
@@ -288,8 +286,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
   }
 
   auto &cfg = table.NamespaceConfig();
-  auto overrides = BuildNamespaceAuthOverrideOptions(
-      cfg.bearer_token_override, cfg.api_key_override);
+  auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
+                                                     cfg.api_key_override);
 
   string bearer_token;
   string api_key;
@@ -307,15 +305,15 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
-  auto overrides = BuildNamespaceAuthOverrideOptions(
-      cfg.bearer_token_override, cfg.api_key_override);
+  auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
+                                                     cfg.api_key_override);
   string bearer_token;
   string api_key;
   ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
                             api_key);
-  return LanceBuildNamespaceDatasetCacheKey(
-      cfg.endpoint, cfg.table_id, bearer_token, api_key, cfg.delimiter,
-      cfg.headers_tsv);
+  return LanceBuildNamespaceDatasetCacheKey(cfg.endpoint, cfg.table_id,
+                                            bearer_token, api_key,
+                                            cfg.delimiter, cfg.headers_tsv);
 }
 
 void LanceInvalidateDatasetCache(ClientContext &context,
@@ -335,8 +333,8 @@ void LanceInvalidateDatasetCacheForPath(ClientContext &context,
 
 void LanceInvalidateDatasetCacheForTable(ClientContext &context,
                                          const LanceTableEntry &table) {
-  LanceInvalidateDatasetCache(context,
-                              LanceBuildDatasetCacheKeyForTable(context, table));
+  LanceInvalidateDatasetCache(
+      context, LanceBuildDatasetCacheKeyForTable(context, table));
 }
 
 } // namespace duckdb

@@ -18,9 +18,9 @@
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
+#include "lance_expr_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_expr_ir.hpp"
 #include "lance_insert.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"

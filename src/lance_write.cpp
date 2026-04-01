@@ -140,9 +140,8 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
   string open_path;
   ResolveLanceStorageOptions(context, file_path, open_path, option_keys,
                              option_values);
-  state->cache_key = LanceBuildResolvedPathDatasetCacheKey(open_path,
-                                                           option_keys,
-                                                           option_values);
+  state->cache_key = LanceBuildResolvedPathDatasetCacheKey(
+      open_path, option_keys, option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
