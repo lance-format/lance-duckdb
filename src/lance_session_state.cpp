@@ -34,7 +34,6 @@ void LanceSessionState::WriteProfilingInformation(std::ostream &ss) {
   }
   ss << "Lance Session Cache: unavailable\n";
 }
-
 shared_ptr<LanceSessionState>
 GetOrCreateLanceSessionState(ClientContext &context) {
   return context.registered_state->GetOrCreate<LanceSessionState>(
