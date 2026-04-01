@@ -1,0 +1,47 @@
+# name: test/sql/dml_alter_table_vector_schema_evolution.test
+# description: ALTER TABLE can cast list vectors to fixed-size arrays for vector indexing
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/data' AS ns (TYPE LANCE);
+
+query T
+SELECT typeof(embedding) FROM ns.main.issue184_list_float LIMIT 1;
+----
+FLOAT[]
+
+statement ok
+ALTER TABLE ns.main.issue184_list_float ALTER COLUMN embedding TYPE FLOAT[3];
+
+query T
+SELECT typeof(embedding) FROM ns.main.issue184_list_float LIMIT 1;
+----
+FLOAT[3]
+
+statement ok
+CREATE INDEX issue184_embedding_idx
+ON ns.main.issue184_list_float (embedding)
+USING IVF_FLAT WITH (num_partitions=1, metric_type='cosine');
+
+query TTTIT
+SHOW INDEXES ON ns.main.issue184_list_float;
+----
+issue184_embedding_idx	<REGEX>:.*	embedding	<REGEX>:[0-9]+	<REGEX>:.*
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'ns.main.issue184_list_float',
+  'embedding',
+  [0.1, 0.2, 0.31]::FLOAT[3],
+  k = 1,
+  use_index = true
+)
+ORDER BY _distance, id;
+----
+1
+
+statement ok
+DETACH ns;

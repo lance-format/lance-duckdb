@@ -326,6 +326,7 @@ ALTER TABLE ns.main.my_table
 
 ALTER TABLE ns.main.my_table RENAME COLUMN score TO score2;
 ALTER TABLE ns.main.my_table ALTER COLUMN age TYPE BIGINT;
+ALTER TABLE ns.main.my_table ALTER COLUMN embedding TYPE FLOAT[128];
 ALTER TABLE ns.main.my_table DROP COLUMN score2;
 
 DETACH ns;
@@ -374,6 +375,9 @@ USING INVERTED;
 
 Notes:
 - `CREATE INDEX` currently supports a single column.
+- Vector indices require a fixed-size vector column. If a dataset was written with
+  `FLOAT[]` / `DOUBLE[]`, first cast it with `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT[N]`
+  (or `DOUBLE[N]`) and then create the index.
 
 ### `SHOW INDEXES`
 
