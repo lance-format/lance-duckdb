@@ -3216,7 +3216,8 @@ static void ValidateAlterColumnTypeTarget(const LogicalType &type) {
   }
   throw NotImplementedException(
       "Lance ALTER COLUMN TYPE only supports a limited set of DuckDB types "
-      "(BOOLEAN, integer/floating, DATE/TIME/TIMESTAMP, VARCHAR, BLOB, ARRAY).");
+      "(BOOLEAN, integer/floating, DATE/TIME/TIMESTAMP, VARCHAR, BLOB, "
+      "ARRAY).");
 }
 
 static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
