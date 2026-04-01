@@ -10,6 +10,7 @@
 
 #include "lance_common.hpp"
 #include "lance_delete.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
@@ -206,6 +207,7 @@ public:
         throw IOException("Failed to commit Lance DELETE transaction for '" +
                           open_path + "'" + LanceFormatErrorSuffix());
       }
+      LanceInvalidateDatasetCache(context.client);
     } else {
       RegisterLancePendingAppend(context.client, table.catalog,
                                  std::move(open_path), std::move(option_keys),

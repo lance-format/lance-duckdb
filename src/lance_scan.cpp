@@ -3341,6 +3341,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       } else {
         // The dataset was already closed above, keep going.
       }
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3359,6 +3360,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3372,6 +3374,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3403,6 +3406,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3416,6 +3420,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3429,6 +3434,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
+      LanceInvalidateDatasetCache(context);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3456,6 +3462,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                         display_uri + LanceFormatErrorSuffix());
     }
     lance_close_dataset(dataset);
+    LanceInvalidateDatasetCache(context);
     return BuildUpdatedLanceTableEntry(context, *this, internal);
     break;
   }

@@ -37,6 +37,7 @@
 #include "duckdb/transaction/transaction.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
@@ -647,6 +648,7 @@ public:
         throw IOException("Failed to update table comment in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
+      LanceInvalidateDatasetCache(context);
     }
 
     auto system_tx =
@@ -797,6 +799,7 @@ public:
     // chain (old entry + tombstone).
     set.CleanupEntry(*existing_entry);
 
+    LanceInvalidateDatasetCache(context);
     InvalidateTableDefaults();
   }
 
@@ -1818,7 +1821,12 @@ public:
       }
     }
 
-    return DuckTransactionManager::CommitTransaction(context, transaction_p);
+    auto result =
+        DuckTransactionManager::CommitTransaction(context, transaction_p);
+    if (!result.HasError() && !appends.empty()) {
+      LanceInvalidateDatasetCache(context);
+    }
+    return result;
   }
 
   void RollbackTransaction(Transaction &transaction_p) override {

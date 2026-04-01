@@ -17,6 +17,7 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_table_entry.hpp"
 
@@ -1074,6 +1075,7 @@ static void LanceCreateIndexFunc(ClientContext &context,
     throw IOException("Failed to create Lance index" +
                       LanceFormatErrorSuffix());
   }
+  LanceInvalidateDatasetCache(context);
 
   output.SetCardinality(0);
 }
@@ -1114,6 +1116,7 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   if (rc != 0) {
     throw IOException("Failed to drop Lance index" + LanceFormatErrorSuffix());
   }
+  LanceInvalidateDatasetCache(context);
 
   output.SetCardinality(0);
 }

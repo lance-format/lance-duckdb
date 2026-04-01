@@ -6,6 +6,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 
 #include <cstdint>
@@ -195,7 +196,7 @@ static void LanceWriteSink(ExecutionContext &context, FunctionData &,
   }
 }
 
-static void LanceWriteFinalize(ClientContext &, FunctionData &,
+static void LanceWriteFinalize(ClientContext &context, FunctionData &,
                                GlobalFunctionData &gstate_p) {
   auto &gstate = gstate_p.Cast<LanceWriteGlobalState>();
   if (!gstate.writer) {
@@ -208,6 +209,7 @@ static void LanceWriteFinalize(ClientContext &, FunctionData &,
     throw IOException("Failed to finalize Lance dataset write" +
                       LanceFormatErrorSuffix());
   }
+  LanceInvalidateDatasetCache(context);
 }
 
 static CopyFunctionExecutionMode

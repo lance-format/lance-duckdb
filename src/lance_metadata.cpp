@@ -5,6 +5,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_resolver.hpp"
 
@@ -158,6 +159,7 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
     throw IOException("Failed to update Lance dataset: " +
                       bind_data.dataset_uri + LanceFormatErrorSuffix());
   }
+  LanceInvalidateDatasetCache(context);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(1));
