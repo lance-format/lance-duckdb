@@ -24,6 +24,7 @@
 #include "duckdb/planner/table_filter.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_resolver.hpp"
@@ -107,19 +108,26 @@ static LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
   return dynamic_cast<LanceTableEntry *>(table_entry);
 }
 
-static void *OpenSearchDataset(ClientContext &context, const Value &input,
-                               const string &function_name,
-                               string &out_display_uri) {
+static shared_ptr<LanceDatasetCacheEntry>
+OpenSearchDatasetEntry(ClientContext &context, const Value &input,
+                       const string &function_name, string &out_display_uri,
+                       bool *out_cache_hit) {
   out_display_uri = ResolveLanceDatasetUri(
       context, input, LanceResolvePolicy::FALLBACK_TO_PATH, function_name);
   auto input_str = input.GetValue<string>();
   if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
     if (StringUtil::CIEquals(out_display_uri, table->DatasetUri())) {
-      return LanceOpenDatasetForTable(context, *table, out_display_uri);
+      return LanceGetOrOpenDatasetEntryForTable(context, *table,
+                                                out_display_uri, out_cache_hit);
     }
   }
 
-  return LanceOpenDataset(context, out_display_uri);
+  auto entry =
+      LanceGetOrOpenDatasetEntry(context, out_display_uri, out_cache_hit);
+  if (entry) {
+    out_display_uri = entry->DisplayUri();
+  }
+  return entry;
 }
 
 static vector<float> ParseQueryVector(const Value &value,
@@ -207,19 +215,15 @@ struct LanceKnnBindData : public TableFunctionData {
   bool use_index = true;
   bool explain_verbose = false;
 
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  bool dataset_cache_hit = false;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
 
   vector<string> lance_pushed_filter_ir_parts;
-
-  ~LanceKnnBindData() override {
-    if (dataset) {
-      lance_close_dataset(dataset);
-    }
-  }
 };
 
 struct LanceKnnGlobalState : public GlobalTableFunctionState {
@@ -349,8 +353,11 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceKnnBindData>();
   result->file_path.clear();
-  result->dataset = OpenSearchDataset(context, input.inputs[0],
-                                      "lance_vector_search", result->file_path);
+  result->dataset_entry =
+      OpenSearchDatasetEntry(context, input.inputs[0], "lance_vector_search",
+                             result->file_path, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->vector_column = input.inputs[1].GetValue<string>();
   result->query = ParseQueryVector(input.inputs[2], "lance_vector_search");
   result->prefilter = false;
@@ -666,6 +673,8 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
   result["Lance Explain Verbose"] =
       bind_data.explain_verbose ? "true" : "false";
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
 
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
@@ -707,6 +716,8 @@ LanceKnnDynamicToString(TableFunctionDynamicToStringInput &input) {
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
   result["Lance Explain Verbose"] =
       bind_data.explain_verbose ? "true" : "false";
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
 
   result["Lance Filter Pushed Down"] =
       global_state.filter_pushed_down ? "true" : "false";
@@ -808,17 +819,13 @@ struct LanceSearchBindData : public TableFunctionData {
 
   uint64_t k = 10;
 
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  bool dataset_cache_hit = false;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
-
-  ~LanceSearchBindData() override {
-    if (dataset) {
-      lance_close_dataset(dataset);
-    }
-  }
 };
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
@@ -954,8 +961,11 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Fts;
   result->file_path.clear();
-  result->dataset = OpenSearchDataset(context, input.inputs[0], "lance_fts",
-                                      result->file_path);
+  result->dataset_entry =
+      OpenSearchDatasetEntry(context, input.inputs[0], "lance_fts",
+                             result->file_path, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->text_column = input.inputs[1].GetValue<string>();
   result->query = input.inputs[2].GetValue<string>();
 
@@ -1041,8 +1051,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
   result->file_path.clear();
-  result->dataset = OpenSearchDataset(context, input.inputs[0],
-                                      "lance_hybrid_search", result->file_path);
+  result->dataset_entry =
+      OpenSearchDatasetEntry(context, input.inputs[0], "lance_hybrid_search",
+                             result->file_path, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->vector_column = input.inputs[1].GetValue<string>();
   result->vector_query =
       ParseQueryVector(input.inputs[2], "lance_hybrid_search");
@@ -1234,6 +1247,59 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
   }
 }
 
+static InsertionOrderPreservingMap<string>
+LanceSearchBindToString(const LanceSearchBindData &bind_data) {
+  InsertionOrderPreservingMap<string> result;
+  result["Lance Path"] = bind_data.file_path;
+  result["Lance Search Mode"] =
+      bind_data.mode == LanceSearchMode::Fts ? "fts" : "hybrid";
+  result["Lance K"] = to_string(bind_data.k);
+  result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
+
+  if (bind_data.mode == LanceSearchMode::Fts) {
+    result["Lance Text Column"] = bind_data.text_column;
+    result["Lance Query"] = bind_data.query;
+  } else {
+    result["Lance Vector Column"] = bind_data.vector_column;
+    result["Lance Text Column"] = bind_data.text_column;
+    result["Lance Vector Query Dim"] = to_string(bind_data.vector_query.size());
+    result["Lance Text Query"] = bind_data.text_query;
+    result["Lance Alpha"] = to_string(bind_data.alpha);
+    result["Lance Oversample Factor"] = to_string(bind_data.oversample_factor);
+  }
+
+  return result;
+}
+
+static InsertionOrderPreservingMap<string>
+LanceSearchToString(TableFunctionToStringInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
+  return LanceSearchBindToString(bind_data);
+}
+
+static InsertionOrderPreservingMap<string>
+LanceSearchDynamicToString(TableFunctionDynamicToStringInput &input) {
+  auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
+  auto result = LanceSearchBindToString(bind_data);
+  auto &global_state = input.global_state->Cast<LanceSearchGlobalState>();
+
+  result["Lance Filter Pushed Down"] =
+      global_state.filter_pushed_down ? "true" : "false";
+  result["Lance Filter Pushdown Fallbacks"] =
+      to_string(global_state.filter_pushdown_fallbacks.load());
+  result["Lance Filter IR Bytes"] =
+      to_string(global_state.lance_filter_ir.size());
+  result["Lance Record Batches"] =
+      to_string(global_state.record_batches.load());
+  result["Lance Record Batch Rows"] =
+      to_string(global_state.record_batch_rows.load());
+  result["Lance Rows Out"] = to_string(global_state.lines_read.load());
+
+  return result;
+}
+
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   TableFunction fts(
       "lance_fts",
@@ -1246,6 +1312,8 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
+  fts.to_string = LanceSearchToString;
+  fts.dynamic_to_string = LanceSearchDynamicToString;
   loader.RegisterFunction(fts);
 }
 
@@ -1259,6 +1327,8 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
+    fun.to_string = LanceSearchToString;
+    fun.dynamic_to_string = LanceSearchDynamicToString;
   };
 
   TableFunction hybrid_f32("lance_hybrid_search",
