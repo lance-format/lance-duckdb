@@ -37,6 +37,15 @@ Expose user-facing capabilities primarily through SQL, not internal helper funct
 
 When in doubt, prefer SQL surface area that matches DuckDB idioms over extension-specific internal entry points.
 
+## Reuse Upstream Mechanisms First
+
+Prefer DuckDB/Lance native mechanisms over extension-specific replacements.
+
+- Before adding a new mechanism, first check whether DuckDB or Lance already provides the required hook, lifecycle, cache, profiling surface, or introspection path.
+- If an upstream mechanism can satisfy the requirement with reasonable adaptation, use it instead of inventing a parallel extension-specific mechanism.
+- Prefer integration with DuckDB-native observability surfaces such as profiling, `EXPLAIN`, and catalog/state hooks over custom debug-only SQL functions.
+- Introduce new extension-specific mechanisms only when upstream surfaces cannot express the requirement cleanly, and document why reuse was insufficient.
+
 ## Essential Commands
 
 ### Building
