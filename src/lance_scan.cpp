@@ -39,6 +39,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_exec_ir.hpp"
@@ -200,11 +201,7 @@ LanceScanGetPartitionStats(ClientContext &context,
   return out;
 }
 
-LanceScanBindData::~LanceScanBindData() {
-  if (dataset) {
-    lance_close_dataset(dataset);
-  }
-}
+LanceScanBindData::~LanceScanBindData() {}
 
 static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
     UINT64_C(9223372036854775900);
@@ -416,17 +413,13 @@ struct LanceExecBindData : public TableFunctionData {
   string file_path;
   string exec_ir;
 
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  bool dataset_cache_hit = false;
   ArrowSchemaWrapper schema_root;
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
-
-  ~LanceExecBindData() override {
-    if (dataset) {
-      lance_close_dataset(dataset);
-    }
-  }
 };
 
 static bool LanceSupportsPushdownType(const FunctionData &bind_data,
@@ -818,7 +811,10 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         verbose_it->second.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
   }
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
+  result->dataset_entry = LanceGetOrOpenDatasetEntry(
+      context, result->file_path, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -904,9 +900,11 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
 
   string table_uri;
   string headers_tsv; // TODO: Add support for headers in table function
+  result->dataset_entry = LanceGetOrOpenDatasetEntryInNamespace(
+      context, endpoint, table_id, bearer_token, api_key, delimiter,
+      headers_tsv, table_uri, &result->dataset_cache_hit);
   result->dataset =
-      LanceOpenDatasetInNamespace(context, endpoint, table_id, bearer_token,
-                                  api_key, delimiter, headers_tsv, table_uri);
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   if (!table_uri.empty()) {
     result->file_path = table_uri;
   }
@@ -1843,6 +1841,8 @@ LanceScanToString(TableFunctionToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
   result["Lance Sampling Pushdown"] =
       bind_data.sampling_pushed_down ? "true" : "false";
   if (bind_data.sampling_pushed_down) {
@@ -1890,6 +1890,8 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   result["Lance Path"] = bind_data.file_path;
   result["Lance Explain Verbose"] =
       bind_data.explain_verbose ? "true" : "false";
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
   result["Lance Scan Mode"] =
       global_state.use_dataset_scanner ? "dataset" : "fragment";
   result["Lance Deferred Materialization"] =
@@ -2534,7 +2536,11 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       exec_bind = make_uniq<LanceExecBindData>();
       exec_bind->file_path = scan_bind.file_path;
       exec_bind->exec_ir = exec_ir;
-      exec_bind->dataset = LanceOpenDataset(context, exec_bind->file_path);
+      exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
+          context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
+      exec_bind->dataset = exec_bind->dataset_entry
+                               ? exec_bind->dataset_entry->Handle()
+                               : nullptr;
       if (!exec_bind->dataset) {
         throw IOException("Failed to open Lance dataset for exec pushdown: " +
                           exec_bind->file_path + LanceFormatErrorSuffix());
@@ -2841,7 +2847,10 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
   result->exec_ir =
       input.inputs[1].DefaultCastAs(LogicalType::BLOB).GetValue<string>();
 
-  result->dataset = LanceOpenDataset(context, result->file_path);
+  result->dataset_entry = LanceGetOrOpenDatasetEntry(
+      context, result->file_path, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -2995,6 +3004,8 @@ LanceExecToString(TableFunctionToStringInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceExecBindData>();
   result["Lance Path"] = bind_data.file_path;
   result["Lance Exec IR Bytes"] = to_string(bind_data.exec_ir.size());
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
   return result;
 }
 
@@ -3005,6 +3016,8 @@ LanceExecDynamicToString(TableFunctionDynamicToStringInput &input) {
   auto &global_state = input.global_state->Cast<LanceExecGlobalState>();
   result["Lance Path"] = bind_data.file_path;
   result["Lance Exec IR Bytes"] = to_string(bind_data.exec_ir.size());
+  result["Lance Dataset Cache Hit"] =
+      bind_data.dataset_cache_hit ? "true" : "false";
   result["Lance Record Batches"] =
       to_string(global_state.record_batches.load());
   result["Lance Record Batch Rows"] =
@@ -3483,7 +3496,10 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->file_path = dataset_uri;
 
   string display_uri;
-  result->dataset = LanceOpenDatasetForTable(context, *this, display_uri);
+  result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+      context, *this, display_uri, &result->dataset_cache_hit);
+  result->dataset =
+      result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->file_path = display_uri;
   if (!result->dataset) {
     throw IOException("Failed to open Lance dataset: " + result->file_path +

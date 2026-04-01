@@ -1,5 +1,7 @@
 #pragma once
 
+#include "lance_dataset_cache.hpp"
+
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -13,7 +15,9 @@ class TableCatalogEntry;
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
   bool explain_verbose = false;
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  bool dataset_cache_hit = false;
   ArrowSchemaWrapper schema_root;
   ArrowSchemaWrapper scan_schema_root;
   ArrowTableSchema arrow_table;

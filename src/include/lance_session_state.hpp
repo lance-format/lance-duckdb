@@ -9,6 +9,7 @@ class LanceSessionState final : public ClientContextState {
 public:
   LanceSessionState();
   ~LanceSessionState() override;
+  void WriteProfilingInformation(std::ostream &ss) override;
 
   void *Handle() const { return session; }
 

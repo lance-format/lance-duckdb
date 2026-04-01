@@ -11,6 +11,7 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_search.cpp src/lance_common.cpp
+                      src/lance_dataset_cache.cpp
                       src/lance_session_state.cpp
                       src/lance_secrets.cpp
                       src/lance_filter_ir.cpp
