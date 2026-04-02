@@ -542,8 +542,9 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
 }
 
 int64_t LanceTruncateDatasetWithStorageOptions(
-    const string &open_path, const vector<string> &option_keys,
-    const vector<string> &option_values, const string &display_uri) {
+    ClientContext &context, const string &open_path,
+    const vector<string> &option_keys, const vector<string> &option_values,
+    const string &display_uri) {
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -594,7 +595,8 @@ int64_t LanceTruncateDatasetWithStorageOptions(
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, &schema_root.arrow_schema);
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, LanceGetSessionHandle(context),
+      &schema_root.arrow_schema);
   if (!writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());
@@ -616,7 +618,7 @@ int64_t LanceTruncateDataset(ClientContext &context,
   vector<string> option_values;
   ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
                              option_values);
-  return LanceTruncateDatasetWithStorageOptions(open_path, option_keys,
+  return LanceTruncateDatasetWithStorageOptions(context, open_path, option_keys,
                                                 option_values, dataset_uri);
 }
 

@@ -604,6 +604,7 @@ pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
     options_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    session: *mut c_void,
     out_transaction: *mut *mut c_void,
     out_deleted_rows: *mut i64,
 ) -> i32 {
@@ -614,6 +615,7 @@ pub unsafe extern "C" fn lance_delete_transaction_with_storage_options(
         options_len,
         filter_ir,
         filter_ir_len,
+        session,
         out_transaction,
         out_deleted_rows,
     ) {
@@ -636,6 +638,7 @@ fn delete_transaction_with_storage_options_inner(
     options_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    session: *mut c_void,
     out_transaction: *mut *mut c_void,
     out_deleted_rows: *mut i64,
 ) -> FfiResult<()> {
@@ -704,13 +707,14 @@ fn delete_transaction_with_storage_options_inner(
             .to_string(),
         None => "true".to_string(),
     };
+    let session = unsafe { optional_session_handle(session)? };
 
     let (maybe_txn, deleted_rows) = match runtime::block_on(async {
-        let dataset = DatasetBuilder::from_uri(path_str)
-            .with_storage_options(storage_options)
-            .load()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut builder = DatasetBuilder::from_uri(path_str).with_storage_options(storage_options);
+        if let Some(session) = session.clone() {
+            builder = builder.with_session(session);
+        }
+        let dataset = builder.load().await.map_err(|e| e.to_string())?;
         let dataset = Arc::new(dataset);
 
         let mut scanner = dataset.scan();

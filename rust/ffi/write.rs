@@ -20,7 +20,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_commit;
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 #[repr(C)]
 struct RawArrowArray {
@@ -529,6 +529,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_writer_inner(
@@ -541,6 +542,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        session,
         schema,
     ) {
         Ok(handle) => {
@@ -565,6 +567,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_uncommitted_writer_inner(
@@ -577,6 +580,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        session,
         schema,
     ) {
         Ok(handle) => {
@@ -627,6 +631,7 @@ fn open_uncommitted_writer_inner(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -718,6 +723,7 @@ fn open_uncommitted_writer_inner(
             })
         })
         .transpose()?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -732,6 +738,7 @@ fn open_uncommitted_writer_inner(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        session,
         store_params: Some(store_params),
         ..Default::default()
     };
@@ -775,6 +782,7 @@ fn open_writer_inner(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -866,6 +874,7 @@ fn open_writer_inner(
             })
         })
         .transpose()?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -880,6 +889,7 @@ fn open_writer_inner(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        session,
         store_params: Some(store_params),
         ..Default::default()
     };
@@ -1313,9 +1323,17 @@ pub unsafe extern "C" fn lance_commit_transaction_with_storage_options(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
     transaction: *mut c_void,
 ) -> i32 {
-    match commit_transaction_inner(path, option_keys, option_values, options_len, transaction) {
+    match commit_transaction_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        session,
+        transaction,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -1332,6 +1350,7 @@ fn commit_transaction_inner(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
     transaction: *mut c_void,
 ) -> FfiResult<()> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -1383,12 +1402,15 @@ fn commit_transaction_inner(
             StorageOptionsAccessor::with_static_options(storage_options),
         ));
     }
+    let session = unsafe { optional_session_handle(session)? };
 
     let txn =
         unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
-    let fut = CommitBuilder::new(path.as_str())
-        .with_store_params(store_params)
-        .execute(*txn);
+    let mut builder = CommitBuilder::new(path.as_str()).with_store_params(store_params);
+    if let Some(session) = session {
+        builder = builder.with_session(session);
+    }
+    let fut = builder.execute(*txn);
     match runtime::block_on(fut) {
         Ok(Ok(_)) => {
             record_commit();

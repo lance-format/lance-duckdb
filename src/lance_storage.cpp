@@ -42,6 +42,7 @@
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
 
@@ -987,7 +988,7 @@ public:
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
         LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-        &schema_root.arrow_schema);
+        LanceGetSessionHandle(context), &schema_root.arrow_schema);
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
                         LanceFormatErrorSuffix());
@@ -1329,7 +1330,7 @@ public:
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
               LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-              &state->schema_root.arrow_schema);
+              LanceGetSessionHandle(context), &state->schema_root.arrow_schema);
           if (!state->writer) {
             throw IOException("Failed to open Lance writer: " +
                               state->open_path + LanceFormatErrorSuffix());
@@ -1812,7 +1813,8 @@ public:
       auto rc = lance_commit_transaction_with_storage_options(
           pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          pending.option_keys.size(), pending.transaction);
+          pending.option_keys.size(), LanceGetSessionHandle(context),
+          pending.transaction);
       if (rc != 0) {
         // Best-effort cleanup of any remaining pending transactions.
         // Note: the transaction pointer is consumed by the commit call, even on

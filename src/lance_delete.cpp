@@ -14,6 +14,7 @@
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
 namespace duckdb {
@@ -186,7 +187,8 @@ public:
     auto rc = lance_delete_transaction_with_storage_options(
         open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        filter_ptr, filter_ir.size(), &txn, &deleted_rows);
+        filter_ptr, filter_ir.size(), LanceGetSessionHandle(context.client),
+        &txn, &deleted_rows);
     if (rc != 0) {
       throw IOException("Failed to create Lance DELETE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());
@@ -202,7 +204,7 @@ public:
       rc = lance_commit_transaction_with_storage_options(
           open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-          txn);
+          LanceGetSessionHandle(context.client), txn);
       if (rc != 0) {
         throw IOException("Failed to commit Lance DELETE transaction for '" +
                           open_path + "'" + LanceFormatErrorSuffix());

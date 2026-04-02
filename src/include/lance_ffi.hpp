@@ -104,7 +104,7 @@ int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
 int32_t lance_delete_transaction_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, const uint8_t *filter_ir, size_t filter_ir_len,
-    void **out_transaction, int64_t *out_deleted_rows);
+    void *session, void **out_transaction, int64_t *out_deleted_rows);
 
 int32_t lance_dataset_add_columns(void *dataset,
                                   const ArrowSchema *new_columns_schema,
@@ -204,12 +204,12 @@ void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, const ArrowSchema *schema);
+    const char *data_storage_version, void *session, const ArrowSchema *schema);
 void *lance_open_uncommitted_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, const ArrowSchema *schema);
+    const char *data_storage_version, void *session, const ArrowSchema *schema);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_finish(void *writer);
 int32_t lance_writer_finish_uncommitted(void *writer, void **out_transaction);
@@ -217,7 +217,7 @@ void lance_close_writer(void *writer);
 
 int32_t lance_commit_transaction_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
-    size_t options_len, void *transaction);
+    size_t options_len, void *session, void *transaction);
 void lance_free_transaction(void *transaction);
 
 int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
@@ -225,13 +225,13 @@ int32_t lance_overwrite_update_transaction_with_irs_and_storage_options(
     size_t options_len, const uint8_t *predicate_ir, size_t predicate_ir_len,
     const char **set_columns, const uint8_t **set_expr_irs,
     const size_t *set_expr_ir_lens, size_t set_len, uint64_t max_rows_per_file,
-    uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
+    uint64_t max_rows_per_group, uint64_t max_bytes_per_file, void *session,
     void **out_transaction, uint64_t *out_rows_updated);
 
 int32_t lance_merge_begin_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
-    uint64_t max_bytes_per_file, void **out_merge_handle);
+    uint64_t max_bytes_per_file, void *session, void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,
                                       size_t row_ids_len);

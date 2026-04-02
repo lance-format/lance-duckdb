@@ -94,8 +94,9 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         string &out_display_uri);
 
 int64_t LanceTruncateDatasetWithStorageOptions(
-    const string &open_path, const vector<string> &option_keys,
-    const vector<string> &option_values, const string &display_uri);
+    ClientContext &context, const string &open_path,
+    const vector<string> &option_keys, const vector<string> &option_values,
+    const string &display_uri);
 
 int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
 

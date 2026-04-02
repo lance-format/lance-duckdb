@@ -8,6 +8,7 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
+#include "lance_session_state.hpp"
 
 #include <cstdint>
 
@@ -152,12 +153,13 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
       bind_data.data_storage_version.empty()
           ? nullptr
           : bind_data.data_storage_version.c_str();
+  auto *session = LanceGetSessionHandle(context);
   state->writer = lance_open_writer_with_storage_options(
       open_path.c_str(), bind_data.mode.c_str(),
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       bind_data.max_rows_per_file, bind_data.max_rows_per_group,
-      bind_data.max_bytes_per_file, data_storage_version_ptr,
+      bind_data.max_bytes_per_file, data_storage_version_ptr, session,
       &state->schema_root.arrow_schema);
   if (!state->writer) {
     throw IOException("Failed to open Lance writer: " + open_path +

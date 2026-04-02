@@ -18,12 +18,13 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::update::{apply_deletions, build_row_id_index};
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 struct MergeHandle {
     input_schema: Arc<arrow_schema::Schema>,
     data_type: DataType,
     path: String,
+    session: Option<Arc<lance::session::Session>>,
     storage_options: HashMap<String, String>,
     max_rows_per_file: usize,
     max_rows_per_group: usize,
@@ -55,6 +56,7 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> i32 {
     match merge_begin_with_storage_options_inner(
@@ -65,6 +67,7 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        session,
         out_merge_handle,
     ) {
         Ok(()) => {
@@ -87,6 +90,7 @@ fn merge_begin_with_storage_options_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
     if out_merge_handle.is_null() {
@@ -151,13 +155,15 @@ fn merge_begin_with_storage_options_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let input_schema: Arc<arrow_schema::Schema> = match runtime::block_on(async {
-        DatasetBuilder::from_uri(path.as_str())
-            .with_storage_options(storage_options.clone())
-            .load()
-            .await
-            .map_err(|e| e.to_string())
+        let mut builder = DatasetBuilder::from_uri(path.as_str())
+            .with_storage_options(storage_options.clone());
+        if let Some(session) = session.clone() {
+            builder = builder.with_session(session);
+        }
+        builder.load().await.map_err(|e| e.to_string())
     }) {
         Ok(Ok(dataset)) => Arc::new(dataset.schema().into()),
         Ok(Err(message)) => {
@@ -179,6 +185,7 @@ fn merge_begin_with_storage_options_inner(
         input_schema,
         data_type,
         path,
+        session,
         storage_options,
         max_rows_per_file,
         max_rows_per_group,
@@ -335,11 +342,12 @@ fn merge_finish_uncommitted_inner(
     let handle = unsafe { Box::from_raw(merge_handle as *mut MergeHandle) };
 
     let maybe_txn = match runtime::block_on(async move {
-        let dataset = DatasetBuilder::from_uri(handle.path.as_str())
-            .with_storage_options(handle.storage_options.clone())
-            .load()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut builder = DatasetBuilder::from_uri(handle.path.as_str())
+            .with_storage_options(handle.storage_options.clone());
+        if let Some(session) = handle.session.clone() {
+            builder = builder.with_session(session);
+        }
+        let dataset = builder.load().await.map_err(|e| e.to_string())?;
         let dataset = Arc::new(dataset);
 
         let mut new_fragments = Vec::new();
@@ -356,6 +364,7 @@ fn merge_finish_uncommitted_inner(
                 max_rows_per_file: handle.max_rows_per_file,
                 max_rows_per_group: handle.max_rows_per_group,
                 max_bytes_per_file: handle.max_bytes_per_file,
+                session: handle.session.clone(),
                 store_params: Some(store_params),
                 ..Default::default()
             };

@@ -16,6 +16,7 @@
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
 #include <cstdint>
@@ -440,7 +441,8 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
       open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, &merge_handle);
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context),
+      &merge_handle);
   if (rc != 0 || !merge_handle) {
     throw IOException("Failed to start Lance MERGE transaction for '" +
                       open_path + "'" + LanceFormatErrorSuffix());

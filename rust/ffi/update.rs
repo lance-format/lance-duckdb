@@ -28,7 +28,7 @@ use crate::expr_ir::parse_expr_ir;
 use crate::filter_ir::parse_filter_ir;
 use crate::runtime;
 
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage_options(
@@ -45,6 +45,7 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    session: *mut c_void,
     out_transaction: *mut *mut c_void,
     out_rows_updated: *mut u64,
 ) -> i32 {
@@ -62,6 +63,7 @@ pub unsafe extern "C" fn lance_overwrite_update_transaction_with_irs_and_storage
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        session,
         out_transaction,
         out_rows_updated,
     ) {
@@ -128,6 +130,7 @@ fn rewrite_rows_update_transaction_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    session: *mut c_void,
     out_transaction: *mut *mut c_void,
     out_rows_updated: *mut u64,
 ) -> FfiResult<()> {
@@ -258,6 +261,7 @@ fn rewrite_rows_update_transaction_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -267,11 +271,13 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let (maybe_txn, rows_updated) = match runtime::block_on(async {
-        let dataset = lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
-            .with_storage_options(storage_options)
-            .load()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut builder =
+            lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
+                .with_storage_options(storage_options);
+        if let Some(session) = session.clone() {
+            builder = builder.with_session(session);
+        }
+        let dataset = builder.load().await.map_err(|e| e.to_string())?;
         let dataset = Arc::new(dataset);
 
         let arrow_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
@@ -387,6 +393,7 @@ fn rewrite_rows_update_transaction_inner(
             max_rows_per_file,
             max_rows_per_group,
             max_bytes_per_file,
+            session: session.clone(),
             store_params: Some(store_params),
             ..Default::default()
         };

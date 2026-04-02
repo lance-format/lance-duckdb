@@ -23,6 +23,7 @@
 #include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
 #include "lance_scan_bind_data.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
 
@@ -235,7 +236,8 @@ public:
         predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
         set_expr_ir_ptrs.data(), set_expr_ir_lens.data(), set_columns.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, &txn, &rows_updated);
+        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context.client),
+        &txn, &rows_updated);
     if (rc != 0) {
       throw IOException("Failed to create Lance UPDATE transaction for '" +
                         open_path + "'" + LanceFormatErrorSuffix());

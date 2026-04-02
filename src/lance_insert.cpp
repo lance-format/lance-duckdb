@@ -10,6 +10,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
 #include <cstdint>
@@ -113,7 +114,8 @@ public:
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
           gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
           LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
-          nullptr, &gstate.schema_root.arrow_schema);
+          nullptr, LanceGetSessionHandle(context.client),
+          &gstate.schema_root.arrow_schema);
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +
                           LanceFormatErrorSuffix());
