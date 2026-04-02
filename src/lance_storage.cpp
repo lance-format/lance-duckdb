@@ -689,6 +689,7 @@ public:
       DuckSchemaEntry::DropEntry(context, info);
       return;
     }
+    auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
     auto existing_type = existing_entry->type;
 
     if (rest_ns) {
@@ -804,7 +805,7 @@ public:
     // chain (old entry + tombstone).
     set.CleanupEntry(*existing_entry);
 
-    LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+    LanceInvalidateDatasetCache(context, cache_key);
     InvalidateTableDefaults();
   }
 
