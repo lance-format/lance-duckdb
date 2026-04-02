@@ -1,0 +1,15 @@
+# name: test/sql/session_cache_scope.test
+# description: Lance session cache is shared per database while dataset cache remains connection-local
+# group: [sql]
+
+require lance
+
+query II con1
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/data/test_data.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=false[\s\S]*Lance Dataset Cache: entries=1 hits=0 misses=1[\s\S]*
+
+query II con2
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/data/test_data.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=true[\s\S]*Lance Dataset Cache: entries=1 hits=0 misses=1[\s\S]*
