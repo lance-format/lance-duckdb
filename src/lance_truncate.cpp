@@ -174,7 +174,7 @@ static void LanceTruncateFunc(ClientContext &context, TableFunctionInput &data,
                                      option_keys, option_values, display_uri);
   auto row_count = LanceTruncateDatasetWithStorageOptions(
       open_path, option_keys, option_values, display_uri);
-  LanceInvalidateDatasetCache(context);
+  LanceInvalidateDatasetCacheForTable(context, *lance_entry);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(row_count));

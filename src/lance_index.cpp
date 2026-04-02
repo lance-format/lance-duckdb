@@ -1075,7 +1075,20 @@ static void LanceCreateIndexFunc(ClientContext &context,
     throw IOException("Failed to create Lance index" +
                       LanceFormatErrorSuffix());
   }
-  LanceInvalidateDatasetCache(context);
+  if (bind_data.target_is_table) {
+    auto &entry =
+        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
+                          bind_data.schema, bind_data.table);
+    auto &table_entry = entry.Cast<TableCatalogEntry>();
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+    if (!lance_entry) {
+      throw InternalException(
+          "__lance_create_index_table resolved non-Lance table entry");
+    }
+    LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+  } else {
+    LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
+  }
 
   output.SetCardinality(0);
 }
@@ -1116,7 +1129,20 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   if (rc != 0) {
     throw IOException("Failed to drop Lance index" + LanceFormatErrorSuffix());
   }
-  LanceInvalidateDatasetCache(context);
+  if (bind_data.target_is_table) {
+    auto &entry =
+        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
+                          bind_data.schema, bind_data.table);
+    auto &table_entry = entry.Cast<TableCatalogEntry>();
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
+    if (!lance_entry) {
+      throw InternalException(
+          "__lance_drop_index_table resolved non-Lance table entry");
+    }
+    LanceInvalidateDatasetCacheForTable(context, *lance_entry);
+  } else {
+    LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
+  }
 
   output.SetCardinality(0);
 }

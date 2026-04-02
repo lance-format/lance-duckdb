@@ -49,6 +49,7 @@ struct LanceWriteBindData : public FunctionData {
 struct LanceWriteGlobalState : public GlobalFunctionData {
   explicit LanceWriteGlobalState() = default;
 
+  string cache_key;
   void *writer = nullptr;
   ArrowSchemaWrapper schema_root;
 
@@ -139,6 +140,8 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
   string open_path;
   ResolveLanceStorageOptions(context, file_path, open_path, option_keys,
                              option_values);
+  state->cache_key = LanceBuildResolvedPathDatasetCacheKey(
+      open_path, option_keys, option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
@@ -209,7 +212,7 @@ static void LanceWriteFinalize(ClientContext &context, FunctionData &,
     throw IOException("Failed to finalize Lance dataset write" +
                       LanceFormatErrorSuffix());
   }
-  LanceInvalidateDatasetCache(context);
+  LanceInvalidateDatasetCache(context, gstate.cache_key);
 }
 
 static CopyFunctionExecutionMode

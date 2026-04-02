@@ -7,6 +7,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
 #include "lance_table_entry.hpp"
@@ -165,7 +166,8 @@ public:
 
     RegisterLancePendingAppend(
         context, table.catalog, std::move(gstate.open_path),
-        std::move(gstate.option_keys), std::move(gstate.option_values), txn);
+        std::move(gstate.option_keys), std::move(gstate.option_values),
+        LanceBuildDatasetCacheKeyForTable(context, table), txn);
     return SinkFinalizeType::READY;
   }
 

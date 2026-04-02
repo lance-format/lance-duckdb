@@ -1,10 +1,10 @@
 #include "duckdb/storage/storage_extension.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
@@ -16,17 +16,17 @@
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/function/table/arrow.hpp"
-#include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
-#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -648,7 +648,7 @@ public:
         throw IOException("Failed to update table comment in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *lance_entry);
     }
 
     auto system_tx =
@@ -684,6 +684,12 @@ public:
       throw InternalException(
           "Failed to drop entry \"%s\" - entry could not be found", info.name);
     }
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(existing_entry.get());
+    if (!lance_entry) {
+      DuckSchemaEntry::DropEntry(context, info);
+      return;
+    }
+    auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
     auto existing_type = existing_entry->type;
 
     if (rest_ns) {
@@ -799,7 +805,7 @@ public:
     // chain (old entry + tombstone).
     set.CleanupEntry(*existing_entry);
 
-    LanceInvalidateDatasetCache(context);
+    LanceInvalidateDatasetCache(context, cache_key);
     InvalidateTableDefaults();
   }
 
@@ -1767,6 +1773,7 @@ struct LancePendingAppend {
   string path;
   vector<string> option_keys;
   vector<string> option_values;
+  string cache_key;
   void *transaction = nullptr;
 };
 
@@ -1824,7 +1831,9 @@ public:
     auto result =
         DuckTransactionManager::CommitTransaction(context, transaction_p);
     if (!result.HasError() && !appends.empty()) {
-      LanceInvalidateDatasetCache(context);
+      for (auto &pending : appends) {
+        LanceInvalidateDatasetCache(context, pending.cache_key);
+      }
     }
     return result;
   }
@@ -1866,7 +1875,7 @@ void RegisterLanceStorage(DBConfig &config) {
 
 void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
                                 string dataset_uri, vector<string> option_keys,
-                                vector<string> option_values,
+                                vector<string> option_values, string cache_key,
                                 void *lance_transaction) {
   auto &txn = Transaction::Get(context, catalog);
   auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
@@ -1879,6 +1888,7 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.path = std::move(dataset_uri);
   pending.option_keys = std::move(option_keys);
   pending.option_values = std::move(option_values);
+  pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
   tm->RegisterPendingAppend(txn, std::move(pending));
 }

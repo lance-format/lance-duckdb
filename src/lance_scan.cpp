@@ -1,5 +1,4 @@
 #include "duckdb.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -8,41 +7,42 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
-#include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_limit.hpp"
-#include "duckdb/planner/operator/logical_order.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/table_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/table_filter.hpp"
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
+#include "lance_exec_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_exec_ir.hpp"
 #include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
@@ -3343,7 +3343,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       } else {
         // The dataset was already closed above, keep going.
       }
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3362,7 +3362,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3376,7 +3376,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3408,7 +3408,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3422,7 +3422,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3436,7 +3436,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                           display_uri + LanceFormatErrorSuffix());
       }
       lance_close_dataset(dataset);
-      LanceInvalidateDatasetCache(context);
+      LanceInvalidateDatasetCacheForTable(context, *this);
       return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
@@ -3464,7 +3464,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                         display_uri + LanceFormatErrorSuffix());
     }
     lance_close_dataset(dataset);
-    LanceInvalidateDatasetCache(context);
+    LanceInvalidateDatasetCacheForTable(context, *this);
     return BuildUpdatedLanceTableEntry(context, *this, internal);
     break;
   }

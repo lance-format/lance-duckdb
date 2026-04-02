@@ -1,0 +1,55 @@
+# name: test/sql/dataset_cache_precise_invalidation.test
+# description: Writes invalidate only the touched dataset cache entry
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s)
+TO 'test/.tmp/cache_precise_a.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 10::BIGINT AS id, 'x'::VARCHAR AS s)
+TO 'test/.tmp/cache_precise_b.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_a.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_b.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_a.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_b.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+statement ok
+ATTACH 'test/.tmp' AS cache_ns (TYPE LANCE);
+
+statement ok
+INSERT INTO cache_ns.main.cache_precise_a VALUES (2::BIGINT, 'b'::VARCHAR);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_a.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_precise_b.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+statement ok
+DETACH cache_ns;

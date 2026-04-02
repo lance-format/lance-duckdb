@@ -17,9 +17,10 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
+#include "lance_expr_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_expr_ir.hpp"
 #include "lance_insert.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
@@ -252,9 +253,10 @@ public:
       return SourceResultType::FINISHED;
     }
 
-    RegisterLancePendingAppend(context.client, table.catalog,
-                               std::move(open_path), std::move(option_keys),
-                               std::move(option_values), txn);
+    RegisterLancePendingAppend(
+        context.client, table.catalog, std::move(open_path),
+        std::move(option_keys), std::move(option_values),
+        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
 
     state.rows_updated = rows_updated;
 

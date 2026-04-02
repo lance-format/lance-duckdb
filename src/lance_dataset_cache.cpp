@@ -5,6 +5,7 @@
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/main/client_context_state.hpp"
 
 #include <functional>
@@ -39,9 +40,9 @@ public:
     return entry;
   }
 
-  void Clear() {
+  void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
-    entries.clear();
+    entries.erase(key);
   }
 
   void QueryBegin(ClientContext &) override {
@@ -91,9 +92,14 @@ static void AppendCacheKeyPart(string &key, idx_t value) {
   AppendCacheKeyPart(key, to_string(value));
 }
 
-static string BuildPathCacheKey(const string &open_path,
-                                const vector<string> &option_keys,
-                                const vector<string> &option_values) {
+static string FingerprintCacheKeyPart(const string &value) {
+  return to_string(Hash(value.c_str(), value.size()));
+}
+
+string
+LanceBuildResolvedPathDatasetCacheKey(const string &open_path,
+                                      const vector<string> &option_keys,
+                                      const vector<string> &option_values) {
   if (option_keys.size() != option_values.size()) {
     throw InternalException(
         "Storage option keys/values size mismatch for Lance dataset cache");
@@ -109,18 +115,41 @@ static string BuildPathCacheKey(const string &open_path,
   return key;
 }
 
-static string
-BuildNamespaceCacheKey(const string &endpoint, const string &table_id,
-                       const string &bearer_token, const string &api_key,
-                       const string &delimiter, const string &headers_tsv) {
+string LanceBuildPathDatasetCacheKey(ClientContext &context,
+                                     const string &path) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
+  return LanceBuildResolvedPathDatasetCacheKey(open_path, option_keys,
+                                               option_values);
+}
+
+string LanceBuildNamespaceDatasetCacheKey(
+    const string &endpoint, const string &table_id, const string &bearer_token,
+    const string &api_key, const string &delimiter, const string &headers_tsv) {
   string key = "namespace|";
   AppendCacheKeyPart(key, endpoint);
   AppendCacheKeyPart(key, table_id);
-  AppendCacheKeyPart(key, bearer_token);
-  AppendCacheKeyPart(key, api_key);
+  AppendCacheKeyPart(key, FingerprintCacheKeyPart(bearer_token));
+  AppendCacheKeyPart(key, FingerprintCacheKeyPart(api_key));
   AppendCacheKeyPart(key, delimiter);
-  AppendCacheKeyPart(key, headers_tsv);
+  AppendCacheKeyPart(key, FingerprintCacheKeyPart(headers_tsv));
   return key;
+}
+
+static unordered_map<string, Value>
+BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
+                                  const string &api_key_override) {
+  unordered_map<string, Value> options;
+  if (!bearer_token_override.empty()) {
+    options["bearer_token"] = Value(bearer_token_override);
+  }
+  if (!api_key_override.empty()) {
+    options["api_key"] = Value(api_key_override);
+  }
+  return options;
 }
 
 static void *OpenResolvedPathDataset(ClientContext &context,
@@ -196,7 +225,8 @@ LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
-  auto cache_key = BuildPathCacheKey(open_path, option_keys, option_values);
+  auto cache_key = LanceBuildResolvedPathDatasetCacheKey(open_path, option_keys,
+                                                         option_values);
 
   return GetOrOpenDatasetCacheEntry(
       context, cache_key,
@@ -215,8 +245,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
     const string &headers_tsv, string &out_display_uri, bool *out_cache_hit) {
-  auto cache_key = BuildNamespaceCacheKey(endpoint, table_id, bearer_token,
-                                          api_key, delimiter, headers_tsv);
+  auto cache_key = LanceBuildNamespaceDatasetCacheKey(
+      endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv);
   auto entry = GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
@@ -256,13 +286,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
   }
 
   auto &cfg = table.NamespaceConfig();
-  unordered_map<string, Value> overrides;
-  if (!cfg.bearer_token_override.empty()) {
-    overrides["bearer_token"] = Value(cfg.bearer_token_override);
-  }
-  if (!cfg.api_key_override.empty()) {
-    overrides["api_key"] = Value(cfg.api_key_override);
-  }
+  auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
+                                                     cfg.api_key_override);
 
   string bearer_token;
   string api_key;
@@ -273,12 +298,43 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
       cfg.headers_tsv, out_display_uri, out_cache_hit);
 }
 
-void LanceInvalidateDatasetCache(ClientContext &context) {
+string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
+                                         const LanceTableEntry &table) {
+  if (!table.IsNamespaceBacked()) {
+    return LanceBuildPathDatasetCacheKey(context, table.DatasetUri());
+  }
+
+  auto &cfg = table.NamespaceConfig();
+  auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
+                                                     cfg.api_key_override);
+  string bearer_token;
+  string api_key;
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
+                            api_key);
+  return LanceBuildNamespaceDatasetCacheKey(cfg.endpoint, cfg.table_id,
+                                            bearer_token, api_key,
+                                            cfg.delimiter, cfg.headers_tsv);
+}
+
+void LanceInvalidateDatasetCache(ClientContext &context,
+                                 const string &cache_key) {
   auto state = context.registered_state->Get<LanceDatasetCacheState>(
       LANCE_DATASET_CACHE_STATE_KEY);
   if (state) {
-    state->Clear();
+    state->Invalidate(cache_key);
   }
+}
+
+void LanceInvalidateDatasetCacheForPath(ClientContext &context,
+                                        const string &path) {
+  LanceInvalidateDatasetCache(context,
+                              LanceBuildPathDatasetCacheKey(context, path));
+}
+
+void LanceInvalidateDatasetCacheForTable(ClientContext &context,
+                                         const LanceTableEntry &table) {
+  LanceInvalidateDatasetCache(
+      context, LanceBuildDatasetCacheKeyForTable(context, table));
 }
 
 } // namespace duckdb
