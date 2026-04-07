@@ -124,7 +124,10 @@ Positional arguments:
 
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
+- `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
+- `refine_factor` (BIGINT, optional): Refine factor for the vector branch. Must be > 0.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
+- `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage for the vector branch when available. If `false`, the vector branch runs exact KNN.
 - `alpha` (FLOAT, default `0.5`): Vector/text mixing weight. Larger values weigh vector similarity more heavily.
 - `oversample_factor` (INTEGER, default `4`): Oversample factor for candidate generation. If provided, must be > 0.
 

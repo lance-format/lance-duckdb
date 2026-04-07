@@ -814,6 +814,9 @@ struct LanceSearchBindData : public TableFunctionData {
   string vector_column;
   vector<float> vector_query;
   string text_query;
+  uint64_t nprobes = 0;
+  uint64_t refine_factor = 0;
+  bool use_index = true;
   float alpha = 0.5F;
   uint32_t oversample_factor = 4;
 
@@ -882,8 +885,9 @@ static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
           bind_data.dataset, bind_data.vector_column.c_str(),
           bind_data.vector_query.data(), bind_data.vector_query.size(),
           bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-          bind_data.k, ir, NumericCast<size_t>(ir_len),
-          bind_data.prefilter ? 1 : 0, bind_data.alpha,
+          bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
+          NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0,
+          bind_data.use_index ? 1 : 0, bind_data.alpha,
           bind_data.oversample_factor);
     };
 
@@ -1073,11 +1077,49 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   }
   result->k = NumericCast<uint64_t>(k_val);
 
+  bool has_nprobes = false;
+  int64_t nprobes_val = 0;
+  auto nprobes_named = input.named_parameters.find("nprobs");
+  if (nprobes_named != input.named_parameters.end() &&
+      !nprobes_named->second.IsNull()) {
+    has_nprobes = true;
+    nprobes_val = nprobes_named->second.DefaultCastAs(LogicalType::BIGINT)
+                      .GetValue<int64_t>();
+  }
+  if (has_nprobes && nprobes_val <= 0) {
+    throw InvalidInputException("lance_hybrid_search requires nprobs > 0");
+  }
+  result->nprobes = has_nprobes ? NumericCast<uint64_t>(nprobes_val) : 0;
+
+  bool has_refine_factor = false;
+  int64_t refine_factor_val = 0;
+  auto refine_factor_named = input.named_parameters.find("refine_factor");
+  if (refine_factor_named != input.named_parameters.end() &&
+      !refine_factor_named->second.IsNull()) {
+    has_refine_factor = true;
+    refine_factor_val =
+        refine_factor_named->second.DefaultCastAs(LogicalType::BIGINT)
+            .GetValue<int64_t>();
+  }
+  if (has_refine_factor && refine_factor_val <= 0) {
+    throw InvalidInputException(
+        "lance_hybrid_search requires refine_factor > 0");
+  }
+  result->refine_factor =
+      has_refine_factor ? NumericCast<uint64_t>(refine_factor_val) : 0;
+
   auto prefilter_named = input.named_parameters.find("prefilter");
   if (prefilter_named != input.named_parameters.end() &&
       !prefilter_named->second.IsNull()) {
     result->prefilter =
         prefilter_named->second.DefaultCastAs(LogicalType::BOOLEAN)
+            .GetValue<bool>();
+  }
+  auto use_index_named = input.named_parameters.find("use_index");
+  if (use_index_named != input.named_parameters.end() &&
+      !use_index_named->second.IsNull()) {
+    result->use_index =
+        use_index_named->second.DefaultCastAs(LogicalType::BOOLEAN)
             .GetValue<bool>();
   }
 
@@ -1266,6 +1308,9 @@ LanceSearchBindToString(const LanceSearchBindData &bind_data) {
     result["Lance Text Column"] = bind_data.text_column;
     result["Lance Vector Query Dim"] = to_string(bind_data.vector_query.size());
     result["Lance Text Query"] = bind_data.text_query;
+    result["Lance Nprobes"] = to_string(bind_data.nprobes);
+    result["Lance Refine Factor"] = to_string(bind_data.refine_factor);
+    result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
     result["Lance Alpha"] = to_string(bind_data.alpha);
     result["Lance Oversample Factor"] = to_string(bind_data.oversample_factor);
   }
@@ -1320,7 +1365,10 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
 static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.named_parameters["k"] = LogicalType::BIGINT;
+    fun.named_parameters["nprobs"] = LogicalType::BIGINT;
+    fun.named_parameters["refine_factor"] = LogicalType::BIGINT;
     fun.named_parameters["prefilter"] = LogicalType::BOOLEAN;
+    fun.named_parameters["use_index"] = LogicalType::BOOLEAN;
     fun.named_parameters["alpha"] = LogicalType::FLOAT;
     fun.named_parameters["oversample_factor"] = LogicalType::INTEGER;
     fun.projection_pushdown = true;

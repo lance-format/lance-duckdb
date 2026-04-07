@@ -191,9 +191,12 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     text_column: *const c_char,
     text_query: *const c_char,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
+    use_index: u8,
     alpha: f32,
     oversample_factor: u32,
 ) -> *mut c_void {
@@ -205,9 +208,12 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         text_column,
         text_query,
         k,
+        nprobes,
+        refine_factor,
         filter_ir,
         filter_ir_len,
         prefilter,
+        use_index,
         alpha,
         oversample_factor,
     ) {
@@ -231,9 +237,12 @@ fn create_hybrid_stream_ir_inner(
     text_column: *const c_char,
     text_query: *const c_char,
     k: u64,
+    nprobes: u64,
+    refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
+    use_index: u8,
     alpha: f32,
     oversample_factor: u32,
 ) -> FfiResult<StreamHandle> {
@@ -265,8 +274,11 @@ fn create_hybrid_stream_ir_inner(
         text_column,
         text_query,
         k_usize,
+        nprobes,
+        refine_factor,
         filter,
         prefilter,
+        use_index,
         alpha,
         oversample_factor,
     )?;
@@ -282,8 +294,11 @@ fn create_hybrid_batch(
     text_column: &str,
     text_query: &str,
     k: usize,
+    nprobes: u64,
+    refine_factor: u64,
     filter: Option<datafusion_expr::Expr>,
     prefilter: u8,
+    use_index: u8,
     alpha: f32,
     oversample_factor: u32,
 ) -> FfiResult<RecordBatch> {
@@ -303,7 +318,17 @@ fn create_hybrid_batch(
                 format!("hybrid vector nearest: {err}"),
             )
         })?;
-    vector_scan.use_index(false);
+    if nprobes != 0 {
+        let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;
+        vector_scan.nprobes(nprobes_usize);
+    }
+    if refine_factor != 0 {
+        let refine_factor_u32: u32 = refine_factor.try_into().map_err(|_| {
+            FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
+        })?;
+        vector_scan.refine(refine_factor_u32);
+    }
+    vector_scan.use_index(use_index != 0);
     vector_scan.with_row_id();
     vector_scan.disable_scoring_autoprojection();
     vector_scan
