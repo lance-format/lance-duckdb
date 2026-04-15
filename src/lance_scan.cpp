@@ -1108,6 +1108,9 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   if (!scan_state.sampling_pushed_down && bind_data.limit_offset_pushed_down) {
     // Limit/offset pushdown requires that any TableFilterSet predicates are
     // evaluated by Lance. Otherwise limit/offset would apply before filtering.
+    // Filter pushability is pre-checked in LanceLimitOffsetPushdown (the
+    // optimizer pass that sets limit_offset_pushed_down), so reaching here
+    // with a non-pushable filter set indicates an optimizer bug.
     if (input.filters && !input.filters->filters.empty() &&
         !scan_state.filter_pushed_down) {
       throw IOException("Lance limit/offset pushdown requires filter pushdown");
@@ -1947,6 +1950,21 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
       return op;
     }
   }
+
+  // Pre-check filter pushability: limit/offset pushdown requires filter
+  // pushdown (otherwise Lance would apply LIMIT before DuckDB's filter,
+  // producing wrong results). If any table filter cannot be encoded to
+  // Lance IR (e.g., LIKE with interior wildcards, unsupported column types,
+  // or 'infinity' literals), keep the LogicalLimit in the plan and skip
+  // limit pushdown. DuckDB then applies LIMIT on top of the filtered
+  // stream — slower than Lance-side pushdown, but correct and strictly
+  // better than the previous "IO Error: Lance limit/offset pushdown
+  // requires filter pushdown" failure.
+  auto probe = ProbeLanceTableFilterIR(get, scan_bind.names, scan_bind.types);
+  if (!probe.all_filters_pushed) {
+    return op;
+  }
+
   scan_bind.limit_offset_pushed_down = true;
   scan_bind.pushed_limit = pushed_limit;
   scan_bind.pushed_offset = pushed_offset;
@@ -2031,7 +2049,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     extra_scan_col_ids.reserve(scan_get.table_filters.filters.size());
 
     if (!scan_get.table_filters.filters.empty()) {
-      idx_t max_col_id = 0;
+      // rowid filters have exec-pushdown-specific semantics; the shared
+      // probe below only covers IR encodability, so bail early here.
       for (auto &it : scan_get.table_filters.filters) {
         auto col_id = NumericCast<idx_t>(it.first);
         if (col_id >= scan_bind.names.size() ||
@@ -2043,21 +2062,10 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
             IsLanceVirtualRowIdColumnId(col_id)) {
           return bail("Lance exec pushdown: rowid filters not supported");
         }
-        max_col_id = MaxValue(max_col_id, col_id);
       }
 
-      vector<column_t> column_ids;
-      column_ids.reserve(max_col_id + 1);
-      for (idx_t i = 0; i <= max_col_id; i++) {
-        column_ids.push_back(NumericCast<column_t>(i));
-      }
-
-      vector<idx_t> projection_ids;
-      TableFunctionInitInput init_input(scan_get.bind_data.get(),
-                                        std::move(column_ids), projection_ids,
-                                        &scan_get.table_filters);
-      auto table_filters = BuildLanceTableFilterIRParts(
-          scan_bind.names, scan_bind.types, init_input, false);
+      auto table_filters =
+          ProbeLanceTableFilterIR(scan_get, scan_bind.names, scan_bind.types);
       if (!table_filters.all_filters_pushed) {
         return bail("Lance exec pushdown: table_filters not fully pushable");
       }

@@ -1,0 +1,158 @@
+# name: test/sql/pushdown_limit_filter_fallback.test
+# description: LIMIT/OFFSET gracefully degrades when filter pushdown fails
+# group: [sql]
+
+require lance
+
+# Setup: tiny table with a timestamp column. Filters involving 'infinity'
+# timestamps are NOT encodable as Lance filter IR (see pushdown_filter_ir_types
+# test: "Lance Filter IR Bytes": "0").
+statement ok
+COPY (
+  SELECT
+    id::BIGINT AS id,
+    TIMESTAMP '2020-01-01 00:00:00' + (id * INTERVAL '1 DAY') AS ts
+  FROM generate_series(1, 10) t(id)
+) TO 'test/.tmp/limit_filter_fallback.lance' (FORMAT lance, mode 'overwrite');
+
+# Baseline: without LIMIT, the unpushable filter runs correctly (Lance returns
+# all rows, DuckDB applies the filter). Returns 10.
+query I
+SELECT count(*) FROM 'test/.tmp/limit_filter_fallback.lance' WHERE ts < 'infinity'::TIMESTAMP;
+----
+10
+
+# Regression: filter pushdown fails (infinity timestamp) AND LIMIT is pushed.
+# Pre-fix this threw "Lance limit/offset pushdown requires filter pushdown".
+# Post-fix: scan runs with filter+limit applied by DuckDB on top of the
+# full-table scan, returning correct results.
+query I
+SELECT count(*) FROM (
+  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  WHERE ts < 'infinity'::TIMESTAMP
+  LIMIT 3
+);
+----
+3
+
+# With OFFSET as well
+query I
+SELECT count(*) FROM (
+  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  WHERE ts < 'infinity'::TIMESTAMP
+  LIMIT 3 OFFSET 2
+);
+----
+3
+
+# LIMIT larger than row count still works (returns all rows post-filter)
+query I
+SELECT count(*) FROM (
+  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  WHERE ts < 'infinity'::TIMESTAMP
+  LIMIT 100
+);
+----
+10
+
+# Results are semantically correct (not just row count): IDs come back
+query I
+SELECT id FROM 'test/.tmp/limit_filter_fallback.lance'
+WHERE ts < 'infinity'::TIMESTAMP
+ORDER BY id
+LIMIT 2;
+----
+1
+2
+
+# OFFSET pushed down with unpushable filter
+query I
+SELECT id FROM 'test/.tmp/limit_filter_fallback.lance'
+WHERE ts < 'infinity'::TIMESTAMP
+ORDER BY id
+LIMIT 2 OFFSET 5;
+----
+6
+7
+
+# Explain: when the filter cannot be pushed to Lance IR, the optimizer
+# leaves the LogicalLimit in the plan (Lance Limit Offset Pushdown=false)
+# so DuckDB applies LIMIT on top of the filtered stream.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+WHERE ts < 'infinity'::TIMESTAMP
+LIMIT 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+# When filters ARE pushable, limit pushdown still works as before.
+statement ok
+COPY (
+  SELECT id::BIGINT AS id FROM generate_series(1, 20) t(id)
+) TO 'test/.tmp/limit_filter_pushable.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/limit_filter_pushable.lance'
+WHERE id > 5
+LIMIT 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+# And returns correct results.
+query I
+SELECT count(*) FROM (
+  SELECT * FROM 'test/.tmp/limit_filter_pushable.lance' WHERE id > 5 LIMIT 3
+);
+----
+3
+
+# Selective unpushable filter: verifies the fix doesn't drop the filter.
+# Pre-fix, if LIMIT pushdown was applied without the filter being encoded,
+# the scan would return the first N rows of the table and DuckDB's filter
+# above might see none of them pass. We use a pushable filter combined with
+# an unpushable filter in a CONJUNCTION_AND — the whole conjunction fails
+# encoding (see lance_filter_ir.cpp CONJUNCTION_AND handling), but the
+# individual pushable filter can still reject rows at the DuckDB layer.
+statement ok
+COPY (
+  SELECT
+    id::BIGINT AS id,
+    TIMESTAMP '2020-01-01 00:00:00' + (id * INTERVAL '1 DAY') AS ts
+  FROM generate_series(1, 20) t(id)
+) TO 'test/.tmp/limit_filter_selective.lance' (FORMAT lance, mode 'overwrite');
+
+# Filter selects ids > 15 (5 matches). With LIMIT 3 we should get 3 of those
+# matches, NOT first 3 rows of the table (ids 1, 2, 3) which would be wrong.
+query I
+SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
+ORDER BY id
+LIMIT 3;
+----
+16
+17
+18
+
+# Same semantics with OFFSET: skip 2 matches, take next 2.
+query I
+SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
+ORDER BY id
+LIMIT 2 OFFSET 2;
+----
+18
+19
+
+# Sparse projection: filter on a column not in the SELECT list. The probe
+# uses synthetic column_ids [0..max_filter_col]; this verifies that the
+# probe's column_ids layout doesn't diverge from real init when projection
+# is pruned.
+query I
+SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
+ORDER BY id
+LIMIT 3;
+----
+16
+17
+18

@@ -846,6 +846,35 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
   }
 }
 
+LanceFilterIRBuildResult
+ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
+                        const vector<LogicalType> &types) {
+  LanceFilterIRBuildResult empty_result;
+  if (get.table_filters.filters.empty()) {
+    return empty_result;
+  }
+  idx_t max_col_id = 0;
+  for (auto &it : get.table_filters.filters) {
+    auto col_id = NumericCast<idx_t>(it.first);
+    if (col_id >= names.size() || col_id >= types.size()) {
+      LanceFilterIRBuildResult oob_result;
+      oob_result.all_filters_pushed = false;
+      oob_result.all_prefilterable_filters_pushed = false;
+      return oob_result;
+    }
+    max_col_id = MaxValue(max_col_id, col_id);
+  }
+  vector<column_t> column_ids;
+  column_ids.reserve(max_col_id + 1);
+  for (idx_t i = 0; i <= max_col_id; i++) {
+    column_ids.push_back(NumericCast<column_t>(i));
+  }
+  vector<idx_t> projection_ids;
+  TableFunctionInitInput probe_input(get.bind_data.get(), std::move(column_ids),
+                                     projection_ids, &get.table_filters);
+  return BuildLanceTableFilterIRParts(names, types, probe_input, false);
+}
+
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const TableFunctionInitInput &input, bool exclude_computed_columns) {
