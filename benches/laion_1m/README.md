@@ -27,7 +27,8 @@ runs. The initial download is the only networked step.
 
 ## Requirements
 
-- official DuckDB CLI
+- `duckdb` available in `PATH`
+- `duckdb >= 1.5.2`
 - Python 3
 - internet access for the first run
 - a stable DuckDB `lance` extension release that includes indexed hybrid search
@@ -35,12 +36,6 @@ runs. The initial download is the only networked step.
 
 The benchmark uses the stable DuckDB `lance` extension via `INSTALL lance; LOAD lance;`.
 It does not require a repository-local Lance build.
-
-By default the examples below assume:
-
-```bash
-DUCKDB=/opt/homebrew/bin/duckdb
-```
 
 ## Quick Start
 
@@ -117,14 +112,14 @@ If you need to run the steps individually instead of using the Python runner:
 
 ```bash
 bash benches/laion_1m/scripts/download_source_parquet.sh
-$DUCKDB -c ".read benches/laion_1m/sql/10_materialize_lz4_parquet.sql"
-$DUCKDB benches/laion_1m/data/laion_1m_indexed.duckdb -c ".read benches/laion_1m/sql/20_build_duckdb_indexed.sql"
-$DUCKDB -c ".read benches/laion_1m/sql/30_build_lance_v22.sql"
+duckdb -c ".read benches/laion_1m/sql/10_materialize_lz4_parquet.sql"
+duckdb benches/laion_1m/data/laion_1m_indexed.duckdb -c ".read benches/laion_1m/sql/20_build_duckdb_indexed.sql"
+duckdb -c ".read benches/laion_1m/sql/30_build_lance_v22.sql"
 ```
 
 You can also run the verification scripts separately:
 
 ```bash
-$DUCKDB benches/laion_1m/data/laion_1m_indexed.duckdb -c ".read benches/laion_1m/sql/50_verify_duckdb_indexed.sql"
-$DUCKDB -c ".read benches/laion_1m/sql/51_verify_lance.sql"
+duckdb benches/laion_1m/data/laion_1m_indexed.duckdb -c ".read benches/laion_1m/sql/50_verify_duckdb_indexed.sql"
+duckdb -c ".read benches/laion_1m/sql/51_verify_lance.sql"
 ```

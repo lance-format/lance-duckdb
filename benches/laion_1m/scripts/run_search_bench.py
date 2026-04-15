@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -23,7 +23,8 @@ class Backend:
     workloads: list[str]
 
 
-OFFICIAL_DUCKDB = os.environ.get("DUCKDB_CLI", "/opt/homebrew/bin/duckdb")
+DUCKDB_BIN = "duckdb"
+MIN_DUCKDB_VERSION = (1, 5, 2)
 
 
 def repo_root() -> Path:
@@ -32,6 +33,33 @@ def repo_root() -> Path:
 
 def results_dir(root: Path) -> Path:
     return root / "benches" / "laion_1m" / "data" / "results"
+
+
+def find_duckdb_cli() -> str:
+    path = shutil.which(DUCKDB_BIN)
+    if path is None:
+        raise RuntimeError(
+            "duckdb not found in PATH; install DuckDB >= 1.5.2 and ensure `duckdb` is available"
+        )
+    return path
+
+
+def parse_duckdb_version(version_output: str) -> tuple[int, int, int]:
+    match = re.search(r"v(\d+)\.(\d+)\.(\d+)", version_output)
+    if match is None:
+        raise RuntimeError(f"failed to parse DuckDB version from: {version_output.strip()}")
+    return tuple(int(part) for part in match.groups())
+
+
+def ensure_duckdb_version(duckdb_cli: str) -> None:
+    result = run_checked([duckdb_cli, "--version"], cwd=repo_root())
+    version = parse_duckdb_version(result.stdout)
+    if version < MIN_DUCKDB_VERSION:
+        minimum = ".".join(str(part) for part in MIN_DUCKDB_VERSION)
+        actual = ".".join(str(part) for part in version)
+        raise RuntimeError(
+            f"duckdb {actual} is too old; this benchmark requires duckdb >= {minimum}"
+        )
 
 
 def ensure_parent(path: Path) -> None:
@@ -53,7 +81,7 @@ def run_checked(cmd: list[str], cwd: Path, stdout_path: Path | None = None) -> s
     return subprocess.run(cmd, cwd=cwd, text=True, check=True, capture_output=True)
 
 
-def prepare_artifacts(root: Path) -> None:
+def prepare_artifacts(root: Path, duckdb_cli: str) -> None:
     data_dir = root / "benches" / "laion_1m" / "data"
     source_glob = data_dir / "source" / "default" / "partial-train"
     lz4_parquet = data_dir / "laion_1m_lz4.parquet"
@@ -69,14 +97,14 @@ def prepare_artifacts(root: Path) -> None:
 
     if not lz4_parquet.exists():
         run_checked(
-            [OFFICIAL_DUCKDB, "-c", ".read benches/laion_1m/sql/10_materialize_lz4_parquet.sql"],
+            [duckdb_cli, "-c", ".read benches/laion_1m/sql/10_materialize_lz4_parquet.sql"],
             cwd=root,
         )
 
     if not indexed_db.exists():
         run_checked(
             [
-                OFFICIAL_DUCKDB,
+                duckdb_cli,
                 str(indexed_db),
                 "-c",
                 ".read benches/laion_1m/sql/20_build_duckdb_indexed.sql",
@@ -87,7 +115,7 @@ def prepare_artifacts(root: Path) -> None:
     if not lance_ds.exists():
         run_checked(
             [
-                OFFICIAL_DUCKDB,
+                duckdb_cli,
                 "-c",
                 ".read benches/laion_1m/sql/30_build_lance_v22.sql",
             ],
@@ -95,20 +123,20 @@ def prepare_artifacts(root: Path) -> None:
         )
 
 
-def build_backends(root: Path) -> list[Backend]:
+def build_backends(root: Path, duckdb_cli: str) -> list[Backend]:
     workloads = ["fts", "vector_exact", "vector_indexed", "hybrid", "blob_read"]
     indexed_db = root / "benches" / "laion_1m" / "data" / "laion_1m_indexed.duckdb"
     return [
         Backend(
             name="parquet",
-            cli=[OFFICIAL_DUCKDB],
+            cli=[duckdb_cli],
             init_sql=root / "benches" / "laion_1m" / "sql" / "workloads" / "parquet" / "_init.sql",
             workloads=workloads,
         ),
         Backend(
             name="duckdb_indexed",
             cli=[
-                OFFICIAL_DUCKDB,
+                duckdb_cli,
                 str(indexed_db),
             ],
             init_sql=root / "benches" / "laion_1m" / "sql" / "workloads" / "duckdb_indexed" / "_init.sql",
@@ -116,7 +144,7 @@ def build_backends(root: Path) -> list[Backend]:
         ),
         Backend(
             name="lance",
-            cli=[OFFICIAL_DUCKDB],
+            cli=[duckdb_cli],
             init_sql=root / "benches" / "laion_1m" / "sql" / "workloads" / "lance" / "_init.sql",
             workloads=workloads,
         ),
@@ -268,13 +296,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = repo_root()
+    duckdb_cli = find_duckdb_cli()
+    ensure_duckdb_version(duckdb_cli)
     out_dir = results_dir(root)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_prepare:
-        prepare_artifacts(root)
+        prepare_artifacts(root, duckdb_cli)
 
-    backends = build_backends(root)
+    backends = build_backends(root, duckdb_cli)
     modes = ["cold", "warm"] if args.mode == "all" else [args.mode]
 
     for mode in modes:
