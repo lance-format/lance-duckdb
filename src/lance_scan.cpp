@@ -43,6 +43,7 @@
 #include "lance_exec_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
@@ -836,6 +837,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -856,6 +858,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->scan_schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
@@ -930,6 +933,7 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -951,6 +955,7 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->scan_schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
   names = result->names;
@@ -1531,6 +1536,11 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
 
   lance_free_batch(batch);
 
+  // Widen any Float16 columns to Float32 before DuckDB consumes the batch.
+  // `tmp_schema` still carries the original "e" format codes, so do this
+  // before it is released.
+  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+
   if (local_state.global_state && tmp_schema.n_children > 0 &&
       new_chunk->arrow_array.n_children == tmp_schema.n_children &&
       !local_state.global_state->scan_column_names.empty()) {
@@ -1648,6 +1658,12 @@ static void LanceFillDeferredColumns(ClientContext &context,
         "Deferred take returned multiple batches (expected one)");
   }
   lance_close_stream(take_stream);
+
+  // Widen Float16 columns before PopulateArrowTableSchema and the deferred
+  // ArrowToDuckDB extraction. Convert buffers first (while `take_schema`
+  // still has "e" formats), then rewrite the schema formats to "f".
+  LanceCoerceArrowArrayForDuckDB(&take_schema, &take_arrow->arrow_array);
+  LanceCoerceArrowSchemaForDuckDB(&take_schema);
 
   ArrowTableSchema take_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, take_table,
@@ -2574,6 +2590,7 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
             LanceFormatErrorSuffix());
       }
       lance_free_schema(schema_handle);
+      LanceCoerceArrowSchemaForDuckDB(&exec_bind->schema_root.arrow_schema);
       ArrowTableFunction::PopulateArrowTableSchema(
           context, exec_bind->arrow_table, exec_bind->schema_root.arrow_schema);
       exec_names = exec_bind->arrow_table.GetNames();
@@ -2885,6 +2902,7 @@ static unique_ptr<FunctionData> LanceExecBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -2954,6 +2972,10 @@ static bool LanceExecLoadNextBatch(LanceExecLocalState &local_state) {
         LanceFormatErrorSuffix());
   }
   lance_free_batch(batch);
+
+  // Widen any Float16 columns to Float32 before DuckDB consumes the batch.
+  // `tmp_schema` still carries the original "e" format codes.
+  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
@@ -3109,7 +3131,8 @@ static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
 
 static void PopulateLanceTableSchemaFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<unique_ptr<Constraint>> &out_constraints) {
+    vector<unique_ptr<Constraint>> &out_constraints,
+    vector<string> *out_coerced_columns = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -3125,6 +3148,10 @@ static void PopulateLanceTableSchemaFromDataset(
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  if (out_coerced_columns) {
+    *out_coerced_columns = std::move(coerced);
+  }
 
   ArrowTableSchema arrow_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
@@ -3178,9 +3205,10 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.internal = internal;
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
+  vector<string> coerced;
   try {
     PopulateLanceTableSchemaFromDataset(context, dataset, create_info.columns,
-                                        create_info.constraints);
+                                        create_info.constraints, &coerced);
   } catch (...) {
     lance_close_dataset(dataset);
     throw;
@@ -3194,6 +3222,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
     entry = make_uniq<LanceTableEntry>(catalog, schema, create_info,
                                        base.DatasetUri());
   }
+  entry->SetCoercedColumnNames(std::move(coerced));
 
   auto *table_md = lance_dataset_list_table_metadata(dataset);
   if (!table_md) {
@@ -3539,6 +3568,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -3559,6 +3589,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(scan_schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->scan_schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 

@@ -54,9 +54,23 @@ public:
     return *namespace_config;
   }
 
+  // Top-level catalog columns whose declared type was coerced to a
+  // DuckDB-compatible shape by the Arrow-compat reader-boundary layer
+  // (e.g. FloatingPoint(HALF) → FloatingPoint(SINGLE)). Writers must refuse
+  // to operate on such columns — DuckDB would hand back values in the
+  // coerced type and silently widen / otherwise corrupt the on-disk storage.
+  bool HasCoercedColumns() const { return !coerced_column_names.empty(); }
+  const vector<string> &CoercedColumnNames() const {
+    return coerced_column_names;
+  }
+  void SetCoercedColumnNames(vector<string> names) {
+    coerced_column_names = std::move(names);
+  }
+
 private:
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
+  vector<string> coerced_column_names;
 };
 
 } // namespace duckdb

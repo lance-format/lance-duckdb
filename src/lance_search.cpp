@@ -27,6 +27,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
@@ -450,6 +451,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -586,6 +588,9 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
   }
 
   lance_free_batch(batch);
+
+  // Widen Float16 columns before DuckDB consumes the batch.
+  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
@@ -931,6 +936,9 @@ static bool LanceSearchLoadNextBatch(LanceSearchLocalState &local_state,
   }
   lance_free_batch(batch);
 
+  // Widen Float16 columns before DuckDB consumes the batch.
+  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+
   local_state.global_state->record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   local_state.global_state->record_batch_rows.fetch_add(rows);
@@ -1015,6 +1023,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
@@ -1160,6 +1169,7 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();

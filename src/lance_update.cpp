@@ -298,6 +298,15 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw InternalException(
         "PlanLanceUpdateOverwrite called for non-Lance table");
   }
+  if (lance_table->HasCoercedColumns()) {
+    throw NotImplementedException(
+        "UPDATE on Lance table '" + lance_table->name +
+        "' is not supported: column(s) [" +
+        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
+        "] have Arrow types DuckDB cannot represent natively, so the "
+        "catalog exposes a coerced type. Writing in the coerced type would "
+        "silently change the on-disk storage.");
+  }
 
   auto parts = ExtractUpdatePlanParts(op);
   auto *scan_bind =

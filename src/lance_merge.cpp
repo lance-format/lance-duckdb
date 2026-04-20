@@ -14,6 +14,7 @@
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -523,6 +524,11 @@ void LanceMergeGlobalState::ForEachTakenChunk(ClientContext &context,
     }
     lance_free_batch(batch);
 
+    // Widen Float16 columns to Float32 so PopulateArrowTableSchema and
+    // DuckDB consumers see a supported type.
+    LanceCoerceArrowArrayForDuckDB(&schema, &arrow_chunk->arrow_array);
+    LanceCoerceArrowSchemaForDuckDB(&schema);
+
     DataChunk taken;
     ConvertArrowArrayToDuckDataChunk(context, *arrow_chunk, schema, taken,
                                      op.table_column_types);
@@ -1002,6 +1008,15 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
   auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
   if (!lance_table) {
     throw InternalException("PlanLanceMergeInto called for non-Lance table");
+  }
+  if (lance_table->HasCoercedColumns()) {
+    throw NotImplementedException(
+        "MERGE INTO Lance table '" + lance_table->name +
+        "' is not supported: column(s) [" +
+        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
+        "] have Arrow types DuckDB cannot represent natively, so the "
+        "catalog exposes a coerced type. Writing in the coerced type would "
+        "silently change the on-disk storage.");
   }
 
   if (op.children.empty() || !op.children[0]) {

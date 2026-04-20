@@ -40,6 +40,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -163,9 +164,9 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
   }
 }
 
-static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
-                                                 void *dataset,
-                                                 ColumnList &out_columns) {
+static void PopulateLanceTableColumnsFromDataset(
+    ClientContext &context, void *dataset, ColumnList &out_columns,
+    vector<string> *out_coerced_columns = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -181,6 +182,10 @@ static void PopulateLanceTableColumnsFromDataset(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  if (out_coerced_columns) {
+    *out_coerced_columns = std::move(coerced);
+  }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
                                  out_columns);
 }
@@ -305,8 +310,10 @@ public:
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+    vector<string> coerced;
     try {
-      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
+                                           &coerced);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -316,8 +323,10 @@ public:
     if (dataset_uri.empty()) {
       dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
     }
-    return make_uniq_base<CatalogEntry, LanceTableEntry>(
-        catalog, schema, info, std::move(dataset_uri));
+    auto entry = make_uniq<LanceTableEntry>(catalog, schema, info,
+                                            std::move(dataset_uri));
+    entry->SetCoercedColumnNames(std::move(coerced));
+    return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
   vector<string> GetDefaultEntries() override {
@@ -358,9 +367,9 @@ private:
   shared_ptr<LanceDirectoryNamespaceConfig> ns;
 };
 
-static void PopulateLanceTableColumnsFromJsonSchema(ClientContext &context,
-                                                    const string &schema_json,
-                                                    ColumnList &out_columns) {
+static void PopulateLanceTableColumnsFromJsonSchema(
+    ClientContext &context, const string &schema_json, ColumnList &out_columns,
+    vector<string> *out_coerced_columns = nullptr) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_json_arrow_schema_to_c(schema_json.c_str(),
@@ -368,6 +377,10 @@ static void PopulateLanceTableColumnsFromJsonSchema(ClientContext &context,
     throw IOException("Failed to convert JSON Arrow schema to C Data "
                       "Interface" +
                       LanceFormatErrorSuffix());
+  }
+  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  if (out_coerced_columns) {
+    *out_coerced_columns = std::move(coerced);
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
                                  out_columns);
@@ -430,13 +443,15 @@ public:
       CreateTableInfo info(schema, entry_name);
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      vector<string> coerced;
       try {
         PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
-                                                info.columns);
+                                                info.columns, &coerced);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
-      return MakeNamespaceEntry(entry_name, table_id, std::move(info));
+      return MakeNamespaceEntry(entry_name, table_id, std::move(info),
+                                std::move(coerced));
     }
 
     // Slow fallback: open dataset from S3.
@@ -451,21 +466,25 @@ public:
       CreateTableInfo info(schema, entry_name);
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      vector<string> coerced;
       try {
-        PopulateLanceTableColumnsFromDataset(context, dataset, info.columns);
+        PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
+                                             &coerced);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
       }
       lance_close_dataset(dataset);
-      return MakeNamespaceEntry(entry_name, table_id, std::move(info));
+      return MakeNamespaceEntry(entry_name, table_id, std::move(info),
+                                std::move(coerced));
     }
 
     // All paths failed — return an empty entry to prevent DuckDB crash.
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info));
+    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
+                              {});
   }
 
   vector<string> GetDefaultEntries() override {
@@ -487,7 +506,8 @@ public:
 private:
   unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
                                               const string &table_id,
-                                              CreateTableInfo info) {
+                                              CreateTableInfo info,
+                                              vector<string> coerced_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.endpoint = endpoint;
     cfg.table_id = table_id;
@@ -495,8 +515,10 @@ private:
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
     cfg.headers_tsv = headers_tsv;
-    return make_uniq_base<CatalogEntry, LanceTableEntry>(catalog, schema, info,
-                                                         std::move(cfg));
+    auto entry = make_uniq<LanceTableEntry>(catalog, schema, info,
+                                            std::move(cfg));
+    entry->SetCoercedColumnNames(std::move(coerced_columns));
+    return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
   bool TryDescribeTableWithSchema(const string &table_id,

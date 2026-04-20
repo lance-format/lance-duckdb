@@ -229,6 +229,15 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
   }
+  if (lance_table->HasCoercedColumns()) {
+    throw NotImplementedException(
+        "INSERT into Lance table '" + lance_table->name +
+        "' is not supported: column(s) [" +
+        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
+        "] have Arrow types DuckDB cannot represent natively, so the "
+        "catalog exposes a coerced type. Writing in the coerced type would "
+        "silently change the on-disk storage.");
+  }
 
   vector<string> column_names;
   vector<LogicalType> column_types;
