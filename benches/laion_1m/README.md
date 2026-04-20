@@ -4,7 +4,7 @@ This directory contains a reproducible benchmark for comparing three query paths
 on the same LAION-derived slice:
 
 - Parquet direct
-- DuckDB indexed
+- DuckDB indexed (a DuckDB table with FTS and VSS indexes built from the same Parquet baseline)
 - Lance
 
 The benchmark uses the public `lance-format/laion-1m` Hugging Face Parquet
@@ -32,7 +32,7 @@ runs. The initial download is the only networked step.
 - Python 3
 - internet access for the first run
 - a stable DuckDB `lance` extension release that includes indexed hybrid search
-  parameters such as `use_index`, `nprobs`, and `refine_factor`
+  parameters such as `use_index`, `nprobes`, and `refine_factor`
 
 The benchmark uses the stable DuckDB `lance` extension via `INSTALL lance; LOAD lance;`.
 It does not require a repository-local Lance build.
