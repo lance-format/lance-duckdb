@@ -52,7 +52,7 @@ def parse_duckdb_version(version_output: str) -> tuple[int, int, int]:
 
 
 def ensure_duckdb_version(duckdb_cli: str) -> None:
-    result = run_checked([duckdb_cli, "--version"], cwd=repo_root())
+    result = run_checked([duckdb_cli, "--version"], cwd=repo_root(), capture=True)
     version = parse_duckdb_version(result.stdout)
     if version < MIN_DUCKDB_VERSION:
         minimum = ".".join(str(part) for part in MIN_DUCKDB_VERSION)
@@ -66,19 +66,30 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def run_checked(cmd: list[str], cwd: Path, stdout_path: Path | None = None) -> subprocess.CompletedProcess[str]:
-    ensure_parent(stdout_path) if stdout_path else None
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run_checked(
+    cmd: list[str],
+    cwd: Path,
+    stdout_path: Path | None = None,
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
     if stdout_path:
-      with stdout_path.open("w") as out:
-        return subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-        )
-    return subprocess.run(cmd, cwd=cwd, text=True, check=True, capture_output=True)
+        ensure_parent(stdout_path)
+        with stdout_path.open("w") as out:
+            return subprocess.run(
+                cmd,
+                cwd=cwd,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=True,
+            )
+    if capture:
+        return subprocess.run(cmd, cwd=cwd, text=True, check=True, capture_output=True)
+    return subprocess.run(cmd, cwd=cwd, text=True, check=True)
 
 
 def prepare_artifacts(root: Path, duckdb_cli: str) -> None:
@@ -90,18 +101,25 @@ def prepare_artifacts(root: Path, duckdb_cli: str) -> None:
 
     source_files = sorted(source_glob.glob("*.parquet"))
     if len(source_files) < 10:
+        log("[prepare] downloading source parquet shards from huggingface (one-time, several minutes)")
         run_checked(
             ["bash", "benches/laion_1m/scripts/download_source_parquet.sh"],
             cwd=root,
         )
+    else:
+        log(f"[prepare] source parquet shards present ({len(source_files)} files), skipping download")
 
     if not lz4_parquet.exists():
+        log("[prepare] materializing lz4 parquet baseline")
         run_checked(
             [duckdb_cli, "-c", ".read benches/laion_1m/sql/10_materialize_lz4_parquet.sql"],
             cwd=root,
         )
+    else:
+        log("[prepare] lz4 parquet baseline present, skipping")
 
     if not indexed_db.exists():
+        log("[prepare] building duckdb indexed database (HNSW + FTS indexes, several minutes)")
         run_checked(
             [
                 duckdb_cli,
@@ -111,8 +129,11 @@ def prepare_artifacts(root: Path, duckdb_cli: str) -> None:
             ],
             cwd=root,
         )
+    else:
+        log("[prepare] duckdb indexed database present, skipping")
 
     if not lance_ds.exists():
+        log("[prepare] building lance dataset")
         run_checked(
             [
                 duckdb_cli,
@@ -121,6 +142,8 @@ def prepare_artifacts(root: Path, duckdb_cli: str) -> None:
             ],
             cwd=root,
         )
+    else:
+        log("[prepare] lance dataset present, skipping")
 
 
 def build_backends(root: Path, duckdb_cli: str) -> list[Backend]:
@@ -180,6 +203,7 @@ def run_cold(
     for workload in backend.workloads:
         samples: list[tuple[float, float, float]] = []
         for repeat in range(1, repeats + 1):
+            log(f"[cold] backend={backend.name} workload={workload} repeat={repeat}/{repeats}")
             log_path = out_dir / f"cold_{backend.name}_{workload}_{repeat:02d}.log"
             cmd = backend.cli + [
                 "-c",
@@ -197,6 +221,7 @@ def run_cold(
                 raise RuntimeError(f"expected at least 1 timing entry in {log_path}, got 0")
             samples.append(times[-1])
         real_s, user_s, sys_s = average_samples(samples)
+        log(f"[cold] backend={backend.name} workload={workload} avg_real_ms={real_s * 1000:.1f}")
         rows.append((workload, real_s, user_s, sys_s))
     return rows
 
@@ -207,6 +232,10 @@ def run_warm(
     out_dir: Path,
     repeats: int,
 ) -> list[tuple[str, float, float, float]]:
+    log(
+        f"[warm] backend={backend.name} running {repeats} repeats × "
+        f"{len(backend.workloads)} workloads in one session"
+    )
     log_path = out_dir / f"warm_{backend.name}.log"
     cmd = backend.cli + [
         "-c",
@@ -238,6 +267,7 @@ def run_warm(
             for repeat in range(repeats)
         ]
         real_s, user_s, sys_s = average_samples(samples)
+        log(f"[warm] backend={backend.name} workload={workload} avg_real_ms={real_s * 1000:.1f}")
         rows.append((workload, real_s, user_s, sys_s))
     return rows
 
@@ -308,6 +338,7 @@ def main() -> int:
     modes = ["cold", "warm"] if args.mode == "all" else [args.mode]
 
     for mode in modes:
+        log(f"[run] mode={mode} repeats={args.repeats}")
         all_rows: list[tuple[str, str, float, float, float]] = []
         for backend in backends:
             timed_rows = (
