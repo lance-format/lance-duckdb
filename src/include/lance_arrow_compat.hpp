@@ -7,8 +7,8 @@
 
 namespace duckdb {
 
-// Compatibility shim between the Arrow types Lance emits and the subset DuckDB's
-// bundled Arrow consumer supports.
+// Compatibility shim between the Arrow types Lance emits and the subset
+// DuckDB's bundled Arrow consumer supports.
 //
 // Some Lance datasets carry Arrow types that DuckDB cannot represent natively
 // (today: FloatingPoint(HALF); future additions slot in without touching call
@@ -31,8 +31,7 @@ namespace duckdb {
 // ArrowSchema / ArrowArray; children are released transitively.
 
 // Umbrella helpers — call these at every Lance → DuckDB boundary.
-std::vector<std::string>
-LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
+std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
 
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
                                     ArrowArray *array);

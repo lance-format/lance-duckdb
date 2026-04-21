@@ -9,7 +9,10 @@ complex nested shapes to cover every recursion branch in the widening hook:
 * ``half_list``    : variable-size list of float16
 * ``half_struct``  : struct containing a float16 and a float32 field
 * ``half_in_list`` : list of struct<half : float16>
-* ``half_map``     : map<string, float16>
+
+(Lance's Rust writer does not yet encode ``map<_, float16>``, so the
+map-of-half case is exercised in the schema-conversion Scala tests on the
+lance-spark side instead of here.)
 
 Run once before committing the fixture. The sqllogic test at
 ``test/sql/float16_widening.test`` reads from this directory.
@@ -53,9 +56,7 @@ VEC = np.array(
 )
 
 scalar_arr = pa.array(SCALAR, type=pa.float16())
-vec_arr = pa.FixedSizeListArray.from_arrays(
-    pa.array(VEC.reshape(-1), type=pa.float16()), 3
-)
+vec_arr = pa.FixedSizeListArray.from_arrays(pa.array(VEC.reshape(-1), type=pa.float16()), 3)
 
 # Variable-size list<float16>: [[1.0, 2.0], [3.0], [], [-1.0, -2.0, -3.0], [0.0]]
 list_values = pa.array(
@@ -82,17 +83,6 @@ inner_struct = pa.StructArray.from_arrays(
 inner_offsets = pa.array([0, 1, 3, 3, 5, 6], type=pa.int32())
 half_in_list = pa.ListArray.from_arrays(inner_offsets, inner_struct)
 
-# Map<string, float16>.
-keys = pa.array(
-    ["a", "b", "c", "a", "b", "c", "d", "e"], type=pa.string()
-)
-vals = pa.array(
-    np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 8.0], dtype=np.float16),
-    type=pa.float16(),
-)
-map_offsets = pa.array([0, 0, 2, 3, 6, 8], type=pa.int32())
-half_map = pa.MapArray.from_arrays(map_offsets, keys, vals)
-
 table = pa.table(
     {
         "id": pa.array(range(len(SCALAR)), type=pa.int64()),
@@ -101,7 +91,6 @@ table = pa.table(
         "half_list": half_list,
         "half_struct": half_struct,
         "half_in_list": half_in_list,
-        "half_map": half_map,
     }
 )
 

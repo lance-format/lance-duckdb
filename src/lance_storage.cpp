@@ -515,8 +515,8 @@ private:
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
     cfg.headers_tsv = headers_tsv;
-    auto entry = make_uniq<LanceTableEntry>(catalog, schema, info,
-                                            std::move(cfg));
+    auto entry =
+        make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }

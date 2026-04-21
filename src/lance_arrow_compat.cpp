@@ -19,7 +19,8 @@ namespace {
 // A rule describes a single Arrow type DuckDB cannot consume. Each rule
 // provides:
 //   * `matches(format)`: does this rule apply to the given Arrow format string?
-//   * `coerced_format`:   static storage Arrow format the schema is rewritten to.
+//   * `coerced_format`:   static storage Arrow format the schema is rewritten
+//   to.
 //   * `convert(src, dst, n)`: widen `n` elements from the on-disk buffer into
 //                              a DuckDB-native buffer. `dst` is a new buffer
 //                              of `coerced_element_size * n` bytes.
@@ -235,8 +236,7 @@ bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema) {
   return SchemaNeedsCoercion(schema);
 }
 
-std::vector<std::string>
-LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
+std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   std::vector<std::string> coerced_top_level;
   if (!schema || !SchemaNeedsCoercion(schema)) {
     return coerced_top_level;
