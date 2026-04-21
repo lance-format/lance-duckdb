@@ -4,6 +4,15 @@
 
 require lance
 
+# Upstream Lance (v4.0.0) panics in
+#   lance-<ver>/src/io/commit/conflict_resolver.rs:1659
+# during concurrent OPTIMIZE/VACUUM/INSERT when a freshly VACUUM-ed
+# manifest (e.g. _versions/99.manifest) disappears before a peer commit
+# attempts to read it. Reproduces on Windows CI runners only; this test
+# never ran on Windows until PR #195 touched CMakeLists.txt, which is
+# what triggers the distribution workflow's Windows job.
+require notwindows
+
 statement ok
 COPY (SELECT * FROM 'test/data/test_data.lance')
 TO 'test/.tmp/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
