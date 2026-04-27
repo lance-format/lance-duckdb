@@ -271,9 +271,8 @@ fn rewrite_rows_update_transaction_inner(
     }
 
     let (maybe_txn, rows_updated) = match runtime::block_on(async {
-        let mut builder =
-            lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
-                .with_storage_options(storage_options);
+        let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(path.as_str())
+            .with_storage_options(storage_options);
         if let Some(session) = session.clone() {
             builder = builder.with_session(session);
         }
