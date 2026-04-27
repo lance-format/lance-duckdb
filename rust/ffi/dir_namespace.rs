@@ -142,22 +142,23 @@ fn open_dataset_in_dir_namespace_inner(
                 format!("dir namespace build '{root}': {err}"),
             )
         })?;
-        let mut builder = DatasetBuilder::from_namespace(
-            Arc::new(namespace),
-            vec![table_name.to_string()],
-        )
-            .await
-            .map_err(|err| {
-                FfiError::new(
-                    ErrorCode::DatasetOpen,
-                    format!("dir namespace describe '{root}/{table_name}': {err}"),
-                )
-            })?;
+        let mut builder =
+            DatasetBuilder::from_namespace(Arc::new(namespace), vec![table_name.to_string()])
+                .await
+                .map_err(|err| {
+                    FfiError::new(
+                        ErrorCode::DatasetOpen,
+                        format!("dir namespace describe '{root}/{table_name}': {err}"),
+                    )
+                })?;
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
         builder.load().await.map_err(|err| {
-            FfiError::new(ErrorCode::DatasetOpen, format!("dir namespace dataset open: {err}"))
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("dir namespace dataset open: {err}"),
+            )
         })
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;

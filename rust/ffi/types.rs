@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use lance::Dataset;
 use lance::session::Session;
+use lance::Dataset;
 
 use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};

@@ -1,14 +1,14 @@
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use lance::session::Session;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
 use super::types::SessionHandle;
-use super::util::{FfiError, FfiResult, optional_session_handle, u64_to_usize};
+use super::util::{optional_session_handle, u64_to_usize, FfiError, FfiResult};
 
 static DATASET_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_DESCRIBE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -124,7 +124,7 @@ fn session_get_stats_inner(session: *mut c_void) -> FfiResult<LanceSessionStats>
 #[no_mangle]
 pub unsafe extern "C" fn lance_debug_get_counters(out_counters: *mut LanceDebugCounters) -> i32 {
     if out_counters.is_null() {
-        set_last_error(ErrorCode::InvalidArgument, "out_counters is null".to_string());
+        set_last_error(ErrorCode::InvalidArgument, "out_counters is null");
         return -1;
     }
 
@@ -161,8 +161,8 @@ mod tests {
 
     use crate::runtime;
 
-    use super::*;
     use super::super::dataset::{lance_close_dataset, lance_open_dataset_with_session};
+    use super::*;
 
     #[test]
     fn test_create_session_and_get_stats() {
@@ -180,12 +180,15 @@ mod tests {
 
     #[test]
     fn test_open_dataset_with_session_records_debug_counters() {
-        let dataset_dir = std::env::temp_dir().join(format!("ffi-session-{}", rand::random::<u64>()));
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-session-{}", rand::random::<u64>()));
         let uri = dataset_dir.to_string_lossy().to_string();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
 
         unsafe {
@@ -193,13 +196,9 @@ mod tests {
             let session = lance_create_session(0, 0);
             assert!(!session.is_null());
 
-            runtime::block_on(Dataset::write(
-                reader,
-                &uri,
-                Some(WriteParams::default()),
-            ))
-            .unwrap()
-            .unwrap();
+            runtime::block_on(Dataset::write(reader, &uri, Some(WriteParams::default())))
+                .unwrap()
+                .unwrap();
 
             let uri_c = CString::new(uri.clone()).unwrap();
             let first = lance_open_dataset_with_session(uri_c.as_ptr(), session);
