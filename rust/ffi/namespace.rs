@@ -580,22 +580,23 @@ fn open_dataset_in_namespace_inner(
 
     let (dataset, table_uri) = runtime::block_on(async move {
         record_namespace_describe();
-        let mut builder = DatasetBuilder::from_namespace(
-            Arc::new(namespace),
-            vec![table_id.to_string()],
-        )
-            .await
-            .map_err(|err| {
-                FfiError::new(
-                    ErrorCode::NamespaceDescribeTable,
-                    format!("namespace describe_table: {err}"),
-                )
-            })?;
+        let mut builder =
+            DatasetBuilder::from_namespace(Arc::new(namespace), vec![table_id.to_string()])
+                .await
+                .map_err(|err| {
+                    FfiError::new(
+                        ErrorCode::NamespaceDescribeTable,
+                        format!("namespace describe_table: {err}"),
+                    )
+                })?;
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
         let dataset = builder.load().await.map_err(|err| {
-            FfiError::new(ErrorCode::DatasetOpen, format!("namespace dataset open: {err}"))
+            FfiError::new(
+                ErrorCode::DatasetOpen,
+                format!("namespace dataset open: {err}"),
+            )
         })?;
         let table_uri = dataset.uri().to_string();
         Ok::<_, FfiError>((Arc::new(dataset), table_uri))

@@ -158,8 +158,8 @@ fn merge_begin_with_storage_options_inner(
     let session = unsafe { optional_session_handle(session)? };
 
     let input_schema: Arc<arrow_schema::Schema> = match runtime::block_on(async {
-        let mut builder = DatasetBuilder::from_uri(path.as_str())
-            .with_storage_options(storage_options.clone());
+        let mut builder =
+            DatasetBuilder::from_uri(path.as_str()).with_storage_options(storage_options.clone());
         if let Some(session) = session.clone() {
             builder = builder.with_session(session);
         }
