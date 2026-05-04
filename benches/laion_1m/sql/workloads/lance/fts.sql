@@ -8,4 +8,4 @@ FROM lance_fts(
 )
 WHERE nsfw = 'UNLIKELY'
   AND width >= 512
-ORDER BY _score DESC, sample_id;
+ORDER BY _score DESC;

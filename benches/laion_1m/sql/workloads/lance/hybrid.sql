@@ -11,8 +11,6 @@ FROM lance_hybrid_search(
   refine_factor = 2,
   alpha = 0.5,
   oversample_factor = 4,
-  prefilter = true
+  prefilter = false
 )
-WHERE nsfw = 'UNLIKELY'
-  AND width >= 512
-ORDER BY _hybrid_score DESC, sample_id;
+ORDER BY _hybrid_score DESC;

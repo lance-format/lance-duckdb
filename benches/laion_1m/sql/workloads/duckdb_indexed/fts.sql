@@ -9,5 +9,5 @@ FROM (
     AND width >= 512
 ) t
 WHERE score IS NOT NULL
-ORDER BY score DESC, sample_id
+ORDER BY score DESC
 LIMIT 20;

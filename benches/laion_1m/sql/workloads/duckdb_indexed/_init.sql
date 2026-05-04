@@ -1,6 +1,7 @@
 LOAD fts;
 LOAD vss;
 
+SET hnsw_enable_experimental_persistence = true;
 SET scalar_subquery_error_on_multiple_rows=false;
 
 CREATE OR REPLACE TEMP VIEW laion_1m_filtered AS

@@ -7,8 +7,6 @@ FROM lance_vector_search(
   use_index = true,
   nprobs = 16,
   refine_factor = 2,
-  prefilter = true
+  prefilter = false
 )
-WHERE nsfw = 'UNLIKELY'
-  AND width >= 512
-ORDER BY _distance ASC, sample_id;
+ORDER BY _distance ASC;

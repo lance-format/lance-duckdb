@@ -25,6 +25,7 @@ SELECT
   image_path
 FROM read_parquet('benches/laion_1m/data/laion_1m_lz4.parquet');
 
+CREATE INDEX laion_1m_sample_id_idx ON laion_1m(sample_id);
 CREATE INDEX laion_1m_nsfw_idx ON laion_1m(nsfw);
 CREATE INDEX laion_1m_width_idx ON laion_1m(width);
 CREATE INDEX laion_1m_img_emb_hnsw_idx ON laion_1m USING HNSW (img_emb);

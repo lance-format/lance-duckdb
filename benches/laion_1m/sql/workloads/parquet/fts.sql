@@ -9,5 +9,5 @@ WITH scored AS (
 SELECT sample_id, caption, lexical_score
 FROM scored
 WHERE lexical_score > 0
-ORDER BY lexical_score DESC, sample_id
+ORDER BY lexical_score DESC
 LIMIT 20;

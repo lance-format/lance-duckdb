@@ -9,4 +9,4 @@ FROM lance_vector_search(
 )
 WHERE nsfw = 'UNLIKELY'
   AND width >= 512
-ORDER BY _distance ASC, sample_id;
+ORDER BY _distance ASC;

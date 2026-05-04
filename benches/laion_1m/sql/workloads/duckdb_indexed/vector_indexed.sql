@@ -1,4 +1,4 @@
 SELECT sample_id, caption, array_distance(img_emb, getvariable('qvec')) AS distance
-FROM laion_1m_filtered
-ORDER BY distance ASC, sample_id
+FROM laion_1m
+ORDER BY distance ASC
 LIMIT 20;
