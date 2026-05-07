@@ -3531,8 +3531,8 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
     copy = make_uniq<LanceTableEntry>(catalog, schema, *create_info,
                                       NamespaceConfig());
   } else {
-    copy = make_uniq<LanceTableEntry>(catalog, schema, *create_info,
-                                      dataset_uri);
+    copy =
+        make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
