@@ -3526,12 +3526,16 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   for (auto &c : constraints) {
     create_info->constraints.push_back(c->Copy());
   }
+  unique_ptr<LanceTableEntry> copy;
   if (IsNamespaceBacked()) {
-    return make_uniq_base<CatalogEntry, LanceTableEntry>(
-        catalog, schema, *create_info, NamespaceConfig());
+    copy = make_uniq<LanceTableEntry>(catalog, schema, *create_info,
+                                      NamespaceConfig());
+  } else {
+    copy = make_uniq<LanceTableEntry>(catalog, schema, *create_info,
+                                      dataset_uri);
   }
-  return make_uniq_base<CatalogEntry, LanceTableEntry>(
-      catalog, schema, *create_info, dataset_uri);
+  copy->SetCoercedColumnNames(coerced_column_names);
+  return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 
 TableFunction
