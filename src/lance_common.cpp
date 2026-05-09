@@ -3,11 +3,14 @@
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
@@ -464,6 +467,36 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
     options["api_key"] = Value(api_key_override);
   }
   return options;
+}
+
+LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
+                                           const string &input) {
+  // Fast-path bail-out: obvious filesystem / URL literals can never match a
+  // qualified catalog identifier.  Avoids parsing attempts and potential
+  // secondary lookups that would just end up throwing ParserException.
+  if (input.empty() || input.find('/') != string::npos ||
+      input.find('\\') != string::npos || input.find("://") != string::npos) {
+    return nullptr;
+  }
+
+  QualifiedName qname;
+  try {
+    qname = QualifiedName::Parse(input);
+  } catch (ParserException &) {
+    return nullptr;
+  }
+
+  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
+  auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema,
+                                 lookup_info, OnEntryNotFound::RETURN_NULL);
+  if (!entry) {
+    return nullptr;
+  }
+  auto *table_entry = dynamic_cast<TableCatalogEntry *>(entry.get());
+  if (!table_entry) {
+    return nullptr;
+  }
+  return dynamic_cast<LanceTableEntry *>(table_entry);
 }
 
 void *LanceOpenDatasetForTable(ClientContext &context,

@@ -82,6 +82,17 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
 
 class LanceTableEntry;
 
+// Resolve a string like "catalog.schema.table" to a LanceTableEntry* if it
+// names a Lance-backed table in an attached catalog.  Returns nullptr for
+// inputs that look like filesystem / URL paths, or when the lookup does not
+// yield a Lance table (missing entry, non-Lance table, malformed qualified
+// name).  This is the canonical way to re-resolve a dataset from its
+// original first-argument literal so we can take the namespace-aware
+// LanceOpenDatasetForTable() path instead of passing the virtual
+// namespace URI directly to lance-io.
+LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
+                                           const string &input);
+
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri);
