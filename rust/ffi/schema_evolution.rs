@@ -12,9 +12,9 @@ use chrono::{Duration, Utc};
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
+use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::DatasetIndexExt;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 

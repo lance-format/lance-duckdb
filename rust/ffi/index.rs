@@ -5,12 +5,13 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::index::vector::{IndexFileVersion, VectorIndexParams};
+use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 

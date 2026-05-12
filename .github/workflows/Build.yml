@@ -58,6 +58,9 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev ninja-build ccache mold
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build
         run: |
           GEN=ninja make release -j 4
