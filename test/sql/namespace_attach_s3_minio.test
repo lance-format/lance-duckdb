@@ -1,12 +1,12 @@
 # name: test/sql/namespace_attach_s3_minio.test
-# description: ATTACH TYPE LANCE directory namespace against S3-compatible storage (MinIO).
-#              Regression test for: tables under the ATTACH prefix were invisible
-#              to the catalog because `DatasetBuilder::from_namespace + load`
-#              opened the dataset with empty storage_options, falling into AWS
-#              bucket-region resolution (aws.rs:217) and failing with
-#              "Bucket '<name>' not found". The fix forwards the caller's
-#              storage_options into the dataset builder after `from_namespace`.
+# description: ATTACH TYPE LANCE directory namespace against S3-compatible MinIO (regression for #206).
 # group: [sql]
+
+# Before the fix, the catalog was always empty on non-AWS S3-compatible endpoints:
+# `DatasetBuilder::from_namespace + load` opened the dataset with empty
+# storage_options, fell into AWS bucket-region resolution (`aws.rs:217`), and
+# failed with "Bucket '<name>' not found". The fix forwards the caller's
+# storage_options into the dataset builder after `from_namespace`.
 
 require-env LANCE_TEST_S3 1
 
@@ -23,6 +23,12 @@ test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
 test-env LANCE_S3_NS_PREFIX ns_attach_test
 
 require lance
+
+statement ok
+INSTALL httpfs;
+
+statement ok
+LOAD httpfs;
 
 statement ok
 CREATE SECRET (
