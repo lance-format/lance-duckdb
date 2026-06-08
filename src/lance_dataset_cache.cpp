@@ -139,23 +139,11 @@ string LanceBuildNamespaceDatasetCacheKey(
   return key;
 }
 
-static string LanceBuildDirNamespaceDatasetCacheKey(
-    const string &root, const string &table_id,
-    const vector<string> &option_keys, const vector<string> &option_values) {
-  if (option_keys.size() != option_values.size()) {
-    throw InternalException(
-        "Storage option keys/values size mismatch for Lance dataset cache");
-  }
-
-  string key = "dir_namespace|";
-  AppendCacheKeyPart(key, root);
-  AppendCacheKeyPart(key, table_id);
-  AppendCacheKeyPart(key, option_keys.size());
-  for (idx_t i = 0; i < option_keys.size(); i++) {
-    AppendCacheKeyPart(key, option_keys[i]);
-    AppendCacheKeyPart(key, option_values[i]);
-  }
-  return key;
+static string
+LanceBuildDirNamespaceDatasetCacheKey(const LanceNamespaceTableConfig &cfg) {
+  return LanceBuildResolvedPathDatasetCacheKey(
+      LanceDirectoryNamespaceDatasetUri(cfg), cfg.option_keys,
+      cfg.option_values);
 }
 
 static unordered_map<string, Value>
@@ -332,8 +320,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
 
   auto &cfg = table.NamespaceConfig();
   if (cfg.IsDirectory()) {
-    auto cache_key = LanceBuildDirNamespaceDatasetCacheKey(
-        cfg.root, cfg.table_id, cfg.option_keys, cfg.option_values);
+    auto display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
+    auto cache_key = LanceBuildDirNamespaceDatasetCacheKey(cfg);
     auto entry = GetOrOpenDatasetCacheEntry(
         context, cache_key,
         [&]() {
@@ -344,13 +332,11 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
           if (!dataset) {
             return shared_ptr<LanceDatasetCacheEntry>();
           }
-          string display_uri =
-              !table_uri.empty()
-                  ? std::move(table_uri)
-                  : (!cfg.display_uri.empty() ? cfg.display_uri
-                                              : cfg.root + "/" + cfg.table_id);
+          string entry_display_uri = !table_uri.empty()
+                                         ? LanceNormalizeS3Scheme(table_uri)
+                                         : display_uri;
           return make_shared_ptr<LanceDatasetCacheEntry>(
-              dataset, std::move(display_uri));
+              dataset, std::move(entry_display_uri));
         },
         out_cache_hit);
     if (entry) {
@@ -381,8 +367,7 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
 
   auto &cfg = table.NamespaceConfig();
   if (cfg.IsDirectory()) {
-    return LanceBuildDirNamespaceDatasetCacheKey(
-        cfg.root, cfg.table_id, cfg.option_keys, cfg.option_values);
+    return LanceBuildDirNamespaceDatasetCacheKey(cfg);
   }
 
   auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,

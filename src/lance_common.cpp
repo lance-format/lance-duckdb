@@ -60,6 +60,26 @@ string LanceNormalizeS3Scheme(const string &path) {
   return path;
 }
 
+string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
+  if (!cfg.display_uri.empty()) {
+    return LanceNormalizeS3Scheme(cfg.display_uri);
+  }
+
+  auto child = cfg.table_id;
+  if (!StringUtil::EndsWith(child, ".lance")) {
+    child += ".lance";
+  }
+  string uri;
+  if (cfg.root.empty()) {
+    uri = std::move(child);
+  } else if (cfg.root.back() == '/' || cfg.root.back() == '\\') {
+    uri = cfg.root + child;
+  } else {
+    uri = cfg.root + "/" + child;
+  }
+  return LanceNormalizeS3Scheme(uri);
+}
+
 static string SecretValueToString(const Value &value) {
   if (value.IsNull()) {
     return "";
@@ -526,7 +546,7 @@ void *LanceOpenDatasetForTable(ClientContext &context,
     } else if (!cfg.display_uri.empty()) {
       out_display_uri = cfg.display_uri;
     } else {
-      out_display_uri = cfg.root + "/" + cfg.table_id;
+      out_display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
     }
     return dataset;
   }
@@ -565,8 +585,7 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
 
   auto &cfg = table.NamespaceConfig();
   if (cfg.IsDirectory()) {
-    out_display_uri = !cfg.display_uri.empty() ? cfg.display_uri
-                                               : cfg.root + "/" + cfg.table_id;
+    out_display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
     out_open_path = out_display_uri;
     out_option_keys = cfg.option_keys;
     out_option_values = cfg.option_values;

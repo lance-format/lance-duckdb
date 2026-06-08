@@ -80,7 +80,10 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
                                 const string &api_key, const string &delimiter,
                                 const string &headers_tsv, string &out_error);
 
+struct LanceNamespaceTableConfig;
 class LanceTableEntry;
+
+string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 
 // Resolve a string like "catalog.schema.table" to a LanceTableEntry* if it
 // names a Lance-backed table in an attached catalog.  Returns nullptr for
