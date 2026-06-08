@@ -7,6 +7,7 @@ mod knn;
 mod merge;
 mod namespace;
 mod projection;
+mod query_table;
 mod scan;
 mod schema_evolution;
 mod search;

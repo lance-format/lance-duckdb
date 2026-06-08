@@ -508,6 +508,29 @@ void *LanceOpenDatasetForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
+                                    key_ptrs, value_ptrs);
+
+    const char *uri_ptr = nullptr;
+    auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
+        cfg.root.c_str(), cfg.table_id.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        cfg.option_keys.size(), LanceGetSessionHandle(context), &uri_ptr);
+    if (uri_ptr) {
+      out_display_uri = uri_ptr;
+      lance_free_string(uri_ptr);
+    } else if (!cfg.display_uri.empty()) {
+      out_display_uri = cfg.display_uri;
+    } else {
+      out_display_uri = cfg.root + "/" + cfg.table_id;
+    }
+    return dataset;
+  }
+
   unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
       cfg.bearer_token_override, cfg.api_key_override);
   string bearer_token;
@@ -541,6 +564,15 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    out_display_uri = !cfg.display_uri.empty() ? cfg.display_uri
+                                               : cfg.root + "/" + cfg.table_id;
+    out_open_path = out_display_uri;
+    out_option_keys = cfg.option_keys;
+    out_option_values = cfg.option_values;
+    return;
+  }
+
   unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
       cfg.bearer_token_override, cfg.api_key_override);
   string bearer_token;

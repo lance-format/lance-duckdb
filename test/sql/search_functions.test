@@ -453,6 +453,49 @@ SELECT count(*) FROM lance_fts('search_test_data', 'text', 'puppy', k = 10)
 ----
 2
 
+# FTS namespace query_table filter
+query I
+SELECT id
+FROM lance_fts(
+  'search_ns.main.search_test_data',
+  'text',
+  'puppy',
+  k = 10,
+  filter = 'label >= 3'
+)
+ORDER BY id
+----
+3
+
+# FTS namespace query_table prefilter requires explicit namespace filter
+statement error
+SELECT id
+FROM lance_fts(
+  'search_ns.main.search_test_data',
+  'text',
+  'puppy',
+  k = 10,
+  prefilter = true
+)
+WHERE label >= 3
+----
+Invalid Input Error: lance_fts requires explicit filter when prefilter=true on namespace-backed tables
+
+# FTS namespace query_table prefilter with explicit filter
+query I
+SELECT id
+FROM lance_fts(
+  'search_ns.main.search_test_data',
+  'text',
+  'puppy',
+  k = 10,
+  prefilter = true,
+  filter = 'label >= 3'
+)
+ORDER BY id
+----
+3
+
 # Vector search using fully qualified catalog table name
 query I
 SELECT id
@@ -468,6 +511,54 @@ ORDER BY _distance
 1
 2
 3
+
+# Vector namespace query_table filter
+query I
+SELECT id
+FROM lance_vector_search(
+  'search_ns.main.search_test_data',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 10,
+  use_index = false,
+  filter = 'label >= 4'
+)
+ORDER BY _distance
+----
+4
+5
+
+# Vector namespace query_table prefilter requires explicit namespace filter
+statement error
+SELECT id
+FROM lance_vector_search(
+  'search_ns.main.search_test_data',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 10,
+  prefilter = true,
+  use_index = false
+)
+WHERE label >= 4
+----
+Invalid Input Error: lance_vector_search requires explicit filter when prefilter=true on namespace-backed tables
+
+# Vector namespace query_table prefilter with explicit filter
+query I
+SELECT id
+FROM lance_vector_search(
+  'search_ns.main.search_test_data',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 10,
+  prefilter = true,
+  use_index = false,
+  filter = 'label >= 4'
+)
+ORDER BY _distance
+----
+4
+5
 
 # Vector search output remains usable without selecting vector column (issue #160)
 query I

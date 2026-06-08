@@ -48,7 +48,7 @@ ORDER BY _distance ASC;
 Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
 
 Positional arguments:
-- `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+- `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
 - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
 
@@ -59,6 +59,7 @@ Named parameters:
 - `refine_factor` (BIGINT, optional): Over-fetch factor for re-ranking using original vectors. Must be > 0. A value of `1` still enables re-ranking.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
+- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table.
 
 Output:
 - Dataset columns plus `_distance` (smaller is closer).
@@ -66,6 +67,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
+- For attached namespace tables, DuckDB `WHERE` filters are applied after the namespace search result. Use the explicit `filter` parameter to send a filter expression to Lance Namespace `query_table`; `prefilter=true` on namespace tables requires this explicit `filter`.
 
 ### Full-text search: `lance_fts`
 
@@ -79,13 +81,14 @@ ORDER BY _score DESC;
 Signature: `lance_fts(uri, text_column, query, ...)`
 
 Positional arguments:
-- `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+- `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `text_column` (VARCHAR): Text column name.
 - `query` (VARCHAR): Query string.
 
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
+- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table.
 
 Output:
 - Dataset columns plus `_score` (larger is better).
@@ -93,6 +96,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
+- For attached namespace tables, DuckDB `WHERE` filters are applied after the namespace search result. Use the explicit `filter` parameter to send a filter expression to Lance Namespace `query_table`; `prefilter=true` on namespace tables requires this explicit `filter`.
 
 ### Hybrid search: `lance_hybrid_search`
 

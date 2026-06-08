@@ -10,13 +10,25 @@ struct CatalogTransaction;
 class CatalogEntry;
 class ClientContext;
 
+enum class LanceNamespaceKind { Directory, Rest };
+
 struct LanceNamespaceTableConfig {
+  LanceNamespaceKind kind = LanceNamespaceKind::Rest;
+
+  string root;
+  vector<string> option_keys;
+  vector<string> option_values;
+
   string endpoint;
   string table_id;
   string delimiter;
   string bearer_token_override;
   string api_key_override;
   string headers_tsv;
+  string display_uri;
+
+  bool IsDirectory() const { return kind == LanceNamespaceKind::Directory; }
+  bool IsRest() const { return kind == LanceNamespaceKind::Rest; }
 };
 
 // LanceTableEntry represents a Lance dataset as a DuckDB base table entry.
