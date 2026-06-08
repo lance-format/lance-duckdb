@@ -134,7 +134,7 @@ fn open_dataset_in_dir_namespace_inner(
     let dataset = runtime::block_on(async {
         let mut ns_builder = DirectoryNamespaceBuilder::new(&root).manifest_enabled(false);
         if !storage_options.is_empty() {
-            ns_builder = ns_builder.storage_options(storage_options);
+            ns_builder = ns_builder.storage_options(storage_options.clone());
         }
         let namespace = ns_builder.build().await.map_err(|err| {
             FfiError::new(
@@ -151,6 +151,24 @@ fn open_dataset_in_dir_namespace_inner(
                         format!("dir namespace describe '{root}/{table_name}': {err}"),
                     )
                 })?;
+        // Forward the caller's storage_options to the dataset open path.
+        //
+        // `DirectoryNamespace::describe_table` returns `storage_options: None`
+        // when no credential vendor is configured, by design — to avoid
+        // leaking the namespace's own static credentials to clients (see
+        // lance-namespace-impls/src/dir.rs::get_storage_options_for_table).
+        // Without this re-injection, `builder.load()` builds an ObjectStore
+        // with empty options. For non-AWS S3-compatible endpoints (TOS,
+        // MinIO, R2, ...) this falls into AWS bucket-region resolution
+        // (lance-io/src/object_store/providers/aws.rs:217) and fails with
+        // "Bucket '<name>' not found".
+        //
+        // `with_storage_options` merges into any accessor already attached
+        // by `from_namespace`, preserving a `StorageOptionsProvider` if one
+        // was returned by a credential vendor.
+        if !storage_options.is_empty() {
+            builder = builder.with_storage_options(storage_options);
+        }
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
