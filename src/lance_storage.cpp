@@ -323,8 +323,15 @@ public:
     if (dataset_uri.empty()) {
       dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
     }
-    auto entry = make_uniq<LanceTableEntry>(catalog, schema, info,
-                                            std::move(dataset_uri));
+    LanceNamespaceTableConfig cfg;
+    cfg.kind = LanceNamespaceKind::Directory;
+    cfg.root = ns->root;
+    cfg.table_id = entry_name;
+    cfg.option_keys = ns->option_keys;
+    cfg.option_values = ns->option_values;
+    cfg.display_uri = std::move(dataset_uri);
+    auto entry =
+        make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
@@ -509,6 +516,7 @@ private:
                                               CreateTableInfo info,
                                               vector<string> coerced_columns) {
     LanceNamespaceTableConfig cfg;
+    cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
     cfg.table_id = table_id;
     cfg.delimiter = delimiter;

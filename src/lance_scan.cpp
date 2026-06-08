@@ -3099,11 +3099,22 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
     : TableCatalogEntry(catalog, schema, info),
       dataset_uri(std::move(dataset_uri)) {}
 
+static string
+LanceNamespaceDisplayUri(const LanceNamespaceTableConfig &config) {
+  if (!config.display_uri.empty()) {
+    return config.display_uri;
+  }
+  if (config.IsDirectory()) {
+    return config.root + "/" + config.table_id;
+  }
+  return config.endpoint + "/" + config.table_id;
+}
+
 LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                  CreateTableInfo &info,
                                  LanceNamespaceTableConfig config)
     : TableCatalogEntry(catalog, schema, info),
-      dataset_uri(config.endpoint + "/" + config.table_id),
+      dataset_uri(LanceNamespaceDisplayUri(config)),
       namespace_config(
           make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
 

@@ -139,6 +139,13 @@ string LanceBuildNamespaceDatasetCacheKey(
   return key;
 }
 
+static string
+LanceBuildDirNamespaceDatasetCacheKey(const LanceNamespaceTableConfig &cfg) {
+  return LanceBuildResolvedPathDatasetCacheKey(
+      LanceDirectoryNamespaceDatasetUri(cfg), cfg.option_keys,
+      cfg.option_values);
+}
+
 static unordered_map<string, Value>
 BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
                                   const string &api_key_override) {
@@ -187,6 +194,32 @@ OpenNamespaceDataset(ClientContext &context, const string &endpoint,
   auto *dataset = lance_open_dataset_in_namespace_with_session(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
       delimiter_ptr, headers_ptr, session, &uri_ptr);
+  if (uri_ptr) {
+    out_table_uri = uri_ptr;
+    lance_free_string(uri_ptr);
+  }
+  return dataset;
+}
+
+static void *OpenDirNamespaceDataset(ClientContext &context, const string &root,
+                                     const string &table_id,
+                                     const vector<string> &option_keys,
+                                     const vector<string> &option_values,
+                                     string &out_table_uri) {
+  out_table_uri.clear();
+  auto *session = LanceGetSessionHandle(context);
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+
+  const char *uri_ptr = nullptr;
+  auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
+      root.c_str(), table_id.c_str(),
+      key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      session, &uri_ptr);
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -286,6 +319,34 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    auto display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
+    auto cache_key = LanceBuildDirNamespaceDatasetCacheKey(cfg);
+    auto entry = GetOrOpenDatasetCacheEntry(
+        context, cache_key,
+        [&]() {
+          string table_uri;
+          auto *dataset = OpenDirNamespaceDataset(context, cfg.root,
+                                                  cfg.table_id, cfg.option_keys,
+                                                  cfg.option_values, table_uri);
+          if (!dataset) {
+            return shared_ptr<LanceDatasetCacheEntry>();
+          }
+          string entry_display_uri = !table_uri.empty()
+                                         ? LanceNormalizeS3Scheme(table_uri)
+                                         : display_uri;
+          return make_shared_ptr<LanceDatasetCacheEntry>(
+              dataset, std::move(entry_display_uri));
+        },
+        out_cache_hit);
+    if (entry) {
+      out_display_uri = entry->DisplayUri();
+    } else {
+      out_display_uri.clear();
+    }
+    return entry;
+  }
+
   auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
                                                      cfg.api_key_override);
 
@@ -305,6 +366,10 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    return LanceBuildDirNamespaceDatasetCacheKey(cfg);
+  }
+
   auto overrides = BuildNamespaceAuthOverrideOptions(cfg.bearer_token_override,
                                                      cfg.api_key_override);
   string bearer_token;
