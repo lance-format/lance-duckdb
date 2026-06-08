@@ -13,17 +13,12 @@
 name: Codex Update Lance Dependency
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        description: "Tag name from Lance (e.g., v2.0.0)"
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag name from Lance (e.g., v2.0.0)"
-        required: true
+        description: "Tag name from Lance. Leave empty to use the latest Lance release that needs an update."
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -37,7 +32,7 @@ jobs:
     steps:
       - name: Show inputs
         run: |
-          echo "tag = ${{ inputs.tag }}"
+          echo "tag = ${{ inputs.tag || 'latest' }}"
 
       - name: Checkout Repo
         uses: actions/checkout@v5
@@ -63,18 +58,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Validate stable release tag
-        env:
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          VERSION="${TAG#refs/tags/}"
-          VERSION="${VERSION#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Only stable Lance versions are allowed (got: ${TAG})" >&2
-            exit 1
-          fi
-
       - name: Configure git user
         run: |
           git config user.name "lance-community"
@@ -88,46 +71,21 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.CODEX_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="${TAG#refs/tags/}"
-          VERSION="${VERSION#v}"
-          BRANCH_NAME="codex/update-lance-${VERSION//[^a-zA-Z0-9]/-}"
+          TARGET_TAG="${TAG:-latest}"
 
           cat <<EOF >/tmp/codex-prompt.txt
           You are running inside the lance-duckdb repository on a GitHub Actions runner.
-          Update the Lance Rust dependencies to version ${VERSION} (semver format) and prepare a pull request for maintainers to review.
 
-          Follow these steps exactly:
-          1. Update versions in Cargo.toml:
-             - In the [dependencies] section, update the versions for these crates to "${VERSION}":
-               lance, lance-arrow, lance-core, lance-index, lance-linalg, lance-namespace, lance-namespace-impls, lance-table.
-             - Keep existing features/flags unchanged.
-             - Do not add or keep a [patch.crates-io] section for Lance crates; dependencies must come from crates.io stable releases only.
-          2. Update Cargo.lock to match the new versions.
-             - Prefer precise updates like:
-               cargo update -p lance --precise ${VERSION}
-               cargo update -p lance-arrow --precise ${VERSION}
-               ... (repeat for each of the crates above)
-             - If Cargo complains about incompatible Arrow/DataFusion versions, update the pinned Arrow/DataFusion versions in Cargo.toml to match the Lance ${VERSION} dependency requirements, then update Cargo.lock again.
-          3. Run these checks:
-             - cargo fmt --all
-             - cargo check --manifest-path Cargo.toml
-             - cargo clippy --manifest-path Cargo.toml --all-targets
-          4. Inspect "git status --short" and "git diff" to confirm the dependency update and any required fixes.
-          5. Create and switch to a new branch named "${BRANCH_NAME}" (replace any duplicated hyphens if necessary).
-          6. Stage all relevant files with "git add -A". Commit using the message "chore: update lance dependency to v${VERSION}".
-          7. Push the branch to origin. If the remote branch already exists, delete it first with "gh api -X DELETE repos/lance-format/lance-duckdb/git/refs/heads/${BRANCH_NAME}" then push with "git push origin ${BRANCH_NAME}". Do NOT use "git push --force" or "git push -f".
-          8. env "GH_TOKEN" is available; use "gh" tools for GitHub operations like creating pull requests.
-          9. Create a pull request targeting "main" with title "chore: update lance dependency to v${VERSION}".
-             - First, write the PR body to /tmp/pr-body.md using a heredoc (cat <<'EOF' > /tmp/pr-body.md).
-             - The body should summarize the dependency bump, key resolver changes (if any), the commands run in step 3, and link the triggering tag (${TAG}).
-             - Then run "gh pr create --body-file /tmp/pr-body.md".
-          10. Display the PR URL, "git status --short", and a concise summary of the commands run and their results.
+          Use \$lance-duckdb-update-lance-dependency with target "${TARGET_TAG}".
 
           Constraints:
-          - Use bash commands.
-          - Do not merge the PR.
-          - If any command fails, diagnose and fix the issue instead of aborting.
-          - For compatibility issues, consult lance-format/lance at tag v${VERSION} for the expected Rust dependency versions.
+          - Use env "GH_TOKEN" for GitHub operations.
+          - Do not merge the pull request.
+          - Do not force-push.
+          - Do not create a duplicate pull request if an open PR already exists for the target Lance version.
+          - If any command fails, diagnose and fix the root cause instead of aborting.
+          - For compatibility issues, consult lance-format/lance at the target tag for the expected Rust dependency versions.
+          - After creating the PR, display the PR URL, "git status --short", and a concise summary of the commands run and their results.
           EOF
 
           printenv OPENAI_API_KEY | codex login --with-api-key

@@ -174,12 +174,13 @@ See the SQL reference for full parameter documentation: [docs/sql.md#search](doc
 
 Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.
 
-### Automation: Lance dependency bumps
+### Manual Lance dependency bumps
 
-This repository includes a GitHub Actions workflow pair that opens a PR when a newer tag is detected in `lance-format/lance`:
+This repository includes a manual GitHub Actions workflow for preparing Lance dependency bump PRs:
 
-- `.github/workflows/lance-release-timer.yml`: polls for a newer Lance tag and triggers the Codex workflow.
-- `.github/workflows/codex-update-lance-dependency.yml`: uses Codex CLI to update `Cargo.toml` / `Cargo.lock`, run basic Rust checks, and open a PR.
+- `.github/workflows/codex-update-lance-dependency.yml`: manually runs Codex CLI with the repo-scoped `$lance-duckdb-update-lance-dependency` skill.
+- `.agents/skills/lance-duckdb-update-lance-dependency/SKILL.md`: defines the shared workflow for latest-release resolution, duplicate PR handling, dependency updates, validation, and PR creation.
+- `ci/update_lance_dependency.py`: provides the deterministic dependency update and metadata entrypoint used by the skill.
 
 Required repository secrets:
 
