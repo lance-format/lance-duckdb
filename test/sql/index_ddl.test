@@ -218,6 +218,85 @@ SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label % 2 = 1;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "0"[\s\S]*
 
+# Nested field index lifecycle: creation target, escaped literal-dot path,
+# same-leaf disambiguation, and canonical metadata display.
+statement ok
+COPY (
+  SELECT
+    {'value': i, 'same': i + 10} AS left_struct,
+    {'value': i * 2, 'same': i + 20} AS right_struct,
+    {'literal.dot': i + 100} AS dotted,
+    {'a,b': i + 200, 'a)b': i + 300, 'a`b': i + 400} AS escaped
+  FROM range(8) tbl(i)
+) TO 'test/.tmp/index_ddl_nested.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX left_value_idx ON 'test/.tmp/index_ddl_nested.lance' (left_struct.value)
+USING BTREE;
+
+statement ok
+CREATE INDEX dotted_literal_idx ON 'test/.tmp/index_ddl_nested.lance' (dotted.`literal.dot`)
+USING BTREE;
+
+statement ok
+CREATE INDEX path_comma_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a,b`)
+USING BTREE;
+
+statement ok
+CREATE INDEX path_paren_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a)b`)
+USING BTREE;
+
+statement ok
+CREATE INDEX path_backtick_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a``b`)
+USING BTREE;
+
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/index_ddl_nested.lance';
+----
+dotted_literal_idx	<REGEX>:.*	dotted.`literal.dot`	8	<REGEX>:.*|NULL
+left_value_idx	<REGEX>:.*	left_struct.value	8	<REGEX>:.*|NULL
+path_backtick_idx	<REGEX>:.*	escaped.`a``b`	8	<REGEX>:.*|NULL
+path_comma_idx	<REGEX>:.*	escaped.`a,b`	8	<REGEX>:.*|NULL
+path_paren_idx	<REGEX>:.*	escaped.`a)b`	8	<REGEX>:.*|NULL
+
+statement ok
+ATTACH 'test/.tmp' AS nested_ns (TYPE LANCE);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*) FROM nested_ns.main.index_ddl_nested WHERE right_struct.value = 4;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+statement ok
+CREATE INDEX right_value_idx ON nested_ns.main.index_ddl_nested (index_ddl_nested.right_struct.value)
+USING BTREE;
+
+query TTTIT
+SHOW INDEXES ON nested_ns.main.index_ddl_nested;
+----
+dotted_literal_idx	<REGEX>:.*	dotted.`literal.dot`	8	<REGEX>:.*|NULL
+left_value_idx	<REGEX>:.*	left_struct.value	8	<REGEX>:.*|NULL
+path_backtick_idx	<REGEX>:.*	escaped.`a``b`	8	<REGEX>:.*|NULL
+path_comma_idx	<REGEX>:.*	escaped.`a,b`	8	<REGEX>:.*|NULL
+path_paren_idx	<REGEX>:.*	escaped.`a)b`	8	<REGEX>:.*|NULL
+right_value_idx	<REGEX>:.*	right_struct.value	8	<REGEX>:.*|NULL
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM nested_ns.main.index_ddl_nested WHERE right_struct.value = 4;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+statement error
+CREATE INDEX ambiguous_leaf_idx ON 'test/.tmp/index_ddl_nested.lance' (value)
+USING BTREE;
+----
+IO Error: Failed to create Lance index
+
+statement ok
+DETACH nested_ns;
+
 statement ok
 COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
 TO 'test/.tmp/index_ddl_untrained.lance' (FORMAT lance, mode 'overwrite');

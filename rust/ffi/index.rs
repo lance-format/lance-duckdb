@@ -19,7 +19,9 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::{SchemaHandle, StreamHandle};
-use super::util::{cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult};
+use super::util::{
+    canonicalize_lance_field_path, cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult,
+};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -112,11 +114,12 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
 
         let mut cols = Vec::new();
         for &field_id in d.field_ids() {
-            if let Some(field) = dataset.schema().field_by_id(field_id as i32) {
-                cols.push(field.name.clone());
-            } else {
-                cols.push(format!("_field_id_{field_id}"));
-            }
+            cols.push(
+                dataset
+                    .schema()
+                    .field_path(field_id as i32)
+                    .unwrap_or_else(|_| format!("_field_id_{field_id}")),
+            );
         }
         fields.push(cols.join(","));
 
@@ -223,8 +226,8 @@ fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<Stri
             continue;
         }
         for &field_id in d.field_ids() {
-            if let Some(field) = schema.field_by_id(field_id as i32) {
-                cols.push(field.name.clone());
+            if let Ok(path) = schema.field_path(field_id as i32) {
+                cols.push(path);
             }
         }
     }
@@ -367,6 +370,8 @@ fn dataset_create_index_inner(
         }
     };
 
+    let canonical_columns = canonicalize_index_columns(handle.dataset.schema(), &columns)?;
+
     let (lance_index_type, params) = build_index_params(&index_type_norm, params_json.as_deref())?;
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
@@ -375,7 +380,7 @@ fn dataset_create_index_inner(
 
     run_with_large_stack(move || {
         match runtime::block_on(async {
-            let cols: [&str; 1] = [columns[0].as_str()];
+            let cols: [&str; 1] = [canonical_columns[0].as_str()];
             let mut builder = ds.create_index_builder(&cols, lance_index_type, params.as_ref());
             if let Some(name) = index_name {
                 builder = builder.name(name);
@@ -614,6 +619,16 @@ fn normalize_index_type(index_type: &str) -> String {
         .trim()
         .to_ascii_uppercase()
         .replace(['-', ' '], "_")
+}
+
+fn canonicalize_index_columns(
+    schema: &lance_core::datatypes::Schema,
+    columns: &[String],
+) -> FfiResult<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| canonicalize_lance_field_path(schema, column, "index column"))
+        .collect()
 }
 
 fn build_index_params(
@@ -871,4 +886,85 @@ fn index_list_schema() -> SchemaHandle {
         Field::new("details", DataType::Utf8, true),
     ]);
     Arc::new(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+
+    fn nested_schema() -> lance_core::datatypes::Schema {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "left_struct",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new(
+                "right_struct",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new(
+                "dotted",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "literal.dot",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+        ]);
+        let mut schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
+        schema.set_field_id(None);
+        schema
+    }
+
+    #[test]
+    fn canonicalizes_nested_index_columns() {
+        let schema = nested_schema();
+
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "left_struct.value", "index column").unwrap(),
+            "left_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "right_struct.value", "index column").unwrap(),
+            "right_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "dotted.`literal.dot`", "index column").unwrap(),
+            "dotted.`literal.dot`"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_case_insensitive_index_columns() {
+        let schema = nested_schema();
+
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "LEFT_STRUCT.VALUE", "index column").unwrap(),
+            "left_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "DOTTED.`LITERAL.DOT`", "index column").unwrap(),
+            "dotted.`literal.dot`"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_leaf_without_parent_path() {
+        let schema = nested_schema();
+        let err = canonicalize_lance_field_path(&schema, "value", "index column").unwrap_err();
+
+        assert!(err.message.contains("index column not found"));
+    }
 }

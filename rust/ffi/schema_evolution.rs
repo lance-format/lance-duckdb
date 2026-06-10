@@ -18,7 +18,10 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 
-use super::util::{cstr_to_str, optional_cstr_array, to_c_string, FfiError, FfiResult};
+use super::util::{
+    canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
+    FfiResult,
+};
 
 fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
     dataset
@@ -1047,7 +1050,7 @@ fn dataset_list_indices_inner(dataset: *mut c_void) -> FfiResult<String> {
         let cols = idx
             .fields
             .iter()
-            .filter_map(|id| schema.field_by_id(*id).map(|f| f.name.as_str()))
+            .filter_map(|id| schema.field_path(*id).ok())
             .collect::<Vec<_>>()
             .join(",");
         out.push_str(&cols);
@@ -1086,7 +1089,8 @@ fn dataset_create_scalar_index_inner(
     let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
 
     let mut ds = (*handle.dataset).clone();
-    let cols = [column];
+    let canonical_column = canonicalize_lance_field_path(ds.schema(), column, "index column")?;
+    let cols = [canonical_column.as_str()];
     match runtime::block_on(ds.create_index(
         &cols,
         IndexType::Scalar,

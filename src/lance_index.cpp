@@ -21,6 +21,7 @@
 #include "lance_ffi.hpp"
 #include "lance_table_entry.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstring>
@@ -77,6 +78,152 @@ static bool IsIdentChar(char c) {
          c == '.';
 }
 
+static bool LanceFieldPathSegmentNeedsQuoting(const string &segment) {
+  if (segment.empty()) {
+    return true;
+  }
+  for (auto c : segment) {
+    if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') {
+      return true;
+    }
+  }
+  return false;
+}
+
+static string FormatLanceFieldPath(const vector<string> &segments) {
+  if (segments.empty()) {
+    throw InternalException("field path has no segments");
+  }
+
+  string out;
+  for (idx_t i = 0; i < segments.size(); i++) {
+    if (i > 0) {
+      out.push_back('.');
+    }
+
+    auto &segment = segments[i];
+    if (!LanceFieldPathSegmentNeedsQuoting(segment)) {
+      out += segment;
+      continue;
+    }
+
+    out.push_back('`');
+    for (auto c : segment) {
+      if (c == '`') {
+        out += "``";
+      } else {
+        out.push_back(c);
+      }
+    }
+    out.push_back('`');
+  }
+  return out;
+}
+
+static vector<string>
+StripMatchingColumnQualifier(const vector<string> &column_names,
+                             const vector<string> &table_qualifier) {
+  if (column_names.size() <= 1 || table_qualifier.empty()) {
+    return column_names;
+  }
+
+  auto max_prefix =
+      std::min<idx_t>(column_names.size() - 1, table_qualifier.size());
+  for (idx_t prefix_len = max_prefix; prefix_len > 0; prefix_len--) {
+    auto qualifier_offset = table_qualifier.size() - prefix_len;
+    bool matches = true;
+    for (idx_t i = 0; i < prefix_len; i++) {
+      if (!StringUtil::CIEquals(column_names[i],
+                                table_qualifier[qualifier_offset + i])) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return vector<string>(column_names.begin() + prefix_len,
+                            column_names.end());
+    }
+  }
+
+  return column_names;
+}
+
+static bool TryParseLanceFieldPathSegments(const string &path,
+                                           vector<string> &out_segments) {
+  out_segments.clear();
+  auto s = TrimCopy(path);
+  if (s.empty()) {
+    return false;
+  }
+
+  idx_t i = 0;
+  while (i < s.size()) {
+    string segment;
+    if (s[i] == '`') {
+      i++;
+      bool closed = false;
+      while (i < s.size()) {
+        auto c = s[i];
+        if (c == '`') {
+          if (i + 1 < s.size() && s[i + 1] == '`') {
+            segment.push_back('`');
+            i += 2;
+            continue;
+          }
+          i++;
+          closed = true;
+          break;
+        }
+        segment.push_back(c);
+        i++;
+      }
+      if (!closed) {
+        return false;
+      }
+    } else {
+      auto start = i;
+      while (i < s.size() && s[i] != '.') {
+        if (s[i] == '`') {
+          return false;
+        }
+        i++;
+      }
+      segment = s.substr(start, i - start);
+    }
+
+    if (segment.empty()) {
+      return false;
+    }
+    out_segments.push_back(std::move(segment));
+
+    if (i == s.size()) {
+      return true;
+    }
+    if (s[i] != '.') {
+      return false;
+    }
+    i++;
+    if (i == s.size()) {
+      return false;
+    }
+  }
+
+  return !out_segments.empty();
+}
+
+static string NormalizeTableIndexColumnPath(const string &column,
+                                            const QualifiedName &table_name) {
+  vector<string> segments;
+  if (!TryParseLanceFieldPathSegments(column, segments)) {
+    return column;
+  }
+
+  vector<string> table_qualifier = {table_name.catalog, table_name.schema,
+                                    table_name.name};
+  return FormatLanceFieldPath(
+      StripMatchingColumnQualifier(segments, table_qualifier));
+}
+
 static bool StartsWithQuotedString(const string &sql) {
   return !sql.empty() && sql[0] == '\'';
 }
@@ -117,21 +264,35 @@ static bool TryParseParenList(const string &sql, vector<string> &out_items,
   idx_t i = 1;
   idx_t start = i;
   bool in_str = false;
+  bool in_backtick = false;
   for (; i < s.size(); i++) {
     auto c = s[i];
-    if (c == '\'') {
-      if (in_str) {
+    if (in_str) {
+      if (c == '\'') {
         if (i + 1 < s.size() && s[i + 1] == '\'') {
           i++;
           continue;
         }
         in_str = false;
-      } else {
-        in_str = true;
       }
       continue;
     }
-    if (in_str) {
+    if (in_backtick) {
+      if (c == '`') {
+        if (i + 1 < s.size() && s[i + 1] == '`') {
+          i++;
+          continue;
+        }
+        in_backtick = false;
+      }
+      continue;
+    }
+    if (c == '\'') {
+      in_str = true;
+      continue;
+    }
+    if (c == '`') {
+      in_backtick = true;
       continue;
     }
     if (c == ',') {
@@ -1229,6 +1390,7 @@ public:
       throw IOException("Failed to create Lance index" +
                         LanceFormatErrorSuffix());
     }
+    LanceInvalidateDatasetCacheForTable(client_context, table);
 
     chunk.SetCardinality(0);
     return SourceResultType::FINISHED;
@@ -1246,7 +1408,8 @@ private:
   bool train;
 };
 
-static string GetSingleColumnNameOrThrow(const CreateIndexInfo &info) {
+static string GetSingleColumnNameOrThrow(const CreateIndexInfo &info,
+                                         const TableCatalogEntry &table) {
   if (info.parsed_expressions.size() != 1) {
     throw NotImplementedException(
         "Lance CREATE INDEX currently supports a single column");
@@ -1260,7 +1423,11 @@ static string GetSingleColumnNameOrThrow(const CreateIndexInfo &info) {
   if (col_ref.column_names.empty()) {
     throw InternalException("column ref has no column names");
   }
-  return col_ref.column_names.back();
+  vector<string> table_qualifier = {table.catalog.GetName(),
+                                    table.ParentSchema().name, table.name};
+  auto field_path_segments =
+      StripMatchingColumnQualifier(col_ref.column_names, table_qualifier);
+  return FormatLanceFieldPath(field_path_segments);
 }
 
 static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
@@ -1273,7 +1440,7 @@ static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
         "BTREE index type is only supported for Lance tables");
   }
 
-  auto column = GetSingleColumnNameOrThrow(*op.info);
+  auto column = GetSingleColumnNameOrThrow(*op.info, *lance_table);
   auto index_type = NormalizeIndexType(op.info->index_type);
 
   bool replace = false;
@@ -1613,13 +1780,15 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
       if (!qname) {
         throw InternalException("CREATE INDEX is missing a target");
       }
+      auto column =
+          NormalizeTableIndexColumnPath(parse_data->columns[0], *qname);
       result.function = LanceCreateIndexTableTableFunction();
       result.parameters = {
           Value(qname->catalog),
           Value(qname->schema),
           Value(qname->name),
           Value(parse_data->index_name),
-          Value(parse_data->columns[0]),
+          Value(std::move(column)),
           Value(parse_data->index_type),
           Value(parse_data->params_json),
           Value::BOOLEAN(parse_data->replace),

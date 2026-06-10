@@ -49,6 +49,7 @@
 #include "lance_table_entry.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -74,6 +75,98 @@
 namespace duckdb {
 
 static TableFunction LanceExecFunction();
+
+static bool LanceFieldPathSegmentNeedsQuoting(const string &segment) {
+  if (segment.empty()) {
+    return true;
+  }
+  for (auto c : segment) {
+    if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') {
+      return true;
+    }
+  }
+  return false;
+}
+
+static string FormatLanceFieldPath(const vector<string> &segments) {
+  if (segments.empty()) {
+    return "";
+  }
+
+  string out;
+  for (idx_t i = 0; i < segments.size(); i++) {
+    if (i > 0) {
+      out.push_back('.');
+    }
+
+    auto &segment = segments[i];
+    if (!LanceFieldPathSegmentNeedsQuoting(segment)) {
+      out += segment;
+      continue;
+    }
+
+    out.push_back('`');
+    for (auto c : segment) {
+      if (c == '`') {
+        out += "``";
+      } else {
+        out.push_back(c);
+      }
+    }
+    out.push_back('`');
+  }
+  return out;
+}
+
+static bool TryBuildLanceColumnIndexPath(const vector<string> &names,
+                                         const vector<LogicalType> &types,
+                                         const ColumnIndex &col_index,
+                                         string &out_path) {
+  out_path.clear();
+  if (col_index.IsVirtualColumn()) {
+    return false;
+  }
+
+  auto col_id = col_index.GetPrimaryIndex();
+  if (col_id >= names.size() || col_id >= types.size()) {
+    return false;
+  }
+
+  vector<string> segments;
+  segments.push_back(names[col_id]);
+  auto leaf_type = types[col_id];
+
+  std::function<bool(const vector<ColumnIndex> &)> append_children;
+  append_children = [&](const vector<ColumnIndex> &children) -> bool {
+    if (children.empty()) {
+      return true;
+    }
+    if (children.size() != 1) {
+      return false;
+    }
+
+    auto &child = children[0];
+    if (child.IsVirtualColumn()) {
+      return false;
+    }
+    auto child_idx = child.GetPrimaryIndex();
+    if (leaf_type.id() != LogicalTypeId::STRUCT ||
+        child_idx >= StructType::GetChildCount(leaf_type)) {
+      return false;
+    }
+
+    segments.push_back(StructType::GetChildName(leaf_type, child_idx));
+    leaf_type = StructType::GetChildType(leaf_type, child_idx);
+    return append_children(child.GetChildIndexes());
+  };
+
+  if (!append_children(col_index.GetChildIndexes())) {
+    return false;
+  }
+
+  out_path = FormatLanceFieldPath(segments);
+  return !out_path.empty();
+}
 
 static unique_ptr<BaseStatistics>
 LanceScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
@@ -1335,9 +1428,17 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       for (auto &it : input.filters->filters) {
         auto scan_col_idx = it.first;
         if (scan_col_idx < input.column_ids.size()) {
-          auto col_id = input.column_ids[scan_col_idx];
-          if (col_id < bind_data.names.size()) {
-            filtered_columns.insert(bind_data.names[col_id]);
+          string filtered_path;
+          if (scan_col_idx < input.column_indexes.size() &&
+              TryBuildLanceColumnIndexPath(bind_data.names, bind_data.types,
+                                           input.column_indexes[scan_col_idx],
+                                           filtered_path)) {
+            filtered_columns.insert(std::move(filtered_path));
+          } else {
+            auto col_id = input.column_ids[scan_col_idx];
+            if (col_id < bind_data.names.size()) {
+              filtered_columns.insert(bind_data.names[col_id]);
+            }
           }
         }
       }

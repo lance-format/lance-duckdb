@@ -6,6 +6,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 use lance::session::Session;
+use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
 
@@ -34,6 +35,34 @@ pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
         Err(_) => CString::new(s.as_ref().replace('\0', "\\0"))
             .unwrap_or_else(|_| CString::new("invalid string").unwrap()),
     }
+}
+
+pub(crate) fn canonicalize_lance_field_path(
+    schema: &LanceSchema,
+    column: &str,
+    what: &'static str,
+) -> FfiResult<String> {
+    let column = column.trim();
+    if column.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} cannot be empty"),
+        ));
+    }
+
+    let field = schema.field_case_insensitive(column).ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} not found: '{column}'"),
+        )
+    })?;
+
+    schema.field_path(field.id).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} path normalize: {err}"),
+        )
+    })
 }
 
 pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> FfiResult<&'a str> {
