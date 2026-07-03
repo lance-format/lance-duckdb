@@ -518,11 +518,11 @@ struct LanceExecBindData : public TableFunctionData {
 
 static bool LanceSupportsPushdownType(const FunctionData &bind_data,
                                       idx_t col_idx) {
-  auto &scan_bind = bind_data.Cast<LanceScanBindData>();
-  if (col_idx >= scan_bind.types.size()) {
-    return false;
-  }
-  return LanceFilterIRSupportsLogicalType(scan_bind.types[col_idx]);
+  (void)bind_data;
+  (void)col_idx;
+  // The scan applies a pushed filter on any type (Lance IR, else ApplyDuckDBFilters);
+  // returning false makes DuckDB retain the filter-only column and desync join layout.
+  return true;
 }
 
 static bool TryParseRowIdValue(const Value &value, uint64_t &out) {
