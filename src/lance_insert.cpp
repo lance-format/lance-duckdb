@@ -229,6 +229,12 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
   }
+  // Plain INSERT does not bind a scan of the target, so the scan-bind
+  // freshness check never runs for it; validate here so a stale entry (e.g.
+  // a coerced-column list outdated by an external type evolution) fails
+  // closed instead of gating the write on stale state. Throws and evicts the
+  // entry on mismatch.
+  lance_table->VerifySchemaFreshness(context);
   if (lance_table->HasCoercedColumns()) {
     throw NotImplementedException(
         "INSERT into Lance table '" + lance_table->name +

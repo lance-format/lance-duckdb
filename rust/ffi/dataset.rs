@@ -216,6 +216,122 @@ fn open_dataset_with_storage_options_inner(
     Ok(DatasetHandle::new(dataset))
 }
 
+/// Refresh a dataset handle to the latest committed version if it is stale.
+///
+/// Compares the handle's checked-out manifest identity against the latest
+/// committed manifest on storage (a metadata-only lookup). The identity is
+/// version + naming scheme + manifest e-tag, mirroring Lance's own
+/// `already_checked_out` semantics: a bare version-id comparison would treat
+/// a dataset that was dropped and re-created at the same URI (whose history
+/// restarts at the same version id) as fresh. A missing e-tag on either side
+/// is conservatively treated as stale.
+///
+/// If the cached manifest is stale, a *new* dataset handle checked out at the
+/// latest version is written to `out_new_dataset`; the input handle is left
+/// untouched so that concurrent readers of the old handle stay valid. If the
+/// handle is already at the latest version, `out_new_dataset` is set to null.
+///
+/// Returns `0` on success and `-1` on error.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_latest_if_stale(
+    dataset: *mut c_void,
+    out_new_dataset: *mut *mut c_void,
+) -> i32 {
+    match checkout_latest_if_stale_inner(dataset, out_new_dataset) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+/// Refresh `dataset` to the latest committed version if its checked-out
+/// manifest is no longer the current one. Shared by the plain and the
+/// namespace-aware revalidation FFI entry points.
+///
+/// Returns `Ok(None)` when the dataset is already at the latest version and
+/// `Ok(Some(refreshed))` when a newer (or re-created) manifest was found.
+pub(crate) async fn refresh_dataset_if_stale(
+    dataset: &Arc<lance::Dataset>,
+) -> Result<Option<lance::Dataset>, String> {
+    let (_, latest_location) = dataset
+        .latest_manifest()
+        .await
+        .map_err(|err| format!("latest manifest lookup: {err}"))?;
+    let cached_location = dataset.manifest_location();
+    // Compare the full manifest identity, not just the version id: a
+    // dataset dropped and re-created at the same URI restarts its history
+    // at the same version id, so only the e-tag distinguishes it from the
+    // cached manifest. Like Lance's own `already_checked_out`, a missing
+    // e-tag on either side means the identity cannot be confirmed and the
+    // entry is treated as stale.
+    let is_current = latest_location.version == cached_location.version
+        && latest_location.naming_scheme == cached_location.naming_scheme
+        && latest_location.e_tag.as_ref().is_some_and(|latest_e_tag| {
+            cached_location
+                .e_tag
+                .as_ref()
+                .is_some_and(|cached_e_tag| latest_e_tag == cached_e_tag)
+        });
+    if is_current {
+        return Ok(None);
+    }
+    // A different manifest was committed, possibly by an external writer.
+    // Check out the latest version on a clone so the original handle
+    // remains usable by existing holders. `checkout_latest` re-reads the
+    // manifest keyed by (version, e-tag), so re-created datasets are
+    // loaded fresh rather than served from the metadata cache.
+    let mut refreshed_dataset = (**dataset).clone();
+    refreshed_dataset
+        .checkout_latest()
+        .await
+        .map_err(|err| format!("checkout latest: {err}"))?;
+    Ok(Some(refreshed_dataset))
+}
+
+fn checkout_latest_if_stale_inner(
+    dataset: *mut c_void,
+    out_new_dataset: *mut *mut c_void,
+) -> FfiResult<()> {
+    if out_new_dataset.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_new_dataset is null",
+        ));
+    }
+
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+
+    let refreshed = match runtime::block_on(refresh_dataset_if_stale(&handle.dataset)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(message)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetCheckoutLatest,
+                format!("dataset checkout latest if stale: {message}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let new_handle = match refreshed {
+        Some(refreshed_dataset) => {
+            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(refreshed_dataset)))) as *mut c_void
+        }
+        None => ptr::null_mut(),
+    };
+
+    // SAFETY: `out_new_dataset` was null-checked above and is provided by the
+    // caller as a valid output location.
+    unsafe {
+        std::ptr::write_unaligned(out_new_dataset, new_handle);
+    }
+    Ok(())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_dataset(dataset: *mut c_void) {
     if !dataset.is_null() {
@@ -882,4 +998,191 @@ fn dataset_delete_inner(
         std::ptr::write_unaligned(out_deleted_rows, deleted_rows_i64);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::fs;
+
+    use arrow_array::{Int32Array, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::Dataset;
+
+    use super::*;
+
+    /// Commit a batch to `uri` through the Lance Rust API, bypassing any FFI
+    /// dataset handle (i.e. acting as an external writer).
+    fn external_write(uri: &str, ids: Vec<i32>, mode: WriteMode) {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        let params = WriteParams {
+            mode,
+            ..Default::default()
+        };
+        runtime::block_on(Dataset::write(reader, uri, Some(params)))
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_checkout_latest_if_stale_sees_external_commits() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-dataset-revalidate-{}", rand::random::<u64>()));
+        let uri = dataset_dir.to_string_lossy().to_string();
+
+        external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+
+        unsafe {
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let handle = lance_open_dataset(uri_c.as_ptr());
+            assert!(!handle.is_null());
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // Already at the latest version: no refreshed handle is produced.
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(handle, &mut refreshed),
+                0
+            );
+            assert!(refreshed.is_null());
+
+            // External append committed behind the open handle's back.
+            external_write(&uri, vec![4, 5], WriteMode::Append);
+
+            // The stale handle still serves the old version...
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // ...but revalidation yields a refreshed handle at the latest
+            // version while leaving the original handle untouched.
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(handle, &mut refreshed),
+                0
+            );
+            assert!(!refreshed.is_null());
+            assert_eq!(lance_dataset_count_rows(refreshed), 5);
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // External delete on top of the refreshed handle.
+            {
+                let mut ds = runtime::block_on(Dataset::open(&uri)).unwrap().unwrap();
+                runtime::block_on(ds.delete("id = 1")).unwrap().unwrap();
+            }
+            let mut refreshed_again: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(refreshed, &mut refreshed_again),
+                0
+            );
+            assert!(!refreshed_again.is_null());
+            assert_eq!(lance_dataset_count_rows(refreshed_again), 4);
+
+            lance_close_dataset(refreshed_again);
+            lance_close_dataset(refreshed);
+            lance_close_dataset(handle);
+        }
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn test_checkout_latest_if_stale_sees_recreated_dataset_with_same_version_id() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+        let dataset_dir = std::env::temp_dir().join(format!(
+            "ffi-dataset-revalidate-recreate-{}",
+            rand::random::<u64>()
+        ));
+        let uri = dataset_dir.to_string_lossy().to_string();
+
+        external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+
+        unsafe {
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let handle = lance_open_dataset(uri_c.as_ptr());
+            assert!(!handle.is_null());
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // External drop + re-create at the same URI: the new dataset's
+            // history restarts at the same version id as the cached handle,
+            // so only the manifest e-tag distinguishes the two tables.
+            fs::remove_dir_all(&dataset_dir).unwrap();
+            external_write(&uri, vec![10, 20], WriteMode::Create);
+
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(handle, &mut refreshed),
+                0
+            );
+            assert!(!refreshed.is_null());
+            assert_eq!(lance_dataset_count_rows(refreshed), 2);
+
+            lance_close_dataset(refreshed);
+            lance_close_dataset(handle);
+        }
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn test_checkout_latest_if_stale_rejects_invalid_arguments() {
+        unsafe {
+            // Null output pointer.
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(ptr::null_mut(), &mut refreshed),
+                -1
+            );
+            // Null dataset handle.
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(ptr::null_mut(), ptr::null_mut()),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkout_latest_if_stale_errors_when_dataset_removed() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+        let dataset_dir = std::env::temp_dir().join(format!(
+            "ffi-dataset-revalidate-removed-{}",
+            rand::random::<u64>()
+        ));
+        let uri = dataset_dir.to_string_lossy().to_string();
+
+        external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+
+        unsafe {
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let handle = lance_open_dataset(uri_c.as_ptr());
+            assert!(!handle.is_null());
+
+            // The dataset vanishing from storage must surface as an error,
+            // not as a silent stale read.
+            fs::remove_dir_all(&dataset_dir).unwrap();
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_latest_if_stale(handle, &mut refreshed),
+                -1
+            );
+            assert!(refreshed.is_null());
+
+            lance_close_dataset(handle);
+        }
+    }
 }

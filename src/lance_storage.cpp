@@ -25,6 +25,7 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -147,9 +148,9 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
   return headers_tsv;
 }
 
-static void PopulateColumnsFromArrowSchema(ClientContext &context,
-                                           ArrowSchema &arrow_schema,
-                                           ColumnList &out_columns) {
+static void PopulateColumnsFromArrowSchema(
+    ClientContext &context, ArrowSchema &arrow_schema, ColumnList &out_columns,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   ArrowTableSchema arrow_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                arrow_schema);
@@ -161,12 +162,22 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
   }
   for (idx_t i = 0; i < names.size(); i++) {
     out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
+
+    // Reflect not-null constraints from the Arrow flags so discovered entries
+    // carry the same nullability state as entries rebuilt after ALTER (see
+    // PopulateLanceTableSchemaFromDataset); the schema freshness check
+    // compares this state against the live dataset schema.
+    auto *child = arrow_schema.children[i];
+    if (out_constraints && child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
+      out_constraints->push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
+    }
   }
 }
 
 static void PopulateLanceTableColumnsFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -186,8 +197,8 @@ static void PopulateLanceTableColumnsFromDataset(
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
+                                 out_constraints);
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -313,7 +324,7 @@ public:
     vector<string> coerced;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced);
+                                           &coerced, &info.constraints);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -376,7 +387,8 @@ private:
 
 static void PopulateLanceTableColumnsFromJsonSchema(
     ClientContext &context, const string &schema_json, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_json_arrow_schema_to_c(schema_json.c_str(),
@@ -389,8 +401,8 @@ static void PopulateLanceTableColumnsFromJsonSchema(
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
+                                 out_constraints);
 }
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -452,8 +464,8 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       try {
-        PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
-                                                info.columns, &coerced);
+        PopulateLanceTableColumnsFromJsonSchema(
+            context, schema_json, info.columns, &coerced, &info.constraints);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
@@ -476,7 +488,7 @@ public:
       vector<string> coerced;
       try {
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced);
+                                             &coerced, &info.constraints);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
@@ -697,6 +709,77 @@ public:
       throw CatalogException::MissingEntry(info.GetCatalogType(), info.name,
                                            string());
     }
+  }
+
+  // Catalog-only reads (DESCRIBE, information_schema/duckdb_columns) expose
+  // the entry's column and NOT NULL metadata without ever binding a scan or
+  // planning DML, so the freshness check must already run when the entry is
+  // resolved. When the entry is stale it is evicted (the DROP TABLE
+  // mechanism) and the lookup retried once so the caller transparently
+  // receives the freshly discovered entry instead of an error. The staleness
+  // probe costs one dataset-cache access per resolution - the same order as
+  // the per-hit revalidation that scans already perform at bind.
+  optional_ptr<CatalogEntry>
+  RefreshStaleTableEntry(CatalogTransaction transaction,
+                         const EntryLookupInfo &lookup_info,
+                         optional_ptr<CatalogEntry> entry) {
+    if (!entry || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
+        !transaction.context) {
+      return entry;
+    }
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(entry.get());
+    if (!lance_entry) {
+      return entry;
+    }
+    bool stale = false;
+    try {
+      stale = lance_entry->IsSchemaStale(*transaction.context);
+    } catch (...) {
+      // Fail open for catalog resolution: an unreachable dataset must not
+      // block metadata access or DROP TABLE cleanup; scans surface the real
+      // error with proper context.
+      return entry;
+    }
+    if (!stale) {
+      return entry;
+    }
+    if (!EvictTableEntry(*transaction.context, *lance_entry)) {
+      return entry;
+    }
+    // NOTE: `entry`/`lance_entry` are dangling from here on. Re-discover the
+    // table with its current schema; no retry loop - if the regenerated
+    // entry is somehow still stale, the scan-bind check fails closed.
+    return DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+  }
+
+  optional_ptr<CatalogEntry>
+  LookupEntry(CatalogTransaction transaction,
+              const EntryLookupInfo &lookup_info) override {
+    auto entry = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+    return RefreshStaleTableEntry(transaction, lookup_info, entry);
+  }
+
+  void Scan(ClientContext &context, CatalogType type,
+            const std::function<void(CatalogEntry &)> &callback) override {
+    if (type == CatalogType::TABLE_ENTRY) {
+      // Enumerations (information_schema, duckdb_columns, SHOW) also expose
+      // entry metadata. Collect the names first: the staleness probe does
+      // storage I/O and eviction mutates the catalog set, neither of which
+      // may run under the set's scan lock.
+      vector<string> table_names;
+      DuckSchemaEntry::Scan(context, type, [&](CatalogEntry &scanned) {
+        if (dynamic_cast<LanceTableEntry *>(&scanned)) {
+          table_names.push_back(scanned.name);
+        }
+      });
+      auto transaction = GetCatalogTransaction(context);
+      for (auto &table_name : table_names) {
+        EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, table_name);
+        auto entry = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+        (void)RefreshStaleTableEntry(transaction, lookup_info, entry);
+      }
+    }
+    DuckSchemaEntry::Scan(context, type, callback);
   }
 
   void DropEntry(ClientContext &context, DropInfo &info) override {
@@ -1061,6 +1144,31 @@ public:
     return nullptr;
   }
 
+  // Evict a table entry whose declared columns no longer match the dataset
+  // schema on storage. Mirrors the catalog part of DropEntry above: drop with
+  // a system transaction, then clean up the committed tombstone so lazy
+  // discovery re-creates the entry from the current dataset schema on the
+  // next access. On success the entry object is destroyed.
+  bool EvictTableEntry(ClientContext &context, LanceTableEntry &table) {
+    (void)context;
+    auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
+    auto system_transaction =
+        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
+    auto existing_entry = set.GetEntry(system_transaction, table.name);
+    if (!existing_entry || existing_entry.get() != &table) {
+      // Already replaced or dropped concurrently; nothing to evict.
+      return false;
+    }
+    if (!set.DropEntry(system_transaction, table.name, false, true)) {
+      return false;
+    }
+    // See DropEntry above: the committed tombstone would otherwise block the
+    // default generator from re-materializing the entry.
+    set.CleanupEntry(table);
+    InvalidateTableDefaults();
+    return true;
+  }
+
 private:
   void InvalidateTableDefaults() {
     if (!table_default_generator) {
@@ -1073,6 +1181,15 @@ private:
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
 };
+
+bool LanceTryEvictStaleTableEntry(ClientContext &context,
+                                  LanceTableEntry &table) {
+  auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&table.schema);
+  if (!lance_schema) {
+    return false;
+  }
+  return lance_schema->EvictTableEntry(context, table);
+}
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:

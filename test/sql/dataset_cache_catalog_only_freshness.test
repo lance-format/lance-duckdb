@@ -1,0 +1,66 @@
+# name: test/sql/dataset_cache_catalog_only_freshness.test
+# description: Catalog-only reads (DESCRIBE / information_schema) observe external schema changes
+# group: [sql]
+
+require lance
+
+# DESCRIBE and information_schema expose the catalog entry's metadata without
+# ever binding a scan or planning DML, so entry resolution itself must run
+# the freshness check: when the first access after an external schema or
+# nullability change is catalog-only, the stale entry is evicted and the
+# fresh one returned transparently.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/cache_catalog_only.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+ATTACH 'test/.tmp' AS cat_reader_ns (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/.tmp' AS cat_writer_ns (TYPE LANCE);
+
+# The reader discovers the table with s nullable.
+query TTTTTT con1
+DESCRIBE cat_reader_ns.main.cache_catalog_only;
+----
+id	BIGINT	YES	NULL	NULL	NULL
+s	VARCHAR	YES	NULL	NULL	NULL
+
+# External SET NOT NULL; the first reader access is catalog-only and must
+# already reflect the new nullability.
+statement ok con2
+ALTER TABLE cat_writer_ns.main.cache_catalog_only ALTER COLUMN s SET NOT NULL;
+
+query TTTTTT con1
+DESCRIBE cat_reader_ns.main.cache_catalog_only;
+----
+id	BIGINT	YES	NULL	NULL	NULL
+s	VARCHAR	NO	NULL	NULL	NULL
+
+# External DROP COLUMN; the first reader access goes through
+# information_schema-style enumeration and must not list the dropped column.
+statement ok con2
+ALTER TABLE cat_writer_ns.main.cache_catalog_only DROP COLUMN s;
+
+query T con1
+SELECT column_name FROM duckdb_columns()
+WHERE database_name = 'cat_reader_ns' AND table_name = 'cache_catalog_only'
+ORDER BY column_name;
+----
+id
+
+# Scans agree with the refreshed metadata without any intermediate error.
+query I con1
+SELECT count(*) FROM cat_reader_ns.main.cache_catalog_only;
+----
+2
+
+statement ok con1
+DETACH cat_reader_ns;
+
+statement ok con2
+DETACH cat_writer_ns;

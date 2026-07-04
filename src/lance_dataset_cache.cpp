@@ -21,10 +21,8 @@ public:
     lock_guard<mutex> guard(lock);
     auto entry = entries.find(key);
     if (entry == entries.end()) {
-      query_misses++;
       return nullptr;
     }
-    query_hits++;
     return entry->second;
   }
 
@@ -38,6 +36,21 @@ public:
     }
     entries[key] = entry;
     return entry;
+  }
+
+  void Replace(const string &key, shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    entries[key] = std::move(entry);
+  }
+
+  void RecordHit() {
+    lock_guard<mutex> guard(lock);
+    query_hits++;
+  }
+
+  void RecordMiss() {
+    lock_guard<mutex> guard(lock);
+    query_misses++;
   }
 
   void Invalidate(const string &key) {
@@ -227,19 +240,88 @@ static void *OpenDirNamespaceDataset(ClientContext &context, const string &root,
   return dataset;
 }
 
+// Revalidation callback for cache hits: given the cached dataset handle,
+// writes a refreshed handle (or nullptr when the cached handle is current) to
+// `out_new_dataset` and optionally a new display URI when the dataset moved.
+// Returns 0 on success and -1 on error (details via lance_last_error_*).
+using LanceDatasetRevalidateFn = std::function<int32_t(
+    void *dataset, void **out_new_dataset, string &out_new_display_uri)>;
+
+// Default revalidation: compare the cached handle's manifest identity with the
+// latest committed manifest at the dataset's resolved URI.
+static int32_t RevalidateDatasetHandle(void *dataset, void **out_new_dataset,
+                                       string &out_new_display_uri) {
+  out_new_display_uri.clear();
+  return lance_dataset_checkout_latest_if_stale(dataset, out_new_dataset);
+}
+
+// Revalidate a cached dataset against the latest committed version. Writes
+// through this connection invalidate the touched entries eagerly, but commits
+// made by external writers (another process or another connection) would
+// otherwise never be observed and the cached entry would serve stale data
+// forever. The check is metadata-only (it resolves the latest manifest
+// version) and therefore cheap relative to a scan, so it is performed
+// unconditionally on every cache hit: correctness of latest-intent reads
+// takes precedence over the micro-cost of one version lookup per query.
+// Returns the (possibly refreshed) entry, or throws if the latest version
+// cannot be determined.
+static shared_ptr<LanceDatasetCacheEntry> RevalidateDatasetCacheEntry(
+    LanceDatasetCacheState &state, const string &cache_key,
+    shared_ptr<LanceDatasetCacheEntry> entry,
+    const LanceDatasetRevalidateFn &revalidate, bool &out_refreshed) {
+  void *refreshed_dataset = nullptr;
+  string refreshed_display_uri;
+  if (revalidate(entry->Handle(), &refreshed_dataset, refreshed_display_uri) !=
+      0) {
+    // The entry can no longer be trusted (e.g. the dataset was dropped by an
+    // external writer); drop it so the next access retries a fresh open.
+    state.Invalidate(cache_key);
+    throw IOException("Failed to check latest version of Lance dataset: " +
+                      entry->DisplayUri() + LanceFormatErrorSuffix());
+  }
+  if (!refreshed_dataset) {
+    // Already at the latest committed version.
+    out_refreshed = false;
+    return entry;
+  }
+  // A newer version was committed externally: replace the cached entry with
+  // the refreshed handle. The old entry stays alive for existing holders via
+  // shared ownership. The display URI only changes when the revalidation
+  // resolved a new physical location (namespace-backed tables).
+  auto refreshed_entry = make_shared_ptr<LanceDatasetCacheEntry>(
+      refreshed_dataset, refreshed_display_uri.empty()
+                             ? entry->DisplayUri()
+                             : std::move(refreshed_display_uri));
+  state.Replace(cache_key, refreshed_entry);
+  out_refreshed = true;
+  return refreshed_entry;
+}
+
 static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
     ClientContext &context, const string &cache_key,
     const std::function<shared_ptr<LanceDatasetCacheEntry>()> &open_dataset,
-    bool *out_cache_hit) {
+    bool *out_cache_hit,
+    const LanceDatasetRevalidateFn &revalidate = RevalidateDatasetHandle) {
   auto state = GetOrCreateLanceDatasetCacheState(context);
   auto entry = state->Get(cache_key);
   if (entry) {
+    bool refreshed = false;
+    entry = RevalidateDatasetCacheEntry(*state, cache_key, std::move(entry),
+                                        revalidate, refreshed);
+    // A stale hit had to be refreshed from storage, so report it as a miss
+    // both in the profiling counters and in the per-scan cache-hit flag.
+    if (refreshed) {
+      state->RecordMiss();
+    } else {
+      state->RecordHit();
+    }
     if (out_cache_hit) {
-      *out_cache_hit = true;
+      *out_cache_hit = !refreshed;
     }
     return entry;
   }
 
+  state->RecordMiss();
   auto opened = open_dataset();
   if (!opened) {
     return nullptr;
@@ -280,6 +362,32 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     const string &headers_tsv, string &out_display_uri, bool *out_cache_hit) {
   auto cache_key = LanceBuildNamespaceDatasetCacheKey(
       endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv);
+  // Namespace tables are cached by endpoint/table id rather than by physical
+  // URI, so cache hits must be revalidated through the namespace: an external
+  // drop/re-create can re-point the table to a new location, which a checkout
+  // against the already-resolved handle would never observe. The re-describe
+  // costs one namespace round trip per hit — the same order as the namespace
+  // open path itself, which also starts with a describe.
+  auto namespace_revalidate = [&](void *dataset, void **out_new_dataset,
+                                  string &out_new_display_uri) -> int32_t {
+    out_new_display_uri.clear();
+    const char *bearer_ptr =
+        bearer_token.empty() ? nullptr : bearer_token.c_str();
+    const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+    const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+    const char *headers_ptr =
+        headers_tsv.empty() ? nullptr : headers_tsv.c_str();
+    const char *uri_ptr = nullptr;
+    auto rc = lance_dataset_namespace_checkout_latest_if_stale(
+        dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+        delimiter_ptr, headers_ptr, LanceGetSessionHandle(context),
+        out_new_dataset, &uri_ptr);
+    if (uri_ptr) {
+      out_new_display_uri = uri_ptr;
+      lance_free_string(uri_ptr);
+    }
+    return rc;
+  };
   auto entry = GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
@@ -296,7 +404,7 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
         return make_shared_ptr<LanceDatasetCacheEntry>(dataset,
                                                        std::move(display_uri));
       },
-      out_cache_hit);
+      out_cache_hit, namespace_revalidate);
   if (entry) {
     out_display_uri = entry->DisplayUri();
   } else {

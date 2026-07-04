@@ -14,6 +14,18 @@ static DATASET_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_DESCRIBE_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// The debug counters above are process-global, so unit tests that either
+/// assert on them or mutate them (e.g. by opening datasets through the FFI)
+/// must be serialized against each other to stay deterministic under the
+/// parallel test runner.
+#[cfg(test)]
+pub(crate) fn debug_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another test failed while holding it; the
+    // guarded state is just the counters, so continuing is safe.
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LanceSessionStats {
@@ -180,6 +192,7 @@ mod tests {
 
     #[test]
     fn test_open_dataset_with_session_records_debug_counters() {
+        let _counter_guard = debug_counter_test_lock();
         let dataset_dir =
             std::env::temp_dir().join(format!("ffi-session-{}", rand::random::<u64>()));
         let uri = dataset_dir.to_string_lossy().to_string();
