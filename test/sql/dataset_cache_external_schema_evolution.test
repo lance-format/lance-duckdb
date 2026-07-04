@@ -1,0 +1,80 @@
+# name: test/sql/dataset_cache_external_schema_evolution.test
+# description: External schema evolution behind a cached catalog entry fails closed and self-heals
+# group: [sql]
+
+require lance
+
+# Each ATTACH creates its own catalog with its own lazily discovered table
+# entries. A schema change committed through the writer catalog acts as an
+# external schema evolution from the reader catalog's perspective: the
+# reader's entry columns were captured at discovery time and no longer match
+# the dataset schema. Serving that stale binding would mislabel columns, so
+# the reader must fail with an explicit error and re-discover the table with
+# its current schema on the next access.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 10::BIGINT AS extra
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s, 20::BIGINT AS extra
+) TO 'test/.tmp/cache_schema_evo.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+ATTACH 'test/.tmp' AS evo_reader (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/.tmp' AS evo_writer (TYPE LANCE);
+
+# con1 discovers the table with the original three-column schema.
+query ITI con1
+SELECT id, s, extra FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+1	a	10
+2	b	20
+
+# External drop-column committed through the writer catalog.
+statement ok con2
+ALTER TABLE evo_writer.main.cache_schema_evo DROP COLUMN s;
+
+# The reader's stale entry must not serve mislabeled results (without the
+# schema check, "s" would silently return the values of "extra"). Entry
+# resolution heals the stale entry transparently, so the query binds against
+# the current schema and fails with a plain missing-column error.
+statement error con1
+SELECT s FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+<REGEX>:.*(not found|does not exist).*
+
+# The healed entry serves the current schema immediately.
+query II con1
+SELECT id, extra FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+1	10
+2	20
+
+query II con1
+SELECT * FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+1	10
+2	20
+
+# External rename: same fail-closed + self-heal cycle.
+statement ok con2
+ALTER TABLE evo_writer.main.cache_schema_evo RENAME extra TO score;
+
+statement error con1
+SELECT extra FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+<REGEX>:.*(not found|does not exist).*
+
+query I con1
+SELECT score FROM evo_reader.main.cache_schema_evo ORDER BY id;
+----
+10
+20
+
+statement ok con1
+DETACH evo_reader;
+
+statement ok con2
+DETACH evo_writer;

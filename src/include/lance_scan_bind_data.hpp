@@ -38,6 +38,13 @@ struct LanceScanBindData : public TableFunctionData {
   optional_idx pushed_limit = optional_idx::Invalid();
   idx_t pushed_offset = 0;
 
+  // The bind data pins a dataset handle checked out at bind time. Cached
+  // prepared statements would keep scanning that version forever, bypassing
+  // the cache revalidation that runs at bind; force a rebind per execution so
+  // prepared statements observe external commits like ad-hoc statements
+  // (same approach as DuckDB's multi-file scans).
+  bool SupportStatementCache() const override { return false; }
+
   ~LanceScanBindData() override;
 };
 

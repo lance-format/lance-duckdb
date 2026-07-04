@@ -21,6 +21,11 @@ pub(crate) struct DatasetHandle {
     pub(crate) arrow_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
+    /// Storage options the namespace vended when this handle was opened
+    /// through a REST namespace (`None` for plain/path opens). Revalidation
+    /// compares them against a fresh describe so rotated credentials or other
+    /// option changes trigger a reopen even when the location is unchanged.
+    pub(crate) namespace_storage_options: Option<std::collections::HashMap<String, String>>,
 }
 
 impl DatasetHandle {
@@ -34,7 +39,16 @@ impl DatasetHandle {
             arrow_schema,
             base_projection,
             fts_projection,
+            namespace_storage_options: None,
         }
+    }
+
+    pub(crate) fn with_namespace_storage_options(
+        mut self,
+        options: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.namespace_storage_options = options;
+        self
     }
 }
 

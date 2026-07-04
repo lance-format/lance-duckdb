@@ -335,6 +335,11 @@ struct LanceKnnBindData : public TableFunctionData {
   vector<LogicalType> types;
 
   vector<string> lance_pushed_filter_ir_parts;
+
+  // Pins a dataset handle checked out at bind time; force a rebind per
+  // execution so prepared statements observe external commits (see
+  // LanceScanBindData::SupportStatementCache).
+  bool SupportStatementCache() const override { return false; }
 };
 
 struct LanceKnnGlobalState : public GlobalTableFunctionState {
@@ -1029,6 +1034,11 @@ struct LanceSearchBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+
+  // Pins a dataset handle checked out at bind time; force a rebind per
+  // execution so prepared statements observe external commits (see
+  // LanceScanBindData::SupportStatementCache).
+  bool SupportStatementCache() const override { return false; }
 };
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
