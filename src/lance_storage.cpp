@@ -411,6 +411,25 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
+    // Only resolve names that are real tables in this namespace. DuckDB probes
+    // the active catalog for system names (e.g. duckdb_tables when SHOW TABLES
+    // runs under `USE <lance_catalog>`); without this guard we'd try to open
+    // those as Lance datasets and throw, aborting the statement. Returning
+    // nullptr (not found) lets resolution fall through to the system catalog.
+    {
+      auto known = GetDefaultEntries();
+      bool found = false;
+      for (auto &k : known) {
+        if (k == entry_name) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return nullptr;
+      }
+    }
+
     unordered_map<string, Value> overrides;
     if (!bearer_token_override.empty()) {
       overrides["bearer_token"] = Value(bearer_token_override);
@@ -464,9 +483,18 @@ public:
     // Slow fallback: open dataset from S3.
     for (auto &table_id : candidates) {
       string table_uri;
-      auto *dataset = LanceOpenDatasetInNamespace(
-          context, endpoint, table_id, resolved_bearer, resolved_api_key,
-          delimiter, headers_tsv, table_uri);
+      void *dataset = nullptr;
+      try {
+        dataset = LanceOpenDatasetInNamespace(
+            context, endpoint, table_id, resolved_bearer, resolved_api_key,
+            delimiter, headers_tsv, table_uri);
+      } catch (...) {
+        // Unresolvable candidate (e.g. a DuckDB system name like
+        // duckdb_tables that SHOW TABLES resolves against the active catalog,
+        // or an invalid 1-segment id) — skip it instead of aborting the
+        // whole statement.
+        continue;
+      }
       if (!dataset) {
         continue;
       }
