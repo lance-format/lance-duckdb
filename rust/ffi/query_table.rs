@@ -622,6 +622,12 @@ mod tests {
             use_index: 1,
         };
 
+        // SAFETY: `config` and `options` are stack-allocated `#[repr(C)]`
+        // structs that outlive the call. Every raw pointer inside them is
+        // either null (parsed as "absent" by `parse_config`) or points into
+        // a NUL-terminated `CString` (`endpoint_c`, `table_id_c`,
+        // `vector_column_c`) or the `query` slice, all of which live until
+        // the end of this test.
         let stream = unsafe { lance_create_namespace_vector_search_stream(&config, &options) };
         // The mock accepted the multi-segment id and returned 200 with a
         // deliberately non-Arrow body: the only permitted failure is the IPC
@@ -630,9 +636,17 @@ mod tests {
         assert!(stream.is_null());
         let message = crate::error::lance_last_error_message();
         assert!(!message.is_null());
+        // SAFETY: `message` was null-checked above and points to the
+        // NUL-terminated allocation whose ownership
+        // `lance_last_error_message` just transferred to us; it stays valid
+        // and unaliased until reclaimed by `lance_free_string` below (the
+        // `CStr` view only borrows it, and `to_string()` copies out).
         let message_str = unsafe { std::ffi::CStr::from_ptr(message) }
             .to_string_lossy()
             .to_string();
+        // SAFETY: reclaims the allocation received from
+        // `lance_last_error_message` above, exactly once; `message` is not
+        // used after this point.
         unsafe { crate::error::lance_free_string(message) };
         assert!(
             message_str.contains("read Arrow IPC"),
