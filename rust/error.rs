@@ -67,6 +67,13 @@ pub enum ErrorCode {
     Exec = 52,
     DatasetMerge = 53,
     NamespaceQueryTable = 54,
+    // 55 is intentionally left unused: an in-flight change (#225) claims it,
+    // and skipping it lets either change merge first without renumbering the
+    // C++ mirror constants (the enum already tolerates a gap at 33).
+    // The namespace reported that the addressed table (or its parent
+    // namespace) does not exist, as opposed to auth/network/server failures.
+    // Mirrored in src/lance_storage.cpp (LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND).
+    NamespaceTableNotFound = 56,
 }
 
 struct LastError {
