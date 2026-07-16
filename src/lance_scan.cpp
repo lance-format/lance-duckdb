@@ -520,8 +520,9 @@ static bool LanceSupportsPushdownType(const FunctionData &bind_data,
                                       idx_t col_idx) {
   (void)bind_data;
   (void)col_idx;
-  // The scan applies a pushed filter on any type (Lance IR, else ApplyDuckDBFilters);
-  // returning false makes DuckDB retain the filter-only column and desync join layout.
+  // The scan applies a pushed filter on any type (Lance IR, else
+  // ApplyDuckDBFilters); returning false makes DuckDB retain the filter-only
+  // column and desync join layout.
   return true;
 }
 
