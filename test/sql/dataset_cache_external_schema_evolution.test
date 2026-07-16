@@ -73,6 +73,34 @@ SELECT score FROM evo_reader.main.cache_schema_evo ORDER BY id;
 10
 20
 
+# DROP TABLE as the very first statement after an external change: the DROP's
+# own bind refreshes the stale entry inside the DROP's transaction, and the
+# non-transactional catalog part of DROP cannot run on top of that
+# uncommitted refresh. It must fail closed BEFORE deleting the dataset
+# (proceeding would delete the data and then abort on the catalog conflict).
+statement ok con2
+ALTER TABLE evo_writer.main.cache_schema_evo ADD COLUMN flag BIGINT;
+
+statement error con1
+DROP TABLE evo_reader.main.cache_schema_evo;
+----
+<REGEX>:.*refreshed in the current transaction.*
+
+# The dataset is intact; a successful statement commits the refreshed entry.
+query I con1
+SELECT count(*) FROM evo_reader.main.cache_schema_evo;
+----
+2
+
+# With the refresh committed, the DROP goes through.
+statement ok con1
+DROP TABLE evo_reader.main.cache_schema_evo;
+
+statement error con1
+SELECT count(*) FROM evo_reader.main.cache_schema_evo;
+----
+<REGEX>:.*(does not exist|not found).*
+
 statement ok con1
 DETACH evo_reader;
 

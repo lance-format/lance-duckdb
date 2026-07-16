@@ -1,5 +1,5 @@
 # name: test/sql/dataset_cache_external_nullability.test
-# description: External SET/DROP NOT NULL evicts stale catalog entries
+# description: External SET/DROP NOT NULL replaces stale catalog entries
 # group: [sql]
 
 require lance

@@ -7,8 +7,8 @@ require lance
 # DESCRIBE and information_schema expose the catalog entry's metadata without
 # ever binding a scan or planning DML, so entry resolution itself must run
 # the freshness check: when the first access after an external schema or
-# nullability change is catalog-only, the stale entry is evicted and the
-# fresh one returned transparently.
+# nullability change is catalog-only, the stale entry is replaced through
+# the catalog version chain and the fresh one returned transparently.
 
 statement ok con1
 COPY (

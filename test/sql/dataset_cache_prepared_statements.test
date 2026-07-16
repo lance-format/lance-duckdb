@@ -60,7 +60,8 @@ EXECUTE prepared_table_count;
 
 # External schema evolution behind a prepared statement: the forced rebind
 # runs the freshness check and fails closed instead of serving the stale
-# binding; re-execution after the eviction succeeds with the new schema.
+# binding; re-execution after the entry is replaced succeeds with the new
+# schema.
 statement ok con2
 ATTACH 'test/.tmp' AS prep_writer_ns (TYPE LANCE);
 

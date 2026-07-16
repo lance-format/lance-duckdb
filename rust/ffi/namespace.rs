@@ -202,7 +202,12 @@ fn describe_table_info_inner(
         // FIX: a qualified table id (e.g. "catalog.schema.table") must be sent as
         // its multi-segment namespace path, not a single segment. Split on the
         // delimiter so the server sees the full 3-level id instead of "got: 1".
-        req.id = Some(table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect());
+        req.id = Some(
+            table_id
+                .split(delimiter.as_str())
+                .map(|s| s.to_string())
+                .collect(),
+        );
         req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
@@ -306,8 +311,10 @@ fn create_empty_table_inner(
     .delimiter(delimiter.clone())
     .build();
 
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DeclareTableRequest::new();
         req.id = Some(table_id_segments);
@@ -413,8 +420,10 @@ fn drop_table_inner(
     .delimiter(delimiter.clone())
     .build();
 
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
     runtime::block_on(async move {
         let mut req = DropTableRequest::new();
         req.id = Some(table_id_segments);
@@ -488,7 +497,12 @@ fn describe_table_with_schema_inner(
     let schema_json = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
         // FIX: split the qualified id into its namespace segments (see describe_table_info_inner).
-        req.id = Some(table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect());
+        req.id = Some(
+            table_id
+                .split(delimiter.as_str())
+                .map(|s| s.to_string())
+                .collect(),
+        );
         req.with_table_uri = Some(true);
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
@@ -587,43 +601,26 @@ fn open_dataset_in_namespace_inner(
     let session = unsafe { optional_session_handle(session)? };
     // FIX: split the qualified id into namespace segments so the crate's internal
     // describe (DatasetBuilder::from_namespace) gets the full 3-level id, not 1.
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
 
-    let (dataset, table_uri, storage_options) = runtime::block_on(async move {
-        // Capture the namespace-vended storage options with an explicit
-        // describe so revalidation can later detect option changes (e.g.
-        // rotated credentials). `DatasetBuilder::from_namespace` consumes its
-        // own describe internally, so this costs one extra namespace round
-        // trip per open — opens only happen on cache misses.
+    let (dataset, table_uri) = runtime::block_on(async move {
+        // `DatasetBuilder::from_namespace` performs the describe internally
+        // and, when the namespace vends storage options, installs Lance's
+        // dynamic storage-options provider so later credential rotation is
+        // refreshed from the namespace automatically — one describe per open,
+        // no snapshot to keep in sync.
         record_namespace_describe();
-        let describe_request = DescribeTableRequest {
-            id: Some(vec![table_id.to_string()]),
-            with_table_uri: Some(true),
-            ..Default::default()
-        };
-        let describe_response =
-            namespace
-                .describe_table(describe_request)
-                .await
-                .map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceDescribeTable,
-                        format!("namespace describe_table: {err}"),
-                    )
-                })?;
-        let storage_options = describe_response.storage_options;
-
-        record_namespace_describe();
-        let mut builder =
-            DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
-                .await
-                .map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceDescribeTable,
-                        format!("namespace describe_table: {err}"),
-                    )
-                })?;
+        let mut builder = DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
+            .await
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::NamespaceDescribeTable,
+                    format!("namespace describe_table: {err}"),
+                )
+            })?;
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
@@ -634,15 +631,12 @@ fn open_dataset_in_namespace_inner(
             )
         })?;
         let table_uri = dataset.uri().to_string();
-        Ok::<_, FfiError>((Arc::new(dataset), table_uri, storage_options))
+        Ok::<_, FfiError>((Arc::new(dataset), table_uri))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
     record_dataset_open();
-    Ok((
-        DatasetHandle::new(dataset).with_namespace_storage_options(storage_options),
-        table_uri,
-    ))
+    Ok((DatasetHandle::new(dataset), table_uri))
 }
 
 #[no_mangle]
@@ -742,6 +736,12 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
 /// back to the manifest-identity revalidation used for plain datasets, which
 /// catches both ordinary new commits and same-location re-creates (e-tag).
 ///
+/// Namespace-vended credential rotation needs no handling here: the handle
+/// was opened via `DatasetBuilder::from_namespace`, which installs Lance's
+/// dynamic storage-options provider, so fresh credentials are fetched from
+/// the namespace by the object store itself. Revalidation only needs to
+/// detect location moves and new commits.
+///
 /// On success writes the refreshed handle (or null when the cached handle is
 /// current) to `out_new_dataset`. `out_table_uri` receives the newly resolved
 /// table URI only when the table moved; the caller frees it with
@@ -824,8 +824,16 @@ fn namespace_checkout_latest_if_stale_inner(
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter)
+    .delimiter(delimiter.clone())
     .build();
+    // FIX: split the qualified id into its namespace segments once (see
+    // describe_table_info_inner) and reuse the vector for both the describe
+    // below and the namespace reopen, so a multi-level table resolves under
+    // the correct namespace during revalidation too.
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
 
     let (refreshed, moved_uri) = runtime::block_on(async move {
         // Re-resolve the table location through the namespace before trusting
@@ -833,7 +841,7 @@ fn namespace_checkout_latest_if_stale_inner(
         // to a different physical URI.
         record_namespace_describe();
         let request = DescribeTableRequest {
-            id: Some(vec![table_id.to_string()]),
+            id: Some(table_id_segments.clone()),
             // Mirror the other describe paths: request the complete table URI
             // so namespaces that only report `table_uri` (the response model
             // allows omitting `location`) can still be revalidated.
@@ -864,23 +872,13 @@ fn namespace_checkout_latest_if_stale_inner(
         let location_matches =
             location.as_deref() == Some(cached_uri) || table_uri.as_deref() == Some(cached_uri);
 
-        // The namespace-vended storage options must match too: a namespace
-        // can re-describe the same physical URI with different options (e.g.
-        // rotated object-store credentials), and the cached handle's object
-        // store would keep using the stale ones. Namespaces that vend
-        // per-describe temporary credentials will reopen on every hit — the
-        // cost of always reading with the freshest credentials.
-        let current_storage_options = response.storage_options;
-        let storage_options_match = handle.namespace_storage_options == current_storage_options;
-
-        if !location_matches || !storage_options_match {
-            // The table was re-pointed to a new location or its storage
-            // options changed: reopen through the namespace path so managed
-            // versioning and namespace-provided storage options are
-            // re-applied (this re-describes internally; the extra round trip
-            // only happens on this path).
+        if !location_matches {
+            // The table was re-pointed to a new location: reopen through the
+            // namespace path so managed versioning and namespace-provided
+            // storage options are re-applied (this re-describes internally;
+            // the extra round trip only happens on this path).
             let mut builder =
-                DatasetBuilder::from_namespace(Arc::new(namespace), vec![table_id.to_string()])
+                DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
                     .await
                     .map_err(|err| {
                         FfiError::new(
@@ -899,15 +897,13 @@ fn namespace_checkout_latest_if_stale_inner(
             })?;
             record_dataset_open();
             let uri = reopened.uri().to_string();
-            let moved = !location_matches;
-            return Ok::<_, FfiError>((
-                Some((reopened, current_storage_options)),
-                moved.then_some(uri),
-            ));
+            return Ok::<_, FfiError>((Some(reopened), Some(uri)));
         }
 
-        // Same location and options: fall back to the manifest-identity
-        // revalidation.
+        // Same location: fall back to the manifest-identity revalidation.
+        // Rotated namespace-vended credentials do not require a reopen — the
+        // handle's object store refreshes them through the dynamic
+        // storage-options provider installed at open time.
         let refreshed = super::dataset::refresh_dataset_if_stale(&handle.dataset)
             .await
             .map_err(|message| {
@@ -916,18 +912,14 @@ fn namespace_checkout_latest_if_stale_inner(
                     format!("dataset checkout latest if stale: {message}"),
                 )
             })?;
-        Ok((
-            refreshed.map(|dataset| (dataset, current_storage_options)),
-            None,
-        ))
+        Ok((refreshed, None))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
     let new_handle = match refreshed {
-        Some((refreshed_dataset, storage_options)) => Box::into_raw(Box::new(
-            DatasetHandle::new(Arc::new(refreshed_dataset))
-                .with_namespace_storage_options(storage_options),
-        )) as *mut c_void,
+        Some(refreshed_dataset) => {
+            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(refreshed_dataset)))) as *mut c_void
+        }
         None => ptr::null_mut(),
     };
 
@@ -1022,15 +1014,32 @@ mod tests {
             .unwrap();
     }
 
+    /// (endpoint, stop flag, log of raw requests) handed out by
+    /// `spawn_describe_server`.
+    type MockServer = (String, Arc<Mutex<bool>>, Arc<Mutex<Vec<String>>>);
+
     /// Minimal REST namespace mock: answers every request with the
     /// `describe_table`-shaped JSON body currently stored in `body`, so tests
     /// can switch between location-only, table_uri-only, and re-pointed
     /// responses (emulating an external drop/re-create that moves the table).
-    fn spawn_describe_server(body: Arc<Mutex<String>>) -> (String, Arc<Mutex<bool>>) {
+    ///
+    /// Every raw request (head + body) is appended to the returned log so
+    /// tests can assert on what actually went over the wire. When
+    /// `expected_id` is set, requests whose JSON body `id` array differs are
+    /// rejected with a 404, emulating a server that resolves multi-level
+    /// identifiers: the REST client joins the segments with the delimiter in
+    /// the URL path (identical for one segment or many), so the body `id`
+    /// array is where a qualified id sent as a single segment shows up.
+    fn spawn_describe_server(
+        body: Arc<Mutex<String>>,
+        expected_id: Option<Vec<&'static str>>,
+    ) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(Mutex::new(false));
         let stop_flag = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_log = requests.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if *stop_flag.lock().unwrap() {
@@ -1080,17 +1089,46 @@ mod tests {
                     buf.extend_from_slice(&chunk[..n]);
                 }
 
-                let body = body.lock().unwrap().clone();
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let request_body = String::from_utf8_lossy(&buf[header_end..]).to_string();
+                requests_log
+                    .lock()
+                    .unwrap()
+                    .push(format!("{head}{request_body}"));
+
+                let id_matches = expected_id.as_ref().is_none_or(|expected| {
+                    serde_json::from_str::<serde_json::Value>(&request_body)
+                        .ok()
+                        .and_then(|request| request.get("id").and_then(|id| id.as_array()).cloned())
+                        .is_some_and(|segments| {
+                            segments
+                                .iter()
+                                .map(|segment| segment.as_str().unwrap_or_default())
+                                .eq(expected.iter().copied())
+                        })
+                });
+                let response = if id_matches {
+                    let body = body.lock().unwrap().clone();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    // Spec-shaped error body: the numeric `code` field drives
+                    // client-side error classification.
+                    let error = "{\"code\": 404, \"error\": \"table not found\"}";
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        error.len(),
+                        error
+                    )
+                };
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        (endpoint, stop)
+        (endpoint, stop, requests)
     }
 
     #[test]
@@ -1135,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn test_namespace_checkout_latest_if_stale_reopens_on_storage_option_change() {
+    fn test_namespace_checkout_latest_if_stale_ignores_storage_option_rotation() {
         // Opening datasets mutates the process-global debug counters, which
         // other tests assert on; serialize with them.
         let _counter_guard = crate::ffi::session::debug_counter_test_lock();
@@ -1146,7 +1184,7 @@ mod tests {
         external_write(&uri, vec![1, 2, 3], WriteMode::Create);
 
         let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri}\"}}")));
-        let (endpoint, stop) = spawn_describe_server(body.clone());
+        let (endpoint, stop, _requests) = spawn_describe_server(body.clone(), None);
 
         unsafe {
             let endpoint_c = CString::new(endpoint).unwrap();
@@ -1168,7 +1206,7 @@ mod tests {
             }
             assert_eq!(lance_dataset_count_rows(handle), 3);
 
-            // Same location and options: current.
+            // Same location, no external commit: current.
             let mut refreshed: *mut c_void = ptr::null_mut();
             let mut moved_uri: *const c_char = ptr::null();
             assert_eq!(
@@ -1190,8 +1228,9 @@ mod tests {
             assert!(moved_uri.is_null());
 
             // The namespace now vends different storage options for the same
-            // location (e.g. rotated credentials): the handle must be
-            // reopened even though the URI is unchanged.
+            // location (e.g. rotated credentials). That must NOT force a
+            // reopen: the handle's object store refreshes credentials through
+            // the dynamic storage-options provider installed at open time.
             *body.lock().unwrap() = format!(
                 "{{\"location\": \"{uri}\", \"storage_options\": {{\"test_option\": \"v1\"}}}}"
             );
@@ -1210,17 +1249,15 @@ mod tests {
                 ),
                 0
             );
-            assert!(!refreshed.is_null());
-            // Location unchanged: the display URI must not be reported as moved.
+            assert!(refreshed.is_null());
             assert!(moved_uri.is_null());
-            assert_eq!(lance_dataset_count_rows(refreshed), 3);
-            let reopened_v1 = refreshed;
 
-            // Unchanged options on the reopened handle: current again.
-            let mut refreshed_again: *mut c_void = ptr::null_mut();
+            // Rotated options must not mask a real external commit: the
+            // manifest-identity fallback still refreshes the handle.
+            external_write(&uri, vec![4, 5], WriteMode::Append);
             assert_eq!(
                 lance_dataset_namespace_checkout_latest_if_stale(
-                    reopened_v1,
+                    handle,
                     endpoint_c.as_ptr(),
                     table_id_c.as_ptr(),
                     ptr::null(),
@@ -1228,37 +1265,16 @@ mod tests {
                     ptr::null(),
                     ptr::null(),
                     ptr::null_mut(),
-                    &mut refreshed_again,
+                    &mut refreshed,
                     &mut moved_uri,
                 ),
                 0
             );
-            assert!(refreshed_again.is_null());
+            assert!(!refreshed.is_null());
+            assert!(moved_uri.is_null());
+            assert_eq!(lance_dataset_count_rows(refreshed), 5);
 
-            // Another rotation: reopen again.
-            *body.lock().unwrap() = format!(
-                "{{\"location\": \"{uri}\", \"storage_options\": {{\"test_option\": \"v2\"}}}}"
-            );
-            assert_eq!(
-                lance_dataset_namespace_checkout_latest_if_stale(
-                    reopened_v1,
-                    endpoint_c.as_ptr(),
-                    table_id_c.as_ptr(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null_mut(),
-                    &mut refreshed_again,
-                    &mut moved_uri,
-                ),
-                0
-            );
-            assert!(!refreshed_again.is_null());
-            assert_eq!(lance_dataset_count_rows(refreshed_again), 3);
-
-            lance_close_dataset(refreshed_again);
-            lance_close_dataset(reopened_v1);
+            lance_close_dataset(refreshed);
             lance_close_dataset(handle);
         }
 
@@ -1282,7 +1298,7 @@ mod tests {
         external_write(&uri_b, vec![10, 20], WriteMode::Create);
 
         let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
-        let (endpoint, stop) = spawn_describe_server(body.clone());
+        let (endpoint, stop, _requests) = spawn_describe_server(body.clone(), None);
 
         unsafe {
             let endpoint_c = CString::new(endpoint).unwrap();
@@ -1402,6 +1418,222 @@ mod tests {
 
             lance_close_dataset(moved);
             lance_close_dataset(refreshed_same_location);
+            lance_close_dataset(handle);
+        }
+
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_namespace_open_and_revalidate_multi_level_table_id() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        let base = std::env::temp_dir().join(format!("ffi-ns-multi-{}", rand::random::<u64>()));
+        let table_a = base.join("a.lance");
+        let table_b = base.join("b.lance");
+        let uri_a = table_a.to_string_lossy().to_string();
+        let uri_b = table_b.to_string_lossy().to_string();
+        external_write(&uri_a, vec![1, 2, 3], WriteMode::Create);
+        external_write(&uri_b, vec![10, 20], WriteMode::Create);
+
+        // The server only answers for the parsed 3-segment id: a qualified id
+        // sent as a single segment gets a 404, so every green assertion below
+        // proves the multi-level identifier went over the wire.
+        let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
+        let (endpoint, stop, requests) =
+            spawn_describe_server(body.clone(), Some(vec!["parent", "child", "tbl"]));
+
+        unsafe {
+            let endpoint_c = CString::new(endpoint).unwrap();
+            let table_id_c = CString::new("parent$child$tbl").unwrap();
+
+            let mut opened_uri: *const c_char = ptr::null();
+            let handle = lance_open_dataset_in_namespace(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &mut opened_uri,
+            );
+            assert!(!handle.is_null());
+            if !opened_uri.is_null() {
+                crate::error::lance_free_string(opened_uri);
+            }
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // The open path must issue exactly one describe (the one inside
+            // `DatasetBuilder::from_namespace`), with the segments joined and
+            // percent-encoded in the URL path ("$" form-encodes to "%24").
+            {
+                let log = requests.lock().unwrap();
+                assert_eq!(log.len(), 1, "open must describe exactly once");
+                assert!(
+                    log[0].contains("/v1/table/parent%24child%24tbl/describe"),
+                    "request: {}",
+                    log[0]
+                );
+            }
+
+            // Fresh cache hit: revalidation describes under the multi-level
+            // id and reports the handle as current.
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            let mut moved_uri: *const c_char = ptr::null();
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    handle,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut refreshed,
+                    &mut moved_uri,
+                ),
+                0
+            );
+            assert!(refreshed.is_null());
+            assert!(moved_uri.is_null());
+
+            // New external commit at the same location: the manifest-identity
+            // fallback refreshes the handle.
+            external_write(&uri_a, vec![4, 5], WriteMode::Append);
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    handle,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut refreshed,
+                    &mut moved_uri,
+                ),
+                0
+            );
+            assert!(!refreshed.is_null());
+            assert!(moved_uri.is_null());
+            assert_eq!(lance_dataset_count_rows(refreshed), 5);
+            let refreshed_same_location = refreshed;
+
+            // Re-point the multi-level table to a new location: revalidation
+            // reopens through the namespace (again under the 3-segment id)
+            // and reports the moved URI.
+            *body.lock().unwrap() = format!("{{\"location\": \"{uri_b}\"}}");
+            let mut moved: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    refreshed_same_location,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut moved,
+                    &mut moved_uri,
+                ),
+                0
+            );
+            assert!(!moved.is_null());
+            assert_eq!(lance_dataset_count_rows(moved), 2);
+            assert!(!moved_uri.is_null());
+            let moved_uri_str = std::ffi::CStr::from_ptr(moved_uri)
+                .to_string_lossy()
+                .to_string();
+            assert!(moved_uri_str.contains("b.lance"), "uri: {moved_uri_str}");
+            crate::error::lance_free_string(moved_uri);
+
+            lance_close_dataset(moved);
+            lance_close_dataset(refreshed_same_location);
+            lance_close_dataset(handle);
+        }
+
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_namespace_revalidate_multi_level_custom_delimiter() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        let base = std::env::temp_dir().join(format!("ffi-ns-delim-{}", rand::random::<u64>()));
+        let table = base.join("t.lance");
+        let uri = table.to_string_lossy().to_string();
+        external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+
+        let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri}\"}}")));
+        let (endpoint, stop, _requests) =
+            spawn_describe_server(body.clone(), Some(vec!["parent", "child", "tbl"]));
+
+        unsafe {
+            let endpoint_c = CString::new(endpoint).unwrap();
+            let table_id_c = CString::new("parent.child.tbl").unwrap();
+            let delimiter_c = CString::new(".").unwrap();
+
+            // Without the matching delimiter the qualified id stays a single
+            // segment, which does not name the same table: the open must fail.
+            let mut opened_uri: *const c_char = ptr::null();
+            let unsplit = lance_open_dataset_in_namespace(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(), // default "$" delimiter leaves "parent.child.tbl" whole
+                ptr::null(),
+                &mut opened_uri,
+            );
+            assert!(unsplit.is_null());
+
+            // With the configured delimiter the id splits into three segments
+            // and resolves.
+            let handle = lance_open_dataset_in_namespace(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                delimiter_c.as_ptr(),
+                ptr::null(),
+                &mut opened_uri,
+            );
+            assert!(!handle.is_null());
+            if !opened_uri.is_null() {
+                crate::error::lance_free_string(opened_uri);
+            }
+            assert_eq!(lance_dataset_count_rows(handle), 3);
+
+            // Cache-hit revalidation must parse with the same delimiter.
+            let mut refreshed: *mut c_void = ptr::null_mut();
+            let mut moved_uri: *const c_char = ptr::null();
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    handle,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    delimiter_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    &mut refreshed,
+                    &mut moved_uri,
+                ),
+                0
+            );
+            assert!(refreshed.is_null());
+            assert!(moved_uri.is_null());
+
             lance_close_dataset(handle);
         }
 

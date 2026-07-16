@@ -1,5 +1,5 @@
 # name: test/sql/dataset_cache_external_schema_coercion.test
-# description: External type evolution between coercion-equivalent Arrow types evicts stale entries
+# description: External type evolution between coercion-equivalent Arrow types replaces stale entries
 # group: [sql]
 
 require lance

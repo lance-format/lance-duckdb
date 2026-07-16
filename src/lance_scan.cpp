@@ -3426,6 +3426,17 @@ LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
     throw InternalException(
         "LanceTableEntry::AlterEntry missing client context");
   }
+  // Internal stale-entry refresh marker (see ReplaceStaleTableEntry in
+  // lance_storage.cpp): rebuild this entry from the current dataset state
+  // without touching the dataset itself. CatalogSet::AlterEntry chains the
+  // rebuilt entry over this one in the version chain, so this (old)
+  // generation stays alive until undo-buffer cleanup and holders of raw
+  // references to it remain safe. Bypasses the autocommit gate below on
+  // purpose: the refresh is a catalog-only, fully transactional operation
+  // (rollback restores this entry), unlike Lance dataset DDL.
+  if (dynamic_cast<LanceRefreshTableAlterInfo *>(&info)) {
+    return BuildUpdatedLanceTableEntry(*transaction.context, *this, internal);
+  }
   return AlterEntry(*transaction.context, info);
 }
 
@@ -3689,10 +3700,10 @@ NotNullIndexesFromArrowSchema(const ArrowSchema &schema_root) {
 // commits do not). DuckDB binds column ids against this entry's columns
 // while scans and writers resolve state through the live dataset schema;
 // serving a mismatched pair would mislabel columns, read the wrong fields,
-// or apply stale write gates. Fail closed instead: evict the stale entry
-// (the same mechanism DROP TABLE uses) so the next access lazily
-// re-discovers the table with its current schema, and surface an explicit
-// error for this statement.
+// or apply stale write gates. Fail closed instead: replace the stale entry
+// through the catalog version chain (the same mechanism ALTER TABLE uses)
+// so the next access serves the entry rebuilt from the current schema, and
+// surface an explicit error for this statement.
 //
 // The comparison covers, beyond top-level names/types:
 // - the coerced-column state: Arrow types that the reader-boundary layer
@@ -3726,7 +3737,7 @@ bool LanceTableEntry::MatchesLiveSchemaState(
   return schema_matches;
 }
 
-void LanceTableEntry::ValidateLiveSchemaOrEvict(
+void LanceTableEntry::ValidateLiveSchemaOrReplace(
     ClientContext &context, const vector<string> &live_names,
     const vector<LogicalType> &live_types,
     const std::vector<std::string> &live_coerced_columns,
@@ -3735,16 +3746,17 @@ void LanceTableEntry::ValidateLiveSchemaOrEvict(
                              live_schema_root)) {
     return;
   }
-  auto table_name = name;
-  auto changed_uri = display_uri;
-  // NOTE: eviction destroys this entry object; no member of `this` may be
-  // touched after this call. The copies above feed the error message.
-  (void)LanceTryEvictStaleTableEntry(context, *this);
+  // The replace supersedes this entry in the catalog version chain, but this
+  // (old) generation stays alive until undo-buffer cleanup, so reading
+  // members of `this` for the error message below remains safe. The heal is
+  // best-effort (fail-open); the error is thrown regardless so this
+  // statement never runs against a mismatched binding.
+  (void)LanceTryReplaceStaleTableEntry(context, *this);
   throw CatalogException(
       "Lance table \"%s\" was changed externally: the dataset schema at "
       "'%s' no longer matches the catalog entry. The entry has been "
       "refreshed from the current schema - please re-run the query.",
-      table_name, changed_uri);
+      name, display_uri);
 }
 
 // Fetch the (revalidated) dataset handle and compare its live schema state
@@ -3785,7 +3797,7 @@ bool LanceTableEntry::FetchLiveSchemaMatches(ClientContext &context,
 
 // Non-throwing-on-mismatch staleness probe for catalog resolution: reports
 // whether this entry's declared schema state diverged from the dataset on
-// storage without evicting anything. Infrastructure errors still propagate.
+// storage without replacing anything. Infrastructure errors still propagate.
 bool LanceTableEntry::IsSchemaStale(ClientContext &context) {
   string display_uri;
   return !FetchLiveSchemaMatches(context, display_uri);
@@ -3793,22 +3805,22 @@ bool LanceTableEntry::IsSchemaStale(ClientContext &context) {
 
 // Freshness validation entry point for statements that do not bind a scan of
 // the table (e.g. plain INSERT): fetches the (revalidated) dataset handle and
-// compares its live schema state against this entry, evicting and failing
-// closed on mismatch just like the scan bind path.
+// compares its live schema state against this entry, replacing the entry and
+// failing closed on mismatch just like the scan bind path.
 void LanceTableEntry::VerifySchemaFreshness(ClientContext &context) {
   string display_uri;
   if (FetchLiveSchemaMatches(context, display_uri)) {
     return;
   }
-  auto table_name = name;
-  // NOTE: eviction destroys this entry object; no member of `this` may be
-  // touched after this call. The copies above feed the error message.
-  (void)LanceTryEvictStaleTableEntry(context, *this);
+  // As in ValidateLiveSchemaOrReplace: the superseded generation (`this`)
+  // stays alive in the version chain until undo-buffer cleanup, so using its
+  // members for the error message remains safe after the best-effort heal.
+  (void)LanceTryReplaceStaleTableEntry(context, *this);
   throw CatalogException(
       "Lance table \"%s\" was changed externally: the dataset schema at "
       "'%s' no longer matches the catalog entry. The entry has been "
       "refreshed from the current schema - please re-run the query.",
-      table_name, display_uri);
+      name, display_uri);
 }
 
 TableFunction
@@ -3852,7 +3864,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
 
-  ValidateLiveSchemaOrEvict(
+  ValidateLiveSchemaOrReplace(
       context, result->names, result->types, live_coerced_columns,
       result->schema_root.arrow_schema, result->file_path);
 
