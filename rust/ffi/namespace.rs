@@ -882,11 +882,15 @@ mod tests {
         ];
 
         for case in cases {
-            unsafe {
-                let endpoint_c = CString::new(case.endpoint.clone()).unwrap();
-                let table_id_c = CString::new(case.table_id).unwrap();
-                let mut schema_json: *const c_char = ptr::null();
-                let rc = lance_namespace_describe_table_with_schema(
+            let endpoint_c = CString::new(case.endpoint.clone()).unwrap();
+            let table_id_c = CString::new(case.table_id).unwrap();
+            let mut schema_json: *const c_char = ptr::null();
+            // SAFETY: `endpoint_c` and `table_id_c` are NUL-terminated
+            // `CString`s that outlive the call, the remaining string inputs
+            // are null (accepted as "absent"), and `schema_json` is a live
+            // stack slot for the out-pointer.
+            let rc = unsafe {
+                lance_namespace_describe_table_with_schema(
                     endpoint_c.as_ptr(),
                     table_id_c.as_ptr(),
                     ptr::null(),
@@ -894,20 +898,24 @@ mod tests {
                     ptr::null(),
                     ptr::null(),
                     &mut schema_json,
-                );
-                assert_ne!(rc, 0, "{}", case.name);
-                assert!(schema_json.is_null(), "{}", case.name);
-                assert_eq!(
-                    crate::error::lance_last_error_code(),
-                    case.want_code,
-                    "{}",
-                    case.name
-                );
-                // Consume the pending message so later tests see a clean slate.
-                let message = crate::error::lance_last_error_message();
-                if !message.is_null() {
-                    crate::error::lance_free_string(message);
-                }
+                )
+            };
+            assert_ne!(rc, 0, "{}", case.name);
+            assert!(schema_json.is_null(), "{}", case.name);
+            assert_eq!(
+                crate::error::lance_last_error_code(),
+                case.want_code,
+                "{}",
+                case.name
+            );
+            // Consume the pending message so later tests see a clean slate.
+            let message = crate::error::lance_last_error_message();
+            if !message.is_null() {
+                // SAFETY: `message` was null-checked and is the allocation
+                // whose ownership `lance_last_error_message` just
+                // transferred to us; it is reclaimed exactly once and not
+                // used afterwards.
+                unsafe { crate::error::lance_free_string(message) };
             }
         }
 
