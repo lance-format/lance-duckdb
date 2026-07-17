@@ -18,6 +18,15 @@ SELECT count(*) FROM ns.main.attach_create_table_empty
 ----
 0
 
+# 322E32 is the hexadecimal representation of "2.2" in the manifest.
+query I
+SELECT contains(hex(content), '322E32')::INTEGER
+FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_empty.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
+
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_with_version
   (id BIGINT, s VARCHAR)
@@ -43,6 +52,14 @@ query I
 SELECT count(*) FROM 'test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance'
 ----
 2
+
+query I
+SELECT contains(hex(content), '322E32')::INTEGER
+FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas AS

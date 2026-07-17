@@ -16,7 +16,7 @@ namespace duckdb {
 
 struct LanceWriteBindData : public FunctionData {
   string mode = "create";
-  string data_storage_version;
+  string data_storage_version = LANCE_DEFAULT_DATA_STORAGE_VERSION;
   uint64_t max_rows_per_file = LANCE_DEFAULT_MAX_ROWS_PER_FILE;
   uint64_t max_rows_per_group = LANCE_DEFAULT_MAX_ROWS_PER_GROUP;
   uint64_t max_bytes_per_file = LANCE_DEFAULT_MAX_BYTES_PER_FILE;

@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Changed
+
+- `COPY`, `CREATE TABLE`, and CTAS now default new or replaced datasets to Lance data storage version `2.2`.
+
 ## [0.5.1] - 2026-02-10
 
 ### Added

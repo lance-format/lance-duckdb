@@ -32,6 +32,7 @@ static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
 static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
 static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
+static constexpr const char *LANCE_DEFAULT_DATA_STORAGE_VERSION = "2.2";
 
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,

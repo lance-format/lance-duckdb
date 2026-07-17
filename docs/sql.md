@@ -201,6 +201,7 @@ COPY (
 
 Notes:
 - `mode` supports at least `overwrite` and `append`.
+- `data_storage_version` defaults to `2.2` when `COPY` creates or overwrites a dataset. Appends preserve the existing storage version.
 - `write_empty_file` controls whether an empty dataset is materialized when the input produces zero rows.
 
 ### `CREATE TABLE` / `CTAS` in an attached namespace
@@ -222,6 +223,9 @@ CREATE OR REPLACE TABLE ns.main.my_dataset AS
 SELECT count(*) FROM ns.main.my_dataset;
 DETACH ns;
 ```
+
+`CREATE TABLE` and CTAS default to data storage version `2.2`. Override it with
+`WITH (data_storage_version = '<version>')` when another version is required.
 
 ## DML on attached tables
 
