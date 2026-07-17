@@ -628,7 +628,7 @@ static string
 GetCreateTableDataStorageVersionOption(const CreateTableInfo &create_info) {
   auto it = create_info.options.find("data_storage_version");
   if (it == create_info.options.end()) {
-    return "";
+    return LANCE_DEFAULT_DATA_STORAGE_VERSION;
   }
   if (!it->second) {
     throw BinderException("data_storage_version option cannot be NULL");

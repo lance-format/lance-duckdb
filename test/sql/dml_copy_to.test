@@ -24,6 +24,15 @@ SELECT sum(id) FROM 'test/.tmp/lance_write_basic.lance';
 ----
 3
 
+# 322E32 is the hexadecimal representation of "2.2" in the manifest.
+query I
+SELECT contains(hex(content), '322E32')::INTEGER
+FROM read_blob('test/.tmp/lance_write_basic.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
+
 statement ok
 COPY (
   SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
@@ -78,6 +87,19 @@ COPY (
 
 query I
 SELECT count(*) FROM 'test/.tmp/lance_write_with_version_21.lance';
+----
+1
+
+statement ok
+COPY (
+  SELECT 2::BIGINT AS id, 'w'::VARCHAR AS s
+) TO 'test/.tmp/lance_write_with_version_21.lance' (FORMAT lance, mode 'append');
+
+query I
+SELECT contains(hex(content), '322E31')::INTEGER
+FROM read_blob('test/.tmp/lance_write_with_version_21.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
 ----
 1
 
