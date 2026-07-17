@@ -468,6 +468,7 @@ fn rewrite_rows_update_transaction_inner(
             fields_for_preserving_frag_bitmap,
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
 
         let txn = Transaction::new(dataset.manifest.version, operation, None);
@@ -503,6 +504,10 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
     }
 
     let base = dataset.branch_location().path;
+    let object_store = dataset
+        .object_store(None)
+        .await
+        .map_err(|e| e.to_string())?;
     let fragments = dataset.get_fragments();
 
     let mut indices = Vec::with_capacity(dataset.manifest.fragments.len());
@@ -514,10 +519,9 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
         let row_id_bytes = match row_id_meta {
             RowIdMeta::Inline(data) => data.clone(),
             RowIdMeta::External(file) => {
-                let path = base.child(file.path.as_str());
+                let path = base.clone().join(file.path.as_str());
                 let range = file.offset as usize..(file.offset + file.size) as usize;
-                dataset
-                    .object_store
+                object_store
                     .open(&path)
                     .await
                     .map_err(|e| e.to_string())?

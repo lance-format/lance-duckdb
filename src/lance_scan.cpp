@@ -2377,6 +2377,52 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
   return op;
 }
 
+static bool TryBuildLanceFilterIRThroughProjections(
+    const LogicalFilter &filter, const LogicalGet &get,
+    const vector<string> &names, const vector<LogicalType> &types,
+    const Expression &expression, string &out_ir) {
+  auto rewritten = expression.Copy();
+  auto *node = filter.children[0].get();
+
+  while (node && node != &get) {
+    if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+      auto &projection = node->Cast<LogicalProjection>();
+      bool valid = true;
+      ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+          rewritten, [&](BoundColumnRefExpression &column_ref,
+                         unique_ptr<Expression> &current) {
+            if (column_ref.depth != 0 ||
+                column_ref.binding.table_index != projection.table_index ||
+                column_ref.binding.column_index >=
+                    projection.expressions.size()) {
+              valid = false;
+              return;
+            }
+
+            auto replacement =
+                projection.expressions[column_ref.binding.column_index]->Copy();
+            if (!column_ref.alias.empty()) {
+              replacement->alias = column_ref.alias;
+            }
+            current = std::move(replacement);
+          });
+      if (!valid) {
+        return false;
+      }
+    } else if (node->type != LogicalOperatorType::LOGICAL_FILTER) {
+      return false;
+    }
+
+    if (node->children.size() != 1 || !node->children[0]) {
+      return false;
+    }
+    node = node->children[0].get();
+  }
+
+  return node == &get && TryBuildLanceExprFilterIR(get, names, types, false,
+                                                   *rewritten, out_ir);
+}
+
 static unique_ptr<LogicalOperator>
 LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
   for (auto &child : op->children) {
@@ -2461,9 +2507,9 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
           continue;
         }
         string discard_ir;
-        if (!TryBuildLanceExprFilterIR(get, scan_bind_check.names,
-                                       scan_bind_check.types, false, *expr,
-                                       discard_ir)) {
+        if (!TryBuildLanceFilterIRThroughProjections(
+                *filter_node, get, scan_bind_check.names, scan_bind_check.types,
+                *expr, discard_ir)) {
           return op;
         }
       }

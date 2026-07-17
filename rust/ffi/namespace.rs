@@ -202,7 +202,12 @@ fn describe_table_info_inner(
         // FIX: a qualified table id (e.g. "catalog.schema.table") must be sent as
         // its multi-segment namespace path, not a single segment. Split on the
         // delimiter so the server sees the full 3-level id instead of "got: 1".
-        req.id = Some(table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect());
+        req.id = Some(
+            table_id
+                .split(delimiter.as_str())
+                .map(|s| s.to_string())
+                .collect(),
+        );
         req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
@@ -306,8 +311,10 @@ fn create_empty_table_inner(
     .delimiter(delimiter.clone())
     .build();
 
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DeclareTableRequest::new();
         req.id = Some(table_id_segments);
@@ -413,8 +420,10 @@ fn drop_table_inner(
     .delimiter(delimiter.clone())
     .build();
 
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
     runtime::block_on(async move {
         let mut req = DropTableRequest::new();
         req.id = Some(table_id_segments);
@@ -488,7 +497,12 @@ fn describe_table_with_schema_inner(
     let schema_json = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
         // FIX: split the qualified id into its namespace segments (see describe_table_info_inner).
-        req.id = Some(table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect());
+        req.id = Some(
+            table_id
+                .split(delimiter.as_str())
+                .map(|s| s.to_string())
+                .collect(),
+        );
         req.with_table_uri = Some(true);
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
@@ -587,20 +601,21 @@ fn open_dataset_in_namespace_inner(
     let session = unsafe { optional_session_handle(session)? };
     // FIX: split the qualified id into namespace segments so the crate's internal
     // describe (DatasetBuilder::from_namespace) gets the full 3-level id, not 1.
-    let table_id_segments: Vec<String> =
-        table_id.split(delimiter.as_str()).map(|s| s.to_string()).collect();
+    let table_id_segments: Vec<String> = table_id
+        .split(delimiter.as_str())
+        .map(|s| s.to_string())
+        .collect();
 
     let (dataset, table_uri) = runtime::block_on(async move {
         record_namespace_describe();
-        let mut builder =
-            DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
-                .await
-                .map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceDescribeTable,
-                        format!("namespace describe_table: {err}"),
-                    )
-                })?;
+        let mut builder = DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
+            .await
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::NamespaceDescribeTable,
+                    format!("namespace describe_table: {err}"),
+                )
+            })?;
         if let Some(session) = session {
             builder = builder.with_session(session);
         }

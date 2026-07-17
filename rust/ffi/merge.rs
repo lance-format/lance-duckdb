@@ -428,6 +428,7 @@ fn merge_finish_uncommitted_inner(
             fields_for_preserving_frag_bitmap: Vec::new(),
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
+            updated_fragment_offsets: None,
         };
         let txn = Transaction::new(dataset.manifest.version, operation, None);
 

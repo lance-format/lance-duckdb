@@ -111,6 +111,19 @@ WHERE database_name = 'ns'
 ----
 const_col	true
 
+statement error
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
+----
+IO Error: Failed to change column type in Lance dataset
+
+query TTTIT
+SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
+----
+age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
+
+statement ok
+DROP INDEX age_idx ON ns.main.alter_table_schema_evolution;
+
 statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
 
