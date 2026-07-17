@@ -435,15 +435,20 @@ public:
       resolved_api_key = api_key;
     }
 
-    // Build candidate table IDs (bare name + optional namespace-prefixed).
-    vector<string> candidates = {entry_name};
-    if (!namespace_id.empty()) {
-      auto delim = delimiter.empty() ? "$" : delimiter;
-      auto prefix = namespace_id + delim;
-      if (!StringUtil::StartsWith(entry_name, prefix)) {
-        candidates.push_back(prefix + entry_name);
-      }
+    // Build candidate table IDs with the CANONICAL id FIRST. With a
+    // non-empty namespace_id the namespace-qualified id is the canonical
+    // form; the bare name is only an alias for server dialects that store
+    // unprefixed ids.
+    auto delim = delimiter.empty() ? "$" : delimiter;
+    auto prefix = namespace_id.empty() ? string() : namespace_id + delim;
+    vector<string> candidates;
+    if (prefix.empty() || StringUtil::StartsWith(entry_name, prefix)) {
+      candidates.push_back(entry_name);
+    } else {
+      candidates.push_back(prefix + entry_name);
+      candidates.push_back(entry_name);
     }
+    constexpr idx_t canonical_idx = 0;
 
     // Existence is decided by the point lookups below, never by listing the
     // namespace up front: REST credentials may permit describing/opening
@@ -452,46 +457,100 @@ public:
     // also probes the active catalog for system names (e.g. duckdb_tables
     // when SHOW TABLES runs under `USE <lance_catalog>`).
     //
-    // Existence precedence — only the CANONICAL candidate is authoritative.
-    // With a non-empty namespace_id the namespace-qualified id (always the
-    // LAST candidate above) is the canonical form; the bare alias exists
-    // for servers that store unprefixed ids, and strict multi-level servers
-    // are expected to reject it with generic invalid-arity errors. Case
-    // matrix over the fast-path describes (Found+convertible returns
-    // immediately; "unconvertible" = describe or open succeeded but the
-    // schema cannot be exposed, tracked across BOTH loops):
-    //   any candidate unconvertible          -> empty entry (table exists)
-    //   canonical NotFound (alias anything)  -> nullptr: authoritative typed
-    //     miss; alias infra errors are suppressed (arity noise must not
-    //     force the membership fallback or an IOException under
-    //     list-denied credentials)
-    //   canonical Error   (alias anything)   -> membership fallback below: a
-    //     typed miss from the non-canonical alias never suppresses an infra
-    //     error on the real id (broken auth plus a spurious alias 404 must
-    //     surface as an error, not "not found")
-    const idx_t canonical_idx = candidates.size() - 1;
+    // Existence precedence — only the CANONICAL candidate is authoritative,
+    // and it is probed FIRST. On a hierarchical server a one-segment id
+    // addresses the ROOT namespace, so the bare alias is doubly guarded:
+    //   - once the canonical id proves existence (describe Found or open
+    //     succeeded, even with an unconvertible schema) the alias is never
+    //     consulted — a same-named root table must not shadow this
+    //     namespace's table;
+    //   - an alias describe/open success only counts after the membership
+    //     listing confirms the name belongs to this namespace (checked
+    //     lazily AFTER the success so system-name probes never pay a list
+    //     round trip); otherwise the alias result is discarded outright;
+    //   - alias NotFound/Error outcomes are never authoritative (arity
+    //     noise from strict multi-level servers must not force the
+    //     membership fallback or an IOException under list-denied
+    //     credentials).
+    // Tail precedence on the canonical outcome ("unconvertible" = describe
+    // or open succeeded but the schema cannot be exposed, tracked across
+    // BOTH loops):
+    //   found but unconvertible -> empty entry (table exists)
+    //   canonical NotFound      -> nullptr: authoritative typed miss
+    //   canonical Error         -> membership fallback below (broken auth
+    //     must surface as an error, not "not found")
     auto canonical_outcome = DescribeTableOutcome::Error;
     string canonical_describe_error = "namespace describe_table did not run";
+    // The canonical id proved the table exists (describe Found or open
+    // succeeded, schema convertibility aside): the alias must not be
+    // consulted at all once this is set.
+    bool canonical_exists = false;
     // A describe or open SUCCEEDED but the schema could not be converted to
     // DuckDB columns: the table provably exists, so the not-found and
     // membership branches below must not run for it.
     bool found_but_unconvertible = false;
 
+    // Memoized membership probe shared by the alias gate and the
+    // canonical-Error fallback tail: at most one list round trip per call.
+    enum class Membership { Listed, NotListed, Unavailable };
+    bool membership_checked = false;
+    auto membership = Membership::Unavailable;
+    auto CheckMembership = [&]() -> Membership {
+      if (membership_checked) {
+        return membership;
+      }
+      membership_checked = true;
+      try {
+        auto known =
+            ListRestNamespaceTables(endpoint, namespace_id, resolved_bearer,
+                                    resolved_api_key, delimiter, headers_tsv);
+        membership = Membership::NotListed;
+        for (auto &k : known) {
+          // Listings may report bare or namespace-prefixed names and the
+          // caller may reference either form; accept any pairing that names
+          // the same table id.
+          if (k == entry_name ||
+              (!prefix.empty() &&
+               (prefix + k == entry_name || k == prefix + entry_name))) {
+            membership = Membership::Listed;
+            break;
+          }
+        }
+      } catch (...) {
+        membership = Membership::Unavailable;
+      }
+      return membership;
+    };
+
     // Fast path: describe_table with schema from REST API (skips S3 open).
     for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
          candidate_idx++) {
+      const bool is_canonical = candidate_idx == canonical_idx;
+      if (!is_canonical && canonical_exists) {
+        // The table exists at the canonical id; the alias must neither
+        // resolve nor set flags.
+        break;
+      }
       auto &table_id = candidates[candidate_idx];
       string schema_json;
       string describe_error;
       auto outcome = TryDescribeTableWithSchema(table_id, resolved_bearer,
                                                 resolved_api_key, schema_json,
                                                 describe_error);
-      if (candidate_idx == canonical_idx) {
+      if (is_canonical) {
         canonical_outcome = outcome;
         canonical_describe_error = describe_error;
+        canonical_exists = outcome == DescribeTableOutcome::Found;
       }
       if (outcome == DescribeTableOutcome::NotFound ||
           outcome == DescribeTableOutcome::Error) {
+        continue;
+      }
+      if (!is_canonical && CheckMembership() != Membership::Listed) {
+        // The alias described, but the name is not confirmed to belong to
+        // this namespace (not listed, or listing unavailable): discard the
+        // result — on a hierarchical server the bare id addressed the root
+        // namespace.
         continue;
       }
       CreateTableInfo info(schema, entry_name);
@@ -511,7 +570,14 @@ public:
     }
 
     // Slow fallback: open dataset from S3.
-    for (auto &table_id : candidates) {
+    for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
+         candidate_idx++) {
+      const bool is_canonical = candidate_idx == canonical_idx;
+      if (!is_canonical && canonical_exists) {
+        // Same exclusion as the fast path: canonical existence is proven.
+        break;
+      }
+      auto &table_id = candidates[candidate_idx];
       string table_uri;
       void *dataset = nullptr;
       try {
@@ -522,10 +588,24 @@ public:
         // Unresolvable candidate (e.g. a DuckDB system name like
         // duckdb_tables that SHOW TABLES resolves against the active catalog,
         // or an invalid 1-segment id) — skip it instead of aborting the
-        // whole statement.
+        // whole statement. The FFI may have recorded a thread-local error
+        // before the exception surfaced; consume it so it cannot leak into
+        // an unrelated LanceFormatErrorSuffix() later.
+        (void)LanceConsumeLastError();
         continue;
       }
       if (!dataset) {
+        // A failed open leaves a thread-local FFI error behind; consume it
+        // so it cannot leak into an unrelated LanceFormatErrorSuffix() later.
+        (void)LanceConsumeLastError();
+        continue;
+      }
+      if (is_canonical) {
+        canonical_exists = true;
+      }
+      if (!is_canonical && CheckMembership() != Membership::Listed) {
+        // Alias gate mirrors the fast path; the dataset is not ours to keep.
+        lance_close_dataset(dataset);
         continue;
       }
       CreateTableInfo info(schema, entry_name);
@@ -569,33 +649,17 @@ public:
       // The canonical describe failed for infrastructure-ish reasons, so
       // existence is still unknown: some server dialects report not-found
       // through non-spec error bodies that deserialize as generic errors.
-      // Disambiguate with a membership listing when we are allowed to list.
-      bool listed = false;
-      try {
-        auto known =
-            ListRestNamespaceTables(endpoint, namespace_id, resolved_bearer,
-                                    resolved_api_key, delimiter, headers_tsv);
-        auto delim = delimiter.empty() ? "$" : delimiter;
-        auto prefix = namespace_id.empty() ? string() : namespace_id + delim;
-        for (auto &k : known) {
-          // Listings may report bare or namespace-prefixed names and the
-          // caller may reference either form; accept any pairing that names
-          // the same table id.
-          if (k == entry_name ||
-              (!prefix.empty() &&
-               (prefix + k == entry_name || k == prefix + entry_name))) {
-            listed = true;
-            break;
-          }
-        }
-      } catch (...) {
+      // Disambiguate with the (memoized) membership listing when we are
+      // allowed to list.
+      auto member = CheckMembership();
+      if (member == Membership::Unavailable) {
         // No list access either: surface the real describe failure on the
         // canonical id instead of reporting a possibly-existing table as
         // not found.
         throw IOException("Failed to describe Lance namespace table '" +
                           entry_name + "': " + canonical_describe_error);
       }
-      if (!listed) {
+      if (member == Membership::NotListed) {
         // The namespace lists fine and the name is not there: treat the
         // ambiguous describe errors as this server's not-found dialect.
         return nullptr;
@@ -610,8 +674,9 @@ public:
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {});
+    // table_id stays the bare entry_name — the value candidates.front()
+    // carried before the canonical-first reordering.
+    return MakeNamespaceEntry(entry_name, entry_name, std::move(info), {});
   }
 
   vector<string> GetDefaultEntries() override {
