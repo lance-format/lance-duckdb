@@ -169,6 +169,11 @@ SELECT count(*) FROM ns.main.some_table;
 DETACH ns;
 ```
 
+Scans of REST namespace tables use the Lance Namespace `query_table` API.
+Projection, supported filters, and `LIMIT`/`OFFSET` pairs are pushed into the
+request; unsupported filters and standalone `OFFSET` operations remain in
+DuckDB. Directory namespace scans continue to read the Lance dataset directly.
+
 ## Write datasets
 
 ### `COPY ... TO ... (FORMAT lance, ...)`

@@ -427,6 +427,7 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
   bool use_dataset_scanner = false;
+  bool use_namespace_query = false;
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;
   int64_t sample_seed = -1;
@@ -816,7 +817,7 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
     if (!expr || expr->HasParameter() || expr->IsVolatile()) {
       continue;
     }
-    if (scan_bind.take_row_ids.empty()) {
+    if (!scan_bind.UsesNamespaceQuery() && scan_bind.take_row_ids.empty()) {
       vector<uint64_t> take_row_ids;
       if (try_extract_rowids(*expr, take_row_ids) && !take_row_ids.empty()) {
         scan_bind.take_row_ids = std::move(take_row_ids);
@@ -1177,6 +1178,39 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
     scan_state.filter_pushed_down =
         table_filters.all_filters_pushed && !scan_state.lance_filter_ir.empty();
+  }
+
+  if (bind_data.UsesNamespaceQuery()) {
+    if (scan_state.sampling_pushed_down) {
+      throw InternalException(
+          "Lance namespace query_table scan does not support sampling");
+    }
+
+    scan_state.use_namespace_query = true;
+    scan_state.use_dataset_scanner = true;
+    scan_state.max_threads = 1;
+
+    if (scan_state.pushed_limit.IsValid() &&
+        scan_state.pushed_limit.GetIndex() == 0) {
+      scan_state.count_only = true;
+      scan_state.count_only_total_rows = 0;
+      return state;
+    }
+
+    // query_table treats an omitted projection as "all columns". Request one
+    // physical column for count(*) and rowid-only scans so the response has a
+    // stable, minimal schema while preserving its row count.
+    bool has_physical_column = false;
+    for (auto col_id : scan_state.scan_column_ids) {
+      if (col_id < bind_data.types.size()) {
+        has_physical_column = true;
+        break;
+      }
+    }
+    if (!has_physical_column && !bind_data.names.empty()) {
+      add_scan_column(0, bind_data.names[0], bind_data.types[0]);
+    }
+    return state;
   }
 
   if (!bind_data.take_row_ids.empty()) {
@@ -1544,7 +1578,45 @@ static bool LanceScanOpenStream(ClientContext &context,
       global_state.filter_pushed_down && filter_ir && filter_ir_len > 0;
 
   void *stream = nullptr;
-  if (global_state.sampling_pushed_down) {
+  if (global_state.use_namespace_query) {
+    if (!bind_data.namespace_query_config) {
+      throw InternalException(
+          "Lance namespace query scan is missing its namespace config");
+    }
+
+    vector<const char *> option_key_ptrs;
+    vector<const char *> option_value_ptrs;
+    vector<const char *> namespace_column_ptrs;
+    string bearer_token;
+    string api_key;
+    LanceNamespaceQueryConfig config{};
+    FillLanceNamespaceQueryConfig(
+        context, *bind_data.namespace_query_config, 0, true, "",
+        global_state.scan_column_names, option_key_ptrs, option_value_ptrs,
+        namespace_column_ptrs, bearer_token, api_key, config);
+
+    auto limit_i64 =
+        global_state.pushed_limit.IsValid()
+            ? NumericCast<int64_t>(global_state.pushed_limit.GetIndex())
+            : int64_t(-1);
+    auto offset_i64 = NumericCast<int64_t>(global_state.pushed_offset);
+    stream = lance_create_namespace_scan_stream_ir(
+        &config, filter_ir, filter_ir_len, limit_i64, offset_i64,
+        global_state.scan_includes_virtual_rowid ? 1 : 0);
+    if (!stream && filter_ir) {
+      if (global_state.limit_offset_pushed_down) {
+        throw IOException("Lance namespace query_table filter pushdown failed" +
+                          LanceFormatErrorSuffix());
+      }
+      // Without a pushed LIMIT, retrying without the remote filter preserves
+      // correctness because DuckDB still evaluates the predicate locally.
+      global_state.filter_pushdown_fallbacks.fetch_add(1);
+      local_state.filter_pushed_down = false;
+      stream = lance_create_namespace_scan_stream_ir(
+          &config, nullptr, 0, limit_i64, offset_i64,
+          global_state.scan_includes_virtual_rowid ? 1 : 0);
+    }
+  } else if (global_state.sampling_pushed_down) {
     local_state.filter_pushed_down = false;
     stream = lance_create_dataset_sample_stream_ir(
         bind_data.dataset, columns.data(), columns.size(),
@@ -1600,8 +1672,10 @@ static bool LanceScanOpenStream(ClientContext &context,
     }
   }
   if (!stream) {
-    throw IOException("Failed to create Lance scan stream" +
-                      LanceFormatErrorSuffix());
+    auto message = global_state.use_namespace_query
+                       ? "Failed to create Lance namespace query_table stream"
+                       : "Failed to create Lance scan stream";
+    throw IOException(message + LanceFormatErrorSuffix());
   }
   global_state.streams_opened.fetch_add(1);
   local_state.stream = stream;
@@ -1962,6 +2036,8 @@ LanceScanToString(TableFunctionToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
+  result["Lance Scan Backend"] =
+      bind_data.UsesNamespaceQuery() ? "namespace_query_table" : "dataset";
   result["Lance Dataset Cache Hit"] =
       bind_data.dataset_cache_hit ? "true" : "false";
   result["Lance Sampling Pushdown"] =
@@ -1989,14 +2065,16 @@ LanceScanToString(TableFunctionToStringInput &input) {
 
   string plan;
   string error;
-  if (TryLanceExplainDatasetScan(
-          bind_data.dataset, nullptr,
-          filter_ir_msg.empty() ? nullptr : &filter_ir_msg,
-          bind_data.pushed_limit, bind_data.pushed_offset,
-          bind_data.explain_verbose, plan, error)) {
-    result["Lance Plan (Bind)"] = plan;
-  } else if (!error.empty()) {
-    result["Lance Plan Error (Bind)"] = error;
+  if (!bind_data.UsesNamespaceQuery()) {
+    if (TryLanceExplainDatasetScan(
+            bind_data.dataset, nullptr,
+            filter_ir_msg.empty() ? nullptr : &filter_ir_msg,
+            bind_data.pushed_limit, bind_data.pushed_offset,
+            bind_data.explain_verbose, plan, error)) {
+      result["Lance Plan (Bind)"] = plan;
+    } else if (!error.empty()) {
+      result["Lance Plan Error (Bind)"] = error;
+    }
   }
 
   return result;
@@ -2013,8 +2091,12 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
       bind_data.explain_verbose ? "true" : "false";
   result["Lance Dataset Cache Hit"] =
       bind_data.dataset_cache_hit ? "true" : "false";
-  result["Lance Scan Mode"] =
-      global_state.use_dataset_scanner ? "dataset" : "fragment";
+  result["Lance Scan Backend"] =
+      global_state.use_namespace_query ? "namespace_query_table" : "dataset";
+  result["Lance Scan Mode"] = global_state.use_namespace_query
+                                  ? "namespace_query_table"
+                              : global_state.use_dataset_scanner ? "dataset"
+                                                                 : "fragment";
   result["Lance Deferred Materialization"] =
       global_state.deferred_materialization ? "true" : "false";
   if (global_state.deferred_materialization) {
@@ -2060,6 +2142,10 @@ LanceScanDynamicToString(TableFunctionDynamicToStringInput &input) {
   if (!global_state.scan_column_names.empty()) {
     result["Lance Projection"] =
         StringUtil::Join(global_state.scan_column_names, "\n");
+  }
+
+  if (global_state.use_namespace_query) {
+    return result;
   }
 
   if (!global_state.explain_computed.load()) {
@@ -2278,6 +2364,9 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
       return op;
     }
     auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+    if (scan_bind.UsesNamespaceQuery()) {
+      return op;
+    }
 
     column_t filter_col_id = LANCE_COLUMN_IDENTIFIER_ROW_ID;
     auto it = get.table_filters.filters.find(filter_col_id);
@@ -2350,6 +2439,9 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
     return op;
   }
   auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+  if (scan_bind.UsesNamespaceQuery()) {
+    return op;
+  }
 
   vector<uint64_t> row_ids;
   idx_t idx = 0;
@@ -2517,6 +2609,15 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
   }
 
   auto &scan_bind = get.bind_data->Cast<LanceScanBindData>();
+  if (scan_bind.UsesNamespaceQuery()) {
+    auto max_query_value =
+        static_cast<idx_t>(std::numeric_limits<int32_t>::max());
+    if ((!pushed_limit.IsValid() && pushed_offset != 0) ||
+        (pushed_limit.IsValid() && pushed_limit.GetIndex() > max_query_value) ||
+        pushed_offset > max_query_value) {
+      return op;
+    }
+  }
   if (!scan_bind.take_row_ids.empty()) {
     return op;
   }
@@ -2626,6 +2727,10 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       return bail("Lance exec pushdown: expected Lance scan LogicalGet");
     }
     auto &scan_bind = scan_get.bind_data->Cast<LanceScanBindData>();
+    if (scan_bind.UsesNamespaceQuery()) {
+      return bail(
+          "Lance exec pushdown: namespace query_table scans not supported");
+    }
 
     vector<string> filter_parts;
     string filter_ir_msg;
@@ -3697,12 +3802,56 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 
+static void PopulateNamespaceQueryScanSchema(ClientContext &context,
+                                             const LanceTableEntry &table,
+                                             LanceScanBindData &result) {
+  vector<string> field_names;
+  vector<LogicalType> field_types;
+  field_names.reserve(table.GetColumns().PhysicalColumnCount());
+  field_types.reserve(table.GetColumns().PhysicalColumnCount());
+  for (auto &column : table.GetColumns().Physical()) {
+    field_names.push_back(column.Name());
+    field_types.push_back(column.Type());
+  }
+
+  memset(&result.schema_root.arrow_schema, 0,
+         sizeof(result.schema_root.arrow_schema));
+  auto properties = context.GetClientProperties();
+  ArrowConverter::ToArrowSchema(&result.schema_root.arrow_schema, field_types,
+                                field_names, properties);
+  LanceCoerceArrowSchemaForDuckDB(&result.schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(context, result.arrow_table,
+                                               result.schema_root.arrow_schema);
+  result.names = result.arrow_table.GetNames();
+  result.types = result.arrow_table.GetTypes();
+
+  field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
+  field_types.push_back(LogicalType::UBIGINT);
+  memset(&result.scan_schema_root.arrow_schema, 0,
+         sizeof(result.scan_schema_root.arrow_schema));
+  ArrowConverter::ToArrowSchema(&result.scan_schema_root.arrow_schema,
+                                field_types, field_names, properties);
+  LanceCoerceArrowSchemaForDuckDB(&result.scan_schema_root.arrow_schema);
+  ArrowTableFunction::PopulateArrowTableSchema(
+      context, result.scan_arrow_table, result.scan_schema_root.arrow_schema);
+}
+
 TableFunction
 LanceTableEntry::GetScanFunction(ClientContext &context,
                                  unique_ptr<FunctionData> &bind_data) {
   auto result = make_uniq<LanceScanBindData>();
   result->table_entry = this;
   result->file_path = dataset_uri;
+
+  if (IsNamespaceBacked() && NamespaceConfig().IsRest()) {
+    result->namespace_query_config =
+        make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
+    PopulateNamespaceQueryScanSchema(context, *this, *result);
+    bind_data = std::move(result);
+    auto function = LanceTableScanFunction();
+    function.sampling_pushdown = false;
+    return function;
+  }
 
   string display_uri;
   result->dataset_entry = LanceGetOrOpenDatasetEntryForTable(

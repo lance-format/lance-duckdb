@@ -50,6 +50,69 @@ bool IsComputedSearchColumn(const string &name) {
   return name == "_distance" || name == "_score" || name == "_hybrid_score";
 }
 
+static void BuildStringPointerArray(const vector<string> &values,
+                                    vector<const char *> &out_ptrs) {
+  out_ptrs.clear();
+  out_ptrs.reserve(values.size());
+  for (auto &value : values) {
+    out_ptrs.push_back(value.c_str());
+  }
+}
+
+void FillLanceNamespaceQueryConfig(
+    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
+    bool prefilter, const string &filter, const vector<string> &columns,
+    vector<const char *> &option_key_ptrs,
+    vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
+    string &bearer_token, string &api_key,
+    LanceNamespaceQueryConfig &out_config) {
+  static constexpr uint8_t NAMESPACE_KIND_DIRECTORY = 0;
+  static constexpr uint8_t NAMESPACE_KIND_REST = 1;
+
+  out_config = {};
+  out_config.table_id = cfg.table_id.c_str();
+  out_config.k = k;
+  out_config.prefilter = prefilter ? 1 : 0;
+  out_config.filter = filter.empty() ? nullptr : filter.c_str();
+
+  BuildStringPointerArray(columns, column_ptrs);
+  out_config.columns = column_ptrs.empty() ? nullptr : column_ptrs.data();
+  out_config.columns_len = column_ptrs.size();
+
+  if (cfg.IsDirectory()) {
+    out_config.namespace_kind = NAMESPACE_KIND_DIRECTORY;
+    out_config.root = cfg.root.c_str();
+    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
+                                    option_key_ptrs, option_value_ptrs);
+    out_config.option_keys =
+        option_key_ptrs.empty() ? nullptr : option_key_ptrs.data();
+    out_config.option_values =
+        option_value_ptrs.empty() ? nullptr : option_value_ptrs.data();
+    out_config.options_len = option_key_ptrs.size();
+    return;
+  }
+
+  out_config.namespace_kind = NAMESPACE_KIND_REST;
+  out_config.endpoint = cfg.endpoint.c_str();
+  out_config.delimiter =
+      cfg.delimiter.empty() ? nullptr : cfg.delimiter.c_str();
+  out_config.headers_tsv =
+      cfg.headers_tsv.empty() ? nullptr : cfg.headers_tsv.c_str();
+
+  unordered_map<string, Value> overrides;
+  if (!cfg.bearer_token_override.empty()) {
+    overrides["bearer_token"] = Value(cfg.bearer_token_override);
+  }
+  if (!cfg.api_key_override.empty()) {
+    overrides["api_key"] = Value(cfg.api_key_override);
+  }
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
+                            api_key);
+  out_config.bearer_token =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  out_config.api_key = api_key.empty() ? nullptr : api_key.c_str();
+}
+
 string LanceNormalizeS3Scheme(const string &path) {
   if (StringUtil::StartsWith(path, "s3a://")) {
     return "s3://" + path.substr(6);

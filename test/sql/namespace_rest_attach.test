@@ -20,6 +20,12 @@ SHOW TABLES FROM ns.main
 ----
 ${LANCE_NAMESPACE_TABLE}
 
+query II
+EXPLAIN (FORMAT JSON)
+SELECT * FROM ns.main."${LANCE_NAMESPACE_TABLE}" LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Scan Backend": "namespace_query_table"[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
 query I
 SELECT count(*) FROM ns.main."${LANCE_NAMESPACE_TABLE}"
 ----

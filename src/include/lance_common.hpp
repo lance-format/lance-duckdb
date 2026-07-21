@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 
+struct LanceNamespaceQueryConfig;
+
 namespace duckdb {
 
 string LanceConsumeLastError();
@@ -83,6 +85,14 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
 
 struct LanceNamespaceTableConfig;
 class LanceTableEntry;
+
+void FillLanceNamespaceQueryConfig(
+    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
+    bool prefilter, const string &filter, const vector<string> &columns,
+    vector<const char *> &option_key_ptrs,
+    vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
+    string &bearer_token, string &api_key,
+    ::LanceNamespaceQueryConfig &out_config);
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 

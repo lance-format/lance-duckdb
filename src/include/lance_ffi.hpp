@@ -272,7 +272,7 @@ void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
                                  uint8_t prefilter);
 
-typedef struct LanceNamespaceSearchConfig {
+typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;
   const char *root;
   const char **option_keys;
@@ -289,7 +289,7 @@ typedef struct LanceNamespaceSearchConfig {
   const char *filter;
   uint64_t k;
   uint8_t prefilter;
-} LanceNamespaceSearchConfig;
+} LanceNamespaceQueryConfig;
 
 typedef struct LanceNamespaceVectorSearchOptions {
   const char *vector_column;
@@ -306,11 +306,14 @@ typedef struct LanceNamespaceFtsSearchOptions {
 } LanceNamespaceFtsSearchOptions;
 
 void *lance_create_namespace_vector_search_stream(
-    const LanceNamespaceSearchConfig *config,
+    const LanceNamespaceQueryConfig *config,
     const LanceNamespaceVectorSearchOptions *options);
 void *lance_create_namespace_fts_search_stream(
-    const LanceNamespaceSearchConfig *config,
+    const LanceNamespaceQueryConfig *config,
     const LanceNamespaceFtsSearchOptions *options);
+void *lance_create_namespace_scan_stream_ir(
+    const LanceNamespaceQueryConfig *config, const uint8_t *filter_ir,
+    size_t filter_ir_len, int64_t limit, int64_t offset, uint8_t with_row_id);
 
 void *lance_get_hybrid_schema(void *dataset);
 void *lance_create_hybrid_stream_ir(

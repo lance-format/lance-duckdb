@@ -11,6 +11,7 @@
 
 namespace duckdb {
 class TableCatalogEntry;
+struct LanceNamespaceTableConfig;
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
@@ -27,6 +28,7 @@ struct LanceScanBindData : public TableFunctionData {
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
+  unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
 
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;
@@ -37,6 +39,8 @@ struct LanceScanBindData : public TableFunctionData {
   bool limit_offset_pushed_down = false;
   optional_idx pushed_limit = optional_idx::Invalid();
   idx_t pushed_offset = 0;
+
+  bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
 
   ~LanceScanBindData() override;
 };

@@ -9,6 +9,7 @@ A Lance REST Namespace provides a centralized catalog for managing Lance tables.
 - Listing tables in a namespace
 - Creating and dropping tables
 - Describing tables (getting location and storage credentials)
+- Querying tables through the `query_table` API
 - Credential vending for accessing underlying storage (S3, GCS, Azure, etc.)
 
 ## Prerequisites
@@ -102,6 +103,13 @@ INSERT INTO users VALUES
 ```
 
 ### 5. Query Data
+
+For tables attached through a REST Namespace, `SELECT` is executed through the
+Lance Namespace `query_table` API. DuckDB pushes the required projection,
+supported `WHERE` predicates, and `LIMIT`/`OFFSET` pairs into the request and
+reads the Arrow IPC response. Reads therefore do not require DuckDB to open the
+underlying object-store location directly. Unsupported predicates remain in
+DuckDB, and an `OFFSET` without a `LIMIT` is also evaluated by DuckDB.
 
 ```sql
 -- Select all rows
