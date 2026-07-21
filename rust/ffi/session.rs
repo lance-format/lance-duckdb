@@ -3,7 +3,9 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session;
+use lance_core::cache::{CacheBackend, MokaCacheBackend};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
@@ -62,24 +64,42 @@ fn create_session_inner(
     index_cache_size_bytes: u64,
     metadata_cache_size_bytes: u64,
 ) -> FfiResult<SessionHandle> {
-    let session = if index_cache_size_bytes == 0 && metadata_cache_size_bytes == 0 {
-        Arc::new(Session::default())
-    } else {
-        Arc::new(Session::new(
-            u64_to_usize(index_cache_size_bytes, "index_cache_size_bytes")?,
-            u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?,
-            Default::default(),
-        ))
-    };
-    Ok(SessionHandle { session })
+    let (index_cache_size_bytes, metadata_cache_size_bytes) =
+        if index_cache_size_bytes == 0 && metadata_cache_size_bytes == 0 {
+            (DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE)
+        } else {
+            (
+                u64_to_usize(index_cache_size_bytes, "index_cache_size_bytes")?,
+                u64_to_usize(metadata_cache_size_bytes, "metadata_cache_size_bytes")?,
+            )
+        };
+    let index_cache: Arc<dyn CacheBackend> =
+        Arc::new(MokaCacheBackend::with_capacity(index_cache_size_bytes));
+    let session = Arc::new(Session::with_index_cache_backend(
+        index_cache.clone(),
+        metadata_cache_size_bytes,
+        Default::default(),
+    ));
+    Ok(SessionHandle {
+        session,
+        index_cache,
+    })
+}
+
+fn clear_session_caches(handle: &SessionHandle) {
+    if let Some(runtime) = crate::runtime::initialized_runtime() {
+        runtime.block_on(async {
+            handle.index_cache.clear().await;
+            handle.session.file_metadata_cache().clear().await;
+        });
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     if !session.is_null() {
-        unsafe {
-            let _ = Box::from_raw(session as *mut SessionHandle);
-        }
+        let handle = unsafe { Box::from_raw(session as *mut SessionHandle) };
+        clear_session_caches(&handle);
     }
 }
 

@@ -13,6 +13,10 @@ pub fn runtime() -> Result<&'static Runtime, io::Error> {
     }
 }
 
+pub fn initialized_runtime() -> Option<&'static Runtime> {
+    RUNTIME.get()?.as_ref().ok()
+}
+
 pub fn handle() -> Result<Handle, io::Error> {
     Ok(runtime()?.handle().clone())
 }
