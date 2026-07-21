@@ -1,0 +1,142 @@
+# name: test/sql/dataset_cache_external_writer_revalidation.test
+# description: Cache hits are revalidated against the latest committed version so external commits become visible
+# group: [sql]
+
+require lance
+
+# The dataset cache is connection-local, so a commit made through con2 acts as
+# an "external writer" from con1's perspective: the write invalidates only
+# con2's own cache entry. Without revalidation on cache hit, con1 would keep
+# serving the pre-commit version forever.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'test/.tmp/cache_external_writer.lance' (FORMAT lance, mode 'overwrite');
+
+# con1 caches the dataset at the initial version.
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_external_writer.lance';
+----
+3
+
+query II con1
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_external_writer.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+# External delete: committed through con2, bypassing con1's connection.
+statement ok con2
+ATTACH 'test/.tmp' AS ext_writer_ns (TYPE LANCE);
+
+query I con2
+DELETE FROM ext_writer_ns.main.cache_external_writer WHERE id = 3;
+----
+1
+
+# con1 must observe the externally committed delete on its next read.
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_external_writer.lance';
+----
+2
+
+query I con1
+SELECT id FROM 'test/.tmp/cache_external_writer.lance' ORDER BY id;
+----
+1
+2
+
+# External append: con2 commits a new row.
+statement ok con2
+COPY (SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s)
+TO 'test/.tmp/cache_external_writer.lance' (FORMAT lance, mode 'append');
+
+# The first con1 access after the external commit refreshes the stale entry
+# and reports it as a cache miss...
+query II con1
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_external_writer.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+# ...and sees the appended row.
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_external_writer.lance';
+----
+3
+
+# Once refreshed, subsequent hits stay hits until the next external commit.
+query II con1
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/.tmp/cache_external_writer.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+# Catalog-attached reads go through the same cache and must also observe
+# external commits.
+statement ok con1
+ATTACH 'test/.tmp' AS ext_reader_ns (TYPE LANCE);
+
+query I con1
+SELECT count(*) FROM ext_reader_ns.main.cache_external_writer;
+----
+3
+
+query I con2
+DELETE FROM ext_writer_ns.main.cache_external_writer WHERE id = 1;
+----
+1
+
+query I con1
+SELECT count(*) FROM ext_reader_ns.main.cache_external_writer;
+----
+2
+
+# External drop + re-create at the same URI: the new table's history restarts
+# at the same version id as the cached entry (both are at version 1), so only
+# the manifest identity (e-tag) distinguishes the two tables. The cached
+# reader must observe the re-created table, not the dropped one.
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'test/.tmp/cache_recreate.lance' (FORMAT lance, mode 'overwrite');
+
+# con1 caches the dataset at version 1 of the original table.
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_recreate.lance';
+----
+3
+
+statement ok con2
+DROP TABLE ext_writer_ns.main.cache_recreate;
+
+statement ok con2
+COPY (
+  SELECT 10::BIGINT AS id, 'x'::VARCHAR AS s
+  UNION ALL
+  SELECT 20::BIGINT AS id, 'y'::VARCHAR AS s
+) TO 'test/.tmp/cache_recreate.lance' (FORMAT lance, mode 'overwrite');
+
+# The re-created table is also at version 1; con1 must still see it.
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_recreate.lance';
+----
+2
+
+query I con1
+SELECT id FROM 'test/.tmp/cache_recreate.lance' ORDER BY id;
+----
+10
+20
+
+statement ok con1
+DETACH ext_reader_ns;
+
+statement ok con2
+DETACH ext_writer_ns;

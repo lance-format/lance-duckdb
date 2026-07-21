@@ -1,0 +1,60 @@
+# name: test/sql/dataset_cache_external_schema_coercion.test
+# description: External type evolution between coercion-equivalent Arrow types replaces stale entries
+# group: [sql]
+
+require lance
+
+# Fixture: test/data/float16_evolution_fixture.lance stores column "h" as
+# float16, which the reader boundary surfaces as FLOAT and whose coerced
+# state gates writes. An external ALTER of "h" to real float32 keeps the
+# post-coercion name/type pair identical, so only the coerced-column state
+# distinguishes the stale catalog entry from the evolved dataset.
+#
+# NOTE: like dml_alter_table_vector_schema_evolution.test, this test evolves
+# a checked-in fixture in place; re-running on a dirty tree requires
+# restoring test/data first (fresh CI checkouts are unaffected).
+
+statement ok con1
+ATTACH 'test/data' AS coerce_reader (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/data' AS coerce_writer (TYPE LANCE);
+
+# The reader discovers the table with the float16 column surfaced as FLOAT...
+query TIR con1
+SELECT typeof(h), id, h FROM coerce_reader.main.float16_evolution_fixture ORDER BY id LIMIT 1;
+----
+FLOAT	1	1.5
+
+# ...and the coerced column rejects writes.
+statement error con1
+INSERT INTO coerce_reader.main.float16_evolution_fixture VALUES (4, 3.5);
+----
+<REGEX>:.*coerced.*
+
+# External evolution: the writer catalog converts h to real float32. The
+# post-coercion schema (name FLOAT) is unchanged; only the coerced state is.
+statement ok con2
+ALTER TABLE coerce_writer.main.float16_evolution_fixture ALTER COLUMN h TYPE FLOAT;
+
+# The reader's stale entry still marks h as coerced; entry resolution heals
+# it transparently and reads see the current (uncoerced) schema immediately.
+query IR con1
+SELECT id, h FROM coerce_reader.main.float16_evolution_fixture ORDER BY id LIMIT 1;
+----
+1	1.5
+
+# Writes now succeed: the refreshed entry no longer lists coerced columns.
+statement ok con1
+INSERT INTO coerce_reader.main.float16_evolution_fixture VALUES (4, 3.5);
+
+query I con1
+SELECT count(*) FROM coerce_reader.main.float16_evolution_fixture;
+----
+4
+
+statement ok con1
+DETACH coerce_reader;
+
+statement ok con2
+DETACH coerce_writer;

@@ -1,0 +1,54 @@
+# name: test/sql/dataset_cache_external_dml_freshness.test
+# description: Write-only DML validates entry freshness without requiring a prior SELECT
+# group: [sql]
+
+require lance
+
+# Plain INSERT does not bind a scan of the target, so it never passes through
+# the scan-bind freshness check. Without validating freshness in the INSERT
+# planning path, a stale entry keeps gating writes on outdated state: after an
+# external float16 -> float32 evolution, INSERT would keep rejecting the
+# column as coerced until the user happens to run a SELECT first.
+#
+# Fixture: test/data/float16_dml_fixture.lance stores column "h" as float16.
+# NOTE: like dml_alter_table_vector_schema_evolution.test, this test evolves
+# a checked-in fixture in place; re-running on a dirty tree requires
+# restoring test/data first (fresh CI checkouts are unaffected).
+
+statement ok con1
+ATTACH 'test/data' AS dml_reader (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/data' AS dml_writer (TYPE LANCE);
+
+# The reader discovers the table with h coerced; writes are gated.
+query I con1
+SELECT count(*) FROM dml_reader.main.float16_dml_fixture;
+----
+3
+
+statement error con1
+INSERT INTO dml_reader.main.float16_dml_fixture VALUES (4, 3.5);
+----
+<REGEX>:.*coerced.*
+
+# External evolution through the writer catalog: h becomes real float32.
+statement ok con2
+ALTER TABLE dml_writer.main.float16_dml_fixture ALTER COLUMN h TYPE FLOAT;
+
+# A direct INSERT (no SELECT in between) must not keep rejecting the column
+# as coerced: entry resolution heals the stale entry transparently and the
+# write goes through against the refreshed entry.
+statement ok con1
+INSERT INTO dml_reader.main.float16_dml_fixture VALUES (4, 3.5);
+
+query I con1
+SELECT count(*) FROM dml_reader.main.float16_dml_fixture;
+----
+4
+
+statement ok con1
+DETACH dml_reader;
+
+statement ok con2
+DETACH dml_writer;

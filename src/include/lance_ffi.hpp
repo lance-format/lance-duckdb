@@ -79,6 +79,13 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
+int32_t lance_dataset_checkout_latest_if_stale(void *dataset,
+                                               void **out_new_dataset);
+int32_t lance_dataset_namespace_checkout_latest_if_stale(
+    void *dataset, const char *endpoint, const char *table_id,
+    const char *bearer_token, const char *api_key, const char *delimiter,
+    const char *headers_tsv, void *session, void **out_new_dataset,
+    const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
 void *lance_get_schema(void *dataset);

@@ -9,6 +9,8 @@
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/exception/catalog_exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -25,6 +27,7 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -147,9 +150,9 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
   return headers_tsv;
 }
 
-static void PopulateColumnsFromArrowSchema(ClientContext &context,
-                                           ArrowSchema &arrow_schema,
-                                           ColumnList &out_columns) {
+static void PopulateColumnsFromArrowSchema(
+    ClientContext &context, ArrowSchema &arrow_schema, ColumnList &out_columns,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   ArrowTableSchema arrow_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                arrow_schema);
@@ -161,12 +164,22 @@ static void PopulateColumnsFromArrowSchema(ClientContext &context,
   }
   for (idx_t i = 0; i < names.size(); i++) {
     out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
+
+    // Reflect not-null constraints from the Arrow flags so discovered entries
+    // carry the same nullability state as entries rebuilt after ALTER (see
+    // PopulateLanceTableSchemaFromDataset); the schema freshness check
+    // compares this state against the live dataset schema.
+    auto *child = arrow_schema.children[i];
+    if (out_constraints && child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
+      out_constraints->push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
+    }
   }
 }
 
 static void PopulateLanceTableColumnsFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -186,8 +199,8 @@ static void PopulateLanceTableColumnsFromDataset(
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
+                                 out_constraints);
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -313,7 +326,7 @@ public:
     vector<string> coerced;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced);
+                                           &coerced, &info.constraints);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -376,7 +389,8 @@ private:
 
 static void PopulateLanceTableColumnsFromJsonSchema(
     ClientContext &context, const string &schema_json, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr,
+    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
   if (lance_json_arrow_schema_to_c(schema_json.c_str(),
@@ -389,8 +403,8 @@ static void PopulateLanceTableColumnsFromJsonSchema(
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
   }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
+  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
+                                 out_constraints);
 }
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -471,8 +485,8 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       try {
-        PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
-                                                info.columns, &coerced);
+        PopulateLanceTableColumnsFromJsonSchema(
+            context, schema_json, info.columns, &coerced, &info.constraints);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
@@ -504,7 +518,7 @@ public:
       vector<string> coerced;
       try {
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced);
+                                             &coerced, &info.constraints);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
@@ -663,6 +677,24 @@ public:
     table_default_generator = generator;
   }
 
+  // Non-transactional CatalogTransaction for direct catalog surgery on this
+  // ephemeral in-memory catalog (the user ALTER/DROP paths, where DuckDB's
+  // transactional TABLE_ENTRY machinery would cast entries to DuckTableEntry
+  // at commit and therefore cannot be used). GetSystemTransaction() has
+  // start_time 1 and thus reports a write-write conflict against any entry
+  // committed by a real transaction - commit ids exceed 1 - which is exactly
+  // what stale-entry heals produce (ReplaceStaleTableEntry commits through
+  // the caller's transaction). Use a start time that treats every committed
+  // entry as current; genuinely uncommitted heads still conflict and are
+  // rejected up-front by the pending-heal guards in Alter and DropEntry.
+  // Entries written under this transaction carry timestamp 1 (committed,
+  // visible to everyone immediately), matching the catalog's pre-existing
+  // system-surgery semantics.
+  CatalogTransaction GetSurgeryTransaction() {
+    return CatalogTransaction(catalog.GetDatabase(), /*transaction_id_p=*/1,
+                              /*start_time_p=*/TRANSACTION_ID_START - 1);
+  }
+
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
     auto &set = GetCatalogSet(info.GetCatalogType());
     auto entry = set.GetEntry(transaction, info.name);
@@ -678,6 +710,22 @@ public:
     if (!context.transaction.IsAutoCommit()) {
       throw NotImplementedException(
           "Lance DDL does not support explicit transactions yet");
+    }
+
+    // The catalog surgery below runs under the non-transactional surgery
+    // transaction, which cannot modify a version chain whose head is an
+    // uncommitted entry - exactly the state the stale-entry heal
+    // (ReplaceStaleTableEntry) leaves behind when this statement's own bind
+    // refreshed the entry after an external change. Fail closed before any
+    // dataset side effects; any successful statement on the table commits
+    // the refreshed entry, after which the ALTER goes through.
+    if (set.GetEntry(GetSurgeryTransaction(), info.name).get() != entry.get()) {
+      throw TransactionException(
+          "Cannot alter Lance table \"%s\": its catalog entry was refreshed "
+          "in the current transaction after an external change and the "
+          "refresh has not committed yet. Run a query on the table first and "
+          "retry the ALTER.",
+          info.name);
     }
 
     // Allow altering internal entries for attached Lance catalogs.
@@ -710,21 +758,93 @@ public:
       LanceInvalidateDatasetCacheForTable(context, *lance_entry);
     }
 
-    auto system_tx =
-        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
-    system_tx.context = &context;
+    auto surgery_tx = GetSurgeryTransaction();
+    surgery_tx.context = &context;
 
     if (info.type == AlterType::CHANGE_OWNERSHIP) {
-      if (!set.AlterOwnership(system_tx, info.Cast<ChangeOwnershipInfo>())) {
+      if (!set.AlterOwnership(surgery_tx, info.Cast<ChangeOwnershipInfo>())) {
         throw CatalogException("Couldn't change ownership!");
       }
       return;
     }
 
-    if (!set.AlterEntry(system_tx, info.name, info)) {
+    if (!set.AlterEntry(surgery_tx, info.name, info)) {
       throw CatalogException::MissingEntry(info.GetCatalogType(), info.name,
                                            string());
     }
+  }
+
+  // Catalog-only reads (DESCRIBE, information_schema/duckdb_columns) expose
+  // the entry's column and NOT NULL metadata without ever binding a scan or
+  // planning DML, so the freshness check must already run when the entry is
+  // resolved. When the entry is stale it is replaced through the catalog
+  // version chain and the lookup retried once so the caller transparently
+  // receives the freshly rebuilt entry instead of an error. The staleness
+  // probe costs one dataset-cache access per resolution - the same order as
+  // the per-hit revalidation that scans already perform at bind.
+  optional_ptr<CatalogEntry>
+  RefreshStaleTableEntry(CatalogTransaction transaction,
+                         const EntryLookupInfo &lookup_info,
+                         optional_ptr<CatalogEntry> entry) {
+    if (!entry || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
+        !transaction.context) {
+      return entry;
+    }
+    auto *lance_entry = dynamic_cast<LanceTableEntry *>(entry.get());
+    if (!lance_entry) {
+      return entry;
+    }
+    bool replaced = false;
+    try {
+      if (!lance_entry->IsSchemaStale(*transaction.context)) {
+        return entry;
+      }
+      replaced = ReplaceStaleTableEntry(transaction, *lance_entry);
+    } catch (...) {
+      // Fail open for catalog resolution: an unreachable dataset must not
+      // block metadata access or DROP TABLE cleanup; scans surface the real
+      // error with proper context. (Covers both the staleness probe and the
+      // entry rebuild inside the replace, which also does storage I/O.)
+      return entry;
+    }
+    if (!replaced) {
+      return entry;
+    }
+    // `entry`/`lance_entry` now point at the superseded generation, which
+    // stays alive in the version chain until undo-buffer cleanup. Re-lookup
+    // to serve the rebuilt entry; no retry loop - if the rebuilt entry is
+    // somehow still stale, the scan-bind check fails closed.
+    return DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+  }
+
+  optional_ptr<CatalogEntry>
+  LookupEntry(CatalogTransaction transaction,
+              const EntryLookupInfo &lookup_info) override {
+    auto entry = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+    return RefreshStaleTableEntry(transaction, lookup_info, entry);
+  }
+
+  void Scan(ClientContext &context, CatalogType type,
+            const std::function<void(CatalogEntry &)> &callback) override {
+    if (type == CatalogType::TABLE_ENTRY) {
+      // Enumerations (information_schema, duckdb_columns, SHOW) also expose
+      // entry metadata. Collect the names first: the staleness probe does
+      // storage I/O and the stale-entry replace mutates the catalog set,
+      // neither of which may run under the set's scan lock.
+      vector<string> table_names;
+      DuckSchemaEntry::Scan(context, type, [&](CatalogEntry &scanned) {
+        if (dynamic_cast<LanceTableEntry *>(&scanned)) {
+          table_names.push_back(scanned.name);
+        }
+      });
+      auto transaction = GetCatalogTransaction(context);
+      for (auto &table_name : table_names) {
+        EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, table_name);
+        auto entry = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+        (void)RefreshStaleTableEntry(transaction, lookup_info, entry);
+      }
+    }
+    DuckSchemaEntry::Scan(context, type, callback);
   }
 
   void DropEntry(ClientContext &context, DropInfo &info) override {
@@ -750,6 +870,25 @@ public:
     }
     auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
     auto existing_type = existing_entry->type;
+
+    // The catalog part of DROP below runs under the non-transactional
+    // surgery transaction (see the comment there), which cannot modify a
+    // version chain whose head is an uncommitted entry - exactly the state
+    // the stale-entry heal (ReplaceStaleTableEntry) leaves behind when this
+    // DROP's own bind refreshed the entry after an external change. Fail
+    // closed BEFORE the dataset is deleted: proceeding would delete the data
+    // and then abort on the catalog conflict, wedging the entry. Any
+    // successful statement on the table commits the refreshed entry, after
+    // which DROP goes through.
+    if (set.GetEntry(GetSurgeryTransaction(), info.name).get() !=
+        existing_entry.get()) {
+      throw TransactionException(
+          "Cannot drop Lance table \"%s\": its catalog entry was refreshed "
+          "in the current transaction after an external change and the "
+          "refresh has not committed yet. Run a query on the table first and "
+          "retry the DROP.",
+          info.name);
+    }
 
     if (rest_ns) {
       unordered_map<string, Value> overrides;
@@ -841,27 +980,26 @@ public:
     // Note: TABLE_ENTRY and VIEW_ENTRY share the same underlying catalog set.
     // DuckDB's transactional DROP path assumes TABLE_ENTRY is always a
     // DuckTableEntry (and will fail for extension-backed TableCatalogEntry
-    // implementations). To avoid that, perform the catalog drop using a system
-    // (non-transactional) CatalogTransaction.
+    // implementations). To avoid that, perform the catalog drop using the
+    // non-transactional surgery CatalogTransaction.
     if (existing_type != CatalogType::TABLE_ENTRY &&
         existing_type != CatalogType::VIEW_ENTRY) {
       throw InternalException(
           "Unexpected catalog entry type for DROP TABLE: %s",
           CatalogTypeToString(existing_type));
     }
-    auto system_transaction =
-        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
-    if (!set.DropEntry(system_transaction, info.name, info.cascade, true)) {
+    auto surgery_transaction = GetSurgeryTransaction();
+    if (!set.DropEntry(surgery_transaction, info.name, info.cascade, true)) {
       throw InternalException(
           "Could not drop element because of an internal error");
     }
 
-    // DropEntry with a system (committed) CatalogTransaction leaves a committed
-    // tombstone behind. This blocks subsequent lazy discovery of a recreated
-    // dataset with the same name, because CatalogSet::GetEntryDetailed will
-    // find the tombstone and never consult the default generator. Since ATTACH
-    // TYPE LANCE catalogs are ephemeral, we can eagerly clean up the entry
-    // chain (old entry + tombstone).
+    // DropEntry with a non-transactional (committed) CatalogTransaction leaves
+    // a committed tombstone behind. This blocks subsequent lazy discovery of a
+    // recreated dataset with the same name, because
+    // CatalogSet::GetEntryDetailed will find the tombstone and never consult
+    // the default generator. Since ATTACH TYPE LANCE catalogs are ephemeral,
+    // we can eagerly clean up the entry chain (old entry + tombstone).
     set.CleanupEntry(*existing_entry);
 
     LanceInvalidateDatasetCache(context, cache_key);
@@ -1089,6 +1227,89 @@ public:
     return nullptr;
   }
 
+  // Replace a table entry whose declared columns no longer match the dataset
+  // schema on storage with an entry rebuilt from the current dataset state.
+  // A drop-and-cleanup (the DROP TABLE mechanism) would destroy the stale
+  // object immediately, but active scans, DML operators and prepared plans
+  // may still hold raw LanceTableEntry references. Instead the entry is
+  // replaced through DuckDB's transactional catalog version chain:
+  // CatalogSet::AlterEntry hands the refresh marker to
+  // LanceTableEntry::AlterEntry (which rebuilds the entry from the live
+  // dataset), chains the rebuilt entry over the stale one, and pushes the old
+  // generation into the caller's undo buffer, so undo-buffer cleanup reclaims
+  // it only once no active transaction can reference it. The marker
+  // serializes as a stock ALTER TABLE payload with an empty column name,
+  // which the commit path treats as metadata-only (no DuckTableEntry cast;
+  // see CommitState::CommitEntryDrop), and this attached catalog is
+  // in-memory, so no WAL is involved. Rollback restores the old generation
+  // generically.
+  //
+  // NOTE: until the caller's transaction commits, the refreshed entry is an
+  // uncommitted head on the version chain, which the system-transaction
+  // catalog surgery of user-issued ALTER/DROP cannot run on top of; those
+  // paths detect the pending refresh and fail closed before any dataset
+  // side effects (see the guards in Alter and DropEntry above).
+  bool ReplaceStaleTableEntry(CatalogTransaction transaction,
+                              LanceTableEntry &table) {
+    if (!transaction.transaction) {
+      // Without a real transaction there is no undo buffer:
+      // CatalogSet::AlterEntry would destroy the old generation immediately
+      // (the TakeChild path), reintroducing the use-after-free this replace
+      // exists to avoid. Serve the current entry unchanged; a later
+      // transactional access heals it.
+      return false;
+    }
+    auto &set = GetCatalogSet(CatalogType::TABLE_ENTRY);
+    auto existing_entry = set.GetEntry(transaction, table.name);
+    if (!existing_entry || existing_entry.get() != &table) {
+      // Already replaced or dropped concurrently; nothing to refresh.
+      return false;
+    }
+    // The replace pushes the superseded generation into this transaction's
+    // undo buffer, which DuckDB only allows on transactions marked
+    // read-write (DuckTransactionManager::PushCatalogEntry fails closed
+    // otherwise). The heal typically runs while BINDING a read statement,
+    // before anything has marked this catalog's transaction as writing, so
+    // upgrade it here. Deliberately NOT MetaTransaction::ModifyDatabase: the
+    // heal is an internal repair of this in-memory catalog mirror, not a
+    // user write - it must neither claim the meta transaction's single
+    // writable-database slot (that would break statements that read a stale
+    // Lance table while writing to another attached database) nor be
+    // rejected in read-only meta transactions. Commit and rollback of the
+    // undo entry are WAL-free for this in-memory catalog.
+    if (transaction.transaction->IsReadOnly()) {
+      transaction.transaction->SetReadWrite();
+    }
+    LanceRefreshTableAlterInfo refresh_info(AlterEntryData(
+        catalog.GetName(), name, table.name, OnEntryNotFound::THROW_EXCEPTION));
+    // Defensive: match the user-ALTER flow above, which also allows internal
+    // entries. (TableCatalogEntry does not propagate CreateTableInfo.internal
+    // to the entry, so lance entries are not actually flagged internal, but
+    // the refresh must never bounce off that check if this ever changes.)
+    refresh_info.allow_internal = true;
+    try {
+      if (!set.AlterEntry(transaction, table.name, refresh_info)) {
+        return false;
+      }
+    } catch (CatalogException &) {
+      // Entry vanished or changed under us (e.g. a concurrent DROP); fail
+      // open and keep serving the current entry, like the staleness probe.
+      return false;
+    } catch (TransactionException &) {
+      // Catalog write-write conflict: another transaction already created a
+      // newer version of this entry. Fail open; the next statement observes
+      // the winner's entry.
+      return false;
+    } catch (IOException &) {
+      // The rebuild inside AlterEntry re-opens the dataset and can hit infra
+      // errors (dataset unreachable). The heal is best-effort: keep serving
+      // the current entry; the caller's fail-closed error or the next bind
+      // surfaces the real problem with proper context.
+      return false;
+    }
+    return true;
+  }
+
 private:
   void InvalidateTableDefaults() {
     if (!table_default_generator) {
@@ -1102,6 +1323,19 @@ private:
   DefaultGenerator *table_default_generator = nullptr;
 };
 
+bool LanceTryReplaceStaleTableEntry(ClientContext &context,
+                                    LanceTableEntry &table) {
+  auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&table.schema);
+  if (!lance_schema) {
+    return false;
+  }
+  // Use the caller's real catalog transaction so the superseded entry lands
+  // in its undo buffer; ReplaceStaleTableEntry skips the refresh (fail open)
+  // for non-transactional callers.
+  auto transaction = table.ParentCatalog().GetCatalogTransaction(context);
+  return lance_schema->ReplaceStaleTableEntry(transaction, table);
+}
+
 class LanceDuckCatalog final : public DuckCatalog {
 public:
   using DuckCatalog::PlanDelete;
@@ -1114,6 +1348,23 @@ public:
         rest_ns(std::move(rest_ns)) {}
 
   using DuckCatalog::PlanUpdate;
+
+  // Lance table entries mirror external datasets whose commits never bump any
+  // DuckDB catalog version, so a "current" version number would vouch for
+  // state this catalog cannot actually track. Returning an invalid version
+  // opts the catalog out of catalog-version identity checks - the documented
+  // escape hatch in CheckCatalogIdentity (prepared_statement_data.cpp) for
+  // catalogs that don't support catalog versions - which forces every EXECUTE
+  // of a prepared statement that reads or writes this catalog to rebind and
+  // observe the same latest state as ad-hoc statements. Scans already force
+  // this through LanceScanBindData::SupportStatementCache() returning false,
+  // but target-only DML (INSERT/UPDATE/DELETE/MERGE without a scan of the
+  // target, e.g. INSERT ... VALUES) binds no scan: its cached physical plan
+  // pins a LanceTableEntry reference that would outlive a catalog-entry
+  // replacement and bypass all bind-time freshness checks.
+  optional_idx GetCatalogVersion(ClientContext &) override {
+    return optional_idx();
+  }
 
   ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
     auto &base = info.Base().Cast<CreateTableInfo>();

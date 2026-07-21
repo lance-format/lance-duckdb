@@ -1,0 +1,69 @@
+# name: test/sql/dataset_cache_external_nullability.test
+# description: External SET/DROP NOT NULL replaces stale catalog entries
+# group: [sql]
+
+require lance
+
+# Nullability changes leave the DuckDB names/types and the coerced-column
+# list untouched, so the freshness check must also compare the NOT NULL
+# state mirrored from the Arrow flags; otherwise the reader keeps exposing
+# and enforcing the old nullability until an unrelated schema change occurs.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/cache_nullability.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+ATTACH 'test/.tmp' AS null_reader_ns (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/.tmp' AS null_writer_ns (TYPE LANCE);
+
+# The reader discovers the table with s nullable.
+query I con1
+SELECT count(*) FROM null_reader_ns.main.cache_nullability;
+----
+2
+
+query TTTTTT con1
+DESCRIBE null_reader_ns.main.cache_nullability;
+----
+id	BIGINT	YES	NULL	NULL	NULL
+s	VARCHAR	YES	NULL	NULL	NULL
+
+# External SET NOT NULL committed through the writer catalog.
+statement ok con2
+ALTER TABLE null_writer_ns.main.cache_nullability ALTER COLUMN s SET NOT NULL;
+
+# The reader's stale entry must not silently keep the old nullability: entry
+# resolution heals it transparently and the very next access reflects the
+# current state.
+query I con1
+SELECT count(*) FROM null_reader_ns.main.cache_nullability;
+----
+2
+
+query TTTTTT con1
+DESCRIBE null_reader_ns.main.cache_nullability;
+----
+id	BIGINT	YES	NULL	NULL	NULL
+s	VARCHAR	NO	NULL	NULL	NULL
+
+# External DROP NOT NULL: same transparent self-heal cycle.
+statement ok con2
+ALTER TABLE null_writer_ns.main.cache_nullability ALTER COLUMN s DROP NOT NULL;
+
+query TTTTTT con1
+DESCRIBE null_reader_ns.main.cache_nullability;
+----
+id	BIGINT	YES	NULL	NULL	NULL
+s	VARCHAR	YES	NULL	NULL	NULL
+
+statement ok con1
+DETACH null_reader_ns;
+
+statement ok con2
+DETACH null_writer_ns;

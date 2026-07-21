@@ -229,6 +229,15 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
   }
+  // Plain INSERT does not bind a scan of the target, so the scan-bind
+  // freshness check never runs for it; validate here so a stale entry (e.g.
+  // a coerced-column list outdated by an external type evolution) fails
+  // closed instead of gating the write on stale state. Throws and replaces
+  // the entry on mismatch. This is defense-in-depth rather than the only
+  // guard for prepared INSERT: LanceDuckCatalog::GetCatalogVersion opts the
+  // catalog out of prepared-plan reuse, so every EXECUTE rebinds and reaches
+  // this check with a freshly resolved entry instead of a cached plan.
+  lance_table->VerifySchemaFreshness(context);
   if (lance_table->HasCoercedColumns()) {
     throw NotImplementedException(
         "INSERT into Lance table '" + lance_table->name +
