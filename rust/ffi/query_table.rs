@@ -226,7 +226,28 @@ unsafe fn parse_config(config: *const LanceNamespaceSearchConfig) -> FfiResult<P
 }
 
 fn apply_base_request(config: &ParsedConfig, request: &mut QueryTableRequest) {
-    request.id = Some(vec![config.table_id.clone()]);
+    // A qualified REST table id (e.g. "parent$child$tbl") must be sent as its
+    // multi-segment namespace path, not a single segment: query_table POSTs
+    // the id array in the request body, so the segment count is observable
+    // server-side. This differs from GET operations like list_tables, whose
+    // URL path re-joins the id with the delimiter and is therefore
+    // wire-identical for one segment or many.
+    // Directory namespaces have single-level ids and no delimiter (a
+    // directory name may legitimately contain '$'), so their id deliberately
+    // stays one segment.
+    request.id = Some(match &config.backend {
+        NamespaceBackend::Rest { delimiter, .. } => {
+            // Must match the delimiter the REST client is built with
+            // (RestNamespaceBuilder's default delimiter is "$").
+            let delimiter = delimiter.as_deref().unwrap_or("$");
+            config
+                .table_id
+                .split(delimiter)
+                .map(|s| s.to_string())
+                .collect()
+        }
+        NamespaceBackend::Directory { .. } => vec![config.table_id.clone()],
+    });
     request.prefilter = Some(config.prefilter);
     if !config.columns.is_empty() {
         let mut columns = QueryTableRequestColumns::new();
@@ -439,4 +460,228 @@ unsafe fn create_namespace_fts_search_stream_inner(
     request.full_text_query = Some(Box::new(fts_query));
 
     execute_to_stream(config, request)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// (endpoint, stop flag, log of raw requests) handed out by
+    /// `spawn_query_server`.
+    type MockServer = (String, Arc<Mutex<bool>>, Arc<Mutex<Vec<String>>>);
+
+    /// Minimal in-process REST namespace mock: answers every request whose
+    /// JSON body `id` array equals `expected_id` with a 200 and a
+    /// deliberately non-Arrow JSON body; every other request gets a
+    /// spec-shaped 404 error body (numeric code 4 = TableNotFound). The REST
+    /// client joins the id segments with the delimiter in the URL path
+    /// (identical for one segment or many), so the body `id` array is where a
+    /// qualified id sent as a single segment shows up. Every raw request
+    /// (head + body) is appended to the returned log so tests can assert on
+    /// what actually went over the wire.
+    fn spawn_query_server(expected_id: Vec<&'static str>) -> MockServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(Mutex::new(false));
+        let stop_flag = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_log = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if *stop_flag.lock().unwrap() {
+                    break;
+                }
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                // Read the request head and the content-length body so the
+                // client sees a complete exchange.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let header_end = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+
+                let request_body = String::from_utf8_lossy(&buf[header_end..]).to_string();
+                requests_log
+                    .lock()
+                    .unwrap()
+                    .push(format!("{head}{request_body}"));
+
+                let id_matches = serde_json::from_str::<serde_json::Value>(&request_body)
+                    .ok()
+                    .and_then(|request| request.get("id").and_then(|id| id.as_array()).cloned())
+                    .is_some_and(|segments| {
+                        segments
+                            .iter()
+                            .map(|segment| segment.as_str().unwrap_or_default())
+                            .eq(expected_id.iter().copied())
+                    });
+                let response = if id_matches {
+                    let body = "{\"not\": \"arrow\"}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    // Spec-shaped error body: the numeric `code` field drives
+                    // client-side error classification, and 4 is the spec's
+                    // TableNotFound code.
+                    let error = "{\"code\": 4, \"error\": \"table not found\"}";
+                    format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        error.len(),
+                        error
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (endpoint, stop, requests)
+    }
+
+    #[test]
+    fn test_namespace_vector_search_splits_multi_level_table_id() {
+        // query_table POSTs the id array in its request body (unlike
+        // list_tables, whose GET path re-joins the id), so the segment count
+        // is observable server-side. The mock only answers for the parsed
+        // 3-segment id: a qualified id sent as a single segment gets a 404
+        // before the response body ever matters.
+        let (endpoint, stop, requests) = spawn_query_server(vec!["parent", "child", "tbl"]);
+
+        let endpoint_c = CString::new(endpoint).unwrap();
+        let table_id_c = CString::new("parent$child$tbl").unwrap();
+        let vector_column_c = CString::new("vec").unwrap();
+        let query = [0.0f32, 1.0f32];
+
+        let config = LanceNamespaceSearchConfig {
+            namespace_kind: NAMESPACE_KIND_REST,
+            root: ptr::null(),
+            option_keys: ptr::null(),
+            option_values: ptr::null(),
+            options_len: 0,
+            endpoint: endpoint_c.as_ptr(),
+            table_id: table_id_c.as_ptr(),
+            bearer_token: ptr::null(),
+            api_key: ptr::null(),
+            delimiter: ptr::null(), // default "$" must drive the split
+            headers_tsv: ptr::null(),
+            columns: ptr::null(),
+            columns_len: 0,
+            filter: ptr::null(),
+            k: 3,
+            prefilter: 0,
+        };
+        let options = LanceNamespaceVectorSearchOptions {
+            vector_column: vector_column_c.as_ptr(),
+            query_values: query.as_ptr(),
+            query_len: query.len(),
+            nprobes: 0,
+            refine_factor: 0,
+            use_index: 1,
+        };
+
+        // SAFETY: `config` and `options` are stack-allocated `#[repr(C)]`
+        // structs that outlive the call. Every raw pointer inside them is
+        // either null (parsed as "absent" by `parse_config`) or points into
+        // a NUL-terminated `CString` (`endpoint_c`, `table_id_c`,
+        // `vector_column_c`) or the `query` slice, all of which live until
+        // the end of this test.
+        let stream = unsafe { lance_create_namespace_vector_search_stream(&config, &options) };
+        // The mock accepted the multi-segment id and returned 200 with a
+        // deliberately non-Arrow body: the only permitted failure is the IPC
+        // parse. A single-segment id would instead fail with the mock's 404
+        // ("namespace query_table: ..." message).
+        assert!(stream.is_null());
+        let message = crate::error::lance_last_error_message();
+        assert!(!message.is_null());
+        // SAFETY: `message` was null-checked above and points to the
+        // NUL-terminated allocation whose ownership
+        // `lance_last_error_message` just transferred to us; it stays valid
+        // and unaliased until reclaimed by `lance_free_string` below (the
+        // `CStr` view only borrows it, and `to_string()` copies out).
+        let message_str = unsafe { std::ffi::CStr::from_ptr(message) }
+            .to_string_lossy()
+            .to_string();
+        // SAFETY: reclaims the allocation received from
+        // `lance_last_error_message` above, exactly once; `message` is not
+        // used after this point.
+        unsafe { crate::error::lance_free_string(message) };
+        assert!(
+            message_str.contains("read Arrow IPC"),
+            "expected to fail only on the fake response body, got: {message_str}"
+        );
+
+        // The request hit the query route with the percent-encoded joined id
+        // in the path and the split id array in the POST body.
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert!(
+            log[0].contains("/v1/table/parent%24child%24tbl/query"),
+            "request: {}",
+            log[0]
+        );
+        let request_body = log[0].split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body_json: serde_json::Value = serde_json::from_str(request_body).unwrap();
+        let id_segments = body_json
+            .get("id")
+            .and_then(|id| id.as_array())
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|s| s.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(
+            id_segments,
+            Some(vec![
+                "parent".to_string(),
+                "child".to_string(),
+                "tbl".to_string()
+            ])
+        );
+
+        *stop.lock().unwrap() = true;
+    }
 }
