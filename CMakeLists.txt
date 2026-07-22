@@ -44,6 +44,7 @@ if(APPLE)
   endif()
   set(PLATFORM_LIBS
       "-framework CoreFoundation"
+      "-framework IOKit"
       "-framework SystemConfiguration"
       "-framework Security")
 elseif(UNIX)
