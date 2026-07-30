@@ -105,10 +105,6 @@ struct LanceExecTableProvider {
 
 #[async_trait::async_trait]
 impl TableProvider for LanceExecTableProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow::datatypes::SchemaRef {
         self.schema.clone()
     }
