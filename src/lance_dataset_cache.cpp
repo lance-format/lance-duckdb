@@ -75,6 +75,70 @@ LanceDatasetCacheEntry::~LanceDatasetCacheEntry() {
   }
 }
 
+LanceVectorIndexMetricLookup
+LanceDatasetCacheEntry::GetOrLookupVectorIndexMetric(const string &column) {
+  {
+    std::lock_guard<std::mutex> guard(vector_metric_mutex);
+    auto it = vector_metric_cache.find(column);
+    if (it != vector_metric_cache.end()) {
+      return it->second;
+    }
+  }
+
+  // FFI call runs without the mutex held to avoid blocking concurrent lookups
+  // on other columns. The window between releasing the read and inserting the
+  // result allows a duplicate call; that is harmless (same result) and rare.
+  LanceVectorIndexMetricLookup result;
+  const char *metric_ptr = nullptr;
+  auto rc =
+      lance_dataset_vector_index_metric(dataset, column.c_str(), &metric_ptr);
+  result.status = rc;
+  if (rc == 0) {
+    if (metric_ptr) {
+      result.metric.assign(metric_ptr);
+      lance_free_string(metric_ptr);
+    } else {
+      // Treat null metric as a soft error: do not cache, so a later call
+      // gets another chance to surface the real reason.
+      result.status = -1;
+      result.error_message = "vector index metric was null";
+      return result;
+    }
+  } else if (rc == -1) {
+    result.error_message = LanceConsumeLastError();
+    if (result.error_message.empty()) {
+      result.error_message = "unknown error";
+    }
+    // Error paths are intentionally not cached: a transient error should be
+    // retried on the next call, otherwise a single failure poisons the cache
+    // for the lifetime of the dataset entry.
+    return result;
+  } else if (rc == 1) {
+    // No vector index on this column. Same-context CREATE INDEX in
+    // lance_index.cpp invalidates the entire dataset cache entry, so this
+    // negative result would normally be discarded with the entry — but
+    // caching it would still leave a foot-gun for any future index DDL path
+    // that forgets to invalidate. Symmetric with the error path: only
+    // cache positive results.
+    return result;
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(vector_metric_mutex);
+    auto insertion = vector_metric_cache.emplace(column, result);
+    // On a benign-race collision the existing entry wins. Both racers ran the
+    // same FFI against the same dataset handle, so the metric must match —
+    // catch the day a Lance bug surfaces a non-deterministic metric.
+    // Release-build behavior if the assertion would fire is still safe: the
+    // first-writer-wins semantics mean both callers proceed with a
+    // consistent (if surprising) metric, and the optimizer's downstream
+    // mismatch check in lance_knn_scan rebind will catch any divergence.
+    D_ASSERT(insertion.second ||
+             insertion.first->second.metric == result.metric);
+    return insertion.first->second;
+  }
+}
+
 static shared_ptr<LanceDatasetCacheState>
 GetOrCreateLanceDatasetCacheState(ClientContext &context) {
   return context.registered_state->GetOrCreate<LanceDatasetCacheState>(

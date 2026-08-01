@@ -234,6 +234,208 @@ fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<Stri
     Ok(cols)
 }
 
+/// Returns the normalized distance metric ("l2"/"cosine"/"dot") of the first
+/// vector index found on `column`.
+///
+/// On success, writes a heap-allocated C string to `*out_metric` and returns 0.
+/// The caller is responsible for freeing the string via `lance_free_string`.
+///
+/// Returns 1 (and writes null to `*out_metric`) if no vector index covers the
+/// column. Returns -1 on error; the caller should consult
+/// `lance_last_error_code` / `lance_last_error_message`.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_vector_index_metric(
+    dataset: *mut c_void,
+    column: *const c_char,
+    out_metric: *mut *const c_char,
+) -> i32 {
+    if !out_metric.is_null() {
+        // SAFETY: Caller guarantees out_metric points to a writable `*const c_char`
+        // when non-null. We initialise it to null so partial writes are not observed
+        // on the error / not-found paths.
+        unsafe {
+            ptr::write(out_metric, ptr::null());
+        }
+    }
+    match dataset_vector_index_metric_inner(dataset, column, out_metric) {
+        Ok(found) => {
+            clear_last_error();
+            if found {
+                0
+            } else {
+                1
+            }
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_vector_index_metric_inner(
+    dataset: *mut c_void,
+    column: *const c_char,
+    out_metric: *mut *const c_char,
+) -> FfiResult<bool> {
+    if out_metric.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "out_metric is null",
+        ));
+    }
+    let handle = unsafe { dataset_handle(dataset)? };
+    let column = unsafe { cstr_to_str(column, "column")? };
+    if column.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "column must be non-empty",
+        ));
+    }
+
+    let dataset = handle.dataset.as_ref().clone();
+
+    let descs = match runtime::block_on(async { dataset.describe_indices(None).await }) {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDescribeIndices,
+                format!("dataset describe_indices: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let schema = dataset.schema();
+    for d in descs {
+        let idx_type = d.index_type().to_string();
+        let normalized = normalize_index_type(&idx_type);
+        if !is_vector_index_type(&normalized) {
+            continue;
+        }
+
+        let matches_column = d.field_ids().iter().any(|&field_id| {
+            schema
+                .field_by_id(field_id as i32)
+                .is_some_and(|f| f.name == column)
+        });
+        if !matches_column {
+            continue;
+        }
+
+        let Some(metric_raw) = lookup_vector_index_metric(&dataset, d.as_ref())? else {
+            continue;
+        };
+        let metric = normalize_vector_metric(&metric_raw)?;
+
+        // SAFETY: out_metric was checked non-null above; the caller guarantees it
+        // points to a writable `*const c_char`. The pointer we hand out is created
+        // via `to_c_string(...).into_raw()` and ownership transfers to the caller,
+        // which must release it with `lance_free_string`.
+        unsafe {
+            ptr::write(
+                out_metric,
+                to_c_string(metric).into_raw() as *const c_char,
+            );
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Looks up the raw metric string for a single vector index description.
+///
+/// Prefers `IndexDescription::details()` (which is cheap when a plugin is
+/// registered for the details type), falling back to `Dataset::index_statistics`
+/// (which opens the index) when the details JSON does not expose the metric.
+/// Returns `Ok(None)` when neither source surfaces a metric so the caller can
+/// continue searching across other index descriptions.
+fn lookup_vector_index_metric(
+    dataset: &Dataset,
+    desc: &dyn lance_index::IndexDescription,
+) -> FfiResult<Option<String>> {
+    // Try IndexDescription::details() first. Vector indices currently use an
+    // empty `VectorIndexDetails` proto with no registered plugin, so this almost
+    // always returns Err today; the branch is kept so plugins that later expose
+    // the metric here will be picked up without further changes.
+    if let Ok(details_json) = desc.details() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&details_json) {
+            if let Some(metric) = value
+                .get("distance_type")
+                .or_else(|| value.get("metric_type"))
+                .and_then(|v| v.as_str())
+            {
+                return Ok(Some(metric.to_string()));
+            }
+        }
+    }
+
+    // Fall back to the richer `index_statistics` JSON which the runtime builds
+    // by opening the index. The IVF statistics carry `metric_type` at the top
+    // level and again inside each entry of the `indices` / `segments` arrays.
+    let stats_json = match runtime::block_on(async { dataset.index_statistics(desc.name()).await })
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetGetIndexMetric,
+                format!("dataset index_statistics({}): {err}", desc.name()),
+            ));
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetGetIndexMetric,
+            format!("parse index_statistics json: {err}"),
+        )
+    })?;
+
+    let metric = stats
+        .get("metric_type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            stats
+                .get("indices")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|obj| obj.get("metric_type"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            stats
+                .get("segments")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|obj| obj.get("metric_type"))
+                .and_then(|v| v.as_str())
+        });
+
+    Ok(metric.map(|s| s.to_string()))
+}
+
+/// Maps a raw distance-type string from Lance into the normalized form expected
+/// by the C++ side: "l2", "cosine", or "dot". Unknown values yield an error
+/// with `ErrorCode::DatasetGetIndexMetric` so the caller can distinguish them
+/// from "no vector index found".
+fn normalize_vector_metric(raw: &str) -> FfiResult<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "l2" | "euclidean" => "l2",
+        "cosine" => "cosine",
+        "dot" | "innerproduct" | "inner_product" => "dot",
+        other => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetGetIndexMetric,
+                format!("unsupported vector index metric: {other}"),
+            ));
+        }
+    };
+    Ok(mapped.to_string())
+}
+
 fn estimate_rows_indexed(
     dataset_total_rows: u64,
     dataset_frag_ids: &roaring::RoaringBitmap,

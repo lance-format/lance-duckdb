@@ -69,7 +69,7 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
 
   auto *plan_ptr = lance_explain_knn_scan_ir(
       dataset, vector_column.c_str(), query.data(), query.size(), k, nprobes,
-      refine_factor, filter_ptr, NumericCast<size_t>(filter_len),
+      refine_factor, /*ef=*/0, filter_ptr, NumericCast<size_t>(filter_len),
       prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
@@ -512,7 +512,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   auto *schema_handle = lance_get_knn_schema(
       result->dataset, result->vector_column.c_str(), result->query.data(),
       result->query.size(), result->k, result->nprobes, result->refine_factor,
-      result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
+      /*ef=*/0, result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
   if (!schema_handle) {
     throw IOException("Failed to get Lance KNN schema: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -646,8 +646,8 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   result->stream = lance_create_knn_stream_ir(
       bind_data.dataset, bind_data.vector_column.c_str(),
       bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      bind_data.nprobes, bind_data.refine_factor, filter_ir, filter_ir_len,
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      bind_data.nprobes, bind_data.refine_factor, /*ef=*/0, filter_ir,
+      filter_ir_len, bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   if (!result->stream && filter_ir && !bind_data.prefilter) {
     // Best-effort: if filter pushdown failed, retry without it and rely on
     // DuckDB-side filter execution for correctness.
@@ -657,7 +657,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->stream = lance_create_knn_stream_ir(
         bind_data.dataset, bind_data.vector_column.c_str(),
         bind_data.query.data(), bind_data.query.size(), bind_data.k,
-        bind_data.nprobes, bind_data.refine_factor, nullptr, 0,
+        bind_data.nprobes, bind_data.refine_factor, /*ef=*/0, nullptr, 0,
         bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
   }
   if (!result->stream) {
