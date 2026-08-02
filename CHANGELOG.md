@@ -9,10 +9,11 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 
 - `array_has_any` / `array_has_all` (and their `list_has_any` / `list_has_all` aliases) on `LIST` columns are now pushed down to Lance, where a `LABEL_LIST` index turns them into an index query instead of a scan.
+- `lance_fts` and `lance_hybrid_search` now push scalar-function predicates (containment, `starts_with`, `LIKE`, `regexp_matches`) to Lance as a prefilter. Previously only simple comparisons reached Lance from those two functions, and `prefilter := true` silently ignored everything else.
 
 ### Fixed
 
-- List child fields written by `COPY`, `INSERT`, `CREATE TABLE`, CTAS and `ALTER TABLE` are now named `item` (Arrow's convention) instead of DuckDB's `l`. Lance persists the name, and DataFusion's array-function coercion casts any column that disagrees, which hides list columns from Lance's scalar-index planner. Appends to datasets written before this change keep their existing field names.
+- List child fields written by `COPY`, `INSERT`, `CREATE TABLE`, CTAS and `ALTER TABLE` are now named `item` (Arrow's convention) instead of DuckDB's `l`. Lance persists the name, and DataFusion's array-function coercion casts any column that disagrees, which hid list columns from Lance's scalar-index planner. Appends to datasets written before this change keep their existing field names.
 
 ### Changed
 

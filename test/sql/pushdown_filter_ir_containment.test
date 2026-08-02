@@ -250,6 +250,30 @@ EXECUTE containment_all(['red', 'green']::VARCHAR[]);
 ----
 4
 
+# A bound list parameter folds to a list constant and pushes down from the
+# search functions too -- `pushdown_complex_filter` skips anything still
+# carrying a parameter, so this must stay folded.
+
+statement ok
+PREPARE hybrid_containment AS
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_any(tags, $1) ORDER BY id;
+
+query I
+EXECUTE hybrid_containment(['red']::VARCHAR[]);
+----
+1
+4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE hybrid_containment(['red']::VARCHAR[]);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
 # ===================================================================
 # Search prefilter: k matching rows come back
 # ===================================================================
@@ -287,11 +311,75 @@ ORDER BY id;
 2
 3
 
+# `puppy` matches rows 1, 2, 4 and 6; `red` narrows that to 1 and 4.
+query I
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_any(tags, ['red'])
+ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green'])
+ORDER BY id;
+----
+4
+
+# `puppy` matches rows 1, 2, 4 and 6 in the inverted index.
+query I
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_any(tags, ['red'])
+ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green'])
+ORDER BY id;
+----
+4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_any(tags, ['red']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT id
 FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
                          [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
 WHERE array_has_any(tags, ['green']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green']);
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*

@@ -313,18 +313,14 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
   }
 };
 
+// Encodes whatever DuckDB could not express as a TableFilter -- scalar
+// functions, LIKE/regexp, containment -- into filter IR parts the search
+// functions hand to Lance as a prefilter.
 static void
-LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
-                           FunctionData *bind_data,
-                           vector<unique_ptr<Expression>> &filters) {
-  if (!bind_data || filters.empty()) {
-    return;
-  }
-  auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
-  if (scan_bind.namespace_backed) {
-    return;
-  }
-
+CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
+                                const vector<LogicalType> &types,
+                                const vector<unique_ptr<Expression>> &filters,
+                                vector<string> &out_parts) {
   for (auto &expr : filters) {
     if (!expr || expr->HasParameter() || expr->IsVolatile()) {
       continue;
@@ -364,12 +360,27 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
       }
     }
     string filter_ir;
-    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
-                                   *expr, filter_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, names, types, true, *expr, filter_ir)) {
       continue;
     }
-    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
+    out_parts.push_back(std::move(filter_ir));
   }
+}
+
+static void
+LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
+                           FunctionData *bind_data,
+                           vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
+  if (scan_bind.namespace_backed) {
+    return;
+  }
+  CollectLancePushedFilterIRParts(get, scan_bind.names, scan_bind.types,
+                                  filters,
+                                  scan_bind.lance_pushed_filter_ir_parts);
 }
 
 static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
@@ -966,6 +977,8 @@ struct LanceSearchBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+
+  vector<string> lance_pushed_filter_ir_parts;
 };
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
@@ -1361,6 +1374,22 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   return std::move(result);
 }
 
+static void
+LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
+                                 FunctionData *bind_data,
+                                 vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &search_bind = bind_data->Cast<LanceSearchBindData>();
+  if (search_bind.namespace_backed) {
+    return;
+  }
+  CollectLancePushedFilterIRParts(get, search_bind.names, search_bind.types,
+                                  filters,
+                                  search_bind.lance_pushed_filter_ir_parts);
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
@@ -1395,9 +1424,18 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   bool has_table_filter_parts = !table_filters.parts.empty();
+  auto filter_parts = std::move(table_filters.parts);
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    filter_parts.reserve(filter_parts.size() +
+                         bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      filter_parts.push_back(part);
+    }
+  }
+
   string filter_ir_msg;
-  if (!table_filters.parts.empty()) {
-    if (!TryEncodeLanceFilterIRMessage(table_filters.parts, filter_ir_msg)) {
+  if (!filter_parts.empty()) {
+    if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
       filter_ir_msg.clear();
     }
     global.lance_filter_ir = std::move(filter_ir_msg);
@@ -1560,6 +1598,7 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
+  fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
   fts.to_string = LanceSearchToString;
   fts.dynamic_to_string = LanceSearchDynamicToString;
   loader.RegisterFunction(fts);
@@ -1578,6 +1617,7 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
+    fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
     fun.to_string = LanceSearchToString;
     fun.dynamic_to_string = LanceSearchDynamicToString;
   };
