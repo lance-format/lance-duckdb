@@ -14,6 +14,7 @@ bool TryEncodeLanceExprIRColumnRef(const string &name, string &out_ir);
 bool TryEncodeLanceExprIRColumnRef(const vector<string> &segments,
                                    string &out_ir);
 bool TryEncodeLanceExprIRLiteral(const Value &value, string &out_ir);
+bool TryEncodeLanceExprIRListLiteral(const Value &value, string &out_ir);
 bool TryEncodeLanceExprIRComparisonOp(ExpressionType type, uint8_t &out_op);
 bool TryEncodeLanceExprIRAnd(const vector<string> &children, string &out_ir);
 bool TryEncodeLanceExprIROr(const vector<string> &children, string &out_ir);
