@@ -40,4 +40,15 @@ void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
 // helpers above would rewrite.
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema);
 
+// DuckDB's Arrow exporter names list child fields `l`; Arrow (and therefore
+// Lance, pyarrow and DataFusion) call them `item`. Lance persists the name, and
+// DataFusion's array-function coercion rewrites any list argument to an `item`
+// field — which wraps a non-`item` column in a cast and hides it from Lance's
+// scalar-index planner, so `array_has_any` / `array_has_all` can never reach a
+// LABEL_LIST index. Rewrite the name on every DuckDB → Lance write boundary.
+//
+// Call on the ROOT ArrowSchema before handing it to Lance. Names are rewritten
+// to static storage, so no allocation is added to the producer's lifetime.
+void LanceNormalizeArrowListFieldNames(ArrowSchema *schema);
+
 } // namespace duckdb

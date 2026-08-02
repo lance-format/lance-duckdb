@@ -6,6 +6,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Fixed
+
+- List child fields written by `COPY`, `INSERT`, `CREATE TABLE`, CTAS and `ALTER TABLE` are now named `item` (Arrow's convention) instead of DuckDB's `l`. Lance persists the name, and DataFusion's array-function coercion casts any column that disagrees, which hides list columns from Lance's scalar-index planner. Appends to datasets written before this change keep their existing field names.
+
 ### Changed
 
 - `COPY`, `CREATE TABLE`, and CTAS now default new or replaced datasets to Lance data storage version `2.2`.
