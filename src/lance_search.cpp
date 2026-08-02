@@ -375,9 +375,6 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     return;
   }
   auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
-  if (scan_bind.namespace_backed) {
-    return;
-  }
   CollectLancePushedFilterIRParts(get, scan_bind.names, scan_bind.types,
                                   filters,
                                   scan_bind.lance_pushed_filter_ir_parts);
@@ -491,11 +488,6 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     result->file_path = table->DatasetUri();
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_vector_search requires explicit filter when prefilter=true "
-          "on namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_distance", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -564,10 +556,6 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
       }
       global.scanned_types.push_back(bind_data.types[col_id]);
     }
-  }
-
-  if (bind_data.namespace_backed) {
-    return state;
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
@@ -639,8 +627,12 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     options.nprobes = bind_data.nprobes;
     options.refine_factor = bind_data.refine_factor;
     options.use_index = bind_data.use_index ? 1 : 0;
-    result->stream =
-        lance_create_namespace_vector_search_stream(&config, &options);
+    const uint8_t *ns_filter_ir =
+        global.lance_filter_ir.empty()
+            ? nullptr
+            : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
+    result->stream = lance_create_namespace_vector_search_stream(
+        &config, &options, ns_filter_ir, global.lance_filter_ir.size());
     if (!result->stream) {
       throw IOException("Failed to create Lance namespace vector search "
                         "stream" +
@@ -807,10 +799,6 @@ LanceKnnToString(TableFunctionToStringInput &input) {
     result["Lance Namespace Filter"] = bind_data.namespace_filter;
   }
 
-  if (bind_data.namespace_backed) {
-    return result;
-  }
-
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
   string filter_ir_msg;
@@ -819,6 +807,12 @@ LanceKnnToString(TableFunctionToStringInput &input) {
                                   filter_ir_msg);
   }
   result["Lance Filter IR Bytes (Bind)"] = to_string(filter_ir_msg.size());
+
+  // A namespace-backed search has no local dataset handle, so there is no plan
+  // to explain -- but the pushdown metrics above are still meaningful.
+  if (bind_data.namespace_backed) {
+    return result;
+  }
 
   string plan;
   string error;
@@ -1034,8 +1028,12 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
-      local_state.stream =
-          lance_create_namespace_fts_search_stream(&config, &options);
+      const uint8_t *ns_filter_ir = global.lance_filter_ir.empty()
+                                        ? nullptr
+                                        : reinterpret_cast<const uint8_t *>(
+                                              global.lance_filter_ir.data());
+      local_state.stream = lance_create_namespace_fts_search_stream(
+          &config, &options, ns_filter_ir, global.lance_filter_ir.size());
       if (!local_state.stream) {
         throw IOException("Failed to create Lance namespace FTS stream" +
                           LanceFormatErrorSuffix());
@@ -1171,11 +1169,6 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     result->file_path = table->DatasetUri();
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_fts requires explicit filter when prefilter=true on "
-          "namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_score", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -1382,9 +1375,6 @@ LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
     return;
   }
   auto &search_bind = bind_data->Cast<LanceSearchBindData>();
-  if (search_bind.namespace_backed) {
-    return;
-  }
   CollectLancePushedFilterIRParts(get, search_bind.names, search_bind.types,
                                   filters,
                                   search_bind.lance_pushed_filter_ir_parts);
@@ -1406,10 +1396,6 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
       }
       global.scanned_types.push_back(bind_data.types[col_id]);
     }
-  }
-
-  if (bind_data.namespace_backed) {
-    return state;
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(

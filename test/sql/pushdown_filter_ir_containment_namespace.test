@@ -1,0 +1,116 @@
+# name: test/sql/pushdown_filter_ir_containment_namespace.test
+# description: array_has_any/array_has_all containment pushdown on namespace-backed tables
+# group: [sql]
+
+require lance
+
+# Rows 9 to 12 carry both tags and are the worst matches on purpose: their embeddings are
+# the farthest and their content is padded, which BM25 penalises. With k := 2 the two best
+# scoring rows are 1 and 2, so a search that filters AFTER selecting top-k returns nothing.
+# Every assertion below therefore proves prefiltering from its row set alone.
+#
+# COPY creates the namespace root directory; ATTACH does not.
+statement ok
+COPY (
+  SELECT i::BIGINT                                                    AS id,
+         CASE WHEN i >= 9 THEN 'puppy ' || repeat('filler ', 20)
+              ELSE 'puppy' END                                        AS content,
+         [i / 100.0, 0.0, 0.0, 0.0]::FLOAT[4]                         AS embedding,
+         CASE WHEN i >= 9      THEN ['project-x', 'design']::VARCHAR[]
+              WHEN i % 3 = 0   THEN ['project-x']::VARCHAR[]
+              WHEN i % 3 = 1   THEN ['design']::VARCHAR[]
+              ELSE                  ['other']::VARCHAR[] END          AS tags,
+         (i != 10)                                                    AS active,
+         (i = 11)                                                     AS archived
+  FROM range(1, 13) t(i)
+) TO 'test/.tmp/containment_ns/items.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp/containment_ns' AS containment_ns (TYPE LANCE);
+
+statement ok
+CREATE INDEX tags_idx ON containment_ns.main.items (tags) USING LABEL_LIST;
+
+statement ok
+CREATE INDEX content_idx ON containment_ns.main.items (content) USING INVERTED;
+
+# The boolean guards drop the inactive row 10 and the archived row 11, leaving 9 and 12.
+
+query I
+SELECT id
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 2, prefilter := true)
+WHERE active = true
+  AND archived = false
+  AND array_has_all(tags, ['project-x', 'design'])
+ORDER BY id;
+----
+9
+12
+
+# The same query without the prefilter: k := 2 selects rows 1 and 2, which carry neither tag.
+query I
+SELECT id
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 2, prefilter := false)
+WHERE active = true
+  AND archived = false
+  AND array_has_all(tags, ['project-x', 'design'])
+ORDER BY id;
+----
+
+query I
+SELECT id
+FROM lance_vector_search('containment_ns.main.items', 'embedding', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         k := 2, prefilter := true)
+WHERE active = true
+  AND archived = false
+  AND array_has_all(tags, ['project-x', 'design'])
+ORDER BY id;
+----
+9
+12
+
+query I
+SELECT id
+FROM lance_hybrid_search('containment_ns.main.items', 'embedding', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'content', 'puppy', k := 2, prefilter := true)
+WHERE active = true
+  AND archived = false
+  AND array_has_all(tags, ['project-x', 'design'])
+ORDER BY id;
+----
+9
+12
+
+# A bound list parameter must fold to a constant before pushdown, which skips any expression
+# still carrying a parameter. Unfolded, the predicate would post-filter and return nothing.
+statement ok
+PREPARE ns_containment AS
+SELECT id
+FROM lance_fts('containment_ns.main.items', 'content', $query, k := $k, prefilter := $prefilter)
+WHERE active = true
+  AND archived = false
+  AND array_has_all(tags, CAST($tags AS VARCHAR[]))
+ORDER BY id;
+
+query I
+EXECUTE ns_containment(query := 'puppy', k := 2, prefilter := true,
+                       tags := ['project-x', 'design']::VARCHAR[]);
+----
+9
+12
+
+# An explicit filter argument combines with the pushed WHERE clause rather than replacing it:
+# the filter admits rows 9, 11 and 12, and the pushed clause removes the archived row 11.
+query I
+SELECT id
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 4, prefilter := true,
+               filter := 'active = true')
+WHERE archived = false
+  AND array_has_all(tags, ['project-x', 'design'])
+ORDER BY id;
+----
+9
+12
+
+statement ok
+DETACH containment_ns;
