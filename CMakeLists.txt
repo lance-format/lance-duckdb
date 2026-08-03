@@ -137,6 +137,7 @@ set(RUST_FFI_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/index.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
+    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/namespace.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/query_table.rs
     ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs

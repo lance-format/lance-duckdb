@@ -467,6 +467,30 @@ pub unsafe extern "C" fn lance_namespace_drop_table(
     }
 }
 
+/// True when `err` reports that the addressed table (or its parent
+/// namespace) does not exist, as opposed to infrastructure failures (auth,
+/// network, server errors). Spec-conformant REST servers report not-found
+/// through the numeric `code` field of the error body, which the client
+/// surfaces as a typed `NamespaceError` inside `lance_core::Error::Namespace`;
+/// non-spec error bodies deserialize to other variants and are deliberately
+/// NOT treated as not-found here — the C++ caller keeps a fail-open path for
+/// those (see LanceRestNamespaceDefaultGenerator::CreateDefaultEntry).
+fn is_table_not_found(err: &LanceError) -> bool {
+    match err {
+        LanceError::NotFound { .. } => true,
+        LanceError::Namespace { source, .. } => source
+            .downcast_ref::<lance_namespace::NamespaceError>()
+            .is_some_and(|ns_err| {
+                matches!(
+                    ns_err,
+                    lance_namespace::NamespaceError::TableNotFound { .. }
+                        | lance_namespace::NamespaceError::NamespaceNotFound { .. }
+                )
+            }),
+        _ => false,
+    }
+}
+
 /// Describe a table with `load_detailed_metadata=true` and return the schema
 /// as a JSON string. This avoids opening the dataset from S3.
 fn describe_table_with_schema_inner(
@@ -506,10 +530,15 @@ fn describe_table_with_schema_inner(
         req.with_table_uri = Some(true);
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
-            FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
-                format!("namespace describe_table: {err}"),
-            )
+            // A typed not-found gets its own code so catalog resolution can
+            // fail soft (fall through to the system catalog) without
+            // masquerading auth/network failures as "table not found".
+            let code = if is_table_not_found(&err) {
+                ErrorCode::NamespaceTableNotFound
+            } else {
+                ErrorCode::NamespaceDescribeTable
+            };
+            FfiError::new(code, format!("namespace describe_table: {err}"))
         })?;
 
         let schema = resp.schema.ok_or_else(|| {
@@ -756,5 +785,155 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// Minimal REST namespace mock that answers every request with a
+    /// spec-shaped `TableNotFound` error body (numeric code 4). The client
+    /// reconstructs the typed `NamespaceError` from that `code` field
+    /// (`NamespaceError::from_code`); a plain HTTP 404 with a non-spec body
+    /// would deserialize to `NamespaceError::Internal` instead and must stay
+    /// a generic describe error.
+    fn spawn_not_found_server() -> (String, Arc<Mutex<bool>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(Mutex::new(false));
+        let stop_flag = stop.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if *stop_flag.lock().unwrap() {
+                    break;
+                }
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                // Drain the request head and the content-length body so the
+                // client sees a complete exchange before the response.
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let header_end = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(pos + 4);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+
+                let error = "{\"code\": 4, \"error\": \"table not found\"}";
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    error.len(),
+                    error
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (endpoint, stop)
+    }
+
+    #[test]
+    fn test_namespace_describe_classifies_not_found_vs_infra_errors() {
+        struct TestCase {
+            name: &'static str,
+            endpoint: String,
+            table_id: &'static str,
+            want_code: i32,
+        }
+
+        let (endpoint, stop) = spawn_not_found_server();
+
+        let cases = [
+            TestCase {
+                name: "typed not-found from a reachable server",
+                endpoint: endpoint.clone(),
+                table_id: "missing",
+                want_code: crate::error::ErrorCode::NamespaceTableNotFound as i32,
+            },
+            TestCase {
+                name: "unreachable endpoint stays an infra error",
+                endpoint: "http://127.0.0.1:1".to_string(),
+                table_id: "missing",
+                want_code: crate::error::ErrorCode::NamespaceDescribeTable as i32,
+            },
+        ];
+
+        for case in cases {
+            let endpoint_c = CString::new(case.endpoint.clone()).unwrap();
+            let table_id_c = CString::new(case.table_id).unwrap();
+            let mut schema_json: *const c_char = ptr::null();
+            // SAFETY: `endpoint_c` and `table_id_c` are NUL-terminated
+            // `CString`s that outlive the call, the remaining string inputs
+            // are null (accepted as "absent"), and `schema_json` is a live
+            // stack slot for the out-pointer.
+            let rc = unsafe {
+                lance_namespace_describe_table_with_schema(
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    &mut schema_json,
+                )
+            };
+            assert_ne!(rc, 0, "{}", case.name);
+            assert!(schema_json.is_null(), "{}", case.name);
+            assert_eq!(
+                crate::error::lance_last_error_code(),
+                case.want_code,
+                "{}",
+                case.name
+            );
+            // Consume the pending message so later tests see a clean slate.
+            let message = crate::error::lance_last_error_message();
+            if !message.is_null() {
+                // SAFETY: `message` was null-checked and is the allocation
+                // whose ownership `lance_last_error_message` just
+                // transferred to us; it is reclaimed exactly once and not
+                // used afterwards.
+                unsafe { crate::error::lance_free_string(message) };
+            }
+        }
+
+        *stop.lock().unwrap() = true;
     }
 }
