@@ -303,6 +303,8 @@ static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
 static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
 static constexpr const char *LANCE_DEFERRED_SETTING =
     "lance_deferred_materialization";
+static constexpr const char *LANCE_NAMESPACE_QUERY_TABLE_SETTING =
+    "lance_namespace_query_table";
 static constexpr uint64_t DEFERRED_AVG_BYTES_THRESHOLD = 1024;
 
 static bool IsLanceVirtualRowIdColumnId(column_t col_id) {
@@ -350,6 +352,17 @@ static bool IsLikelyHeavyColumnType(const LogicalType &type) {
 static bool LanceDeferredMaterializationEnabled(ClientContext &context) {
   Value val;
   if (context.TryGetCurrentSetting(LANCE_DEFERRED_SETTING, val)) {
+    return val.GetValue<bool>();
+  }
+  return true; // default on
+}
+
+// When disabled, REST namespace table scans skip the query_table API and open
+// the underlying dataset directly (the pre-query_table behaviour), which is
+// required against namespace servers that do not implement query_table.
+static bool LanceNamespaceQueryTableEnabled(ClientContext &context) {
+  Value val;
+  if (context.TryGetCurrentSetting(LANCE_NAMESPACE_QUERY_TABLE_SETTING, val)) {
     return val.GetValue<bool>();
   }
   return true; // default on
@@ -3843,7 +3856,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->table_entry = this;
   result->file_path = dataset_uri;
 
-  if (IsNamespaceBacked() && NamespaceConfig().IsRest()) {
+  if (IsNamespaceBacked() && NamespaceConfig().IsRest() &&
+      LanceNamespaceQueryTableEnabled(context)) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
     PopulateNamespaceQueryScanSchema(context, *this, *result);
