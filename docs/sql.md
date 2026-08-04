@@ -173,6 +173,9 @@ Scans of REST namespace tables use the Lance Namespace `query_table` API.
 Projection, supported filters, and `LIMIT`/`OFFSET` pairs are pushed into the
 request; unsupported filters and standalone `OFFSET` operations remain in
 DuckDB. Directory namespace scans continue to read the Lance dataset directly.
+Set `lance_namespace_query_table = false` to have REST namespace scans open
+the underlying dataset directly as well, e.g. when the namespace server does
+not implement `query_table`.
 
 ## Write datasets
 
