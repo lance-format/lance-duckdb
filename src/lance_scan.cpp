@@ -3184,12 +3184,15 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   auto result =
       make_uniq<LanceExecLocalState>(std::move(chunk), context.client);
   result->global_state = &global;
+  LanceExecContext exec_ctx;
+  exec_ctx.threads =
+      NumericCast<uint32_t>(DBConfig::GetConfig(context.client).options.maximum_threads);
   result->stream = lance_create_dataset_exec_stream_ir(
       bind_data.dataset,
       bind_data.exec_ir.empty()
           ? nullptr
           : reinterpret_cast<const uint8_t *>(bind_data.exec_ir.data()),
-      bind_data.exec_ir.size());
+      bind_data.exec_ir.size(), &exec_ctx);
   if (!result->stream) {
     throw IOException("Failed to create Lance exec stream" +
                       LanceFormatErrorSuffix());

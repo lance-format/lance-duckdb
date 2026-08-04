@@ -17,6 +17,10 @@ typedef struct LanceDebugCounters {
   uint64_t commit_count;
 } LanceDebugCounters;
 
+typedef struct LanceExecContext {
+  uint32_t threads;
+} LanceExecContext;
+
 void *lance_create_session(uint64_t index_cache_size_bytes,
                            uint64_t metadata_cache_size_bytes);
 void lance_close_session(void *session);
@@ -92,7 +96,8 @@ void lance_close_stream(void *stream);
 void *lance_get_exec_schema(void *dataset, const uint8_t *exec_ir,
                             size_t exec_ir_len);
 void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
-                                          size_t exec_ir_len);
+                                          size_t exec_ir_len,
+                                          const LanceExecContext *exec_ctx);
 
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
