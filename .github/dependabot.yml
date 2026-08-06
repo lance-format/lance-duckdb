@@ -40,44 +40,34 @@ updates:
     schedule:
       interval: "semiannually"
     groups:
-      # HTTP, TLS, serialization and utilities
-      http-serialization-utils:
+      # Lance and its compatible Arrow and DataFusion dependencies
+      lance-stack:
         patterns:
-          - "backon"
-          - "base64"
-          - "bytes"
+          - "lance*"
+          - "arrow*"
+          - "datafusion*"
+      # Serialization and date/time utilities
+      serialization-utils:
+        patterns:
           - "chrono"
-          - "http*"
-          - "percent-encoding"
-          - "prometheus*"
-          - "quick-xml"
-          - "reqwest"
-          - "reqsign"
-          - "rustls*"
           - "serde*"
-          - "uuid"
       # Async runtime and runtime tools
       async-runtime:
         patterns:
           - "tokio*"
           - "async-*"
           - "futures*"
-          - "sqlx"
-      # Logs, errors and checksums
-      logs-errors-checksums:
+      # Error handling
+      error-handling:
         patterns:
           - "anyhow"
-          - "*error*"
-          - "log"
-          - "crc32c"
-          - "sha*"
-          - "md-5"
-          - "metrics"
-          - "tracing"
+          - "snafu"
       others:
         patterns:
           - "*"
         exclude-patterns:
+          - "lance*"
+          - "arrow*"
+          - "datafusion*"
           # Please upgrade to new APIs when updating "rand"
           - "rand"
-          - "getrandom"
