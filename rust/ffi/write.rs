@@ -12,7 +12,7 @@ use arrow_array::{
     make_array, Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
     RecordBatch, RecordBatchReader, StructArray,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 
@@ -430,6 +430,79 @@ fn convert_list_array_to_fixed_size(
     }
 }
 
+/// Best-effort read of the destination dataset's schema; `None` when the
+/// dataset does not exist yet, in which case an append behaves like a create.
+fn existing_dataset_schema(path: &str, storage_options: &HashMap<String, String>) -> Option<Schema> {
+    let builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
+        .with_storage_options(storage_options.clone());
+    let dataset = runtime::block_on(builder.load()).ok()?.ok()?;
+    Some(Schema::from(dataset.schema()))
+}
+
+/// Rewrites list child field names in `schema` to match `reference`.
+///
+/// DuckDB's Arrow exporter names list children `l`; the C++ write paths rewrite
+/// them to Arrow's `item` so DataFusion leaves list columns uncoerced and Lance
+/// can answer `array_has_*` from a LABEL_LIST index. Datasets written before
+/// that change still carry `l`, and Lance rejects an append whose schema
+/// disagrees, so an append has to speak whatever the destination already uses.
+fn align_list_field_names(fields: &Fields, reference: &Fields) -> Option<Fields> {
+    let mut aligned = fields.as_ref().to_vec();
+    let mut changed = false;
+    for slot in &mut aligned {
+        let Some(reference_field) = reference.iter().find(|f| f.name() == slot.name()) else {
+            continue;
+        };
+        let Some(field) = align_list_field(slot, reference_field) else {
+            continue;
+        };
+        *slot = field;
+        changed = true;
+    }
+    changed.then(|| Fields::from(aligned))
+}
+
+fn align_list_field(field: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
+    let data_type = match (field.data_type(), reference.data_type()) {
+        (DataType::List(child), DataType::List(reference_child)) => {
+            let child = align_list_child(child, reference_child)?;
+            DataType::List(child)
+        }
+        (DataType::LargeList(child), DataType::LargeList(reference_child)) => {
+            let child = align_list_child(child, reference_child)?;
+            DataType::LargeList(child)
+        }
+        (DataType::Struct(children), DataType::Struct(reference_children)) => {
+            DataType::Struct(align_list_field_names(children, reference_children)?)
+        }
+        _ => return None,
+    };
+    Some(Arc::new(
+        Field::new(field.name(), data_type, field.is_nullable())
+            .with_metadata(field.metadata().clone()),
+    ))
+}
+
+fn align_list_child(child: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
+    let nested = match (child.data_type(), reference.data_type()) {
+        (DataType::Struct(children), DataType::Struct(reference_children)) => {
+            align_list_field_names(children, reference_children).map(DataType::Struct)
+        }
+        _ => None,
+    };
+    if child.name() == reference.name() && nested.is_none() {
+        return None;
+    }
+    Some(Arc::new(
+        Field::new(
+            reference.name(),
+            nested.unwrap_or_else(|| child.data_type().clone()),
+            child.is_nullable(),
+        )
+        .with_metadata(child.metadata().clone()),
+    ))
+}
+
 fn build_output_schema(
     input_schema: &SchemaRef,
     conversions: &[VectorConversion],
@@ -686,7 +759,7 @@ fn open_uncommitted_writer_inner(
             "schema must be a struct",
         ));
     };
-    let schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
+    let mut schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
 
     let write_mode = WriteMode::try_from(mode).map_err(|err| {
         FfiError::new(
@@ -694,6 +767,18 @@ fn open_uncommitted_writer_inner(
             format!("invalid write mode '{mode}': {err}"),
         )
     })?;
+
+    // The incoming Arrow arrays are imported against `data_type`, so realigning
+    // the schema without it would fail RecordBatch validation.
+    let mut data_type = data_type.clone();
+    if matches!(write_mode, WriteMode::Append) {
+        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
+            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
+                data_type = DataType::Struct(fields.clone());
+                schema = Arc::new(Schema::new(fields));
+            }
+        }
+    }
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -837,7 +922,7 @@ fn open_writer_inner(
             "schema must be a struct",
         ));
     };
-    let schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
+    let mut schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
 
     let write_mode = WriteMode::try_from(mode).map_err(|err| {
         FfiError::new(
@@ -845,6 +930,18 @@ fn open_writer_inner(
             format!("invalid write mode '{mode}': {err}"),
         )
     })?;
+
+    // The incoming Arrow arrays are imported against `data_type`, so realigning
+    // the schema without it would fail RecordBatch validation.
+    let mut data_type = data_type.clone();
+    if matches!(write_mode, WriteMode::Append) {
+        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
+            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
+                data_type = DataType::Struct(fields.clone());
+                schema = Arc::new(Schema::new(fields));
+            }
+        }
+    }
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -1434,5 +1531,56 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
     }
     unsafe {
         let _ = Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction);
+    }
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    fn list_of(child_name: &str) -> DataType {
+        DataType::List(Arc::new(Field::new(child_name, DataType::Utf8, true)))
+    }
+
+    #[test]
+    fn renames_list_child_to_match_the_destination() {
+        let incoming = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        let existing = Fields::from(vec![Field::new("tags", list_of("l"), true)]);
+
+        let aligned = align_list_field_names(&incoming, &existing).expect("expected a rename");
+        assert_eq!(aligned[0].data_type(), &list_of("l"));
+    }
+
+    #[test]
+    fn leaves_matching_schemas_alone() {
+        let fields = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        assert!(align_list_field_names(&fields, &fields.clone()).is_none());
+    }
+
+    #[test]
+    fn ignores_columns_the_destination_does_not_have() {
+        let incoming = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        let existing = Fields::from(vec![Field::new("other", list_of("l"), true)]);
+        assert!(align_list_field_names(&incoming, &existing).is_none());
+    }
+
+    #[test]
+    fn descends_into_struct_columns() {
+        let incoming = Fields::from(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_of("item"), true)])),
+            true,
+        )]);
+        let existing = Fields::from(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_of("l"), true)])),
+            true,
+        )]);
+
+        let aligned = align_list_field_names(&incoming, &existing).expect("expected a rename");
+        let DataType::Struct(children) = aligned[0].data_type() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(children[0].data_type(), &list_of("l"));
     }
 }

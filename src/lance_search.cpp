@@ -313,20 +313,66 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
   }
 };
 
-static void
-LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
-                           FunctionData *bind_data,
-                           vector<unique_ptr<Expression>> &filters) {
-  if (!bind_data || filters.empty()) {
-    return;
+// One stream-creation policy for every search backend, dataset- and
+// namespace-backed alike. Generated filter IR is best-effort when
+// prefilter=false: a stream that fails to open with pushed IR is retried
+// without it and DuckDB re-applies the filters after top-k. The explicit
+// namespace filter is unaffected by the retry -- it travels in the query
+// config, not in the IR. With prefilter=true the IR is required for
+// correctness, so the failure surfaces to the caller.
+template <class GLOBAL, class LOCAL, class CREATE>
+static void *CreateLanceSearchStreamWithFallback(GLOBAL &global, LOCAL &local,
+                                                 bool prefilter,
+                                                 CREATE &&create) {
+  const uint8_t *filter_ir =
+      global.lance_filter_ir.empty()
+          ? nullptr
+          : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
+  auto *stream = create(filter_ir, global.lance_filter_ir.size());
+  if (!stream && filter_ir && !prefilter) {
+    global.filter_pushdown_fallbacks.fetch_add(1);
+    global.filter_pushed_down = false;
+    local.filter_pushed_down = false;
+    stream = create(nullptr, size_t{0});
   }
-  auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
-  if (scan_bind.namespace_backed) {
-    return;
-  }
+  return stream;
+}
 
+// Encodes whatever DuckDB could not express as a TableFilter -- scalar
+// functions, LIKE/regexp, containment -- into filter IR parts the search
+// functions hand to Lance as a prefilter.
+//
+// Returns false when any predicate could not be encoded. Callers that require
+// a complete prefilter (prefilter=true) must reject the query in that case:
+// Lance would run top-k before the missing predicate, and DuckDB's post-scan
+// filter cannot restore rows lost to the truncation. Silent skipping is only
+// sound for prefilter=false, where filtering after top-k is the documented
+// semantics. `out_unencodable` receives the first predicate that failed.
+static bool
+CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
+                                const vector<LogicalType> &types,
+                                const vector<unique_ptr<Expression>> &filters,
+                                vector<string> &out_parts,
+                                string &out_unencodable) {
+  auto complete = true;
+  auto mark_unencodable = [&](const Expression &expr) {
+    if (complete) {
+      out_unencodable = expr.ToString();
+    }
+    complete = false;
+  };
   for (auto &expr : filters) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+    if (!expr) {
+      continue;
+    }
+    // Parameters are exempt from completeness: PREPARE plans once with the
+    // parameter unbound, and every EXECUTE re-plans with the value folded to a
+    // constant, which then encodes (or fails) here. Deferral, not loss.
+    if (expr->HasParameter()) {
+      continue;
+    }
+    if (expr->IsVolatile()) {
+      mark_unencodable(*expr);
       continue;
     }
     if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
@@ -357,6 +403,9 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
                  node->expression_class == ExpressionClass::BOUND_REF;
         };
 
+        // Exempt from completeness: these comparisons are routed through
+        // `pushdown_expression` into TableFilters and reach Lance as prefilter
+        // SQL, so nothing is lost.
         if ((is_column(cmp.left) && is_constant(cmp.right)) ||
             (is_column(cmp.right) && is_constant(cmp.left))) {
           continue;
@@ -364,11 +413,33 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
       }
     }
     string filter_ir;
-    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, true,
-                                   *expr, filter_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, names, types, true, *expr, filter_ir)) {
+      mark_unencodable(*expr);
       continue;
     }
-    scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
+    out_parts.push_back(std::move(filter_ir));
+  }
+  return complete;
+}
+
+static void
+LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
+                           FunctionData *bind_data,
+                           vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
+  string unencodable;
+  if (!CollectLancePushedFilterIRParts(
+          get, scan_bind.names, scan_bind.types, filters,
+          scan_bind.lance_pushed_filter_ir_parts, unencodable) &&
+      scan_bind.prefilter) {
+    throw InvalidInputException(
+        "lance_vector_search: predicate %s cannot be pushed to Lance as a "
+        "required prefilter; rewrite the predicate or set prefilter := false "
+        "to filter after top-k",
+        unencodable);
   }
 }
 
@@ -480,11 +551,6 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
     result->file_path = table->DatasetUri();
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_vector_search requires explicit filter when prefilter=true "
-          "on namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_distance", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -553,10 +619,6 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
       }
       global.scanned_types.push_back(bind_data.types[col_id]);
     }
-  }
-
-  if (bind_data.namespace_backed) {
-    return state;
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
@@ -628,8 +690,12 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     options.nprobes = bind_data.nprobes;
     options.refine_factor = bind_data.refine_factor;
     options.use_index = bind_data.use_index ? 1 : 0;
-    result->stream =
-        lance_create_namespace_vector_search_stream(&config, &options);
+    result->stream = CreateLanceSearchStreamWithFallback(
+        global, *result, bind_data.prefilter,
+        [&](const uint8_t *ir, size_t ir_len) {
+          return lance_create_namespace_vector_search_stream(&config, &options,
+                                                             ir, ir_len);
+        });
     if (!result->stream) {
       throw IOException("Failed to create Lance namespace vector search "
                         "stream" +
@@ -638,28 +704,15 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     return std::move(result);
   }
 
-  const uint8_t *filter_ir =
-      global.lance_filter_ir.empty()
-          ? nullptr
-          : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
-  auto filter_ir_len = global.lance_filter_ir.size();
-  result->stream = lance_create_knn_stream_ir(
-      bind_data.dataset, bind_data.vector_column.c_str(),
-      bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      bind_data.nprobes, bind_data.refine_factor, filter_ir, filter_ir_len,
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
-  if (!result->stream && filter_ir && !bind_data.prefilter) {
-    // Best-effort: if filter pushdown failed, retry without it and rely on
-    // DuckDB-side filter execution for correctness.
-    global.filter_pushdown_fallbacks.fetch_add(1);
-    global.filter_pushed_down = false;
-    result->filter_pushed_down = false;
-    result->stream = lance_create_knn_stream_ir(
-        bind_data.dataset, bind_data.vector_column.c_str(),
-        bind_data.query.data(), bind_data.query.size(), bind_data.k,
-        bind_data.nprobes, bind_data.refine_factor, nullptr, 0,
-        bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
-  }
+  result->stream = CreateLanceSearchStreamWithFallback(
+      global, *result, bind_data.prefilter,
+      [&](const uint8_t *ir, size_t ir_len) {
+        return lance_create_knn_stream_ir(
+            bind_data.dataset, bind_data.vector_column.c_str(),
+            bind_data.query.data(), bind_data.query.size(), bind_data.k,
+            bind_data.nprobes, bind_data.refine_factor, ir, ir_len,
+            bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      });
   if (!result->stream) {
     throw IOException("Failed to create Lance KNN stream" +
                       LanceFormatErrorSuffix());
@@ -796,10 +849,6 @@ LanceKnnToString(TableFunctionToStringInput &input) {
     result["Lance Namespace Filter"] = bind_data.namespace_filter;
   }
 
-  if (bind_data.namespace_backed) {
-    return result;
-  }
-
   result["Lance Pushed Filter Parts"] =
       to_string(bind_data.lance_pushed_filter_ir_parts.size());
   string filter_ir_msg;
@@ -808,6 +857,12 @@ LanceKnnToString(TableFunctionToStringInput &input) {
                                   filter_ir_msg);
   }
   result["Lance Filter IR Bytes (Bind)"] = to_string(filter_ir_msg.size());
+
+  // A namespace-backed search has no local dataset handle, so there is no plan
+  // to explain -- but the pushdown metrics above are still meaningful.
+  if (bind_data.namespace_backed) {
+    return result;
+  }
 
   string plan;
   string error;
@@ -966,6 +1021,8 @@ struct LanceSearchBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+
+  vector<string> lance_pushed_filter_ir_parts;
 };
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
@@ -1021,45 +1078,35 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
-      local_state.stream =
-          lance_create_namespace_fts_search_stream(&config, &options);
+      local_state.stream = CreateLanceSearchStreamWithFallback(
+          global, local_state, bind_data.prefilter,
+          [&](const uint8_t *ir, size_t ir_len) {
+            return lance_create_namespace_fts_search_stream(&config, &options,
+                                                            ir, ir_len);
+          });
       if (!local_state.stream) {
         throw IOException("Failed to create Lance namespace FTS stream" +
                           LanceFormatErrorSuffix());
       }
     } else {
-      const uint8_t *filter_ir = global.lance_filter_ir.empty()
-                                     ? nullptr
-                                     : reinterpret_cast<const uint8_t *>(
-                                           global.lance_filter_ir.data());
-      auto filter_ir_len = NumericCast<idx_t>(global.lance_filter_ir.size());
-
-      auto create_stream = [&](const uint8_t *ir, idx_t ir_len) -> void * {
-        if (bind_data.mode == LanceSearchMode::Fts) {
-          return lance_create_fts_stream_ir(
-              bind_data.dataset, bind_data.text_column.c_str(),
-              bind_data.query.c_str(), bind_data.k, ir,
-              NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0);
-        }
-        return lance_create_hybrid_stream_ir(
-            bind_data.dataset, bind_data.vector_column.c_str(),
-            bind_data.vector_query.data(), bind_data.vector_query.size(),
-            bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-            bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
-            NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0,
-            bind_data.use_index ? 1 : 0, bind_data.alpha,
-            bind_data.oversample_factor);
-      };
-
-      local_state.stream = create_stream(filter_ir, filter_ir_len);
-      if (!local_state.stream && filter_ir && !bind_data.prefilter) {
-        // Best-effort: if filter pushdown failed, retry without it and rely on
-        // DuckDB-side filter execution for correctness.
-        global.filter_pushdown_fallbacks.fetch_add(1);
-        global.filter_pushed_down = false;
-        local_state.filter_pushed_down = false;
-        local_state.stream = create_stream(nullptr, 0);
-      }
+      local_state.stream = CreateLanceSearchStreamWithFallback(
+          global, local_state, bind_data.prefilter,
+          [&](const uint8_t *ir, size_t ir_len) -> void * {
+            if (bind_data.mode == LanceSearchMode::Fts) {
+              return lance_create_fts_stream_ir(
+                  bind_data.dataset, bind_data.text_column.c_str(),
+                  bind_data.query.c_str(), bind_data.k, ir, ir_len,
+                  bind_data.prefilter ? 1 : 0);
+            }
+            return lance_create_hybrid_stream_ir(
+                bind_data.dataset, bind_data.vector_column.c_str(),
+                bind_data.vector_query.data(), bind_data.vector_query.size(),
+                bind_data.text_column.c_str(), bind_data.text_query.c_str(),
+                bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
+                ir_len, bind_data.prefilter ? 1 : 0,
+                bind_data.use_index ? 1 : 0, bind_data.alpha,
+                bind_data.oversample_factor);
+          });
       if (!local_state.stream) {
         throw IOException("Failed to create Lance search stream" +
                           LanceFormatErrorSuffix());
@@ -1158,11 +1205,6 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
     result->file_path = table->DatasetUri();
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
-    if (result->prefilter && result->namespace_filter.empty()) {
-      throw InvalidInputException(
-          "lance_fts requires explicit filter when prefilter=true on "
-          "namespace-backed tables");
-    }
     PopulateNamespaceSearchSchema(
         context, *table, "_score", result->schema_root, result->arrow_table,
         result->names, result->types, names, return_types);
@@ -1361,6 +1403,29 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   return std::move(result);
 }
 
+static void
+LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
+                                 FunctionData *bind_data,
+                                 vector<unique_ptr<Expression>> &filters) {
+  if (!bind_data || filters.empty()) {
+    return;
+  }
+  auto &search_bind = bind_data->Cast<LanceSearchBindData>();
+  string unencodable;
+  if (!CollectLancePushedFilterIRParts(
+          get, search_bind.names, search_bind.types, filters,
+          search_bind.lance_pushed_filter_ir_parts, unencodable) &&
+      search_bind.prefilter) {
+    throw InvalidInputException(
+        "%s: predicate %s cannot be pushed to Lance as a required prefilter; "
+        "rewrite the predicate or set prefilter := false to filter after "
+        "top-k",
+        search_bind.mode == LanceSearchMode::Fts ? "lance_fts"
+                                                 : "lance_hybrid_search",
+        unencodable);
+  }
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
@@ -1379,10 +1444,6 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
     }
   }
 
-  if (bind_data.namespace_backed) {
-    return state;
-  }
-
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
@@ -1395,9 +1456,18 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   bool has_table_filter_parts = !table_filters.parts.empty();
+  auto filter_parts = std::move(table_filters.parts);
+  if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
+    filter_parts.reserve(filter_parts.size() +
+                         bind_data.lance_pushed_filter_ir_parts.size());
+    for (auto &part : bind_data.lance_pushed_filter_ir_parts) {
+      filter_parts.push_back(part);
+    }
+  }
+
   string filter_ir_msg;
-  if (!table_filters.parts.empty()) {
-    if (!TryEncodeLanceFilterIRMessage(table_filters.parts, filter_ir_msg)) {
+  if (!filter_parts.empty()) {
+    if (!TryEncodeLanceFilterIRMessage(filter_parts, filter_ir_msg)) {
       filter_ir_msg.clear();
     }
     global.lance_filter_ir = std::move(filter_ir_msg);
@@ -1560,6 +1630,7 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   fts.filter_pushdown = true;
   fts.filter_prune = true;
   fts.pushdown_expression = LancePushdownExpression;
+  fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
   fts.to_string = LanceSearchToString;
   fts.dynamic_to_string = LanceSearchDynamicToString;
   loader.RegisterFunction(fts);
@@ -1578,6 +1649,7 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
     fun.filter_pushdown = true;
     fun.filter_prune = true;
     fun.pushdown_expression = LancePushdownExpression;
+    fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
     fun.to_string = LanceSearchToString;
     fun.dynamic_to_string = LanceSearchDynamicToString;
   };

@@ -365,9 +365,27 @@ fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
         .map_err(|err| {
             FfiError::new(
                 ErrorCode::NamespaceQueryTable,
-                format!("unparse namespace scan filter: {err}"),
+                format!("unparse namespace filter: {err}"),
             )
         })
+}
+
+// A pushed filter arrives as a DataFusion `Expr`, but namespace query_table only accepts a
+// filter string, so it is unparsed here and ANDed with whatever the caller passed as the
+// explicit `filter :=` argument.
+fn apply_filter_expr(
+    request: &mut QueryTableRequest,
+    filter_expr: Option<&Expr>,
+) -> FfiResult<()> {
+    let Some(filter_expr) = filter_expr else {
+        return Ok(());
+    };
+    let filter_sql = filter_expr_to_sql(filter_expr)?;
+    request.filter = Some(match request.filter.take() {
+        Some(existing) => format!("({existing}) AND ({filter_sql})"),
+        None => filter_sql,
+    });
+    Ok(())
 }
 
 fn build_namespace_scan_request(
@@ -433,13 +451,7 @@ fn build_namespace_scan_request(
         }
     }
 
-    if let Some(filter_expr) = filter_expr {
-        let filter_sql = filter_expr_to_sql(filter_expr)?;
-        request.filter = Some(match request.filter.take() {
-            Some(existing) => format!("({existing}) AND ({filter_sql})"),
-            None => filter_sql,
-        });
-    }
+    apply_filter_expr(&mut request, filter_expr)?;
     Ok(request)
 }
 
@@ -507,8 +519,12 @@ unsafe fn create_namespace_scan_stream_ir_inner(
 pub unsafe extern "C" fn lance_create_namespace_vector_search_stream(
     config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceVectorSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> *mut c_void {
-    match create_namespace_vector_search_stream_inner(config, options) {
+    match unsafe {
+        create_namespace_vector_search_stream_inner(config, options, filter_ir, filter_ir_len)
+    } {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -523,6 +539,8 @@ pub unsafe extern "C" fn lance_create_namespace_vector_search_stream(
 unsafe fn create_namespace_vector_search_stream_inner(
     config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceVectorSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> FfiResult<StreamHandle> {
     if options.is_null() {
         return Err(FfiError::new(
@@ -550,8 +568,18 @@ unsafe fn create_namespace_vector_search_stream_inner(
 
     let mut vector = QueryTableRequestVector::new();
     vector.single_vector = Some(query_values.to_vec());
+    let filter_expr = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::NamespaceQueryTable,
+            "namespace vector search filter_ir",
+        )?
+    };
+
     let mut request = QueryTableRequest::new(config.k, vector);
     apply_base_request(&config, &mut request);
+    apply_filter_expr(&mut request, filter_expr.as_ref())?;
     request.vector_column = Some(vector_column.to_string());
     if options.nprobes != 0 {
         request.nprobes =
@@ -573,8 +601,12 @@ unsafe fn create_namespace_vector_search_stream_inner(
 pub unsafe extern "C" fn lance_create_namespace_fts_search_stream(
     config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceFtsSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> *mut c_void {
-    match create_namespace_fts_search_stream_inner(config, options) {
+    match unsafe {
+        create_namespace_fts_search_stream_inner(config, options, filter_ir, filter_ir_len)
+    } {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -589,6 +621,8 @@ pub unsafe extern "C" fn lance_create_namespace_fts_search_stream(
 unsafe fn create_namespace_fts_search_stream_inner(
     config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceFtsSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> FfiResult<StreamHandle> {
     if options.is_null() {
         return Err(FfiError::new(
@@ -607,8 +641,18 @@ unsafe fn create_namespace_fts_search_stream_inner(
     let text_column = unsafe { cstr_to_str(options.text_column, "text_column")? };
     let query = unsafe { cstr_to_str(options.query, "query")? };
 
+    let filter_expr = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::NamespaceQueryTable,
+            "namespace FTS search filter_ir",
+        )?
+    };
+
     let mut request = QueryTableRequest::new(config.k, QueryTableRequestVector::new());
     apply_base_request(&config, &mut request);
+    apply_filter_expr(&mut request, filter_expr.as_ref())?;
 
     let mut string_query = StringFtsQuery::new(query.to_string());
     string_query.columns = Some(vec![text_column.to_string()]);

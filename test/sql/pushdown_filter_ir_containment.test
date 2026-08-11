@@ -1,0 +1,433 @@
+# name: test/sql/pushdown_filter_ir_containment.test
+# description: array_has_any/array_has_all containment pushdown over LABEL_LIST columns
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (1::BIGINT, 'puppy dog'::VARCHAR, [0.1, 0.0, 0.0, 0.0]::FLOAT[4],
+     ['red', 'blue']::VARCHAR[], [1, 2]::BIGINT[], ['blue']::VARCHAR[]),
+    (2::BIGINT, 'puppy cat'::VARCHAR, [0.2, 0.0, 0.0, 0.0]::FLOAT[4],
+     ['blue', 'green']::VARCHAR[], [2, 3]::BIGINT[], ['red']::VARCHAR[]),
+    (3::BIGINT, 'kitten cat'::VARCHAR, [0.3, 0.0, 0.0, 0.0]::FLOAT[4],
+     ['green']::VARCHAR[], [3]::BIGINT[], ['green']::VARCHAR[]),
+    (4::BIGINT, 'puppy bird'::VARCHAR, [0.4, 0.0, 0.0, 0.0]::FLOAT[4],
+     ['red', 'green']::VARCHAR[], [1, 3]::BIGINT[], ['purple']::VARCHAR[]),
+    (5::BIGINT, 'fish tank'::VARCHAR, [0.5, 0.0, 0.0, 0.0]::FLOAT[4],
+     []::VARCHAR[], []::BIGINT[], ['red']::VARCHAR[]),
+    (6::BIGINT, 'puppy fish'::VARCHAR, [0.6, 0.0, 0.0, 0.0]::FLOAT[4],
+     NULL::VARCHAR[], NULL::BIGINT[], ['red']::VARCHAR[])
+  ) t(id, text, vec, tags, nums, other_tags)
+) TO 'test/.tmp/filter_ir_containment.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX tags_idx ON 'test/.tmp/filter_ir_containment.lance' (tags) USING LABEL_LIST;
+
+statement ok
+CREATE INDEX text_idx ON 'test/.tmp/filter_ir_containment.lance' (text) USING INVERTED;
+
+# ===================================================================
+# Correctness on plain scans
+# ===================================================================
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red']) ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red', 'green']) ORDER BY id;
+----
+1
+2
+3
+4
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(tags, ['red', 'blue']) ORDER BY id;
+----
+1
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(tags, ['green']) ORDER BY id;
+----
+2
+3
+4
+
+# The `list_*` spelling of the same DuckDB functions pushes down identically.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE list_has_any(tags, ['blue']) ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE list_has_all(tags, ['red', 'green']) ORDER BY id;
+----
+4
+
+# Non-string element types.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(nums, [3]::BIGINT[]) ORDER BY id;
+----
+2
+3
+4
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(nums, [1, 3]::BIGINT[]) ORDER BY id;
+----
+4
+
+# Cast-wrapped constant needle.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, CAST(['red', 'green'] AS VARCHAR[])) ORDER BY id;
+----
+1
+2
+3
+4
+
+# Negation keeps SQL three-valued semantics: row 6 has NULL tags.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE NOT array_has_any(tags, ['red']) ORDER BY id;
+----
+2
+3
+5
+
+# Conjunction with an ordinary pushed predicate.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['green']) AND id > 2 ORDER BY id;
+----
+3
+4
+
+# ===================================================================
+# Pushdown diagnostics
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red', 'blue']);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(tags, ['red', 'blue']);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(nums, [3]::BIGINT[]);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red', 'blue']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*
+
+# An indexed containment predicate resolves through the dataset scanner.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+
+# ===================================================================
+# LABEL_LIST index usage
+#
+# DuckDB's Arrow exporter names list child fields `l`; the write paths rewrite
+# them to Arrow's `item` so DataFusion leaves the column uncoerced and Lance's
+# scalar-index planner can see it. Without that the predicate still pushes down
+# and prefilters, but Lance answers it with a scan.
+# ===================================================================
+
+# The predicate becomes a LABEL_LIST index query with no refine (recheck) step.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id FROM __lance_scan('test/.tmp/filter_ir_containment.lance',
+                            explain_verbose = true)
+WHERE array_has_any(tags, ['red']);
+----
+physical_plan	<REGEX>:[\s\S]*ScalarIndexQuery: query=\[array_has_any\(tags, List\(\[red\]\)\)\]@tags_idx\(LabelList\)[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id FROM __lance_scan('test/.tmp/filter_ir_containment.lance',
+                            explain_verbose = true)
+WHERE array_has_all(tags, ['red', 'green']);
+----
+physical_plan	<REGEX>:[\s\S]*refine_filter=--[\s\S]*ScalarIndexQuery: query=\[array_has_all\(tags, List\(\[red, green\]\)\)\]@tags_idx\(LabelList\)[\s\S]*
+
+# ===================================================================
+# Negative case: a non-constant needle falls back to DuckDB
+# ===================================================================
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, other_tags) ORDER BY id;
+----
+1
+3
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, other_tags);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "0"[\s\S]*
+
+# An empty needle is not pushed down, but still returns DuckDB semantics.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(tags, []::VARCHAR[]) ORDER BY id;
+----
+1
+2
+3
+4
+5
+
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, []::VARCHAR[]) ORDER BY id;
+----
+
+# A NULL needle element is not pushed down, but still returns DuckDB semantics.
+query I
+SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, ['red', NULL]::VARCHAR[]) ORDER BY id;
+----
+1
+4
+
+# ===================================================================
+# Bound parameters fold to a list constant
+# ===================================================================
+
+statement ok
+PREPARE containment_any AS SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_any(tags, $1) ORDER BY id;
+
+query I
+EXECUTE containment_any(['red']::VARCHAR[]);
+----
+1
+4
+
+query I
+EXECUTE containment_any(['green']::VARCHAR[]);
+----
+2
+3
+4
+
+statement ok
+PREPARE containment_all AS SELECT id FROM 'test/.tmp/filter_ir_containment.lance'
+WHERE array_has_all(tags, $1) ORDER BY id;
+
+query I
+EXECUTE containment_all(['red', 'green']::VARCHAR[]);
+----
+4
+
+# A bound list parameter folds to a list constant and pushes down from the
+# search functions too -- `pushdown_complex_filter` skips anything still
+# carrying a parameter, so this must stay folded.
+
+statement ok
+PREPARE hybrid_containment AS
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_any(tags, $1) ORDER BY id;
+
+query I
+EXECUTE hybrid_containment(['red']::VARCHAR[]);
+----
+1
+4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE hybrid_containment(['red']::VARCHAR[]);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# ===================================================================
+# Search prefilter: k matching rows come back
+# ===================================================================
+
+# Rows 2, 3 and 4 match the predicate; the two nearest of those are 2 and 3, so
+# a prefiltered k=2 search returns k matching rows.
+query I
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
+WHERE array_has_any(tags, ['green'])
+ORDER BY id;
+----
+2
+3
+
+# Without the prefilter the same k=2 search picks rows 1 and 2 first, so only
+# one of them survives the predicate.
+query I
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = false)
+WHERE array_has_any(tags, ['green'])
+ORDER BY id;
+----
+2
+
+query I
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
+WHERE array_has_all(tags, ['green'])
+ORDER BY id;
+----
+2
+3
+
+# `puppy` matches rows 1, 2, 4 and 6; `red` narrows that to 1 and 4.
+query I
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_any(tags, ['red'])
+ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green'])
+ORDER BY id;
+----
+4
+
+# `puppy` matches rows 1, 2, 4 and 6 in the inverted index.
+query I
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_any(tags, ['red'])
+ORDER BY id;
+----
+1
+4
+
+query I
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green'])
+ORDER BY id;
+----
+4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_any(tags, ['red']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
+WHERE array_has_any(tags, ['green']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, ['red', 'green']);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# ===================================================================
+# Required prefilter rejects predicates it cannot encode
+# ===================================================================
+
+# An empty needle is not pushed down. With prefilter=true that must be an
+# error, not a silent skip: top-k would run before the missing predicate and
+# post-filtering the truncated result loses rows.
+
+statement error
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_vector_search: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+statement error
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_fts: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+statement error
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_hybrid_search: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+# With prefilter=false the same predicate stays on the DuckDB side and filters
+# after top-k, which is the documented semantics.
+query I
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 6, prefilter = false)
+WHERE array_has_all(tags, []::VARCHAR[]) ORDER BY id;
+----
+1
+2
+3
+4
+5

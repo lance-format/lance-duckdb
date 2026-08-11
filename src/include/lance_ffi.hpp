@@ -307,10 +307,12 @@ typedef struct LanceNamespaceFtsSearchOptions {
 
 void *lance_create_namespace_vector_search_stream(
     const LanceNamespaceQueryConfig *config,
-    const LanceNamespaceVectorSearchOptions *options);
+    const LanceNamespaceVectorSearchOptions *options, const uint8_t *filter_ir,
+    size_t filter_ir_len);
 void *lance_create_namespace_fts_search_stream(
     const LanceNamespaceQueryConfig *config,
-    const LanceNamespaceFtsSearchOptions *options);
+    const LanceNamespaceFtsSearchOptions *options, const uint8_t *filter_ir,
+    size_t filter_ir_len);
 void *lance_create_namespace_scan_stream_ir(
     const LanceNamespaceQueryConfig *config, const uint8_t *filter_ir,
     size_t filter_ir_len, int64_t limit, int64_t offset, uint8_t with_row_id);
