@@ -383,3 +383,51 @@ FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
 WHERE array_has_all(tags, ['red', 'green']);
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# ===================================================================
+# Required prefilter rejects predicates it cannot encode
+# ===================================================================
+
+# An empty needle is not pushed down. With prefilter=true that must be an
+# error, not a silent skip: top-k would run before the missing predicate and
+# post-filtering the truncated result loses rows.
+
+statement error
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 2, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_vector_search: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+statement error
+SELECT id
+FROM lance_fts('test/.tmp/filter_ir_containment.lance', 'text', 'puppy',
+               k = 6, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_fts: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+statement error
+SELECT id
+FROM lance_hybrid_search('test/.tmp/filter_ir_containment.lance',
+                         'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         'text', 'puppy',
+                         k = 4, prefilter = true)
+WHERE array_has_all(tags, []::VARCHAR[]);
+----
+Invalid Input Error: lance_hybrid_search: predicate array_has_all(tags, []) cannot be pushed to Lance as a required prefilter
+
+# With prefilter=false the same predicate stays on the DuckDB side and filters
+# after top-k, which is the documented semantics.
+query I
+SELECT id
+FROM lance_vector_search('test/.tmp/filter_ir_containment.lance', 'vec',
+                         [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 6, prefilter = false)
+WHERE array_has_all(tags, []::VARCHAR[]) ORDER BY id;
+----
+1
+2
+3
+4
+5

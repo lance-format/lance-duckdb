@@ -316,13 +316,38 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
 // Encodes whatever DuckDB could not express as a TableFilter -- scalar
 // functions, LIKE/regexp, containment -- into filter IR parts the search
 // functions hand to Lance as a prefilter.
-static void
+//
+// Returns false when any predicate could not be encoded. Callers that require
+// a complete prefilter (prefilter=true) must reject the query in that case:
+// Lance would run top-k before the missing predicate, and DuckDB's post-scan
+// filter cannot restore rows lost to the truncation. Silent skipping is only
+// sound for prefilter=false, where filtering after top-k is the documented
+// semantics. `out_unencodable` receives the first predicate that failed.
+static bool
 CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
                                 const vector<LogicalType> &types,
                                 const vector<unique_ptr<Expression>> &filters,
-                                vector<string> &out_parts) {
+                                vector<string> &out_parts,
+                                string &out_unencodable) {
+  auto complete = true;
+  auto mark_unencodable = [&](const Expression &expr) {
+    if (complete) {
+      out_unencodable = expr.ToString();
+    }
+    complete = false;
+  };
   for (auto &expr : filters) {
-    if (!expr || expr->HasParameter() || expr->IsVolatile()) {
+    if (!expr) {
+      continue;
+    }
+    // Parameters are exempt from completeness: PREPARE plans once with the
+    // parameter unbound, and every EXECUTE re-plans with the value folded to a
+    // constant, which then encodes (or fails) here. Deferral, not loss.
+    if (expr->HasParameter()) {
+      continue;
+    }
+    if (expr->IsVolatile()) {
+      mark_unencodable(*expr);
       continue;
     }
     if (expr->expression_class == ExpressionClass::BOUND_COMPARISON) {
@@ -353,6 +378,9 @@ CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
                  node->expression_class == ExpressionClass::BOUND_REF;
         };
 
+        // Exempt from completeness: these comparisons are routed through
+        // `pushdown_expression` into TableFilters and reach Lance as prefilter
+        // SQL, so nothing is lost.
         if ((is_column(cmp.left) && is_constant(cmp.right)) ||
             (is_column(cmp.right) && is_constant(cmp.left))) {
           continue;
@@ -361,10 +389,12 @@ CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
     }
     string filter_ir;
     if (!TryBuildLanceExprFilterIR(get, names, types, true, *expr, filter_ir)) {
+      mark_unencodable(*expr);
       continue;
     }
     out_parts.push_back(std::move(filter_ir));
   }
+  return complete;
 }
 
 static void
@@ -375,9 +405,17 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
     return;
   }
   auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
-  CollectLancePushedFilterIRParts(get, scan_bind.names, scan_bind.types,
-                                  filters,
-                                  scan_bind.lance_pushed_filter_ir_parts);
+  string unencodable;
+  if (!CollectLancePushedFilterIRParts(
+          get, scan_bind.names, scan_bind.types, filters,
+          scan_bind.lance_pushed_filter_ir_parts, unencodable) &&
+      scan_bind.prefilter) {
+    throw InvalidInputException(
+        "lance_vector_search: predicate %s cannot be pushed to Lance as a "
+        "required prefilter; rewrite the predicate or set prefilter := false "
+        "to filter after top-k",
+        unencodable);
+  }
 }
 
 static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
@@ -1375,9 +1413,19 @@ LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
     return;
   }
   auto &search_bind = bind_data->Cast<LanceSearchBindData>();
-  CollectLancePushedFilterIRParts(get, search_bind.names, search_bind.types,
-                                  filters,
-                                  search_bind.lance_pushed_filter_ir_parts);
+  string unencodable;
+  if (!CollectLancePushedFilterIRParts(
+          get, search_bind.names, search_bind.types, filters,
+          search_bind.lance_pushed_filter_ir_parts, unencodable) &&
+      search_bind.prefilter) {
+    throw InvalidInputException(
+        "%s: predicate %s cannot be pushed to Lance as a required prefilter; "
+        "rewrite the predicate or set prefilter := false to filter after "
+        "top-k",
+        search_bind.mode == LanceSearchMode::Fts ? "lance_fts"
+                                                 : "lance_hybrid_search",
+        unencodable);
+  }
 }
 
 static unique_ptr<GlobalTableFunctionState>
