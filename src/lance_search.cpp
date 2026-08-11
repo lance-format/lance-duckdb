@@ -313,6 +313,31 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
   }
 };
 
+// One stream-creation policy for every search backend, dataset- and
+// namespace-backed alike. Generated filter IR is best-effort when
+// prefilter=false: a stream that fails to open with pushed IR is retried
+// without it and DuckDB re-applies the filters after top-k. The explicit
+// namespace filter is unaffected by the retry -- it travels in the query
+// config, not in the IR. With prefilter=true the IR is required for
+// correctness, so the failure surfaces to the caller.
+template <class GLOBAL, class LOCAL, class CREATE>
+static void *CreateLanceSearchStreamWithFallback(GLOBAL &global, LOCAL &local,
+                                                 bool prefilter,
+                                                 CREATE &&create) {
+  const uint8_t *filter_ir =
+      global.lance_filter_ir.empty()
+          ? nullptr
+          : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
+  auto *stream = create(filter_ir, global.lance_filter_ir.size());
+  if (!stream && filter_ir && !prefilter) {
+    global.filter_pushdown_fallbacks.fetch_add(1);
+    global.filter_pushed_down = false;
+    local.filter_pushed_down = false;
+    stream = create(nullptr, size_t{0});
+  }
+  return stream;
+}
+
 // Encodes whatever DuckDB could not express as a TableFilter -- scalar
 // functions, LIKE/regexp, containment -- into filter IR parts the search
 // functions hand to Lance as a prefilter.
@@ -665,12 +690,12 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     options.nprobes = bind_data.nprobes;
     options.refine_factor = bind_data.refine_factor;
     options.use_index = bind_data.use_index ? 1 : 0;
-    const uint8_t *ns_filter_ir =
-        global.lance_filter_ir.empty()
-            ? nullptr
-            : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
-    result->stream = lance_create_namespace_vector_search_stream(
-        &config, &options, ns_filter_ir, global.lance_filter_ir.size());
+    result->stream = CreateLanceSearchStreamWithFallback(
+        global, *result, bind_data.prefilter,
+        [&](const uint8_t *ir, size_t ir_len) {
+          return lance_create_namespace_vector_search_stream(&config, &options,
+                                                             ir, ir_len);
+        });
     if (!result->stream) {
       throw IOException("Failed to create Lance namespace vector search "
                         "stream" +
@@ -679,28 +704,15 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     return std::move(result);
   }
 
-  const uint8_t *filter_ir =
-      global.lance_filter_ir.empty()
-          ? nullptr
-          : reinterpret_cast<const uint8_t *>(global.lance_filter_ir.data());
-  auto filter_ir_len = global.lance_filter_ir.size();
-  result->stream = lance_create_knn_stream_ir(
-      bind_data.dataset, bind_data.vector_column.c_str(),
-      bind_data.query.data(), bind_data.query.size(), bind_data.k,
-      bind_data.nprobes, bind_data.refine_factor, filter_ir, filter_ir_len,
-      bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
-  if (!result->stream && filter_ir && !bind_data.prefilter) {
-    // Best-effort: if filter pushdown failed, retry without it and rely on
-    // DuckDB-side filter execution for correctness.
-    global.filter_pushdown_fallbacks.fetch_add(1);
-    global.filter_pushed_down = false;
-    result->filter_pushed_down = false;
-    result->stream = lance_create_knn_stream_ir(
-        bind_data.dataset, bind_data.vector_column.c_str(),
-        bind_data.query.data(), bind_data.query.size(), bind_data.k,
-        bind_data.nprobes, bind_data.refine_factor, nullptr, 0,
-        bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
-  }
+  result->stream = CreateLanceSearchStreamWithFallback(
+      global, *result, bind_data.prefilter,
+      [&](const uint8_t *ir, size_t ir_len) {
+        return lance_create_knn_stream_ir(
+            bind_data.dataset, bind_data.vector_column.c_str(),
+            bind_data.query.data(), bind_data.query.size(), bind_data.k,
+            bind_data.nprobes, bind_data.refine_factor, ir, ir_len,
+            bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
+      });
   if (!result->stream) {
     throw IOException("Failed to create Lance KNN stream" +
                       LanceFormatErrorSuffix());
@@ -1066,49 +1078,35 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();
       options.query = bind_data.query.c_str();
-      const uint8_t *ns_filter_ir = global.lance_filter_ir.empty()
-                                        ? nullptr
-                                        : reinterpret_cast<const uint8_t *>(
-                                              global.lance_filter_ir.data());
-      local_state.stream = lance_create_namespace_fts_search_stream(
-          &config, &options, ns_filter_ir, global.lance_filter_ir.size());
+      local_state.stream = CreateLanceSearchStreamWithFallback(
+          global, local_state, bind_data.prefilter,
+          [&](const uint8_t *ir, size_t ir_len) {
+            return lance_create_namespace_fts_search_stream(&config, &options,
+                                                            ir, ir_len);
+          });
       if (!local_state.stream) {
         throw IOException("Failed to create Lance namespace FTS stream" +
                           LanceFormatErrorSuffix());
       }
     } else {
-      const uint8_t *filter_ir = global.lance_filter_ir.empty()
-                                     ? nullptr
-                                     : reinterpret_cast<const uint8_t *>(
-                                           global.lance_filter_ir.data());
-      auto filter_ir_len = NumericCast<idx_t>(global.lance_filter_ir.size());
-
-      auto create_stream = [&](const uint8_t *ir, idx_t ir_len) -> void * {
-        if (bind_data.mode == LanceSearchMode::Fts) {
-          return lance_create_fts_stream_ir(
-              bind_data.dataset, bind_data.text_column.c_str(),
-              bind_data.query.c_str(), bind_data.k, ir,
-              NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0);
-        }
-        return lance_create_hybrid_stream_ir(
-            bind_data.dataset, bind_data.vector_column.c_str(),
-            bind_data.vector_query.data(), bind_data.vector_query.size(),
-            bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-            bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
-            NumericCast<size_t>(ir_len), bind_data.prefilter ? 1 : 0,
-            bind_data.use_index ? 1 : 0, bind_data.alpha,
-            bind_data.oversample_factor);
-      };
-
-      local_state.stream = create_stream(filter_ir, filter_ir_len);
-      if (!local_state.stream && filter_ir && !bind_data.prefilter) {
-        // Best-effort: if filter pushdown failed, retry without it and rely on
-        // DuckDB-side filter execution for correctness.
-        global.filter_pushdown_fallbacks.fetch_add(1);
-        global.filter_pushed_down = false;
-        local_state.filter_pushed_down = false;
-        local_state.stream = create_stream(nullptr, 0);
-      }
+      local_state.stream = CreateLanceSearchStreamWithFallback(
+          global, local_state, bind_data.prefilter,
+          [&](const uint8_t *ir, size_t ir_len) -> void * {
+            if (bind_data.mode == LanceSearchMode::Fts) {
+              return lance_create_fts_stream_ir(
+                  bind_data.dataset, bind_data.text_column.c_str(),
+                  bind_data.query.c_str(), bind_data.k, ir, ir_len,
+                  bind_data.prefilter ? 1 : 0);
+            }
+            return lance_create_hybrid_stream_ir(
+                bind_data.dataset, bind_data.vector_column.c_str(),
+                bind_data.vector_query.data(), bind_data.vector_query.size(),
+                bind_data.text_column.c_str(), bind_data.text_query.c_str(),
+                bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
+                ir_len, bind_data.prefilter ? 1 : 0,
+                bind_data.use_index ? 1 : 0, bind_data.alpha,
+                bind_data.oversample_factor);
+          });
       if (!local_state.stream) {
         throw IOException("Failed to create Lance search stream" +
                           LanceFormatErrorSuffix());

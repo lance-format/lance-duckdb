@@ -112,5 +112,46 @@ ORDER BY id;
 9
 12
 
+# ===================================================================
+# Pushed IR the namespace backend cannot parse falls back to DuckDB
+# ===================================================================
+
+# Lance rejects the regexp 'p' option flag when parsing the pushed IR at
+# stream creation. With prefilter=false the stream is recreated without the
+# generated IR and DuckDB applies the predicate after top-k -- the same
+# semantics as the path-backed search. Rows 1 and 2 are the top-2 and both
+# match 'p.ppy'.
+query I
+SELECT count(*)
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 2, prefilter := false)
+WHERE regexp_matches(content, 'p.ppy', 'p');
+----
+2
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*)
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 2, prefilter := false)
+WHERE regexp_matches(content, 'p.ppy', 'p');
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "1"[\s\S]*
+
+query I
+SELECT count(*)
+FROM lance_vector_search('containment_ns.main.items', 'embedding', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+                         k := 2, prefilter := false)
+WHERE regexp_matches(content, 'p.ppy', 'p');
+----
+2
+
+# With prefilter=true the pushed IR is required for correctness, so the
+# backend's rejection surfaces instead of a silent retry.
+statement error
+SELECT count(*)
+FROM lance_fts('containment_ns.main.items', 'content', 'puppy', k := 2, prefilter := true)
+WHERE regexp_matches(content, 'p.ppy', 'p');
+----
+unsupported regexp option: p
+
 statement ok
 DETACH containment_ns;
