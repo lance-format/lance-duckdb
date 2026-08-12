@@ -12,6 +12,7 @@
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
@@ -596,6 +597,98 @@ static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
 }
 
+enum class DirectoryReplaceStrategy { NONE, LOCAL_STAGED, REMOTE_DROP_FIRST };
+
+struct DirectoryReplacePlan {
+  DirectoryReplaceStrategy strategy = DirectoryReplaceStrategy::NONE;
+  LanceResolvedPath final_path;
+  LanceResolvedPath staging_path;
+
+  bool UsesCreateMode() const {
+    return strategy != DirectoryReplaceStrategy::NONE;
+  }
+};
+
+static LanceResolvedPath
+MakeDirectoryReplaceStagingPath(ClientContext &context,
+                                const LanceResolvedPath &namespace_root) {
+  if (!namespace_root.IsLocal()) {
+    throw InternalException(
+        "Staging CREATE OR REPLACE TABLE requires a local namespace root");
+  }
+  auto &fs = FileSystem::GetFileSystem(context);
+  auto staging_root =
+      JoinNamespacePath(namespace_root.local_os_path, ".duckdb_replace");
+  fs.CreateDirectory(staging_root);
+  auto staging_os = JoinNamespacePath(
+      staging_root, UUID::ToString(UUID::GenerateRandomUUID()) + ".lance");
+  return LanceResolvePath(context, staging_os);
+}
+
+static void TryRemoveLocalDatasetDirectory(FileSystem &fs,
+                                           const string &os_path) {
+  try {
+    if (!os_path.empty() && fs.DirectoryExists(os_path)) {
+      fs.RemoveDirectory(os_path);
+    }
+  } catch (...) {
+  }
+}
+
+class DirectoryReplaceStagingGuard {
+public:
+  DirectoryReplaceStagingGuard(ClientContext &context_p,
+                               const string &staging_os_path_p)
+      : context(context_p), staging_os_path(staging_os_path_p),
+        active(!staging_os_path.empty()) {}
+
+  void Release() { active = false; }
+
+  ~DirectoryReplaceStagingGuard() {
+    if (active) {
+      TryRemoveLocalDatasetDirectory(FileSystem::GetFileSystem(context),
+                                     staging_os_path);
+    }
+  }
+
+private:
+  ClientContext &context;
+  string staging_os_path;
+  bool active;
+};
+
+class LanceSchemaEntry;
+
+static void
+DropDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &directory_ns,
+                            const string &table_name) {
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(directory_ns.option_keys,
+                                  directory_ns.option_values, key_ptrs,
+                                  value_ptrs);
+  auto rc = lance_dir_namespace_drop_table(
+      directory_ns.root.c_str(), table_name.c_str(),
+      key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(),
+      directory_ns.option_keys.size());
+  if (rc != 0) {
+    throw IOException(
+        "Failed to drop Lance dataset: " +
+        JoinNamespacePath(directory_ns.root, GetDatasetDirName(table_name)) +
+        LanceFormatErrorSuffix());
+  }
+}
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name);
+
+static void CommitDirectoryNamespaceReplace(
+    ClientContext &context, LanceSchemaEntry &schema,
+    CatalogTransaction transaction, const string &table_name,
+    const LanceResolvedPath &final_path, const LanceResolvedPath &staging_path);
+
 static bool IsSafeDatasetTableName(const string &name) {
   if (name.empty()) {
     return false;
@@ -812,27 +905,8 @@ public:
       if (!directory_ns || directory_ns->root.empty()) {
         throw InternalException("Lance directory namespace root is empty");
       }
-      auto root = directory_ns->root;
 
-      vector<string> option_keys;
-      vector<string> option_values;
-      option_keys = directory_ns->option_keys;
-      option_values = directory_ns->option_values;
-
-      vector<const char *> key_ptrs;
-      vector<const char *> value_ptrs;
-      BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                      value_ptrs);
-
-      auto rc = lance_dir_namespace_drop_table(
-          root.c_str(), info.name.c_str(),
-          key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
-      if (rc != 0) {
-        throw IOException("Failed to drop Lance dataset: " + root + "/" +
-                          GetDatasetDirName(info.name) +
-                          LanceFormatErrorSuffix());
-      }
+      DropDirectoryNamespaceTable(*directory_ns, info.name);
     }
 
     // Drop the DuckDB catalog entry after the dataset has been deleted
@@ -885,6 +959,7 @@ public:
     string dataset_path;
     vector<string> option_keys;
     vector<string> option_values;
+    DirectoryReplacePlan replace_plan;
 
     if (rest_ns) {
       unordered_map<string, Value> overrides;
@@ -998,8 +1073,11 @@ public:
         throw InternalException("Lance directory namespace root is empty");
       }
 
-      dataset_path = JoinNamespacePath(directory_ns->root,
-                                       GetDatasetDirName(create_info.table));
+      auto namespace_root = LanceResolvePath(context, directory_ns->root);
+      replace_plan.final_path = LanceResolvePath(
+          context, JoinNamespacePath(directory_ns->root,
+                                     GetDatasetDirName(create_info.table)));
+      dataset_path = replace_plan.final_path.lance_uri;
 
       auto exists =
           DirectoryNamespaceTableExists(*directory_ns, create_info.table);
@@ -1012,10 +1090,30 @@ public:
           exists) {
         throw IOException("Lance dataset already exists: " + dataset_path);
       }
+      if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT &&
+          exists) {
+        if (namespace_root.IsLocal()) {
+          replace_plan.staging_path =
+              MakeDirectoryReplaceStagingPath(context, namespace_root);
+          dataset_path = replace_plan.staging_path.lance_uri;
+          replace_plan.strategy = DirectoryReplaceStrategy::LOCAL_STAGED;
+        } else {
+          // Remote roots: drop in place, then recreate (non-atomic).
+          DropDirectoryNamespaceTable(*directory_ns, create_info.table);
+          LanceInvalidateDatasetCacheForPath(context,
+                                             replace_plan.final_path.lance_uri);
+          EvictLanceTableCatalogEntry(*this, transaction, create_info.table);
+          dataset_path = replace_plan.final_path.lance_uri;
+          replace_plan.strategy = DirectoryReplaceStrategy::REMOTE_DROP_FIRST;
+        }
+      }
 
       option_keys = directory_ns->option_keys;
       option_values = directory_ns->option_values;
     }
+
+    DirectoryReplaceStagingGuard replace_staging_guard(
+        context, replace_plan.staging_path.local_os_path);
 
     vector<string> names;
     vector<LogicalType> types;
@@ -1032,7 +1130,9 @@ public:
     ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
                                   props);
 
-    auto mode = CreateTableModeFromConflict(create_info.on_conflict);
+    auto mode = replace_plan.UsesCreateMode()
+                    ? "create"
+                    : CreateTableModeFromConflict(create_info.on_conflict);
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -1056,6 +1156,14 @@ public:
     if (rc != 0) {
       throw IOException("Failed to finalize Lance dataset write" +
                         LanceFormatErrorSuffix());
+    }
+
+    if (replace_plan.strategy == DirectoryReplaceStrategy::LOCAL_STAGED) {
+      CommitDirectoryNamespaceReplace(
+          context, *this, transaction, create_info.table,
+          replace_plan.final_path, replace_plan.staging_path);
+      replace_staging_guard.Release();
+      dataset_path = replace_plan.final_path.lance_uri;
     }
 
     // Best-effort persistence of DuckDB column defaults in Lance field
@@ -1101,6 +1209,90 @@ private:
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
 };
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name) {
+  auto &set = schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
+  auto existing_entry = set.GetEntry(transaction, table_name);
+  if (!existing_entry) {
+    return;
+  }
+  auto existing_type = existing_entry->type;
+  if (existing_type != CatalogType::TABLE_ENTRY &&
+      existing_type != CatalogType::VIEW_ENTRY) {
+    throw InternalException(
+        "Unexpected catalog entry type for Lance table '%s': %s", table_name,
+        CatalogTypeToString(existing_type));
+  }
+  auto system_transaction =
+      CatalogTransaction::GetSystemTransaction(schema.catalog.GetDatabase());
+  if (!set.DropEntry(system_transaction, table_name, false, true)) {
+    throw InternalException("Could not drop catalog entry for Lance table '%s'",
+                            table_name);
+  }
+  set.CleanupEntry(*existing_entry);
+}
+
+static void CommitDirectoryNamespaceReplace(
+    ClientContext &context, LanceSchemaEntry &schema,
+    CatalogTransaction transaction, const string &table_name,
+    const LanceResolvedPath &final_path,
+    const LanceResolvedPath &staging_path) {
+  const auto &final_os = final_path.local_os_path;
+  const auto &staging_os = staging_path.local_os_path;
+  if (final_os.empty() || staging_os.empty()) {
+    throw InternalException(
+        "Local CREATE OR REPLACE TABLE swap requires local filesystem paths");
+  }
+
+  auto &fs = FileSystem::GetFileSystem(context);
+  const string backup_os = final_os + ".__duckdb_backup__." +
+                           UUID::ToString(UUID::GenerateRandomUUID());
+  bool backed_up = false;
+
+  try {
+    if (fs.DirectoryExists(final_os)) {
+      fs.MoveFile(final_os, backup_os);
+      backed_up = true;
+    }
+    if (!fs.DirectoryExists(staging_os)) {
+      throw IOException(
+          "Missing staged Lance dataset for CREATE OR REPLACE TABLE: " +
+          staging_path.lance_uri + LanceFormatErrorSuffix());
+    }
+    fs.MoveFile(staging_os, final_os);
+    if (backed_up) {
+      TryRemoveLocalDatasetDirectory(fs, backup_os);
+    }
+  } catch (std::exception &ex) {
+    string restore_error;
+    if (backed_up) {
+      try {
+        if (fs.DirectoryExists(final_os)) {
+          TryRemoveLocalDatasetDirectory(fs, final_os);
+        }
+        if (fs.DirectoryExists(backup_os)) {
+          fs.MoveFile(backup_os, final_os);
+        }
+      } catch (std::exception &restore_ex) {
+        restore_error = restore_ex.what();
+      }
+    }
+    TryRemoveLocalDatasetDirectory(fs, staging_os);
+    if (!restore_error.empty()) {
+      throw IOException(StringUtil::Format(
+          "CREATE OR REPLACE TABLE swap failed: %s; backup restore also "
+          "failed: %s",
+          ex.what(), restore_error));
+    }
+    throw;
+  }
+
+  LanceInvalidateDatasetCacheForPath(context, final_path.lance_uri);
+  LanceInvalidateDatasetCacheForPath(context, staging_path.lance_uri);
+  EvictLanceTableCatalogEntry(schema, transaction, table_name);
+}
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
@@ -1746,12 +1938,12 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   string api_key_override;
 
   if (!is_rest_namespace) {
-    auto root = FileSystem::GetFileSystem(context).ExpandPath(attach_path);
+    auto resolved = LanceResolvePath(context, attach_path);
     vector<string> option_keys;
     vector<string> option_values;
     string open_root;
-    ResolveLanceStorageOptions(context, root, open_root, option_keys,
-                               option_values);
+    ResolveLanceStorageOptions(context, resolved.lance_uri, open_root,
+                               option_keys, option_values);
 
     string list_error;
     vector<string> discovered_tables;

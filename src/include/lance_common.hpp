@@ -17,6 +17,15 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
 void *LanceOpenDataset(ClientContext &context, const string &path);
 
 string LanceNormalizeS3Scheme(const string &path);
+
+struct LanceResolvedPath {
+  string lance_uri;
+  string local_os_path;
+
+  bool IsLocal() const { return !local_os_path.empty(); }
+};
+
+LanceResolvedPath LanceResolvePath(ClientContext &context, const string &path);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
                                         const string &path,
                                         vector<string> &out_keys,

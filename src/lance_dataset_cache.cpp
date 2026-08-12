@@ -47,6 +47,9 @@ public:
 
   void QueryBegin(ClientContext &) override {
     lock_guard<mutex> guard(lock);
+    // Per-connection cache; clear each query to avoid stale handles across
+    // commits.
+    entries.clear();
     query_hits = 0;
     query_misses = 0;
   }

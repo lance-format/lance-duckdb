@@ -232,6 +232,27 @@ DETACH ns;
 `CREATE TABLE` and CTAS default to data storage version `2.2`. Override it with
 `WITH (data_storage_version = '<version>')` when another version is required.
 
+#### `CREATE OR REPLACE TABLE` semantics (schema-only)
+
+An empty writer in `overwrite` mode does not replace an existing dataset, so a
+schema-only `CREATE OR REPLACE TABLE` (without `AS SELECT`) must drop and
+recreate the dataset instead of relying on overwrite mode.
+
+- **Local directory namespaces** (`ATTACH '/path/to/dir' ...`, `ATTACH 'file:///path/to/dir'
+  ...`, or `ATTACH 'file://localhost/path/to/dir' ...`): the extension stages the new
+  dataset under `{root}/.duckdb_replace/{uuid}.lance`, then swaps it into place with a
+  local backup/restore path. A writer failure before the swap leaves the
+  original table intact.
+- **Remote directory namespaces** (`s3://`, `cos://`, ...): there is no atomic
+  rename across object stores. The extension drops the existing dataset first,
+  then writes the replacement in place. This is **not atomic** — if the writer
+  fails after the drop, the table may be missing or left in a partial state.
+  Concurrent `CREATE OR REPLACE TABLE` on the same table can also observe
+  intermediate states.
+
+CTAS `CREATE OR REPLACE TABLE ... AS SELECT` writes rows through the writer and
+does not use the staging swap path above.
+
 ## DML on attached tables
 
 These statements apply to tables inside an attached namespace (e.g. `ns.main.my_table`).

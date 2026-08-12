@@ -1,0 +1,98 @@
+# name: test/sql/namespace_replace_schema_file_uri.test
+# description: CREATE OR REPLACE on file:// directory namespace keeps data on writer failure
+# group: [sql]
+
+require lance
+
+statement error
+ATTACH 'file://invalid-authority/tmp/foo' AS bad_ns (TYPE LANCE);
+----
+Invalid Input Error: Unsupported file URI authority
+
+statement error
+ATTACH 'file:///tmp/lance?query' AS query_ns (TYPE LANCE);
+----
+Invalid Input Error: File URI query strings and fragments are not supported
+
+statement error
+ATTACH 'file:///tmp/lance#fragment' AS fragment_ns (TYPE LANCE);
+----
+Invalid Input Error: File URI query strings and fragments are not supported
+
+statement error
+ATTACH 'FILE://invalid-authority/tmp/foo' AS uppercase_bad_ns (TYPE LANCE);
+----
+Invalid Input Error: Unsupported file URI authority
+
+statement error
+ATTACH 'file:///tmp/lance%00suffix' AS nul_ns (TYPE LANCE);
+----
+Invalid Input Error: File URI path contains an encoded NUL byte
+
+statement ok
+ATTACH 'FILE://LOCALHOST/__WORKING_DIRECTORY__/__TEST_DIR__/nsroot_uppercase_file_uri' AS uppercase_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE uppercase_ns.main.uppercase_t (id BIGINT);
+
+statement ok
+DETACH uppercase_ns;
+
+statement ok
+ATTACH 'file://localhost/__WORKING_DIRECTORY__/__TEST_DIR__/nsroot_replace_file_uri_128' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.replace_file_uri_t (id BIGINT);
+
+statement ok
+INSERT INTO ns.main.replace_file_uri_t VALUES (42);
+
+query I
+SELECT count(*) FROM ns.main.replace_file_uri_t
+----
+1
+
+statement error
+CREATE OR REPLACE TABLE ns.main.replace_file_uri_t (id BIGINT, label VARCHAR)
+  WITH (data_storage_version = 'bad_version');
+----
+IO Error: Failed to open Lance writer:
+
+query I
+SELECT count(*) FROM ns.main.replace_file_uri_t
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.replace_file_uri_t (id BIGINT, label VARCHAR);
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'ns' AND schema_name = 'main' AND table_name = 'replace_file_uri_t'
+ORDER BY column_index
+----
+id	BIGINT
+label	VARCHAR
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH 'file://localhost/__WORKING_DIRECTORY__/__TEST_DIR__/nsroot%20replace%20encoded' AS encoded_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE encoded_ns.main.encoded_t (id BIGINT);
+
+statement ok
+CREATE OR REPLACE TABLE encoded_ns.main.encoded_t (id BIGINT, label VARCHAR);
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'encoded_ns' AND schema_name = 'main' AND table_name = 'encoded_t'
+ORDER BY column_index
+----
+id	BIGINT
+label	VARCHAR
+
+statement ok
+DETACH encoded_ns;

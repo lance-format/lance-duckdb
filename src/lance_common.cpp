@@ -8,6 +8,7 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -121,6 +122,87 @@ string LanceNormalizeS3Scheme(const string &path) {
     return "s3://" + path.substr(6);
   }
   return path;
+}
+
+static string DecodeFileUriPath(const string &encoded, const string &uri) {
+  auto decoded = StringUtil::URLDecode(encoded, false);
+  if (decoded.find('\0') != string::npos) {
+    throw InvalidInputException("File URI path contains an encoded NUL byte: " +
+                                uri);
+  }
+  return decoded;
+}
+
+static string ParseFileUriPathComponent(const string &path) {
+  if (path.size() < 7 || !StringUtil::CIEquals(path.substr(0, 7), "file://")) {
+    throw InvalidInputException("Expected file URI, got: " + path);
+  }
+  if (path.find('?') != string::npos || path.find('#') != string::npos) {
+    throw InvalidInputException(
+        "File URI query strings and fragments are not supported: " + path);
+  }
+
+  string rest = path.substr(7);
+  if (rest.empty()) {
+    return "/";
+  }
+
+  if (rest[0] == '/') {
+    return DecodeFileUriPath(rest, path);
+  }
+
+  auto slash = rest.find('/');
+  auto authority = slash == string::npos ? rest : rest.substr(0, slash);
+  if (StringUtil::CIEquals(authority, "localhost")) {
+    auto local_path = slash == string::npos ? "/" : rest.substr(slash);
+    return DecodeFileUriPath(local_path, path);
+  }
+  throw InvalidInputException(
+      "Unsupported file URI authority '%s' in '%s'; use "
+      "file:///absolute/path or file://localhost/absolute/path",
+      authority, path);
+}
+
+static string LocalOsPathToLanceUri(const string &path) {
+  auto uri_path = StringUtil::Replace(path, "\\", "/");
+  if (uri_path.empty() || uri_path[0] != '/') {
+    uri_path = "/" + uri_path;
+  }
+  return "file://" + StringUtil::URLEncode(uri_path, false);
+}
+
+static string ResolveLocalOsPath(ClientContext &context, const string &path) {
+  auto &fs = FileSystem::GetFileSystem(context);
+  auto expanded = fs.ExpandPath(path);
+  if (fs.IsPathAbsolute(expanded)) {
+    return expanded;
+  }
+  return fs.JoinPath(FileSystem::GetWorkingDirectory(), expanded);
+}
+
+LanceResolvedPath LanceResolvePath(ClientContext &context, const string &path) {
+  LanceResolvedPath result;
+  if (path.empty()) {
+    return result;
+  }
+  auto normalized = LanceNormalizeS3Scheme(path);
+
+  if (normalized.size() >= 7 &&
+      StringUtil::CIEquals(normalized.substr(0, 7), "file://")) {
+    auto path_component = ParseFileUriPathComponent(normalized);
+    result.local_os_path = ResolveLocalOsPath(context, path_component);
+    result.lance_uri = LocalOsPathToLanceUri(result.local_os_path);
+    return result;
+  }
+
+  if (normalized.find("://") != string::npos) {
+    result.lance_uri = normalized;
+    return result;
+  }
+
+  result.local_os_path = ResolveLocalOsPath(context, normalized);
+  result.lance_uri = LocalOsPathToLanceUri(result.local_os_path);
+  return result;
 }
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
@@ -266,11 +348,16 @@ void ResolveLanceNamespaceAuthOverrides(
 void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path, vector<string> &out_keys,
                                 vector<string> &out_values) {
-  out_open_path = path;
   out_keys.clear();
   out_values.clear();
 
-  out_open_path = LanceNormalizeS3Scheme(out_open_path);
+  auto normalized = LanceNormalizeS3Scheme(path);
+  auto &fs = FileSystem::GetFileSystem(context);
+  auto is_file_uri = normalized.size() >= 7 &&
+                     StringUtil::CIEquals(normalized.substr(0, 7), "file://");
+  out_open_path = is_file_uri || fs.IsPathAbsolute(normalized)
+                      ? LanceResolvePath(context, normalized).lance_uri
+                      : normalized;
   LanceFillStorageOptionsFromSecrets(context, out_open_path, out_keys,
                                      out_values);
 }
