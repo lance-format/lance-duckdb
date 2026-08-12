@@ -596,6 +596,12 @@ static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
 }
 
+class LanceSchemaEntry;
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name);
+
 static bool IsSafeDatasetTableName(const string &name) {
   if (name.empty()) {
     return false;
@@ -885,6 +891,7 @@ public:
     string dataset_path;
     vector<string> option_keys;
     vector<string> option_values;
+    bool refresh_directory_entry = false;
 
     if (rest_ns) {
       unordered_map<string, Value> overrides;
@@ -1012,6 +1019,9 @@ public:
           exists) {
         throw IOException("Lance dataset already exists: " + dataset_path);
       }
+      refresh_directory_entry =
+          exists &&
+          create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 
       option_keys = directory_ns->option_keys;
       option_values = directory_ns->option_values;
@@ -1058,6 +1068,13 @@ public:
                         LanceFormatErrorSuffix());
     }
 
+    if (refresh_directory_entry) {
+      auto cache_key = LanceBuildResolvedPathDatasetCacheKey(
+          dataset_path, option_keys, option_values);
+      LanceInvalidateDatasetCache(context, cache_key);
+      EvictLanceTableCatalogEntry(*this, transaction, create_info.table);
+    }
+
     // Best-effort persistence of DuckDB column defaults in Lance field
     // metadata. Lance itself does not currently expose defaults through
     // DuckDB's catalog, but we can still use the metadata during UPDATE
@@ -1101,6 +1118,30 @@ private:
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
 };
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name) {
+  auto &set = schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
+  auto existing_entry = set.GetEntry(transaction, table_name);
+  if (!existing_entry) {
+    return;
+  }
+  auto existing_type = existing_entry->type;
+  if (existing_type != CatalogType::TABLE_ENTRY &&
+      existing_type != CatalogType::VIEW_ENTRY) {
+    throw InternalException(
+        "Unexpected catalog entry type for Lance table '%s': %s", table_name,
+        CatalogTypeToString(existing_type));
+  }
+  auto system_transaction =
+      CatalogTransaction::GetSystemTransaction(schema.catalog.GetDatabase());
+  if (!set.DropEntry(system_transaction, table_name, false, true)) {
+    throw InternalException("Could not drop catalog entry for Lance table '%s'",
+                            table_name);
+  }
+  set.CleanupEntry(*existing_entry);
+}
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
