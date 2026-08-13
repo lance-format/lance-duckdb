@@ -795,7 +795,7 @@ public:
           break;
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
-          table_id_for_ops = leaf_id;
+          table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
           break;
         }
       }
@@ -939,6 +939,9 @@ public:
       }
       auto table_id_for_ops =
           exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
+      if (!prefixed_id.empty()) {
+        table_id_for_ops = prefixed_id;
+      }
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableDefaults();
@@ -1276,6 +1279,13 @@ public:
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
     if (rest_ns) {
+      auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&op.schema);
+      if (!lance_schema || !lance_schema->GetRestNamespace()) {
+        throw InternalException(
+            "REST Lance CTAS requires a namespace-backed schema");
+      }
+      auto schema_rest_ns = lance_schema->GetRestNamespace();
+
       class PhysicalLanceCreateTableAs final : public PhysicalOperator {
       public:
         PhysicalLanceCreateTableAs(
@@ -1411,7 +1421,8 @@ public:
               break;
             }
             if (StringUtil::CIEquals(t, leaf_id)) {
-              state->table_id = leaf_id;
+              state->table_id =
+                  prefixed_id.empty() ? leaf_id : prefixed_id;
               break;
             }
           }
@@ -1593,31 +1604,33 @@ public:
       // Use LIST TABLES to implement conflict behavior in a side-effect-free
       // way.
       unordered_map<string, Value> overrides;
-      if (!rest_ns->bearer_token_override.empty()) {
-        overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+      if (!schema_rest_ns->bearer_token_override.empty()) {
+        overrides["bearer_token"] =
+            Value(schema_rest_ns->bearer_token_override);
       }
-      if (!rest_ns->api_key_override.empty()) {
-        overrides["api_key"] = Value(rest_ns->api_key_override);
+      if (!schema_rest_ns->api_key_override.empty()) {
+        overrides["api_key"] = Value(schema_rest_ns->api_key_override);
       }
       string bearer_token;
       string api_key;
-      ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+      ResolveLanceNamespaceAuth(context, schema_rest_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
       vector<string> discovered;
       string list_error;
       if (!TryLanceNamespaceListTables(
-              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
-              list_error)) {
+              context, schema_rest_ns->endpoint, schema_rest_ns->namespace_id,
+              bearer_token, api_key, schema_rest_ns->delimiter,
+              schema_rest_ns->headers_tsv, discovered, list_error)) {
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
 
-      auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-      auto prefix = rest_ns->namespace_id.empty()
+      auto delim =
+          schema_rest_ns->delimiter.empty() ? "$" : schema_rest_ns->delimiter;
+      auto prefix = schema_rest_ns->namespace_id.empty()
                         ? string()
-                        : (rest_ns->namespace_id + delim);
+                        : (schema_rest_ns->namespace_id + delim);
       auto leaf_id = create_info.table;
       string prefixed_id;
       if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
@@ -1653,11 +1666,12 @@ public:
       auto types = create_info.columns.GetColumnTypes();
       string mode = CreateTableModeFromConflict(create_info.on_conflict);
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
-          op.types, rest_ns->endpoint, rest_ns->namespace_id,
-          rest_ns->delimiter, rest_ns->bearer_token_override,
-          rest_ns->api_key_override, rest_ns->headers_tsv, create_info.table,
-          mode, data_storage_version, std::move(names), std::move(types),
-          op.estimated_cardinality);
+          op.types, schema_rest_ns->endpoint, schema_rest_ns->namespace_id,
+          schema_rest_ns->delimiter,
+          schema_rest_ns->bearer_token_override,
+          schema_rest_ns->api_key_override, schema_rest_ns->headers_tsv,
+          create_info.table, mode, data_storage_version, std::move(names),
+          std::move(types), op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
