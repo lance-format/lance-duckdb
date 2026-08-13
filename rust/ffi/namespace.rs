@@ -11,7 +11,7 @@ use lance_namespace::models::{
     DropTableRequest, ListNamespacesRequest, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
-use lance_namespace::LanceNamespace;
+use lance_namespace::{ErrorCode as NamespaceErrorCode, LanceNamespace, NamespaceError};
 use lance_namespace_impls::RestNamespaceBuilder;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -181,6 +181,12 @@ fn namespace_operation_config(
 
 fn is_unsupported_namespace_operation(error: &LanceError) -> bool {
     matches!(error, LanceError::NotSupported { .. })
+        || match error {
+            LanceError::Namespace { source, .. } => source
+                .downcast_ref::<NamespaceError>()
+                .is_some_and(|error| error.code() == NamespaceErrorCode::Unsupported),
+            _ => false,
+        }
         // lance-namespace 9.0.1 maps an empty HTTP 501 response to Internal
         // because there is no structured error code to preserve.
         || error.to_string().contains("status=501 Not Implemented")

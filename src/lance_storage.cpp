@@ -786,6 +786,10 @@ public:
     auto existing_type = existing_entry->type;
 
     if (rest_ns) {
+      if (!context.transaction.IsAutoCommit()) {
+        throw NotImplementedException(
+            "Lance table DDL does not support explicit transactions");
+      }
       unordered_map<string, Value> overrides;
       if (!rest_ns->bearer_token_override.empty()) {
         overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
@@ -916,6 +920,10 @@ public:
     vector<string> option_values;
 
     if (rest_ns) {
+      if (!context.transaction.IsAutoCommit()) {
+        throw NotImplementedException(
+            "Lance table DDL does not support explicit transactions");
+      }
       unordered_map<string, Value> overrides;
       if (!rest_ns->bearer_token_override.empty()) {
         overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
@@ -1234,6 +1242,10 @@ public:
       auto result = CreateRestSchemaEntry(transaction, info, child_ns,
                                           bearer_token, api_key);
       if (!result) {
+        if (info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT) {
+          throw CatalogException::EntryAlreadyExists(CatalogType::SCHEMA_ENTRY,
+                                                     info.schema);
+        }
         return nullptr;
       }
       string error;
@@ -1380,6 +1392,10 @@ public:
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
     if (rest_ns) {
+      if (!context.transaction.IsAutoCommit()) {
+        throw NotImplementedException(
+            "Lance table DDL does not support explicit transactions");
+      }
       auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&op.schema);
       if (!lance_schema || !lance_schema->GetRestNamespace()) {
         throw InternalException(

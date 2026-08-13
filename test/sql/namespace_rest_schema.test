@@ -30,9 +30,36 @@ statement ok
 CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
 
 statement error
+CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+----
+Catalog Error: Schema with name "${LANCE_TEST_SCHEMA}" already exists!
+
+statement error
 CREATE OR REPLACE SCHEMA ns."${LANCE_TEST_SCHEMA}";
 ----
 Not implemented Error: CREATE OR REPLACE SCHEMA is not supported for Lance namespaces
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}".regular_in_transaction (x INTEGER);
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}".ctas_in_transaction AS SELECT 1 AS x;
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
 
 query T
 SELECT schema_name
