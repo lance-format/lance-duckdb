@@ -293,6 +293,69 @@ void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
   }
 }
 
+string LanceEncodeStringList(const vector<string> &values) {
+  string result = "LID1;" + to_string(values.size()) + ";";
+  for (const auto &value : values) {
+    result += to_string(value.size()) + ":" + value;
+  }
+  return result;
+}
+
+vector<string> LanceDecodeStringList(const string &encoded) {
+  constexpr const char *prefix = "LID1;";
+  if (encoded.compare(0, strlen(prefix), prefix) != 0) {
+    vector<string> values;
+    for (auto &value : StringUtil::Split(encoded, '\n')) {
+      if (!value.empty()) {
+        values.push_back(std::move(value));
+      }
+    }
+    return values;
+  }
+
+  idx_t offset = strlen(prefix);
+  auto read_size = [&](char terminator) {
+    if (offset >= encoded.size()) {
+      throw IOException("Invalid Lance identifier list encoding");
+    }
+    idx_t value = 0;
+    bool has_digit = false;
+    while (offset < encoded.size() && encoded[offset] != terminator) {
+      auto ch = encoded[offset++];
+      if (ch < '0' || ch > '9') {
+        throw IOException("Invalid Lance identifier list encoding");
+      }
+      has_digit = true;
+      auto digit = NumericCast<idx_t>(ch - '0');
+      if (value > (NumericLimits<idx_t>::Maximum() - digit) / 10) {
+        throw IOException("Lance identifier list length is too large");
+      }
+      value = value * 10 + digit;
+    }
+    if (!has_digit || offset >= encoded.size()) {
+      throw IOException("Invalid Lance identifier list encoding");
+    }
+    offset++;
+    return value;
+  };
+
+  auto count = read_size(';');
+  vector<string> values;
+  values.reserve(count);
+  for (idx_t value_idx = 0; value_idx < count; value_idx++) {
+    auto length = read_size(':');
+    if (length > encoded.size() - offset) {
+      throw IOException("Invalid Lance identifier list encoding");
+    }
+    values.push_back(encoded.substr(offset, length));
+    offset += length;
+  }
+  if (offset != encoded.size()) {
+    throw IOException("Invalid Lance identifier list encoding");
+  }
+  return values;
+}
+
 bool TryLanceNamespaceListTables(
     ClientContext &context, const string &endpoint, const string &namespace_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
@@ -318,13 +381,7 @@ bool TryLanceNamespaceListTables(
   }
   string joined = ptr;
   lance_free_string(ptr);
-
-  vector<string> parts = StringUtil::Split(joined, '\n');
-  for (auto &p : parts) {
-    if (!p.empty()) {
-      out_tables.push_back(std::move(p));
-    }
-  }
+  out_tables = LanceDecodeStringList(joined);
   return true;
 }
 
@@ -348,11 +405,7 @@ bool TryLanceNamespaceListNamespaces(
   }
   string joined = ptr;
   lance_free_string(ptr);
-  for (auto &name : StringUtil::Split(joined, '\n')) {
-    if (!name.empty()) {
-      out_namespaces.push_back(std::move(name));
-    }
-  }
+  out_namespaces = LanceDecodeStringList(joined);
   return true;
 }
 

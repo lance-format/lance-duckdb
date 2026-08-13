@@ -87,12 +87,69 @@ fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, Str
         .join("\n")
 }
 
-fn split_id(id: &str, delimiter: &str) -> Vec<String> {
-    if id.is_empty() {
-        Vec::new()
-    } else {
-        id.split(delimiter).map(ToString::to_string).collect()
+const STRING_LIST_PREFIX: &str = "LID1;";
+
+fn encode_string_list(values: &[String]) -> String {
+    let mut encoded = format!("{STRING_LIST_PREFIX}{};", values.len());
+    for value in values {
+        encoded.push_str(&format!("{}:", value.len()));
+        encoded.push_str(value);
     }
+    encoded
+}
+
+pub(crate) fn decode_id(id: &str, delimiter: &str) -> FfiResult<Vec<String>> {
+    let Some(encoded) = id.strip_prefix(STRING_LIST_PREFIX) else {
+        return Ok(if id.is_empty() {
+            Vec::new()
+        } else {
+            id.split(delimiter).map(ToString::to_string).collect()
+        });
+    };
+
+    let (count_text, mut encoded) = encoded.split_once(';').ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "invalid Lance identifier list encoding",
+        )
+    })?;
+    let count = count_text.parse::<usize>().map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "invalid Lance identifier list count",
+        )
+    })?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let colon = encoded.find(':').ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "invalid Lance identifier list encoding",
+            )
+        })?;
+        let length = encoded[..colon].parse::<usize>().map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "invalid Lance identifier length",
+            )
+        })?;
+        encoded = &encoded[colon + 1..];
+        if length > encoded.len() || !encoded.is_char_boundary(length) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "invalid Lance identifier length",
+            ));
+        }
+        values.push(encoded[..length].to_string());
+        encoded = &encoded[length..];
+    }
+    if !encoded.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "trailing data in Lance identifier list",
+        ));
+    }
+    Ok(values)
 }
 
 fn namespace_operation_config(
@@ -110,7 +167,7 @@ fn namespace_operation_config(
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
-    let id = split_id(namespace_id, &delimiter);
+    let id = decode_id(namespace_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -167,7 +224,7 @@ pub unsafe extern "C" fn lance_namespace_list_namespaces(
     match result {
         Ok(namespaces) => {
             clear_last_error();
-            to_c_string(namespaces.join("\n")).into_raw() as *const c_char
+            to_c_string(encode_string_list(&namespaces)).into_raw() as *const c_char
         }
         Err(err) => {
             set_last_error(err.code, err.message);
@@ -284,6 +341,7 @@ fn list_tables_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace_id = decode_id(namespace_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -298,11 +356,7 @@ fn list_tables_inner(
         let mut page_token: Option<String> = None;
         loop {
             let mut req = ListTablesRequest::new();
-            req.id = Some(if namespace_id.is_empty() {
-                Vec::new()
-            } else {
-                vec![namespace_id.to_string()]
-            });
+            req.id = Some(namespace_id.clone());
             req.page_token = page_token.clone();
             req.limit = Some(1000);
             let resp = namespace.list_tables(req).await.map_err(|err| {
@@ -343,8 +397,7 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     ) {
         Ok(tables) => {
             clear_last_error();
-            let joined = tables.join("\n");
-            to_c_string(joined).into_raw() as *const c_char
+            to_c_string(encode_string_list(&tables)).into_raw() as *const c_char
         }
         Err(err) => {
             set_last_error(err.code, err.message);
@@ -369,27 +422,20 @@ fn describe_table_info_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let table_id_segments = decode_id(table_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter.clone())
+    .delimiter(delimiter)
     .build();
 
     let (location, storage_options_tsv) = runtime::block_on(async move {
         record_namespace_describe();
         let mut req = DescribeTableRequest::new();
-        // FIX: a qualified table id (e.g. "catalog.schema.table") must be sent as
-        // its multi-segment namespace path, not a single segment. Split on the
-        // delimiter so the server sees the full 3-level id instead of "got: 1".
-        req.id = Some(
-            table_id
-                .split(delimiter.as_str())
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        req.id = Some(table_id_segments);
         req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
@@ -484,19 +530,16 @@ fn create_empty_table_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let table_id_segments = decode_id(table_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter.clone())
+    .delimiter(delimiter)
     .build();
 
-    let table_id_segments: Vec<String> = table_id
-        .split(delimiter.as_str())
-        .map(|s| s.to_string())
-        .collect();
     let (location, storage_options_tsv) = runtime::block_on(async move {
         let mut req = DeclareTableRequest::new();
         req.id = Some(table_id_segments);
@@ -593,19 +636,16 @@ fn drop_table_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let table_id_segments = decode_id(table_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter.clone())
+    .delimiter(delimiter)
     .build();
 
-    let table_id_segments: Vec<String> = table_id
-        .split(delimiter.as_str())
-        .map(|s| s.to_string())
-        .collect();
     runtime::block_on(async move {
         let mut req = DropTableRequest::new();
         req.id = Some(table_id_segments);
@@ -667,24 +707,19 @@ fn describe_table_with_schema_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let table_id_segments = decode_id(table_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter.clone())
+    .delimiter(delimiter)
     .build();
 
     let schema_json = runtime::block_on(async move {
         let mut req = DescribeTableRequest::new();
-        // FIX: split the qualified id into its namespace segments (see describe_table_info_inner).
-        req.id = Some(
-            table_id
-                .split(delimiter.as_str())
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        req.id = Some(table_id_segments);
         req.with_table_uri = Some(true);
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
@@ -772,21 +807,16 @@ fn open_dataset_in_namespace_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let table_id_segments = decode_id(table_id, &delimiter)?;
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter.clone())
+    .delimiter(delimiter)
     .build();
     let session = unsafe { optional_session_handle(session)? };
-    // FIX: split the qualified id into namespace segments so the crate's internal
-    // describe (DatasetBuilder::from_namespace) gets the full 3-level id, not 1.
-    let table_id_segments: Vec<String> = table_id
-        .split(delimiter.as_str())
-        .map(|s| s.to_string())
-        .collect();
 
     let (dataset, table_uri) = runtime::block_on(async move {
         record_namespace_describe();
@@ -938,5 +968,30 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_id, encode_string_list};
+
+    #[test]
+    fn identifier_list_round_trips_delimiters_and_newlines() {
+        let values = vec![
+            "default".to_string(),
+            "a$b".to_string(),
+            "a\nb".to_string(),
+            "销售".to_string(),
+        ];
+        let encoded = encode_string_list(&values);
+        assert_eq!(decode_id(&encoded, "$").unwrap(), values);
+    }
+
+    #[test]
+    fn legacy_identifier_still_uses_configured_delimiter() {
+        assert_eq!(
+            decode_id("default$schema$table", "$").unwrap(),
+            vec!["default", "schema", "table"]
+        );
     }
 }

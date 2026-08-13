@@ -68,6 +68,39 @@ struct LanceRestNamespaceConfig {
   string headers_tsv; // Tab-separated key\tvalue pairs for custom headers
 };
 
+static string EffectiveNamespaceDelimiter(const string &delimiter) {
+  return delimiter.empty() ? "$" : delimiter;
+}
+
+static vector<string> DecodeRestIdentifier(const string &identifier,
+                                           const string &delimiter) {
+  if (identifier.compare(0, 5, "LID1;") == 0) {
+    return LanceDecodeStringList(identifier);
+  }
+  if (identifier.empty()) {
+    return {};
+  }
+  return StringUtil::Split(identifier, EffectiveNamespaceDelimiter(delimiter));
+}
+
+static string EncodeRestIdentifier(const vector<string> &segments) {
+  return LanceEncodeStringList(segments);
+}
+
+static string AppendRestIdentifier(const string &identifier,
+                                   const string &delimiter,
+                                   const string &segment) {
+  auto segments = DecodeRestIdentifier(identifier, delimiter);
+  segments.push_back(segment);
+  return EncodeRestIdentifier(segments);
+}
+
+static string DisplayRestIdentifier(const string &identifier,
+                                    const string &delimiter) {
+  return StringUtil::Join(DecodeRestIdentifier(identifier, delimiter),
+                          EffectiveNamespaceDelimiter(delimiter));
+}
+
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
   for (auto &kv : info.options) {
     if (!StringUtil::CIEquals(kv.first, "endpoint") || kv.second.IsNull()) {
@@ -249,13 +282,7 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   string joined = ptr;
   lance_free_string(ptr);
 
-  vector<string> out;
-  for (auto &p : StringUtil::Split(joined, '\n')) {
-    if (!p.empty()) {
-      out.push_back(std::move(p));
-    }
-  }
-  return out;
+  return LanceDecodeStringList(joined);
 }
 
 static bool
@@ -449,15 +476,12 @@ public:
       resolved_api_key = api_key;
     }
 
-    // Build candidate table IDs (bare name + optional namespace-prefixed).
-    vector<string> candidates = {entry_name};
-    if (!namespace_id.empty()) {
-      auto delim = delimiter.empty() ? "$" : delimiter;
-      auto prefix = namespace_id + delim;
-      if (!StringUtil::StartsWith(entry_name, prefix)) {
-        candidates.push_back(prefix + entry_name);
-      }
-    }
+    // Preserve identifier segment boundaries across the FFI. A lookup must
+    // never retry in a different namespace after a qualified request fails.
+    vector<string> candidates = {
+        namespace_id.empty()
+            ? EncodeRestIdentifier({entry_name})
+            : AppendRestIdentifier(namespace_id, delimiter, entry_name)};
 
     // Fast path: describe_table with schema from REST API (skips S3 open).
     for (auto &table_id : candidates) {
@@ -528,8 +552,8 @@ public:
     if (namespace_id.empty()) {
       return tables;
     }
-    auto delim = delimiter.empty() ? "$" : delimiter;
-    auto prefix = namespace_id + delim;
+    auto prefix = DisplayRestIdentifier(namespace_id, delimiter) +
+                  EffectiveNamespaceDelimiter(delimiter);
     for (auto &t : tables) {
       if (StringUtil::StartsWith(t, prefix)) {
         t = t.substr(prefix.size());
@@ -776,14 +800,11 @@ public:
                                 bearer_token, api_key);
 
       auto leaf_id = info.name;
-      string prefixed_id;
-      if (!rest_ns->namespace_id.empty()) {
-        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-        auto prefix = rest_ns->namespace_id + delim;
-        if (!StringUtil::StartsWith(leaf_id, prefix)) {
-          prefixed_id = prefix + leaf_id;
-        }
-      }
+      auto qualified_id = AppendRestIdentifier(rest_ns->namespace_id,
+                                               rest_ns->delimiter, leaf_id);
+      auto qualified_display =
+          DisplayRestIdentifier(rest_ns->namespace_id, rest_ns->delimiter) +
+          EffectiveNamespaceDelimiter(rest_ns->delimiter) + leaf_id;
 
       vector<string> discovered;
       string list_error;
@@ -794,14 +815,12 @@ public:
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
-      string table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
+      string table_id_for_ops = qualified_id;
       for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-          table_id_for_ops = prefixed_id;
+        if (StringUtil::CIEquals(t, qualified_display)) {
           break;
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
-          table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
           break;
         }
       }
@@ -911,14 +930,11 @@ public:
                                 bearer_token, api_key);
 
       auto leaf_id = create_info.table;
-      string prefixed_id;
-      if (!rest_ns->namespace_id.empty()) {
-        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-        auto prefix = rest_ns->namespace_id + delim;
-        if (!StringUtil::StartsWith(leaf_id, prefix)) {
-          prefixed_id = prefix + leaf_id;
-        }
-      }
+      auto qualified_id = AppendRestIdentifier(rest_ns->namespace_id,
+                                               rest_ns->delimiter, leaf_id);
+      auto qualified_display =
+          DisplayRestIdentifier(rest_ns->namespace_id, rest_ns->delimiter) +
+          EffectiveNamespaceDelimiter(rest_ns->delimiter) + leaf_id;
 
       vector<string> discovered;
       string list_error;
@@ -932,9 +948,9 @@ public:
       bool exists = false;
       string existing_id;
       for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+        if (StringUtil::CIEquals(t, qualified_display)) {
           exists = true;
-          existing_id = prefixed_id;
+          existing_id = t;
           break;
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
@@ -943,11 +959,7 @@ public:
           break;
         }
       }
-      auto table_id_for_ops =
-          exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
-      if (!prefixed_id.empty()) {
-        table_id_for_ops = prefixed_id;
-      }
+      auto table_id_for_ops = qualified_id;
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableDefaults();
@@ -975,27 +987,9 @@ public:
               context, rest_ns->endpoint, table_id_for_ops, bearer_token,
               api_key, rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
               option_keys, option_values, create_error)) {
-        // Best-effort fallback for namespace implementations that do not use
-        // a qualified object identifier for tables in ListTables.
-        if (!prefixed_id.empty() && table_id_for_ops == prefixed_id) {
-          option_keys.clear();
-          option_values.clear();
-          dataset_path.clear();
-          create_error.clear();
-          if (!TryLanceNamespaceCreateEmptyTable(
-                  context, rest_ns->endpoint, leaf_id, bearer_token, api_key,
-                  rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
-                  option_keys, option_values, create_error)) {
-            throw IOException(
-                "Failed to create Lance table via namespace: " +
-                (create_error.empty() ? "unknown error" : create_error));
-          }
-          table_id_for_ops = leaf_id;
-        } else {
-          throw IOException(
-              "Failed to create Lance table via namespace: " +
-              (create_error.empty() ? "unknown error" : create_error));
-        }
+        throw IOException(
+            "Failed to create Lance table via namespace: " +
+            (create_error.empty() ? "unknown error" : create_error));
       }
       if (dataset_path.empty()) {
         throw IOException(
@@ -1108,17 +1102,37 @@ private:
   DefaultGenerator *table_default_generator = nullptr;
 };
 
-static void InvalidateLanceSchema(ClientContext &context,
-                                  const string &catalog_name,
-                                  const string &schema_name) {
+static void RefreshLanceSchemaTable(ClientContext &context,
+                                    const string &catalog_name,
+                                    const string &schema_name,
+                                    const string &table_name) {
   auto schema = Catalog::GetSchema(context, catalog_name, schema_name,
                                    OnEntryNotFound::RETURN_NULL);
-  if (schema) {
-    auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(schema.get());
-    if (lance_schema) {
-      lance_schema->InvalidateTableDefaults();
-    }
+  auto *lance_schema =
+      schema ? dynamic_cast<LanceSchemaEntry *>(schema.get()) : nullptr;
+  if (!lance_schema) {
+    return;
   }
+  lance_schema->InvalidateTableDefaults();
+
+  auto &set = lance_schema->GetCatalogSet(CatalogType::TABLE_ENTRY);
+  auto transaction =
+      CatalogTransaction::GetSystemTransaction(schema->catalog.GetDatabase());
+  auto existing_entry = set.GetEntry(transaction, table_name);
+  if (!existing_entry) {
+    return;
+  }
+  if (existing_entry->type != CatalogType::TABLE_ENTRY &&
+      existing_entry->type != CatalogType::VIEW_ENTRY) {
+    throw InternalException(
+        "Unexpected catalog entry type for Lance table '%s': %s", table_name,
+        CatalogTypeToString(existing_entry->type));
+  }
+  if (!set.DropEntry(transaction, existing_entry->name, false, true)) {
+    throw InternalException(
+        "Could not refresh catalog entry for Lance table '%s'", table_name);
+  }
+  set.CleanupEntry(*existing_entry);
 }
 
 class PhysicalLanceCopyToFile final : public PhysicalCopyToFile {
@@ -1127,23 +1141,25 @@ public:
                           vector<LogicalType> types, CopyFunction function,
                           unique_ptr<FunctionData> bind_data,
                           idx_t estimated_cardinality, string catalog_name,
-                          string schema_name)
+                          string schema_name, string table_name)
       : PhysicalCopyToFile(physical_plan, std::move(types), std::move(function),
                            std::move(bind_data), estimated_cardinality),
         catalog_name(std::move(catalog_name)),
-        schema_name(std::move(schema_name)) {}
+        schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
+  }
 
   SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
                             ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
     auto result = PhysicalCopyToFile::Finalize(pipeline, event, context, input);
-    InvalidateLanceSchema(context, catalog_name, schema_name);
+    RefreshLanceSchemaTable(context, catalog_name, schema_name, table_name);
     return result;
   }
 
 private:
   string catalog_name;
   string schema_name;
+  string table_name;
 };
 
 class PhysicalLanceBatchCopyToFile final : public PhysicalBatchCopyToFile {
@@ -1152,25 +1168,27 @@ public:
                                vector<LogicalType> types, CopyFunction function,
                                unique_ptr<FunctionData> bind_data,
                                idx_t estimated_cardinality, string catalog_name,
-                               string schema_name)
+                               string schema_name, string table_name)
       : PhysicalBatchCopyToFile(physical_plan, std::move(types),
                                 std::move(function), std::move(bind_data),
                                 estimated_cardinality),
         catalog_name(std::move(catalog_name)),
-        schema_name(std::move(schema_name)) {}
+        schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
+  }
 
   SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
                             ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
     auto result =
         PhysicalBatchCopyToFile::Finalize(pipeline, event, context, input);
-    InvalidateLanceSchema(context, catalog_name, schema_name);
+    RefreshLanceSchemaTable(context, catalog_name, schema_name, table_name);
     return result;
   }
 
 private:
   string catalog_name;
   string schema_name;
+  string table_name;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
@@ -1459,15 +1477,12 @@ public:
           ResolveLanceNamespaceAuth(context, state->endpoint, overrides,
                                     bearer_token, api_key);
 
-          auto delim = state->delimiter.empty() ? "$" : state->delimiter;
-          auto prefix = state->namespace_id.empty()
-                            ? string()
-                            : (state->namespace_id + delim);
           auto leaf_id = state->table_name;
-          string prefixed_id;
-          if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
-            prefixed_id = prefix + leaf_id;
-          }
+          auto qualified_id = AppendRestIdentifier(state->namespace_id,
+                                                   state->delimiter, leaf_id);
+          auto qualified_display =
+              DisplayRestIdentifier(state->namespace_id, state->delimiter) +
+              EffectiveNamespaceDelimiter(state->delimiter) + leaf_id;
 
           vector<string> discovered;
           string list_error;
@@ -1480,14 +1495,12 @@ public:
                 (list_error.empty() ? "unknown error" : list_error));
           }
 
-          state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
+          state->table_id = qualified_id;
           for (auto &t : discovered) {
-            if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-              state->table_id = prefixed_id;
+            if (StringUtil::CIEquals(t, qualified_display)) {
               break;
             }
             if (StringUtil::CIEquals(t, leaf_id)) {
-              state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
               break;
             }
           }
@@ -1511,26 +1524,9 @@ public:
                   api_key, state->delimiter, state->headers_tsv,
                   state->open_path, state->option_keys, state->option_values,
                   create_error)) {
-            if (!prefixed_id.empty() && state->table_id == prefixed_id) {
-              state->table_id = leaf_id;
-              state->open_path.clear();
-              state->option_keys.clear();
-              state->option_values.clear();
-              create_error.clear();
-              if (!TryLanceNamespaceCreateEmptyTable(
-                      context, state->endpoint, state->table_id, bearer_token,
-                      api_key, state->delimiter, state->headers_tsv,
-                      state->open_path, state->option_keys,
-                      state->option_values, create_error)) {
-                throw IOException(
-                    "Failed to create Lance table via namespace: " +
-                    (create_error.empty() ? "unknown error" : create_error));
-              }
-            } else {
-              throw IOException(
-                  "Failed to create Lance table via namespace: " +
-                  (create_error.empty() ? "unknown error" : create_error));
-            }
+            throw IOException(
+                "Failed to create Lance table via namespace: " +
+                (create_error.empty() ? "unknown error" : create_error));
           }
           if (state->open_path.empty()) {
             throw IOException(
@@ -1620,7 +1616,8 @@ public:
             }
           }
 
-          InvalidateLanceSchema(context, catalog_name, schema_name);
+          RefreshLanceSchemaTable(context, catalog_name, schema_name,
+                                  table_name);
 
           return SinkFinalizeType::READY;
         }
@@ -1694,23 +1691,18 @@ public:
                           (list_error.empty() ? "unknown error" : list_error));
       }
 
-      auto delim =
-          schema_rest_ns->delimiter.empty() ? "$" : schema_rest_ns->delimiter;
-      auto prefix = schema_rest_ns->namespace_id.empty()
-                        ? string()
-                        : (schema_rest_ns->namespace_id + delim);
       auto leaf_id = create_info.table;
-      string prefixed_id;
-      if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
-        prefixed_id = prefix + leaf_id;
-      }
+      auto qualified_display =
+          DisplayRestIdentifier(schema_rest_ns->namespace_id,
+                                schema_rest_ns->delimiter) +
+          EffectiveNamespaceDelimiter(schema_rest_ns->delimiter) + leaf_id;
 
       bool exists = false;
       string existing_id;
       for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
+        if (StringUtil::CIEquals(t, qualified_display)) {
           exists = true;
-          existing_id = prefixed_id;
+          existing_id = t;
           break;
         }
         if (StringUtil::CIEquals(t, leaf_id)) {
@@ -1809,8 +1801,8 @@ public:
     if (execution_mode == CopyFunctionExecutionMode::BATCH_COPY_TO_FILE) {
       auto &copy = planner.Make<PhysicalLanceBatchCopyToFile>(
           op.types, copy_function, std::move(bind_data),
-          op.estimated_cardinality, op.schema.catalog.GetName(),
-          op.schema.name);
+          op.estimated_cardinality, op.schema.catalog.GetName(), op.schema.name,
+          create_info.table);
       auto &cast_copy = copy.Cast<PhysicalLanceBatchCopyToFile>();
       cast_copy.file_path = dataset_path;
       cast_copy.use_tmp_file = false;
@@ -1822,7 +1814,7 @@ public:
 
     auto &copy = planner.Make<PhysicalLanceCopyToFile>(
         op.types, copy_function, std::move(bind_data), op.estimated_cardinality,
-        op.schema.catalog.GetName(), op.schema.name);
+        op.schema.catalog.GetName(), op.schema.name, create_info.table);
     auto &cast_copy = copy.Cast<PhysicalLanceCopyToFile>();
     cast_copy.file_path = dataset_path;
     cast_copy.use_tmp_file = false;
@@ -1890,8 +1882,8 @@ private:
   shared_ptr<LanceRestNamespaceConfig>
   MakeRestChildNamespace(const string &schema_name) const {
     auto child = make_shared_ptr<LanceRestNamespaceConfig>(*rest_ns);
-    auto delimiter = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-    child->namespace_id = rest_ns->namespace_id + delimiter + schema_name;
+    child->namespace_id = AppendRestIdentifier(rest_ns->namespace_id,
+                                               rest_ns->delimiter, schema_name);
     return child;
   }
 
@@ -1999,11 +1991,12 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     directory_ns->option_keys = std::move(option_keys);
     directory_ns->option_values = std::move(option_values);
   } else {
-    namespace_id = attach_path;
-    if (namespace_id.empty()) {
+    if (attach_path.empty()) {
       throw InvalidInputException(
           "ATTACH TYPE LANCE with ENDPOINT requires a non-empty namespace id");
     }
+    namespace_id = EncodeRestIdentifier(
+        StringUtil::Split(attach_path, EffectiveNamespaceDelimiter(delimiter)));
     ResolveLanceNamespaceAuth(context, endpoint, info.options, bearer_token,
                               api_key);
     ResolveLanceNamespaceAuthOverrides(info.options, bearer_token_override,

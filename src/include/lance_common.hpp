@@ -46,6 +46,11 @@ void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
     string &out_api_key);
 
+// Encode string lists crossing the C++/Rust FFI without relying on sentinel
+// characters that may legally occur in namespace identifiers.
+string LanceEncodeStringList(const vector<string> &values);
+vector<string> LanceDecodeStringList(const string &encoded);
+
 bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,
                                  const string &bearer_token,

@@ -18,6 +18,7 @@ use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::namespace::decode_id;
 use super::types::StreamHandle;
 use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
 
@@ -230,15 +231,14 @@ unsafe fn parse_config(
     })
 }
 
-fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTableRequest) {
+fn apply_base_request(
+    config: &ParsedNamespaceQueryConfig,
+    request: &mut QueryTableRequest,
+) -> FfiResult<()> {
     request.id = Some(match &config.backend {
         NamespaceBackend::Rest { delimiter, .. } => {
             let delimiter = delimiter.as_deref().unwrap_or("$");
-            config
-                .table_id
-                .split(delimiter)
-                .map(str::to_string)
-                .collect()
+            decode_id(&config.table_id, delimiter)?
         }
         NamespaceBackend::Directory { .. } => vec![config.table_id.clone()],
     });
@@ -251,6 +251,7 @@ fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTa
     if let Some(filter) = &config.filter {
         request.filter = Some(filter.clone());
     }
+    Ok(())
 }
 
 async fn execute_query_table(
@@ -414,7 +415,7 @@ fn build_namespace_scan_request(
     })?;
 
     let mut request = QueryTableRequest::new(k, QueryTableRequestVector::new());
-    apply_base_request(config, &mut request);
+    apply_base_request(config, &mut request)?;
     request.prefilter = None;
     if offset != 0 {
         request.offset = Some(offset);
@@ -551,7 +552,7 @@ unsafe fn create_namespace_vector_search_stream_inner(
     let mut vector = QueryTableRequestVector::new();
     vector.single_vector = Some(query_values.to_vec());
     let mut request = QueryTableRequest::new(config.k, vector);
-    apply_base_request(&config, &mut request);
+    apply_base_request(&config, &mut request)?;
     request.vector_column = Some(vector_column.to_string());
     if options.nprobes != 0 {
         request.nprobes =
@@ -608,7 +609,7 @@ unsafe fn create_namespace_fts_search_stream_inner(
     let query = unsafe { cstr_to_str(options.query, "query")? };
 
     let mut request = QueryTableRequest::new(config.k, QueryTableRequestVector::new());
-    apply_base_request(&config, &mut request);
+    apply_base_request(&config, &mut request)?;
 
     let mut string_query = StringFtsQuery::new(query.to_string());
     string_query.columns = Some(vec![text_column.to_string()]);

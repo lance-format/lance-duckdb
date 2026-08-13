@@ -30,4 +30,31 @@ SELECT sum(id) FROM ns.main.ctas_new
 42
 
 statement ok con1
+CREATE TABLE ns.main.replace_schema AS SELECT 1::INTEGER AS a;
+
+query TT con1
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'ns' AND schema_name = 'main'
+  AND table_name = 'replace_schema'
+ORDER BY column_index
+----
+a	INTEGER
+
+statement ok con2
+CREATE OR REPLACE TABLE ns.main.replace_schema AS SELECT 'x'::VARCHAR AS b;
+
+query TT con1
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'ns' AND schema_name = 'main'
+  AND table_name = 'replace_schema'
+ORDER BY column_index
+----
+b	VARCHAR
+
+query T con1
+SELECT b FROM ns.main.replace_schema
+----
+x
+
+statement ok con1
 DETACH ns;
