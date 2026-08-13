@@ -1115,6 +1115,17 @@ public:
 
   using DuckCatalog::PlanUpdate;
 
+  optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction,
+                                          CreateSchemaInfo &info) override {
+    if (directory_ns && !info.internal && info.schema != DEFAULT_SCHEMA &&
+        !DefaultSchemaGenerator::IsDefaultSchema(info.schema)) {
+      throw NotImplementedException(
+          "CREATE SCHEMA is not supported for legacy Lance directory "
+          "namespaces because manifest mode is disabled");
+    }
+    return DuckCatalog::CreateSchema(transaction, info);
+  }
+
   ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
     auto &base = info.Base().Cast<CreateTableInfo>();
     if (!base.partition_keys.empty()) {
