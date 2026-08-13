@@ -258,16 +258,16 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return out;
 }
 
-static bool
-DirectoryNamespaceTableExists(const LanceDirectoryNamespaceConfig &ns,
-                              const string &table_name) {
+static string
+FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
+                            const string &table_name) {
   auto tables = ListDirectoryNamespaceTables(ns);
   for (auto &t : tables) {
     if (StringUtil::CIEquals(t, table_name)) {
-      return true;
+      return t;
     }
   }
-  return false;
+  return string();
 }
 
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
@@ -1005,11 +1005,12 @@ public:
         throw InternalException("Lance directory namespace root is empty");
       }
 
+      auto matched_table =
+          FindDirectoryNamespaceTable(*directory_ns, create_info.table);
+      auto exists = !matched_table.empty();
+      auto physical_table = exists ? matched_table : create_info.table;
       dataset_path = JoinNamespacePath(directory_ns->root,
-                                       GetDatasetDirName(create_info.table));
-
-      auto exists =
-          DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                       GetDatasetDirName(physical_table));
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableDefaults();
@@ -1621,11 +1622,12 @@ public:
       throw InternalException("Lance directory namespace root is empty");
     }
 
+    auto matched_table =
+        FindDirectoryNamespaceTable(*directory_ns, create_info.table);
+    auto exists = !matched_table.empty();
+    auto physical_table = exists ? matched_table : create_info.table;
     auto dataset_path = JoinNamespacePath(directory_ns->root,
-                                          GetDatasetDirName(create_info.table));
-
-    auto exists =
-        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                          GetDatasetDirName(physical_table));
 
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {
