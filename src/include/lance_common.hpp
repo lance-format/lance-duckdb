@@ -52,6 +52,19 @@ bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &api_key, const string &delimiter,
                                  const string &headers_tsv,
                                  vector<string> &out_tables, string &out_error);
+bool TryLanceNamespaceListNamespaces(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, vector<string> &out_namespaces,
+    string &out_error);
+bool TryLanceNamespaceCreateNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, const string &mode, string &out_error);
+bool TryLanceNamespaceDropNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, bool cascade, string &out_error);
 
 bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
                                     vector<string> &out_tables,

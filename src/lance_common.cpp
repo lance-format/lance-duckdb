@@ -328,6 +328,73 @@ bool TryLanceNamespaceListTables(
   return true;
 }
 
+bool TryLanceNamespaceListNamespaces(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, vector<string> &out_namespaces,
+    string &out_error) {
+  (void)context;
+  out_namespaces.clear();
+  out_error.clear();
+  auto *ptr = lance_namespace_list_namespaces(
+      endpoint.c_str(), namespace_id.c_str(),
+      bearer_token.empty() ? nullptr : bearer_token.c_str(),
+      api_key.empty() ? nullptr : api_key.c_str(),
+      delimiter.empty() ? nullptr : delimiter.c_str(),
+      headers_tsv.empty() ? nullptr : headers_tsv.c_str());
+  if (!ptr) {
+    out_error = LanceConsumeLastError();
+    return false;
+  }
+  string joined = ptr;
+  lance_free_string(ptr);
+  for (auto &name : StringUtil::Split(joined, '\n')) {
+    if (!name.empty()) {
+      out_namespaces.push_back(std::move(name));
+    }
+  }
+  return true;
+}
+
+bool TryLanceNamespaceCreateNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, const string &mode, string &out_error) {
+  (void)context;
+  out_error.clear();
+  auto rc = lance_namespace_create_namespace(
+      endpoint.c_str(), namespace_id.c_str(),
+      bearer_token.empty() ? nullptr : bearer_token.c_str(),
+      api_key.empty() ? nullptr : api_key.c_str(),
+      delimiter.empty() ? nullptr : delimiter.c_str(),
+      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), mode.c_str());
+  if (rc != 0) {
+    out_error = LanceConsumeLastError();
+    return false;
+  }
+  return true;
+}
+
+bool TryLanceNamespaceDropNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, bool cascade, string &out_error) {
+  (void)context;
+  out_error.clear();
+  auto behavior = cascade ? "Cascade" : "Restrict";
+  auto rc = lance_namespace_drop_namespace(
+      endpoint.c_str(), namespace_id.c_str(),
+      bearer_token.empty() ? nullptr : bearer_token.c_str(),
+      api_key.empty() ? nullptr : api_key.c_str(),
+      delimiter.empty() ? nullptr : delimiter.c_str(),
+      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), behavior);
+  if (rc != 0) {
+    out_error = LanceConsumeLastError();
+    return false;
+  }
+  return true;
+}
+
 static void ParseStorageOptionsTsv(const char *ptr, vector<string> &out_keys,
                                    vector<string> &out_values) {
   out_keys.clear();

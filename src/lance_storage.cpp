@@ -659,6 +659,10 @@ public:
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
 
+  const shared_ptr<LanceRestNamespaceConfig> &GetRestNamespace() const {
+    return rest_ns;
+  }
+
   void SetTableDefaultGenerator(DefaultGenerator *generator) {
     table_default_generator = generator;
   }
@@ -1123,7 +1127,82 @@ public:
           "CREATE SCHEMA is not supported for legacy Lance directory "
           "namespaces because manifest mode is disabled");
     }
+    if (rest_ns && !info.internal && info.schema != DEFAULT_SCHEMA &&
+        !DefaultSchemaGenerator::IsDefaultSchema(info.schema)) {
+      auto &context = transaction.GetContext();
+      string bearer_token;
+      string api_key;
+      ResolveRestAuth(context, bearer_token, api_key);
+      auto child_ns = MakeRestChildNamespace(info.schema);
+      string error;
+      if (!TryLanceNamespaceCreateNamespace(
+              context, rest_ns->endpoint, child_ns->namespace_id, bearer_token,
+              api_key, rest_ns->delimiter, rest_ns->headers_tsv,
+              CreateNamespaceMode(info.on_conflict), error)) {
+        throw IOException("Failed to create Lance schema '%s': %s",
+                          info.schema, error);
+      }
+      return CreateRestSchemaEntry(transaction, info, std::move(child_ns),
+                                   bearer_token, api_key);
+    }
     return DuckCatalog::CreateSchema(transaction, info);
+  }
+
+  void LoadRestSchemas(ClientContext &context,
+                       CatalogTransaction transaction,
+                       const vector<string> &schema_names) {
+    string bearer_token;
+    string api_key;
+    ResolveRestAuth(context, bearer_token, api_key);
+    for (auto &schema_name : schema_names) {
+      CreateSchemaInfo info;
+      info.schema = schema_name;
+      info.internal = false;
+      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+      (void)CreateRestSchemaEntry(transaction, info,
+                                  MakeRestChildNamespace(schema_name),
+                                  bearer_token, api_key);
+    }
+  }
+
+  void DropSchema(ClientContext &context, DropInfo &info) override {
+    if (!rest_ns || info.name == DEFAULT_SCHEMA ||
+        DefaultSchemaGenerator::IsDefaultSchema(info.name)) {
+      auto transaction = GetCatalogTransaction(context);
+      if (!GetSchemaCatalogSet().DropEntry(transaction, info.name,
+                                           info.cascade) &&
+          info.if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+        throw CatalogException::MissingEntry(CatalogType::SCHEMA_ENTRY,
+                                             info.name, string());
+      }
+      return;
+    }
+    auto transaction = GetCatalogTransaction(context);
+    auto existing = GetSchemaCatalogSet().GetEntry(transaction, info.name);
+    if (!existing) {
+      if (info.if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+        throw CatalogException::MissingEntry(CatalogType::SCHEMA_ENTRY,
+                                             info.name, string());
+      }
+      return;
+    }
+    string bearer_token;
+    string api_key;
+    ResolveRestAuth(context, bearer_token, api_key);
+    auto child_ns = MakeRestChildNamespace(existing->name);
+    string error;
+    if (!TryLanceNamespaceDropNamespace(
+            context, rest_ns->endpoint, child_ns->namespace_id, bearer_token,
+            api_key, rest_ns->delimiter, rest_ns->headers_tsv, info.cascade,
+            error)) {
+      throw IOException("Failed to drop Lance schema '%s': %s", info.name,
+                        error);
+    }
+    if (!GetSchemaCatalogSet().DropEntry(transaction, existing->name,
+                                         info.cascade)) {
+      throw InternalException("Failed to drop Lance schema entry: " +
+                              existing->name);
+    }
   }
 
   ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
@@ -1712,6 +1791,65 @@ public:
   }
 
 private:
+  string CreateNamespaceMode(OnCreateConflict conflict) const {
+    switch (conflict) {
+    case OnCreateConflict::ERROR_ON_CONFLICT:
+      return "Create";
+    case OnCreateConflict::IGNORE_ON_CONFLICT:
+      return "ExistOk";
+    case OnCreateConflict::REPLACE_ON_CONFLICT:
+      return "Overwrite";
+    default:
+      throw InternalException("Unsupported CREATE SCHEMA conflict mode");
+    }
+  }
+
+  shared_ptr<LanceRestNamespaceConfig>
+  MakeRestChildNamespace(const string &schema_name) const {
+    auto child = make_shared_ptr<LanceRestNamespaceConfig>(*rest_ns);
+    auto delimiter = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
+    child->namespace_id = rest_ns->namespace_id + delimiter + schema_name;
+    return child;
+  }
+
+  void ResolveRestAuth(ClientContext &context, string &bearer_token,
+                       string &api_key) const {
+    unordered_map<string, Value> overrides;
+    if (!rest_ns->bearer_token_override.empty()) {
+      overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+    }
+    if (!rest_ns->api_key_override.empty()) {
+      overrides["api_key"] = Value(rest_ns->api_key_override);
+    }
+    ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+                              bearer_token, api_key);
+  }
+
+  optional_ptr<CatalogEntry> CreateRestSchemaEntry(
+      CatalogTransaction transaction, CreateSchemaInfo &info,
+      shared_ptr<LanceRestNamespaceConfig> schema_ns,
+      const string &bearer_token, const string &api_key) {
+    auto &schemas = GetSchemaCatalogSet();
+    LogicalDependencyList dependencies;
+    auto entry =
+        make_uniq<LanceSchemaEntry>(*this, info, nullptr, schema_ns);
+    auto result = entry.get();
+    if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
+                             dependencies)) {
+      return nullptr;
+    }
+    auto &table_set = result->GetCatalogSet(CatalogType::TABLE_ENTRY);
+    auto generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
+        *this, *result, schema_ns->endpoint, schema_ns->namespace_id,
+        bearer_token, api_key, schema_ns->delimiter,
+        schema_ns->bearer_token_override, schema_ns->api_key_override,
+        schema_ns->headers_tsv);
+    auto *generator_ptr = generator.get();
+    table_set.SetDefaultGenerator(std::move(generator));
+    result->SetTableDefaultGenerator(generator_ptr);
+    return result;
+  }
+
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
 };
@@ -1751,6 +1889,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
 
   auto is_rest_namespace = !endpoint.empty();
   string namespace_id;
+  vector<string> discovered_namespaces;
   string bearer_token;
   string api_key;
   string bearer_token_override;
@@ -1804,6 +1943,13 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     rest_ns->bearer_token_override = bearer_token_override;
     rest_ns->api_key_override = api_key_override;
     rest_ns->headers_tsv = headers_tsv;
+
+    if (!TryLanceNamespaceListNamespaces(
+            context, endpoint, namespace_id, bearer_token, api_key, delimiter,
+            headers_tsv, discovered_namespaces, list_error)) {
+      throw IOException("Failed to list schemas from Lance namespace: " +
+                        list_error);
+    }
   }
 
   // Back the attached catalog by an in-memory DuckCatalog that lazily
@@ -1834,6 +1980,11 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto *generator_ptr = generator.get();
   catalog_set.SetDefaultGenerator(std::move(generator));
   lance_schema.SetTableDefaultGenerator(generator_ptr);
+
+  if (rest_ns && !discovered_namespaces.empty()) {
+    catalog->LoadRestSchemas(context, system_transaction,
+                             discovered_namespaces);
+  }
 
   (void)name;
   return std::move(catalog);

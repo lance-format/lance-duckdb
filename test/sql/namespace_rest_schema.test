@@ -1,0 +1,45 @@
+# name: test/sql/namespace_rest_schema.test
+# description: REST child namespaces are exposed as persistent DuckDB schemas
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
+test-env LANCE_NAMESPACE_ID default
+
+test-env LANCE_TEST_SCHEMA rest_schema_crud
+
+require lance
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+statement ok
+CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+query T
+SELECT schema_name
+FROM duckdb_schemas()
+WHERE database_name = 'ns' AND schema_name = '${LANCE_TEST_SCHEMA}'
+----
+${LANCE_TEST_SCHEMA}
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+query T
+SELECT schema_name
+FROM duckdb_schemas()
+WHERE database_name = 'ns' AND schema_name = '${LANCE_TEST_SCHEMA}'
+----
+${LANCE_TEST_SCHEMA}
+
+statement ok
+DROP SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement ok
+DETACH ns;

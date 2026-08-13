@@ -7,7 +7,8 @@ use lance::dataset::builder::DatasetBuilder;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
-    DeclareTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
+    CreateNamespaceRequest, DeclareTableRequest, DescribeTableRequest, DropNamespaceRequest,
+    DropTableRequest, ListNamespacesRequest, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::LanceNamespace;
@@ -84,6 +85,187 @@ fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, Str
         .map(|(k, v)| format!("{k}\t{v}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn split_id(id: &str, delimiter: &str) -> Vec<String> {
+    if id.is_empty() {
+        Vec::new()
+    } else {
+        id.split(delimiter).map(ToString::to_string).collect()
+    }
+}
+
+fn namespace_operation_config(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> FfiResult<(impl LanceNamespace, Vec<String>)> {
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
+    let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")? };
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? }
+        .unwrap_or_else(|| "$".to_string());
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+    let id = split_id(namespace_id, &delimiter);
+    let namespace = build_config(
+        endpoint,
+        bearer_token.as_deref(),
+        api_key.as_deref(),
+        headers_tsv.as_deref(),
+    )
+    .delimiter(delimiter)
+    .build();
+    Ok((namespace, id))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_list_namespaces(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> *const c_char {
+    let result = (|| {
+        let (namespace, id) = namespace_operation_config(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )?;
+        runtime::block_on(async move {
+            let mut out = Vec::new();
+            let mut page_token = None;
+            loop {
+                let mut request = ListNamespacesRequest::new();
+                request.id = Some(id.clone());
+                request.page_token = page_token.clone();
+                request.limit = Some(1000);
+                let response = namespace.list_namespaces(request).await.map_err(|err| {
+                    FfiError::new(
+                        ErrorCode::NamespaceListNamespaces,
+                        format!("namespace list_namespaces: {err}"),
+                    )
+                })?;
+                out.extend(response.namespaces);
+                match response.page_token {
+                    Some(token) if !token.is_empty() => page_token = Some(token),
+                    _ => break,
+                }
+            }
+            Ok::<_, FfiError>(out)
+        })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+    })();
+    match result {
+        Ok(namespaces) => {
+            clear_last_error();
+            to_c_string(namespaces.join("\n")).into_raw() as *const c_char
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_create_namespace(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    mode: *const c_char,
+) -> i32 {
+    let result = (|| {
+        let (namespace, id) = namespace_operation_config(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )?;
+        let mode = unsafe { optional_cstr_to_string(mode, "mode")? };
+        runtime::block_on(async move {
+            let mut request = CreateNamespaceRequest::new();
+            request.id = Some(id);
+            request.mode = mode;
+            namespace.create_namespace(request).await.map_err(|err| {
+                FfiError::new(
+                    ErrorCode::NamespaceCreateNamespace,
+                    format!("namespace create_namespace: {err}"),
+                )
+            })?;
+            Ok::<_, FfiError>(())
+        })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_drop_namespace(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    behavior: *const c_char,
+) -> i32 {
+    let result = (|| {
+        let (namespace, id) = namespace_operation_config(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )?;
+        let behavior = unsafe { optional_cstr_to_string(behavior, "behavior")? };
+        runtime::block_on(async move {
+            let mut request = DropNamespaceRequest::new();
+            request.id = Some(id);
+            request.behavior = behavior;
+            namespace.drop_namespace(request).await.map_err(|err| {
+                FfiError::new(
+                    ErrorCode::NamespaceDropNamespace,
+                    format!("namespace drop_namespace: {err}"),
+                )
+            })?;
+            Ok::<_, FfiError>(())
+        })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+    })();
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 fn list_tables_inner(
