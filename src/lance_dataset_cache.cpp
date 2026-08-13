@@ -7,6 +7,7 @@
 
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <functional>
 
@@ -14,29 +15,63 @@ namespace duckdb {
 
 static constexpr const char *LANCE_DATASET_CACHE_STATE_KEY =
     "lance_dataset_cache_state";
+static constexpr const char *LANCE_DATASET_CACHE_GENERATIONS_KEY =
+    "lance.dataset_cache_generations.v1";
+
+class LanceDatasetCacheGenerations final : public ObjectCacheEntry {
+public:
+  static string ObjectType() { return "lance_dataset_cache_generations"; }
+  string GetObjectType() override { return ObjectType(); }
+  optional_idx GetEstimatedCacheMemory() const override {
+    return optional_idx();
+  }
+
+  idx_t Get(const string &key) {
+    lock_guard<mutex> guard(lock);
+    return generations[key];
+  }
+
+  void Bump(const string &key) {
+    lock_guard<mutex> guard(lock);
+    generations[key]++;
+  }
+
+private:
+  mutex lock;
+  unordered_map<string, idx_t> generations;
+};
+
+struct LanceCachedDataset {
+  idx_t generation;
+  shared_ptr<LanceDatasetCacheEntry> entry;
+};
 
 class LanceDatasetCacheState final : public ClientContextState {
 public:
-  shared_ptr<LanceDatasetCacheEntry> Get(const string &key) {
+  shared_ptr<LanceDatasetCacheEntry> Get(const string &key, idx_t generation) {
     lock_guard<mutex> guard(lock);
     auto entry = entries.find(key);
-    if (entry == entries.end()) {
+    if (entry == entries.end() || entry->second.generation != generation) {
+      if (entry != entries.end()) {
+        entries.erase(entry);
+      }
       query_misses++;
       return nullptr;
     }
     query_hits++;
-    return entry->second;
+    return entry->second.entry;
   }
 
   shared_ptr<LanceDatasetCacheEntry>
-  PutOrGetExisting(const string &key,
+  PutOrGetExisting(const string &key, idx_t generation,
                    shared_ptr<LanceDatasetCacheEntry> entry) {
     lock_guard<mutex> guard(lock);
     auto existing = entries.find(key);
-    if (existing != entries.end()) {
-      return existing->second;
+    if (existing != entries.end() &&
+        existing->second.generation == generation) {
+      return existing->second.entry;
     }
-    entries[key] = entry;
+    entries[key] = {generation, entry};
     return entry;
   }
 
@@ -59,7 +94,7 @@ public:
 
 private:
   mutex lock;
-  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
+  unordered_map<string, LanceCachedDataset> entries;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
 };
@@ -79,6 +114,13 @@ static shared_ptr<LanceDatasetCacheState>
 GetOrCreateLanceDatasetCacheState(ClientContext &context) {
   return context.registered_state->GetOrCreate<LanceDatasetCacheState>(
       LANCE_DATASET_CACHE_STATE_KEY);
+}
+
+static shared_ptr<LanceDatasetCacheGenerations>
+GetOrCreateLanceDatasetCacheGenerations(ClientContext &context) {
+  return ObjectCache::GetObjectCache(context)
+      .GetOrCreate<LanceDatasetCacheGenerations>(
+          LANCE_DATASET_CACHE_GENERATIONS_KEY);
 }
 
 static void AppendCacheKeyPart(string &key, const string &value) {
@@ -232,22 +274,29 @@ static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
     const std::function<shared_ptr<LanceDatasetCacheEntry>()> &open_dataset,
     bool *out_cache_hit) {
   auto state = GetOrCreateLanceDatasetCacheState(context);
-  auto entry = state->Get(cache_key);
-  if (entry) {
-    if (out_cache_hit) {
-      *out_cache_hit = true;
+  auto generations = GetOrCreateLanceDatasetCacheGenerations(context);
+  while (true) {
+    auto generation = generations->Get(cache_key);
+    auto entry = state->Get(cache_key, generation);
+    if (entry) {
+      if (out_cache_hit) {
+        *out_cache_hit = true;
+      }
+      return entry;
     }
-    return entry;
-  }
 
-  auto opened = open_dataset();
-  if (!opened) {
-    return nullptr;
+    auto opened = open_dataset();
+    if (!opened) {
+      return nullptr;
+    }
+    if (generations->Get(cache_key) != generation) {
+      continue;
+    }
+    if (out_cache_hit) {
+      *out_cache_hit = false;
+    }
+    return state->PutOrGetExisting(cache_key, generation, opened);
   }
-  if (out_cache_hit) {
-    *out_cache_hit = false;
-  }
-  return state->PutOrGetExisting(cache_key, opened);
 }
 
 shared_ptr<LanceDatasetCacheEntry>
@@ -383,6 +432,7 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
 
 void LanceInvalidateDatasetCache(ClientContext &context,
                                  const string &cache_key) {
+  GetOrCreateLanceDatasetCacheGenerations(context)->Bump(cache_key);
   auto state = context.registered_state->Get<LanceDatasetCacheState>(
       LANCE_DATASET_CACHE_STATE_KEY);
   if (state) {

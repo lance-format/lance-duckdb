@@ -1128,6 +1128,10 @@ static void RefreshLanceSchemaTable(ClientContext &context,
         "Unexpected catalog entry type for Lance table '%s': %s", table_name,
         CatalogTypeToString(existing_entry->type));
   }
+  auto *lance_table = dynamic_cast<LanceTableEntry *>(existing_entry.get());
+  if (lance_table) {
+    LanceInvalidateDatasetCacheForTable(context, *lance_table);
+  }
   if (!set.DropEntry(transaction, existing_entry->name, false, true)) {
     throw InternalException(
         "Could not refresh catalog entry for Lance table '%s'", table_name);
@@ -1215,10 +1219,23 @@ public:
     if (rest_ns && !info.internal && info.schema != DEFAULT_SCHEMA &&
         !DefaultSchemaGenerator::IsDefaultSchema(info.schema)) {
       auto &context = transaction.GetContext();
+      if (!context.transaction.IsAutoCommit()) {
+        throw NotImplementedException(
+            "Lance schema DDL does not support explicit transactions");
+      }
+      if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+        throw NotImplementedException(
+            "CREATE OR REPLACE SCHEMA is not supported for Lance namespaces");
+      }
       string bearer_token;
       string api_key;
       ResolveRestAuth(context, bearer_token, api_key);
       auto child_ns = MakeRestChildNamespace(info.schema);
+      auto result = CreateRestSchemaEntry(transaction, info, child_ns,
+                                          bearer_token, api_key);
+      if (!result) {
+        return nullptr;
+      }
       string error;
       if (!TryLanceNamespaceCreateNamespace(
               context, rest_ns->endpoint, child_ns->namespace_id, bearer_token,
@@ -1227,8 +1244,7 @@ public:
         throw IOException("Failed to create Lance schema '%s': %s", info.schema,
                           error);
       }
-      return CreateRestSchemaEntry(transaction, info, std::move(child_ns),
-                                   bearer_token, api_key);
+      return result;
     }
     return DuckCatalog::CreateSchema(transaction, info);
   }
@@ -1262,6 +1278,10 @@ public:
       return;
     }
     auto transaction = GetCatalogTransaction(context);
+    if (!context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance schema DDL does not support explicit transactions");
+    }
     auto existing = GetSchemaCatalogSet().GetEntry(transaction, info.name);
     if (!existing) {
       if (info.if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
@@ -1269,6 +1289,11 @@ public:
                                              info.name, string());
       }
       return;
+    }
+    if (!GetSchemaCatalogSet().DropEntry(transaction, existing->name,
+                                         info.cascade)) {
+      throw InternalException("Failed to drop Lance schema entry: " +
+                              existing->name);
     }
     string bearer_token;
     string api_key;
@@ -1281,11 +1306,6 @@ public:
             error)) {
       throw IOException("Failed to drop Lance schema '%s': %s", info.name,
                         error);
-    }
-    if (!GetSchemaCatalogSet().DropEntry(transaction, existing->name,
-                                         info.cascade)) {
-      throw InternalException("Failed to drop Lance schema entry: " +
-                              existing->name);
     }
   }
 

@@ -179,6 +179,13 @@ fn namespace_operation_config(
     Ok((namespace, id))
 }
 
+fn is_unsupported_namespace_operation(error: &LanceError) -> bool {
+    matches!(error, LanceError::NotSupported { .. })
+        // lance-namespace 9.0.1 maps an empty HTTP 501 response to Internal
+        // because there is no structured error code to preserve.
+        || error.to_string().contains("status=501 Not Implemented")
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_namespace_list_namespaces(
     endpoint: *const c_char,
@@ -205,12 +212,16 @@ pub unsafe extern "C" fn lance_namespace_list_namespaces(
                 request.id = Some(id.clone());
                 request.page_token = page_token.clone();
                 request.limit = Some(1000);
-                let response = namespace.list_namespaces(request).await.map_err(|err| {
-                    FfiError::new(
-                        ErrorCode::NamespaceListNamespaces,
-                        format!("namespace list_namespaces: {err}"),
-                    )
-                })?;
+                let response = match namespace.list_namespaces(request).await {
+                    Ok(response) => response,
+                    Err(err) if is_unsupported_namespace_operation(&err) => break,
+                    Err(err) => {
+                        return Err(FfiError::new(
+                            ErrorCode::NamespaceListNamespaces,
+                            format!("namespace list_namespaces: {err}"),
+                        ));
+                    }
+                };
                 out.extend(response.namespaces);
                 match response.page_token {
                     Some(token) if !token.is_empty() => page_token = Some(token),

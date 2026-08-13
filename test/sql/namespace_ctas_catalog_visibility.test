@@ -40,6 +40,11 @@ ORDER BY column_index
 ----
 a	INTEGER
 
+query I con1
+SELECT a FROM ns.main.replace_schema
+----
+1
+
 statement ok con2
 CREATE OR REPLACE TABLE ns.main.replace_schema AS SELECT 'x'::VARCHAR AS b;
 
