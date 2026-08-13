@@ -287,6 +287,15 @@ public:
           "Unsafe Lance dataset name for directory namespace: " + entry_name);
     }
 
+    // DuckDB resolves catalog identifiers case-insensitively, while directory
+    // namespace paths are case-sensitive. Resolve the requested spelling back
+    // to the physical table identifier before opening and materializing the
+    // catalog entry so an evicted Foo.lance is not rediscovered as foo.lance.
+    auto physical_table = FindDirectoryNamespaceTable(*ns, entry_name);
+    if (physical_table.empty()) {
+      return nullptr;
+    }
+
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
@@ -294,7 +303,7 @@ public:
 
     const char *uri_ptr = nullptr;
     auto *dataset = lance_open_dataset_in_dir_namespace(
-        ns->root.c_str(), entry_name.c_str(),
+        ns->root.c_str(), physical_table.c_str(),
         key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(),
         ns->option_keys.size(), &uri_ptr);
@@ -307,7 +316,7 @@ public:
       return nullptr;
     }
 
-    CreateTableInfo info(schema, entry_name);
+    CreateTableInfo info(schema, physical_table);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
@@ -321,12 +330,13 @@ public:
     lance_close_dataset(dataset);
 
     if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+      dataset_uri =
+          JoinNamespacePath(ns->root, GetDatasetDirName(physical_table));
     }
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Directory;
     cfg.root = ns->root;
-    cfg.table_id = entry_name;
+    cfg.table_id = physical_table;
     cfg.option_keys = ns->option_keys;
     cfg.option_values = ns->option_values;
     cfg.display_uri = std::move(dataset_uri);
@@ -830,13 +840,14 @@ public:
       BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                       value_ptrs);
 
+      const auto &physical_table = lance_entry->NamespaceConfig().table_id;
       auto rc = lance_dir_namespace_drop_table(
-          root.c_str(), info.name.c_str(),
+          root.c_str(), physical_table.c_str(),
           key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
       if (rc != 0) {
         throw IOException("Failed to drop Lance dataset: " + root + "/" +
-                          GetDatasetDirName(info.name) +
+                          GetDatasetDirName(physical_table) +
                           LanceFormatErrorSuffix());
       }
     }
