@@ -667,6 +667,12 @@ public:
     table_default_generator = generator;
   }
 
+  void InvalidateTableDefaults() {
+    if (table_default_generator) {
+      table_default_generator->created_all_entries = false;
+    }
+  }
+
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
     auto &set = GetCatalogSet(info.GetCatalogType());
     auto entry = set.GetEntry(transaction, info.name);
@@ -1097,16 +1103,74 @@ public:
   }
 
 private:
-  void InvalidateTableDefaults() {
-    if (!table_default_generator) {
-      return;
-    }
-    table_default_generator->created_all_entries = false;
-  }
-
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
+};
+
+static void InvalidateLanceSchema(ClientContext &context,
+                                  const string &catalog_name,
+                                  const string &schema_name) {
+  auto schema = Catalog::GetSchema(context, catalog_name, schema_name,
+                                   OnEntryNotFound::RETURN_NULL);
+  if (schema) {
+    auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(schema.get());
+    if (lance_schema) {
+      lance_schema->InvalidateTableDefaults();
+    }
+  }
+}
+
+class PhysicalLanceCopyToFile final : public PhysicalCopyToFile {
+public:
+  PhysicalLanceCopyToFile(PhysicalPlan &physical_plan,
+                          vector<LogicalType> types, CopyFunction function,
+                          unique_ptr<FunctionData> bind_data,
+                          idx_t estimated_cardinality, string catalog_name,
+                          string schema_name)
+      : PhysicalCopyToFile(physical_plan, std::move(types), std::move(function),
+                           std::move(bind_data), estimated_cardinality),
+        catalog_name(std::move(catalog_name)),
+        schema_name(std::move(schema_name)) {}
+
+  SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
+                            ClientContext &context,
+                            OperatorSinkFinalizeInput &input) const override {
+    auto result = PhysicalCopyToFile::Finalize(pipeline, event, context, input);
+    InvalidateLanceSchema(context, catalog_name, schema_name);
+    return result;
+  }
+
+private:
+  string catalog_name;
+  string schema_name;
+};
+
+class PhysicalLanceBatchCopyToFile final : public PhysicalBatchCopyToFile {
+public:
+  PhysicalLanceBatchCopyToFile(PhysicalPlan &physical_plan,
+                               vector<LogicalType> types, CopyFunction function,
+                               unique_ptr<FunctionData> bind_data,
+                               idx_t estimated_cardinality, string catalog_name,
+                               string schema_name)
+      : PhysicalBatchCopyToFile(physical_plan, std::move(types),
+                                std::move(function), std::move(bind_data),
+                                estimated_cardinality),
+        catalog_name(std::move(catalog_name)),
+        schema_name(std::move(schema_name)) {}
+
+  SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
+                            ClientContext &context,
+                            OperatorSinkFinalizeInput &input) const override {
+    auto result =
+        PhysicalBatchCopyToFile::Finalize(pipeline, event, context, input);
+    InvalidateLanceSchema(context, catalog_name, schema_name);
+    return result;
+  }
+
+private:
+  string catalog_name;
+  string schema_name;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
@@ -1142,8 +1206,8 @@ public:
               context, rest_ns->endpoint, child_ns->namespace_id, bearer_token,
               api_key, rest_ns->delimiter, rest_ns->headers_tsv,
               CreateNamespaceMode(info.on_conflict), error)) {
-        throw IOException("Failed to create Lance schema '%s': %s",
-                          info.schema, error);
+        throw IOException("Failed to create Lance schema '%s': %s", info.schema,
+                          error);
       }
       return CreateRestSchemaEntry(transaction, info, std::move(child_ns),
                                    bearer_token, api_key);
@@ -1151,8 +1215,7 @@ public:
     return DuckCatalog::CreateSchema(transaction, info);
   }
 
-  void LoadRestSchemas(ClientContext &context,
-                       CatalogTransaction transaction,
+  void LoadRestSchemas(ClientContext &context, CatalogTransaction transaction,
                        const vector<string> &schema_names) {
     string bearer_token;
     string api_key;
@@ -1292,9 +1355,10 @@ public:
             PhysicalPlan &physical_plan, vector<LogicalType> types_p,
             string endpoint, string namespace_id, string delimiter,
             string bearer_token_override, string api_key_override,
-            string headers_tsv, string table_name, string writer_mode,
-            string data_storage_version, vector<string> column_names_p,
-            vector<LogicalType> column_types_p, idx_t estimated_cardinality)
+            string headers_tsv, string catalog_name, string schema_name,
+            string table_name, string writer_mode, string data_storage_version,
+            vector<string> column_names_p, vector<LogicalType> column_types_p,
+            idx_t estimated_cardinality)
             : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                                std::move(types_p), estimated_cardinality),
               endpoint(std::move(endpoint)),
@@ -1303,6 +1367,8 @@ public:
               bearer_token_override(std::move(bearer_token_override)),
               api_key_override(std::move(api_key_override)),
               headers_tsv(std::move(headers_tsv)),
+              catalog_name(std::move(catalog_name)),
+              schema_name(std::move(schema_name)),
               table_name(std::move(table_name)),
               writer_mode(std::move(writer_mode)),
               data_storage_version(std::move(data_storage_version)),
@@ -1421,8 +1487,7 @@ public:
               break;
             }
             if (StringUtil::CIEquals(t, leaf_id)) {
-              state->table_id =
-                  prefixed_id.empty() ? leaf_id : prefixed_id;
+              state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
               break;
             }
           }
@@ -1542,7 +1607,6 @@ public:
         SinkFinalizeType
         Finalize(Pipeline &, Event &, ClientContext &context,
                  OperatorSinkFinalizeInput &input) const override {
-          (void)context;
           auto &gstate = input.global_state.Cast<GlobalState>();
 
           {
@@ -1555,6 +1619,8 @@ public:
                                 LanceFormatErrorSuffix());
             }
           }
+
+          InvalidateLanceSchema(context, catalog_name, schema_name);
 
           return SinkFinalizeType::READY;
         }
@@ -1594,6 +1660,8 @@ public:
         string bearer_token_override;
         string api_key_override;
         string headers_tsv;
+        string catalog_name;
+        string schema_name;
         string table_name;
         string writer_mode;
         string data_storage_version;
@@ -1667,11 +1735,11 @@ public:
       string mode = CreateTableModeFromConflict(create_info.on_conflict);
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
           op.types, schema_rest_ns->endpoint, schema_rest_ns->namespace_id,
-          schema_rest_ns->delimiter,
-          schema_rest_ns->bearer_token_override,
+          schema_rest_ns->delimiter, schema_rest_ns->bearer_token_override,
           schema_rest_ns->api_key_override, schema_rest_ns->headers_tsv,
-          create_info.table, mode, data_storage_version, std::move(names),
-          std::move(types), op.estimated_cardinality);
+          op.schema.catalog.GetName(), op.schema.name, create_info.table, mode,
+          data_storage_version, std::move(names), std::move(types),
+          op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
@@ -1739,10 +1807,11 @@ public:
     }
 
     if (execution_mode == CopyFunctionExecutionMode::BATCH_COPY_TO_FILE) {
-      auto &copy = planner.Make<PhysicalBatchCopyToFile>(
+      auto &copy = planner.Make<PhysicalLanceBatchCopyToFile>(
           op.types, copy_function, std::move(bind_data),
-          op.estimated_cardinality);
-      auto &cast_copy = copy.Cast<PhysicalBatchCopyToFile>();
+          op.estimated_cardinality, op.schema.catalog.GetName(),
+          op.schema.name);
+      auto &cast_copy = copy.Cast<PhysicalLanceBatchCopyToFile>();
       cast_copy.file_path = dataset_path;
       cast_copy.use_tmp_file = false;
       cast_copy.return_type = CopyFunctionReturnType::CHANGED_ROWS;
@@ -1751,10 +1820,10 @@ public:
       return copy;
     }
 
-    auto &copy = planner.Make<PhysicalCopyToFile>(op.types, copy_function,
-                                                  std::move(bind_data),
-                                                  op.estimated_cardinality);
-    auto &cast_copy = copy.Cast<PhysicalCopyToFile>();
+    auto &copy = planner.Make<PhysicalLanceCopyToFile>(
+        op.types, copy_function, std::move(bind_data), op.estimated_cardinality,
+        op.schema.catalog.GetName(), op.schema.name);
+    auto &cast_copy = copy.Cast<PhysicalLanceCopyToFile>();
     cast_copy.file_path = dataset_path;
     cast_copy.use_tmp_file = false;
     cast_copy.filename_pattern = FilenamePattern();
@@ -1839,14 +1908,13 @@ private:
                               bearer_token, api_key);
   }
 
-  optional_ptr<CatalogEntry> CreateRestSchemaEntry(
-      CatalogTransaction transaction, CreateSchemaInfo &info,
-      shared_ptr<LanceRestNamespaceConfig> schema_ns,
-      const string &bearer_token, const string &api_key) {
+  optional_ptr<CatalogEntry>
+  CreateRestSchemaEntry(CatalogTransaction transaction, CreateSchemaInfo &info,
+                        shared_ptr<LanceRestNamespaceConfig> schema_ns,
+                        const string &bearer_token, const string &api_key) {
     auto &schemas = GetSchemaCatalogSet();
     LogicalDependencyList dependencies;
-    auto entry =
-        make_uniq<LanceSchemaEntry>(*this, info, nullptr, schema_ns);
+    auto entry = make_uniq<LanceSchemaEntry>(*this, info, nullptr, schema_ns);
     auto result = entry.get();
     if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
                              dependencies)) {
