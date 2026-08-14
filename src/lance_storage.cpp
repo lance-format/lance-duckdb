@@ -1136,10 +1136,6 @@ static void RefreshLanceSchemaTable(ClientContext &context,
         "Unexpected catalog entry type for Lance table '%s': %s", table_name,
         CatalogTypeToString(existing_entry->type));
   }
-  auto *lance_table = dynamic_cast<LanceTableEntry *>(existing_entry.get());
-  if (lance_table) {
-    LanceInvalidateDatasetCacheForTable(context, *lance_table);
-  }
   if (!set.DropEntry(transaction, existing_entry->name, false, true)) {
     throw InternalException(
         "Could not refresh catalog entry for Lance table '%s'", table_name);
