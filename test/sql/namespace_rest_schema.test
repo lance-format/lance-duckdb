@@ -26,8 +26,18 @@ Not implemented Error: Lance schema DDL does not support explicit transactions
 statement ok
 ROLLBACK;
 
+statement error
+CREATE SCHEMA ns."x$y";
+----
+Invalid Input Error: Lance REST identifier segment 'x$y' contains the configured delimiter '$'
+
 statement ok
 CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}"."x$y" (x INTEGER);
+----
+Invalid Input Error: Lance REST identifier segment 'x$y' contains the configured delimiter '$'
 
 statement error
 CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";

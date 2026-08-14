@@ -293,6 +293,24 @@ void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
   }
 }
 
+vector<string> LanceConsumeStringList(LanceStringList &list) {
+  vector<string> values;
+  try {
+    values.reserve(list.count);
+    for (idx_t i = 0; i < list.count; i++) {
+      if (!list.items || !list.items[i]) {
+        throw IOException("Invalid Lance string list");
+      }
+      values.emplace_back(list.items[i]);
+    }
+  } catch (...) {
+    lance_free_string_list(&list);
+    throw;
+  }
+  lance_free_string_list(&list);
+  return values;
+}
+
 bool TryLanceNamespaceListTables(
     ClientContext &context, const string &endpoint, const string &namespace_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
@@ -306,23 +324,18 @@ bool TryLanceNamespaceListTables(
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(
-      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr);
-  if (!ptr) {
+  LanceStringList list{nullptr, 0};
+  auto rc = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                        bearer_ptr, api_key_ptr, delimiter_ptr,
+                                        headers_ptr, &list);
+  if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
     }
     return false;
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-  for (auto &table : StringUtil::Split(joined, '\n')) {
-    if (!table.empty()) {
-      out_tables.push_back(std::move(table));
-    }
-  }
+  out_tables = LanceConsumeStringList(list);
   return true;
 }
 
@@ -334,20 +347,21 @@ bool TryLanceNamespaceListNamespaces(
   (void)context;
   out_namespaces.clear();
   out_error.clear();
-  auto *ptr = lance_namespace_list_namespaces(
+  LanceStringList list{nullptr, 0};
+  auto rc = lance_namespace_list_namespaces(
       endpoint.c_str(), namespace_id.c_str(),
       bearer_token.empty() ? nullptr : bearer_token.c_str(),
       api_key.empty() ? nullptr : api_key.c_str(),
       delimiter.empty() ? nullptr : delimiter.c_str(),
-      headers_tsv.empty() ? nullptr : headers_tsv.c_str());
-  if (!ptr) {
+      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), &list);
+  if (rc != 0) {
     out_error = LanceConsumeLastError();
     return false;
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-  for (auto &namespace_name : StringUtil::Split(joined, '\n')) {
-    if (!namespace_name.empty()) {
+  auto effective_delimiter = delimiter.empty() ? "$" : delimiter;
+  for (auto &namespace_name : LanceConsumeStringList(list)) {
+    if (!namespace_name.empty() &&
+        namespace_name.find(effective_delimiter) == string::npos) {
       out_namespaces.push_back(std::move(namespace_name));
     }
   }
@@ -536,10 +550,12 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
 
-  auto *ptr = lance_dir_namespace_list_tables(
+  LanceStringList list{nullptr, 0};
+  auto rc = lance_dir_namespace_list_tables(
       open_root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
-  if (!ptr) {
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      &list);
+  if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
@@ -547,11 +563,7 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
     return false;
   }
 
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> parts = StringUtil::Split(joined, '\n');
-  for (auto &p : parts) {
+  for (auto &p : LanceConsumeStringList(list)) {
     if (!p.empty()) {
       out_tables.push_back(std::move(p));
     }

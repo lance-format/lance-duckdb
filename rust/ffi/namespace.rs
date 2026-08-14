@@ -20,8 +20,8 @@ use crate::runtime;
 use super::session::{record_dataset_open, record_namespace_describe};
 use super::types::DatasetHandle;
 use super::util::{
-    cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
-    FfiResult,
+    cstr_to_str, export_string_list, optional_session_handle, schema_to_ffi_arrow_schema,
+    to_c_string, FfiError, FfiResult, LanceStringList,
 };
 
 unsafe fn optional_cstr_to_string(
@@ -95,6 +95,33 @@ fn split_id(id: &str, delimiter: &str) -> Vec<String> {
     }
 }
 
+fn normalize_listed_tables(
+    tables: Vec<String>,
+    namespace_id: &str,
+    delimiter: &str,
+) -> Vec<String> {
+    let namespace_prefix = if namespace_id.is_empty() {
+        None
+    } else {
+        Some(format!("{namespace_id}{delimiter}"))
+    };
+    tables
+        .into_iter()
+        .filter_map(|table| {
+            let relative = match namespace_prefix.as_deref() {
+                Some(prefix) if table.starts_with(prefix) => table[prefix.len()..].to_string(),
+                _ if !table.contains(delimiter) => table,
+                _ => return None,
+            };
+            if relative.is_empty() || relative.contains(delimiter) {
+                None
+            } else {
+                Some(relative)
+            }
+        })
+        .collect()
+}
+
 fn namespace_operation_config(
     endpoint: *const c_char,
     namespace_id: *const c_char,
@@ -143,7 +170,8 @@ pub unsafe extern "C" fn lance_namespace_list_namespaces(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
-) -> *const c_char {
+    out: *mut LanceStringList,
+) -> i32 {
     let result = (|| {
         let (namespace, id) = namespace_operation_config(
             endpoint,
@@ -181,16 +209,7 @@ pub unsafe extern "C" fn lance_namespace_list_namespaces(
         })
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
     })();
-    match result {
-        Ok(namespaces) => {
-            clear_last_error();
-            to_c_string(namespaces.join("\n")).into_raw() as *const c_char
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null()
-        }
-    }
+    unsafe { export_string_list(result, out) }
 }
 
 #[no_mangle]
@@ -301,14 +320,14 @@ fn list_tables_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace_id = split_id(namespace_id, &delimiter);
+    let namespace_parts = split_id(&namespace_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter)
+    .delimiter(delimiter.clone())
     .build();
 
     let tables = runtime::block_on(async move {
@@ -316,7 +335,7 @@ fn list_tables_inner(
         let mut page_token: Option<String> = None;
         loop {
             let mut req = ListTablesRequest::new();
-            req.id = Some(namespace_id.clone());
+            req.id = Some(namespace_parts.clone());
             req.page_token = page_token.clone();
             req.limit = Some(1000);
             let resp = namespace.list_tables(req).await.map_err(|err| {
@@ -335,7 +354,7 @@ fn list_tables_inner(
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
-    Ok(tables)
+    Ok(normalize_listed_tables(tables, &namespace_id, &delimiter))
 }
 
 #[no_mangle]
@@ -346,24 +365,17 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
-) -> *const c_char {
-    match list_tables_inner(
+    out: *mut LanceStringList,
+) -> i32 {
+    let result = list_tables_inner(
         endpoint,
         namespace_id,
         bearer_token,
         api_key,
         delimiter,
         headers_tsv,
-    ) {
-        Ok(tables) => {
-            clear_last_error();
-            to_c_string(tables.join("\n")).into_raw() as *const c_char
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null()
-        }
-    }
+    );
+    unsafe { export_string_list(result, out) }
 }
 
 fn describe_table_info_inner(
@@ -928,5 +940,40 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
             set_last_error(err.code, err.message);
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_listed_tables;
+
+    #[test]
+    fn listed_tables_are_relative_to_the_requested_namespace() {
+        let tables = vec![
+            "default$child$t".to_string(),
+            "default$child$a\nb".to_string(),
+            "compat".to_string(),
+            "default$child$grand$t".to_string(),
+            "default$other$t".to_string(),
+        ];
+        assert_eq!(
+            normalize_listed_tables(tables, "default$child", "$"),
+            vec!["t", "a\nb", "compat"]
+        );
+    }
+
+    #[test]
+    fn root_table_listing_excludes_descendants() {
+        let tables = vec!["t".to_string(), "child$t".to_string()];
+        assert_eq!(normalize_listed_tables(tables, "", "$"), vec!["t"]);
+    }
+
+    #[test]
+    fn listed_tables_use_the_configured_delimiter() {
+        let tables = vec!["default/child/t".to_string()];
+        assert_eq!(
+            normalize_listed_tables(tables, "default/child", "/"),
+            vec!["t"]
+        );
     }
 }

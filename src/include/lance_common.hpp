@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 
 struct LanceNamespaceQueryConfig;
+struct LanceStringList;
 
 namespace duckdb {
 
@@ -45,6 +46,8 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
 void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
     string &out_api_key);
+
+vector<string> LanceConsumeStringList(LanceStringList &list);
 
 bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,

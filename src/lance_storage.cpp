@@ -75,10 +75,17 @@ static string EffectiveNamespaceDelimiter(const string &delimiter) {
 static string AppendRestIdentifier(const string &identifier,
                                    const string &delimiter,
                                    const string &segment) {
+  auto effective_delimiter = EffectiveNamespaceDelimiter(delimiter);
+  if (segment.find(effective_delimiter) != string::npos) {
+    throw InvalidInputException(
+        "Lance REST identifier segment '%s' contains the configured delimiter "
+        "'%s'",
+        segment, effective_delimiter);
+  }
   if (identifier.empty()) {
     return segment;
   }
-  return identifier + EffectiveNamespaceDelimiter(delimiter) + segment;
+  return identifier + effective_delimiter + segment;
 }
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -223,23 +230,16 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   BuildStorageOptionPointerArrays(ns.option_keys, ns.option_values, key_ptrs,
                                   value_ptrs);
 
-  auto *ptr = lance_dir_namespace_list_tables(
+  LanceStringList list{nullptr, 0};
+  auto rc = lance_dir_namespace_list_tables(
       ns.root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size());
-  if (!ptr) {
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size(),
+      &list);
+  if (rc != 0) {
     throw IOException("Failed to list tables from Lance directory namespace: " +
                       ns.root + LanceFormatErrorSuffix());
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> out;
-  for (auto &p : StringUtil::Split(joined, '\n')) {
-    if (!p.empty()) {
-      out.push_back(std::move(p));
-    }
-  }
-  return out;
+  return LanceConsumeStringList(list);
 }
 
 static vector<string>
@@ -252,23 +252,15 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(
-      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr);
-  if (!ptr) {
+  LanceStringList list{nullptr, 0};
+  auto rc = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                        bearer_ptr, api_key_ptr, delimiter_ptr,
+                                        headers_ptr, &list);
+  if (rc != 0) {
     throw IOException("Failed to list tables from Lance namespace: " +
                       endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> tables;
-  for (auto &table : StringUtil::Split(joined, '\n')) {
-    if (!table.empty()) {
-      tables.push_back(std::move(table));
-    }
-  }
-  return tables;
+  return LanceConsumeStringList(list);
 }
 
 static bool
@@ -531,18 +523,8 @@ public:
   }
 
   vector<string> GetDefaultEntries() override {
-    auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
-                                          api_key, delimiter, headers_tsv);
-    if (namespace_id.empty()) {
-      return tables;
-    }
-    auto prefix = namespace_id + EffectiveNamespaceDelimiter(delimiter);
-    for (auto &t : tables) {
-      if (StringUtil::StartsWith(t, prefix)) {
-        t = t.substr(prefix.size());
-      }
-    }
-    return tables;
+    return ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
+                                   api_key, delimiter, headers_tsv);
   }
 
 private:
