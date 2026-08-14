@@ -72,33 +72,13 @@ static string EffectiveNamespaceDelimiter(const string &delimiter) {
   return delimiter.empty() ? "$" : delimiter;
 }
 
-static vector<string> DecodeRestIdentifier(const string &identifier,
-                                           const string &delimiter) {
-  if (identifier.compare(0, 5, "LID1;") == 0) {
-    return LanceDecodeStringList(identifier);
-  }
-  if (identifier.empty()) {
-    return {};
-  }
-  return StringUtil::Split(identifier, EffectiveNamespaceDelimiter(delimiter));
-}
-
-static string EncodeRestIdentifier(const vector<string> &segments) {
-  return LanceEncodeStringList(segments);
-}
-
 static string AppendRestIdentifier(const string &identifier,
                                    const string &delimiter,
                                    const string &segment) {
-  auto segments = DecodeRestIdentifier(identifier, delimiter);
-  segments.push_back(segment);
-  return EncodeRestIdentifier(segments);
-}
-
-static string DisplayRestIdentifier(const string &identifier,
-                                    const string &delimiter) {
-  return StringUtil::Join(DecodeRestIdentifier(identifier, delimiter),
-                          EffectiveNamespaceDelimiter(delimiter));
+  if (identifier.empty()) {
+    return segment;
+  }
+  return identifier + EffectiveNamespaceDelimiter(delimiter) + segment;
 }
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -282,7 +262,13 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   string joined = ptr;
   lance_free_string(ptr);
 
-  return LanceDecodeStringList(joined);
+  vector<string> tables;
+  for (auto &table : StringUtil::Split(joined, '\n')) {
+    if (!table.empty()) {
+      tables.push_back(std::move(table));
+    }
+  }
+  return tables;
 }
 
 static bool
@@ -476,12 +462,10 @@ public:
       resolved_api_key = api_key;
     }
 
-    // Preserve identifier segment boundaries across the FFI. A lookup must
-    // never retry in a different namespace after a qualified request fails.
+    // A qualified lookup must never retry in a different namespace after it
+    // fails.
     vector<string> candidates = {
-        namespace_id.empty()
-            ? EncodeRestIdentifier({entry_name})
-            : AppendRestIdentifier(namespace_id, delimiter, entry_name)};
+        AppendRestIdentifier(namespace_id, delimiter, entry_name)};
 
     // Fast path: describe_table with schema from REST API (skips S3 open).
     for (auto &table_id : candidates) {
@@ -552,8 +536,7 @@ public:
     if (namespace_id.empty()) {
       return tables;
     }
-    auto prefix = DisplayRestIdentifier(namespace_id, delimiter) +
-                  EffectiveNamespaceDelimiter(delimiter);
+    auto prefix = namespace_id + EffectiveNamespaceDelimiter(delimiter);
     for (auto &t : tables) {
       if (StringUtil::StartsWith(t, prefix)) {
         t = t.substr(prefix.size());
@@ -806,9 +789,7 @@ public:
       auto leaf_id = info.name;
       auto qualified_id = AppendRestIdentifier(rest_ns->namespace_id,
                                                rest_ns->delimiter, leaf_id);
-      auto qualified_display =
-          DisplayRestIdentifier(rest_ns->namespace_id, rest_ns->delimiter) +
-          EffectiveNamespaceDelimiter(rest_ns->delimiter) + leaf_id;
+      auto qualified_display = qualified_id;
 
       vector<string> discovered;
       string list_error;
@@ -940,9 +921,7 @@ public:
       auto leaf_id = create_info.table;
       auto qualified_id = AppendRestIdentifier(rest_ns->namespace_id,
                                                rest_ns->delimiter, leaf_id);
-      auto qualified_display =
-          DisplayRestIdentifier(rest_ns->namespace_id, rest_ns->delimiter) +
-          EffectiveNamespaceDelimiter(rest_ns->delimiter) + leaf_id;
+      auto qualified_display = qualified_id;
 
       vector<string> discovered;
       string list_error;
@@ -1512,9 +1491,7 @@ public:
           auto leaf_id = state->table_name;
           auto qualified_id = AppendRestIdentifier(state->namespace_id,
                                                    state->delimiter, leaf_id);
-          auto qualified_display =
-              DisplayRestIdentifier(state->namespace_id, state->delimiter) +
-              EffectiveNamespaceDelimiter(state->delimiter) + leaf_id;
+          auto qualified_display = qualified_id;
 
           vector<string> discovered;
           string list_error;
@@ -1724,10 +1701,8 @@ public:
       }
 
       auto leaf_id = create_info.table;
-      auto qualified_display =
-          DisplayRestIdentifier(schema_rest_ns->namespace_id,
-                                schema_rest_ns->delimiter) +
-          EffectiveNamespaceDelimiter(schema_rest_ns->delimiter) + leaf_id;
+      auto qualified_display = AppendRestIdentifier(
+          schema_rest_ns->namespace_id, schema_rest_ns->delimiter, leaf_id);
 
       bool exists = false;
       string existing_id;
@@ -2027,8 +2002,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
       throw InvalidInputException(
           "ATTACH TYPE LANCE with ENDPOINT requires a non-empty namespace id");
     }
-    namespace_id = EncodeRestIdentifier(
-        StringUtil::Split(attach_path, EffectiveNamespaceDelimiter(delimiter)));
+    namespace_id = attach_path;
     ResolveLanceNamespaceAuth(context, endpoint, info.options, bearer_token,
                               api_key);
     ResolveLanceNamespaceAuthOverrides(info.options, bearer_token_override,

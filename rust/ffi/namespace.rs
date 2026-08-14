@@ -87,69 +87,12 @@ fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, Str
         .join("\n")
 }
 
-const STRING_LIST_PREFIX: &str = "LID1;";
-
-fn encode_string_list(values: &[String]) -> String {
-    let mut encoded = format!("{STRING_LIST_PREFIX}{};", values.len());
-    for value in values {
-        encoded.push_str(&format!("{}:", value.len()));
-        encoded.push_str(value);
+fn split_id(id: &str, delimiter: &str) -> Vec<String> {
+    if id.is_empty() {
+        Vec::new()
+    } else {
+        id.split(delimiter).map(ToString::to_string).collect()
     }
-    encoded
-}
-
-pub(crate) fn decode_id(id: &str, delimiter: &str) -> FfiResult<Vec<String>> {
-    let Some(encoded) = id.strip_prefix(STRING_LIST_PREFIX) else {
-        return Ok(if id.is_empty() {
-            Vec::new()
-        } else {
-            id.split(delimiter).map(ToString::to_string).collect()
-        });
-    };
-
-    let (count_text, mut encoded) = encoded.split_once(';').ok_or_else(|| {
-        FfiError::new(
-            ErrorCode::InvalidArgument,
-            "invalid Lance identifier list encoding",
-        )
-    })?;
-    let count = count_text.parse::<usize>().map_err(|_| {
-        FfiError::new(
-            ErrorCode::InvalidArgument,
-            "invalid Lance identifier list count",
-        )
-    })?;
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let colon = encoded.find(':').ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::InvalidArgument,
-                "invalid Lance identifier list encoding",
-            )
-        })?;
-        let length = encoded[..colon].parse::<usize>().map_err(|_| {
-            FfiError::new(
-                ErrorCode::InvalidArgument,
-                "invalid Lance identifier length",
-            )
-        })?;
-        encoded = &encoded[colon + 1..];
-        if length > encoded.len() || !encoded.is_char_boundary(length) {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                "invalid Lance identifier length",
-            ));
-        }
-        values.push(encoded[..length].to_string());
-        encoded = &encoded[length..];
-    }
-    if !encoded.is_empty() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "trailing data in Lance identifier list",
-        ));
-    }
-    Ok(values)
 }
 
 fn namespace_operation_config(
@@ -167,7 +110,7 @@ fn namespace_operation_config(
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
-    let id = decode_id(namespace_id, &delimiter)?;
+    let id = split_id(namespace_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -241,7 +184,7 @@ pub unsafe extern "C" fn lance_namespace_list_namespaces(
     match result {
         Ok(namespaces) => {
             clear_last_error();
-            to_c_string(encode_string_list(&namespaces)).into_raw() as *const c_char
+            to_c_string(namespaces.join("\n")).into_raw() as *const c_char
         }
         Err(err) => {
             set_last_error(err.code, err.message);
@@ -358,7 +301,7 @@ fn list_tables_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace_id = decode_id(namespace_id, &delimiter)?;
+    let namespace_id = split_id(namespace_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -414,7 +357,7 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     ) {
         Ok(tables) => {
             clear_last_error();
-            to_c_string(encode_string_list(&tables)).into_raw() as *const c_char
+            to_c_string(tables.join("\n")).into_raw() as *const c_char
         }
         Err(err) => {
             set_last_error(err.code, err.message);
@@ -439,7 +382,7 @@ fn describe_table_info_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let table_id_segments = decode_id(table_id, &delimiter)?;
+    let table_id_segments = split_id(table_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -547,7 +490,7 @@ fn create_empty_table_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let table_id_segments = decode_id(table_id, &delimiter)?;
+    let table_id_segments = split_id(table_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -653,7 +596,7 @@ fn drop_table_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let table_id_segments = decode_id(table_id, &delimiter)?;
+    let table_id_segments = split_id(table_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -724,7 +667,7 @@ fn describe_table_with_schema_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let table_id_segments = decode_id(table_id, &delimiter)?;
+    let table_id_segments = split_id(table_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -824,7 +767,7 @@ fn open_dataset_in_namespace_inner(
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let table_id_segments = decode_id(table_id, &delimiter)?;
+    let table_id_segments = split_id(table_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
@@ -985,30 +928,5 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
             set_last_error(err.code, err.message);
             -1
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{decode_id, encode_string_list};
-
-    #[test]
-    fn identifier_list_round_trips_delimiters_and_newlines() {
-        let values = vec![
-            "default".to_string(),
-            "a$b".to_string(),
-            "a\nb".to_string(),
-            "销售".to_string(),
-        ];
-        let encoded = encode_string_list(&values);
-        assert_eq!(decode_id(&encoded, "$").unwrap(), values);
-    }
-
-    #[test]
-    fn legacy_identifier_still_uses_configured_delimiter() {
-        assert_eq!(
-            decode_id("default$schema$table", "$").unwrap(),
-            vec!["default", "schema", "table"]
-        );
     }
 }
