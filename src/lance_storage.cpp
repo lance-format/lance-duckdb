@@ -1089,37 +1089,16 @@ private:
   DefaultGenerator *table_default_generator = nullptr;
 };
 
-static void RefreshLanceSchemaTable(ClientContext &context,
-                                    const string &catalog_name,
-                                    const string &schema_name,
-                                    const string &table_name) {
+static void InvalidateLanceSchema(ClientContext &context,
+                                  const string &catalog_name,
+                                  const string &schema_name) {
   auto schema = Catalog::GetSchema(context, catalog_name, schema_name,
                                    OnEntryNotFound::RETURN_NULL);
   auto *lance_schema =
       schema ? dynamic_cast<LanceSchemaEntry *>(schema.get()) : nullptr;
-  if (!lance_schema) {
-    return;
+  if (lance_schema) {
+    lance_schema->InvalidateTableDefaults();
   }
-  lance_schema->InvalidateTableDefaults();
-
-  auto &set = lance_schema->GetCatalogSet(CatalogType::TABLE_ENTRY);
-  auto transaction =
-      CatalogTransaction::GetSystemTransaction(schema->catalog.GetDatabase());
-  auto existing_entry = set.GetEntry(transaction, table_name);
-  if (!existing_entry) {
-    return;
-  }
-  if (existing_entry->type != CatalogType::TABLE_ENTRY &&
-      existing_entry->type != CatalogType::VIEW_ENTRY) {
-    throw InternalException(
-        "Unexpected catalog entry type for Lance table '%s': %s", table_name,
-        CatalogTypeToString(existing_entry->type));
-  }
-  if (!set.DropEntry(transaction, existing_entry->name, false, true)) {
-    throw InternalException(
-        "Could not refresh catalog entry for Lance table '%s'", table_name);
-  }
-  set.CleanupEntry(*existing_entry);
 }
 
 class PhysicalLanceCopyToFile final : public PhysicalCopyToFile {
@@ -1128,25 +1107,23 @@ public:
                           vector<LogicalType> types, CopyFunction function,
                           unique_ptr<FunctionData> bind_data,
                           idx_t estimated_cardinality, string catalog_name,
-                          string schema_name, string table_name)
+                          string schema_name)
       : PhysicalCopyToFile(physical_plan, std::move(types), std::move(function),
                            std::move(bind_data), estimated_cardinality),
         catalog_name(std::move(catalog_name)),
-        schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
-  }
+        schema_name(std::move(schema_name)) {}
 
   SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
                             ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
     auto result = PhysicalCopyToFile::Finalize(pipeline, event, context, input);
-    RefreshLanceSchemaTable(context, catalog_name, schema_name, table_name);
+    InvalidateLanceSchema(context, catalog_name, schema_name);
     return result;
   }
 
 private:
   string catalog_name;
   string schema_name;
-  string table_name;
 };
 
 class PhysicalLanceBatchCopyToFile final : public PhysicalBatchCopyToFile {
@@ -1155,27 +1132,25 @@ public:
                                vector<LogicalType> types, CopyFunction function,
                                unique_ptr<FunctionData> bind_data,
                                idx_t estimated_cardinality, string catalog_name,
-                               string schema_name, string table_name)
+                               string schema_name)
       : PhysicalBatchCopyToFile(physical_plan, std::move(types),
                                 std::move(function), std::move(bind_data),
                                 estimated_cardinality),
         catalog_name(std::move(catalog_name)),
-        schema_name(std::move(schema_name)), table_name(std::move(table_name)) {
-  }
+        schema_name(std::move(schema_name)) {}
 
   SinkFinalizeType Finalize(Pipeline &pipeline, Event &event,
                             ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
     auto result =
         PhysicalBatchCopyToFile::Finalize(pipeline, event, context, input);
-    RefreshLanceSchemaTable(context, catalog_name, schema_name, table_name);
+    InvalidateLanceSchema(context, catalog_name, schema_name);
     return result;
   }
 
 private:
   string catalog_name;
   string schema_name;
-  string table_name;
 };
 
 class LanceDuckCatalog final : public DuckCatalog {
@@ -1625,8 +1600,7 @@ public:
             }
           }
 
-          RefreshLanceSchemaTable(context, catalog_name, schema_name,
-                                  table_name);
+          InvalidateLanceSchema(context, catalog_name, schema_name);
 
           return SinkFinalizeType::READY;
         }
@@ -1808,8 +1782,8 @@ public:
     if (execution_mode == CopyFunctionExecutionMode::BATCH_COPY_TO_FILE) {
       auto &copy = planner.Make<PhysicalLanceBatchCopyToFile>(
           op.types, copy_function, std::move(bind_data),
-          op.estimated_cardinality, op.schema.catalog.GetName(), op.schema.name,
-          create_info.table);
+          op.estimated_cardinality, op.schema.catalog.GetName(),
+          op.schema.name);
       auto &cast_copy = copy.Cast<PhysicalLanceBatchCopyToFile>();
       cast_copy.file_path = dataset_path;
       cast_copy.use_tmp_file = false;
@@ -1821,7 +1795,7 @@ public:
 
     auto &copy = planner.Make<PhysicalLanceCopyToFile>(
         op.types, copy_function, std::move(bind_data), op.estimated_cardinality,
-        op.schema.catalog.GetName(), op.schema.name, create_info.table);
+        op.schema.catalog.GetName(), op.schema.name);
     auto &cast_copy = copy.Cast<PhysicalLanceCopyToFile>();
     cast_copy.file_path = dataset_path;
     cast_copy.use_tmp_file = false;
