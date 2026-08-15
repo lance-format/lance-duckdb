@@ -1480,18 +1480,22 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
 
     if (!filtered_columns.empty()) {
-      size_t indexed_cols_len = 0;
-      auto indexed_cols_ptr = lance_dataset_list_scalar_indexed_columns(
-          bind_data.dataset, &indexed_cols_len);
+      LanceStringList indexed_columns{nullptr, 0};
+      auto rc = lance_dataset_list_scalar_indexed_columns(bind_data.dataset,
+                                                          &indexed_columns);
       bool has_indexed_filter = false;
-      for (size_t i = 0; i < indexed_cols_len; i++) {
-        if (indexed_cols_ptr[i] &&
-            filtered_columns.count(indexed_cols_ptr[i])) {
-          has_indexed_filter = true;
-          break;
+      if (rc == 0) {
+        for (auto &column : LanceConsumeStringList(indexed_columns)) {
+          if (filtered_columns.count(column)) {
+            has_indexed_filter = true;
+            break;
+          }
         }
+      } else {
+        // Index discovery is an optimization; preserve the existing fallback
+        // to the regular scanner when it is unavailable.
+        (void)LanceConsumeLastError();
       }
-      lance_free_scalar_indexed_columns(indexed_cols_ptr, indexed_cols_len);
       if (has_indexed_filter) {
         scan_state.use_dataset_scanner = true;
         scan_state.max_threads = 1;
