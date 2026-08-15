@@ -1,0 +1,53 @@
+# name: test/sql/namespace_replace_schema_case.test
+# description: Case-variant replacements preserve the discovered physical table identifier
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '__TEST_DIR__/nsroot_replace_schema_case' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main."Foo" (id BIGINT);
+
+statement ok
+INSERT INTO ns.main."Foo" VALUES (7);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.foo (id BIGINT, label VARCHAR);
+
+query I
+SELECT count(label) FROM ns.main.foo;
+----
+0
+
+query I
+SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/Foo.lance'
+----
+0
+
+statement error
+SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/foo.lance';
+----
+IO Error: Failed to open Lance dataset:
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.foo AS SELECT 11::BIGINT AS id, 'ctas'::VARCHAR AS label;
+
+query IT
+SELECT id, label FROM ns.main.foo;
+----
+11	ctas
+
+query I
+SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/Foo.lance'
+----
+1
+
+statement error
+SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/foo.lance';
+----
+IO Error: Failed to open Lance dataset:
+
+statement ok
+DETACH ns;

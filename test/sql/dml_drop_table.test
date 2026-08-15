@@ -46,4 +46,20 @@ SELECT count(*) FROM 'test/.tmp/unsafe.lance';
 1
 
 statement ok
+CREATE TABLE ns.main."DropCase" (id BIGINT);
+
+statement ok
+DROP TABLE ns.main.dropcase;
+
+statement error
+SELECT count(*) FROM 'test/.tmp/nsroot/DropCase.lance';
+----
+IO Error: Failed to open Lance dataset: test/.tmp/nsroot/DropCase.lance (Lance error: dataset open 'test/.tmp/nsroot/DropCase.lance':
+
+statement error
+SELECT count(*) FROM ns.main.dropcase;
+----
+Catalog Error: Table with name dropcase does not exist
+
+statement ok
 DETACH ns;
