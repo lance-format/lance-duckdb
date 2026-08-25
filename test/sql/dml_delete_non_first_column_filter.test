@@ -1,0 +1,29 @@
+# name: test/sql/dml_delete_non_first_column_filter.test
+# description: DELETE with a predicate on a non-first column deletes only matching rows
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 0::BIGINT AS flag
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s, 1::BIGINT AS flag
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s, 0::BIGINT AS flag
+  UNION ALL
+  SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s, 1::BIGINT AS flag
+) TO 'test/.tmp/lance_delete_non_first.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS del_col_ns (TYPE LANCE);
+
+# Predicate on the non-first column: only the flag=1 rows may be removed.
+statement ok
+DELETE FROM del_col_ns.main.lance_delete_non_first WHERE flag = 1;
+
+query IT
+SELECT id, s FROM del_col_ns.main.lance_delete_non_first ORDER BY id;
+----
+1	a
+3	c
