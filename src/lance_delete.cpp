@@ -99,13 +99,12 @@ static bool TryBuildLanceDeleteFilterIR(LogicalDelete &op,
 
   vector<string> parts;
 
-  vector<ColumnIndex> column_indexes = get->GetColumnIds();
-  TableFunctionInitInput init_input(get->bind_data.get(),
-                                    std::move(column_indexes),
-                                    get->projection_ids, &get->table_filters);
-  auto table_filters =
-      BuildLanceTableFilterIRParts(names, types, init_input, false);
-  parts = std::move(table_filters.parts);
+  if (!TryBuildLanceTableFilterIRParts(names, types, get->table_filters,
+                                       parts)) {
+    out_error = "unsupported DELETE predicate for Lance: pushed-down table "
+                "filter could not be translated to Lance filter IR";
+    return false;
+  }
 
   vector<const Expression *> predicates;
   if (!TryCollectDeleteFilterPredicates(*op.children[0], predicates,
