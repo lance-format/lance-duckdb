@@ -113,7 +113,12 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
     if let Some(v) = input.defer_index_remap {
         options.defer_index_remap = v;
     }
-    options.validate();
+    options.validate().map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("compact_files options validate: {err}"),
+        )
+    })?;
     Ok(options)
 }
 

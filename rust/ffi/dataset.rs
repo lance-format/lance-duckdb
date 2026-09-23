@@ -22,7 +22,7 @@ use crate::runtime;
 
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
-use super::update::{apply_deletions, build_row_id_index, CapturedRowIds};
+use super::update::{apply_deletions, build_row_id_index, lookup_row_address, CapturedRowIds};
 use super::util::{
     cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
@@ -781,10 +781,7 @@ fn delete_transaction_with_storage_options_inner(
                     let row_id_index = build_row_id_index(dataset.as_ref()).await?;
                     let mut addrs = RoaringTreemap::new();
                     for row_id in sequence.iter() {
-                        let addr = row_id_index
-                            .get(row_id)
-                            .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
-                        addrs.insert(u64::from(addr));
+                        addrs.insert(lookup_row_address(&row_id_index, row_id)?);
                     }
                     addrs
                 }

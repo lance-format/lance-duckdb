@@ -17,7 +17,7 @@ use roaring::RoaringTreemap;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::update::{apply_deletions, build_row_id_index};
+use super::update::{apply_deletions, build_row_id_index, lookup_row_address};
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 struct MergeHandle {
@@ -394,10 +394,7 @@ fn merge_finish_uncommitted_inner(
                     .await
                     .map_err(|e| e.to_string())?;
                 for row_id in handle.delete_row_ids.iter() {
-                    let addr = row_id_index
-                        .get(row_id)
-                        .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
-                    row_addrs.insert(u64::from(addr));
+                    row_addrs.insert(lookup_row_address(&row_id_index, row_id)?);
                 }
             } else {
                 row_addrs = handle.delete_row_ids;
@@ -424,7 +421,7 @@ fn merge_finish_uncommitted_inner(
             updated_fragments,
             new_fragments,
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: Vec::new(),
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,

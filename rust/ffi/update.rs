@@ -426,7 +426,7 @@ fn rewrite_rows_update_transaction_inner(
             let sequences = rechunk_sequences(vec![sequence.clone()], fragment_sizes, false)
                 .map_err(|e| e.to_string())?;
             for (fragment, seq) in new_fragments.iter_mut().zip(sequences) {
-                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq)));
+                fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&seq).into()));
             }
         }
 
@@ -438,10 +438,7 @@ fn rewrite_rows_update_transaction_inner(
                     .map_err(|e| e.to_string())?;
                 let mut addrs = RoaringTreemap::new();
                 for row_id in sequence.iter() {
-                    let addr = row_id_index
-                        .get(row_id)
-                        .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
-                    addrs.insert(u64::from(addr));
+                    addrs.insert(lookup_row_address(&row_id_index, row_id)?);
                 }
                 addrs
             }
@@ -464,7 +461,7 @@ fn rewrite_rows_update_transaction_inner(
             updated_fragments,
             new_fragments,
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
@@ -517,7 +514,7 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
             .as_ref()
             .ok_or_else(|| "missing row id meta".to_string())?;
         let row_id_bytes = match row_id_meta {
-            RowIdMeta::Inline(data) => data.clone(),
+            RowIdMeta::Inline(data) => data.to_vec(),
             RowIdMeta::External(file) => {
                 let path = base.clone().join(file.path.as_str());
                 let range = file.offset as usize..(file.offset + file.size) as usize;
@@ -550,6 +547,14 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
     }
 
     RowIdIndex::new(&indices).map_err(|e| e.to_string())
+}
+
+pub(super) fn lookup_row_address(row_id_index: &RowIdIndex, row_id: u64) -> Result<u64, String> {
+    let addr = row_id_index
+        .get(row_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("row id missing from row id index: {row_id}"))?;
+    Ok(u64::from(addr))
 }
 
 pub(super) async fn apply_deletions(
