@@ -28,7 +28,7 @@ lance-namespace = "12.0.0"
 lance-namespace-impls = { version = "12.0.0", features = ["rest"] }
 lance-table = "12.0.0"
 
-arrow = { version = "58.0.0", features = ["ffi"] }
+arrow = { version = "60.0.0", features = ["ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 
