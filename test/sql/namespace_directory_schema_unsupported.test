@@ -1,0 +1,39 @@
+# name: test/sql/namespace_directory_schema_unsupported.test
+# description: Legacy directory namespaces reject child schemas
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '__TEST_DIR__/nsroot_directory_schema_unsupported' AS ns (TYPE LANCE);
+
+statement error
+CREATE SCHEMA ns.s1;
+----
+Not implemented Error: CREATE SCHEMA is not supported for legacy Lance directory namespaces because manifest mode is disabled
+
+statement error
+CREATE TABLE ns.s1.regular_t (id BIGINT);
+----
+Catalog Error: Schema with name s1 does not exist!
+
+statement error
+CREATE TABLE ns.s1.ctas_t AS SELECT 1::BIGINT AS id;
+----
+Catalog Error: Schema with name s1 does not exist!
+
+statement ok
+CREATE TABLE ns.main.main_t AS SELECT 1::BIGINT AS id;
+
+query I
+SELECT sum(id) FROM '__TEST_DIR__/nsroot_directory_schema_unsupported/main_t.lance'
+----
+1
+
+statement error
+SELECT count(*) FROM '__TEST_DIR__/nsroot_directory_schema_unsupported/main/main_t.lance';
+----
+IO Error: Failed to open Lance dataset:
+
+statement ok
+DETACH ns;

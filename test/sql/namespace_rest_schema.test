@@ -1,0 +1,125 @@
+# name: test/sql/namespace_rest_schema.test
+# description: REST child namespaces are exposed as persistent DuckDB schemas
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
+test-env LANCE_NAMESPACE_ID default
+
+test-env LANCE_TEST_SCHEMA rest_schema_crud
+
+require lance
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+statement ok
+BEGIN;
+
+statement error
+CREATE SCHEMA ns.rest_schema_in_transaction;
+----
+Not implemented Error: Lance schema DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement error
+CREATE SCHEMA ns."x$y";
+----
+Invalid Input Error: Lance REST identifier segment 'x$y' contains the configured delimiter '$'
+
+statement ok
+CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}"."x$y" (x INTEGER);
+----
+Invalid Input Error: Lance REST identifier segment 'x$y' contains the configured delimiter '$'
+
+statement error
+CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+----
+Catalog Error: Schema with name "${LANCE_TEST_SCHEMA}" already exists!
+
+statement error
+CREATE OR REPLACE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+----
+Not implemented Error: CREATE OR REPLACE SCHEMA is not supported for Lance namespaces
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}".regular_in_transaction (x INTEGER);
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}".ctas_in_transaction AS SELECT 1 AS x;
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT schema_name
+FROM duckdb_schemas()
+WHERE database_name = 'ns' AND schema_name = '${LANCE_TEST_SCHEMA}'
+----
+${LANCE_TEST_SCHEMA}
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+query T
+SELECT schema_name
+FROM duckdb_schemas()
+WHERE database_name = 'ns' AND schema_name = '${LANCE_TEST_SCHEMA}'
+----
+${LANCE_TEST_SCHEMA}
+
+statement ok
+CREATE VIEW ns."${LANCE_TEST_SCHEMA}".dependency_view AS SELECT 42 AS x;
+
+statement error
+DROP SCHEMA ns."${LANCE_TEST_SCHEMA}";
+----
+Dependency Error: Cannot drop entry "${LANCE_TEST_SCHEMA}" because there are entries that depend on it.
+
+query I
+SELECT x FROM ns."${LANCE_TEST_SCHEMA}".dependency_view
+----
+42
+
+statement ok
+BEGIN;
+
+statement error
+DROP SCHEMA ns."${LANCE_TEST_SCHEMA}";
+----
+Not implemented Error: Lance schema DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP VIEW ns."${LANCE_TEST_SCHEMA}".dependency_view;
+
+statement ok
+DROP SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement ok
+DETACH ns;

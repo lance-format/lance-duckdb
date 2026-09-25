@@ -17,6 +17,12 @@ typedef struct LanceDebugCounters {
   uint64_t commit_count;
 } LanceDebugCounters;
 
+typedef struct LanceStringList {
+  // Rust-owned strings; release the complete list with lance_free_string_list.
+  char **items;
+  size_t count;
+} LanceStringList;
+
 void *lance_create_session(uint64_t index_cache_size_bytes,
                            uint64_t metadata_cache_size_bytes);
 void lance_close_session(void *session);
@@ -33,10 +39,11 @@ void *lance_open_dataset_with_storage_options(const char *path,
 void *lance_open_dataset_with_storage_options_and_session(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session);
-const char *lance_dir_namespace_list_tables(const char *root,
-                                            const char **option_keys,
-                                            const char **option_values,
-                                            size_t options_len);
+int32_t lance_dir_namespace_list_tables(const char *root,
+                                        const char **option_keys,
+                                        const char **option_values,
+                                        size_t options_len,
+                                        LanceStringList *out);
 int32_t lance_dir_namespace_drop_table(const char *root, const char *table_name,
                                        const char **option_keys,
                                        const char **option_values,
@@ -48,10 +55,27 @@ void *lance_open_dataset_in_dir_namespace_with_session(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, void *session,
     const char **out_table_uri);
-const char *
-lance_namespace_list_tables(const char *endpoint, const char *namespace_id,
-                            const char *bearer_token, const char *api_key,
-                            const char *delimiter, const char *headers_tsv);
+int32_t lance_namespace_list_tables(const char *endpoint,
+                                    const char *namespace_id,
+                                    const char *bearer_token,
+                                    const char *api_key, const char *delimiter,
+                                    const char *headers_tsv,
+                                    LanceStringList *out);
+int32_t
+lance_namespace_list_namespaces(const char *endpoint, const char *namespace_id,
+                                const char *bearer_token, const char *api_key,
+                                const char *delimiter, const char *headers_tsv,
+                                LanceStringList *out);
+int32_t
+lance_namespace_create_namespace(const char *endpoint, const char *namespace_id,
+                                 const char *bearer_token, const char *api_key,
+                                 const char *delimiter, const char *headers_tsv,
+                                 const char *mode);
+int32_t
+lance_namespace_drop_namespace(const char *endpoint, const char *namespace_id,
+                               const char *bearer_token, const char *api_key,
+                               const char *delimiter, const char *headers_tsv,
+                               const char *behavior);
 int32_t lance_json_arrow_schema_to_c(const char *json_schema,
                                      ArrowSchema *out_schema);
 int32_t lance_namespace_describe_table_with_schema(
@@ -97,6 +121,7 @@ void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
 void lance_free_string(const char *s);
+void lance_free_string_list(LanceStringList *list);
 
 int64_t lance_dataset_count_rows(void *dataset);
 int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
@@ -338,9 +363,8 @@ lance_dataset_optimize_index_with_options(void *dataset, const char *index_name,
                                           const char **out_metrics_json);
 void *lance_get_index_list_schema(void *dataset);
 void *lance_create_index_list_stream(void *dataset);
-char **lance_dataset_list_scalar_indexed_columns(void *dataset,
-                                                 size_t *out_len);
-void lance_free_scalar_indexed_columns(char **ptr, size_t len);
+int32_t lance_dataset_list_scalar_indexed_columns(void *dataset,
+                                                  LanceStringList *out);
 
 void lance_free_batch(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,

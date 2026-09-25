@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 
 struct LanceNamespaceQueryConfig;
+struct LanceStringList;
 
 namespace duckdb {
 
@@ -46,12 +47,27 @@ void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
     string &out_api_key);
 
+vector<string> LanceConsumeStringList(LanceStringList &list);
+
 bool TryLanceNamespaceListTables(ClientContext &context, const string &endpoint,
                                  const string &namespace_id,
                                  const string &bearer_token,
                                  const string &api_key, const string &delimiter,
                                  const string &headers_tsv,
                                  vector<string> &out_tables, string &out_error);
+bool TryLanceNamespaceListNamespaces(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, vector<string> &out_namespaces,
+    string &out_error);
+bool TryLanceNamespaceCreateNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, const string &mode, string &out_error);
+bool TryLanceNamespaceDropNamespace(
+    ClientContext &context, const string &endpoint, const string &namespace_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, bool cascade, string &out_error);
 
 bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
                                     vector<string> &out_tables,

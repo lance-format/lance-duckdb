@@ -15,7 +15,8 @@ use crate::runtime;
 use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::util::{
-    cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
+    cstr_to_str, export_string_list, optional_session_handle, slice_from_ptr, to_c_string,
+    FfiError, FfiResult, LanceStringList,
 };
 
 fn parse_storage_options(
@@ -102,18 +103,10 @@ pub unsafe extern "C" fn lance_dir_namespace_list_tables(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
-) -> *const c_char {
-    match dir_namespace_list_tables_inner(root, option_keys, option_values, options_len) {
-        Ok(tables) => {
-            clear_last_error();
-            let joined = tables.join("\n");
-            to_c_string(joined).into_raw() as *const c_char
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null()
-        }
-    }
+    out: *mut LanceStringList,
+) -> i32 {
+    let result = dir_namespace_list_tables_inner(root, option_keys, option_values, options_len);
+    unsafe { export_string_list(result, out) }
 }
 
 fn open_dataset_in_dir_namespace_inner(

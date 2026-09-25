@@ -1,0 +1,49 @@
+# name: test/sql/namespace_rest_ctas_schema.test
+# description: REST CTAS writes to the namespace bound to its schema
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
+test-env LANCE_NAMESPACE_ID default
+
+test-env LANCE_TEST_SCHEMA rest_ctas_schema_routing
+
+require lance
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+statement ok
+CREATE SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement ok
+CREATE TABLE ns."${LANCE_TEST_SCHEMA}".routed_table AS SELECT 42 AS id;
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+query T
+SHOW TABLES FROM ns."${LANCE_TEST_SCHEMA}"
+----
+routed_table
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'ns' AND schema_name = 'main'
+  AND table_name = 'routed_table'
+----
+0
+
+statement ok
+DROP TABLE ns."${LANCE_TEST_SCHEMA}".routed_table;
+
+statement ok
+DROP SCHEMA ns."${LANCE_TEST_SCHEMA}";
+
+statement ok
+DETACH ns;
