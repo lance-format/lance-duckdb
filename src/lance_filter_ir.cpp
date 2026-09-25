@@ -1084,6 +1084,14 @@ bool TryBuildLanceTableFilterIRParts(const vector<string> &names,
     if (!filter) {
       continue;
     }
+    // OPTIONAL_FILTER / DYNAMIC_FILTER are pruning hints that are not required
+    // for correctness: DuckDB pushes them as PUSHED_DOWN_PARTIALLY and keeps
+    // the exact predicate as a residual LogicalFilter (collected separately for
+    // DELETE). Skip them here rather than failing translation.
+    if (filter->filter_type == TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == TableFilterType::DYNAMIC_FILTER) {
+      continue;
+    }
     if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
         col_id == COLUMN_IDENTIFIER_EMPTY) {
       return false;

@@ -1,0 +1,24 @@
+# name: test/sql/dml_delete_keyword_column.test
+# description: DELETE predicates on columns whose names are SQL keywords still match rows
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 'x'::VARCHAR AS name, 1::BIGINT AS id
+  UNION ALL
+  SELECT 'y'::VARCHAR AS name, 2::BIGINT AS id
+) TO 'test/.tmp/lance_delete_keyword.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 'test/.tmp' AS del_kw_ns (TYPE LANCE);
+
+# 'name' is a SQL keyword; the predicate must still match and delete the row.
+statement ok
+DELETE FROM del_kw_ns.main.lance_delete_keyword WHERE name = 'x';
+
+query TI
+SELECT name, id FROM del_kw_ns.main.lance_delete_keyword ORDER BY id;
+----
+y	2
