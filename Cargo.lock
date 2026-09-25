@@ -74,9 +74,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approx"
@@ -3415,7 +3415,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "snafu 0.9.0",
+ "snafu",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3516,7 +3516,7 @@ dependencies = [
  "rand 0.9.2",
  "roaring",
  "serde_json",
- "snafu 0.9.0",
+ "snafu",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3796,7 +3796,7 @@ dependencies = [
  "lance-namespace-reqwest-client",
  "serde",
  "serde_json",
- "snafu 0.9.0",
+ "snafu",
 ]
 
 [[package]]
@@ -3895,7 +3895,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "snafu 0.9.0",
+ "snafu",
  "tokio",
  "tracing",
  "url",
@@ -3944,7 +3944,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
- "snafu 0.8.9",
+ "snafu",
  "tokio",
 ]
 
@@ -6259,32 +6259,11 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "snafu-derive 0.8.9",
-]
-
-[[package]]
-name = "snafu"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1d4bced6a69f90b2056c03dcff2c4737f98d6fb9e0853493996e1d253ca29c6"
 dependencies = [
- "snafu-derive 0.9.0",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "snafu-derive",
 ]
 
 [[package]]
