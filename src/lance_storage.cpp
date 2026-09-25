@@ -258,16 +258,16 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return out;
 }
 
-static bool
-DirectoryNamespaceTableExists(const LanceDirectoryNamespaceConfig &ns,
-                              const string &table_name) {
+static string
+FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
+                            const string &table_name) {
   auto tables = ListDirectoryNamespaceTables(ns);
   for (auto &t : tables) {
     if (StringUtil::CIEquals(t, table_name)) {
-      return true;
+      return t;
     }
   }
-  return false;
+  return string();
 }
 
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
@@ -287,6 +287,15 @@ public:
           "Unsafe Lance dataset name for directory namespace: " + entry_name);
     }
 
+    // DuckDB resolves catalog identifiers case-insensitively, while directory
+    // namespace paths are case-sensitive. Resolve the requested spelling back
+    // to the physical table identifier before opening and materializing the
+    // catalog entry so an evicted Foo.lance is not rediscovered as foo.lance.
+    auto physical_table = FindDirectoryNamespaceTable(*ns, entry_name);
+    if (physical_table.empty()) {
+      return nullptr;
+    }
+
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
@@ -294,7 +303,7 @@ public:
 
     const char *uri_ptr = nullptr;
     auto *dataset = lance_open_dataset_in_dir_namespace(
-        ns->root.c_str(), entry_name.c_str(),
+        ns->root.c_str(), physical_table.c_str(),
         key_ptrs.empty() ? nullptr : key_ptrs.data(),
         value_ptrs.empty() ? nullptr : value_ptrs.data(),
         ns->option_keys.size(), &uri_ptr);
@@ -307,7 +316,7 @@ public:
       return nullptr;
     }
 
-    CreateTableInfo info(schema, entry_name);
+    CreateTableInfo info(schema, physical_table);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
@@ -321,12 +330,13 @@ public:
     lance_close_dataset(dataset);
 
     if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
+      dataset_uri =
+          JoinNamespacePath(ns->root, GetDatasetDirName(physical_table));
     }
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Directory;
     cfg.root = ns->root;
-    cfg.table_id = entry_name;
+    cfg.table_id = physical_table;
     cfg.option_keys = ns->option_keys;
     cfg.option_values = ns->option_values;
     cfg.display_uri = std::move(dataset_uri);
@@ -596,6 +606,12 @@ static string GetDatasetDirName(const string &table_name) {
   return table_name + ".lance";
 }
 
+class LanceSchemaEntry;
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name);
+
 static bool IsSafeDatasetTableName(const string &name) {
   if (name.empty()) {
     return false;
@@ -824,13 +840,14 @@ public:
       BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                       value_ptrs);
 
+      const auto &physical_table = lance_entry->NamespaceConfig().table_id;
       auto rc = lance_dir_namespace_drop_table(
-          root.c_str(), info.name.c_str(),
+          root.c_str(), physical_table.c_str(),
           key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
       if (rc != 0) {
         throw IOException("Failed to drop Lance dataset: " + root + "/" +
-                          GetDatasetDirName(info.name) +
+                          GetDatasetDirName(physical_table) +
                           LanceFormatErrorSuffix());
       }
     }
@@ -885,6 +902,7 @@ public:
     string dataset_path;
     vector<string> option_keys;
     vector<string> option_values;
+    bool refresh_directory_entry = false;
 
     if (rest_ns) {
       unordered_map<string, Value> overrides;
@@ -998,11 +1016,12 @@ public:
         throw InternalException("Lance directory namespace root is empty");
       }
 
+      auto matched_table =
+          FindDirectoryNamespaceTable(*directory_ns, create_info.table);
+      auto exists = !matched_table.empty();
+      auto physical_table = exists ? matched_table : create_info.table;
       dataset_path = JoinNamespacePath(directory_ns->root,
-                                       GetDatasetDirName(create_info.table));
-
-      auto exists =
-          DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                       GetDatasetDirName(physical_table));
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableDefaults();
@@ -1012,6 +1031,9 @@ public:
           exists) {
         throw IOException("Lance dataset already exists: " + dataset_path);
       }
+      refresh_directory_entry =
+          exists &&
+          create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 
       option_keys = directory_ns->option_keys;
       option_values = directory_ns->option_values;
@@ -1058,6 +1080,13 @@ public:
                         LanceFormatErrorSuffix());
     }
 
+    if (refresh_directory_entry) {
+      auto cache_key = LanceBuildResolvedPathDatasetCacheKey(
+          dataset_path, option_keys, option_values);
+      LanceInvalidateDatasetCache(context, cache_key);
+      EvictLanceTableCatalogEntry(*this, transaction, create_info.table);
+    }
+
     // Best-effort persistence of DuckDB column defaults in Lance field
     // metadata. Lance itself does not currently expose defaults through
     // DuckDB's catalog, but we can still use the metadata during UPDATE
@@ -1101,6 +1130,30 @@ private:
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   DefaultGenerator *table_default_generator = nullptr;
 };
+
+static void EvictLanceTableCatalogEntry(LanceSchemaEntry &schema,
+                                        CatalogTransaction transaction,
+                                        const string &table_name) {
+  auto &set = schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
+  auto existing_entry = set.GetEntry(transaction, table_name);
+  if (!existing_entry) {
+    return;
+  }
+  auto existing_type = existing_entry->type;
+  if (existing_type != CatalogType::TABLE_ENTRY &&
+      existing_type != CatalogType::VIEW_ENTRY) {
+    throw InternalException(
+        "Unexpected catalog entry type for Lance table '%s': %s", table_name,
+        CatalogTypeToString(existing_type));
+  }
+  auto system_transaction =
+      CatalogTransaction::GetSystemTransaction(schema.catalog.GetDatabase());
+  if (!set.DropEntry(system_transaction, table_name, false, true)) {
+    throw InternalException("Could not drop catalog entry for Lance table '%s'",
+                            table_name);
+  }
+  set.CleanupEntry(*existing_entry);
+}
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
@@ -1580,11 +1633,12 @@ public:
       throw InternalException("Lance directory namespace root is empty");
     }
 
+    auto matched_table =
+        FindDirectoryNamespaceTable(*directory_ns, create_info.table);
+    auto exists = !matched_table.empty();
+    auto physical_table = exists ? matched_table : create_info.table;
     auto dataset_path = JoinNamespacePath(directory_ns->root,
-                                          GetDatasetDirName(create_info.table));
-
-    auto exists =
-        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                          GetDatasetDirName(physical_table));
 
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {
