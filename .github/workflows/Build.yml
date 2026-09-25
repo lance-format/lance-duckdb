@@ -25,7 +25,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore ccache
         id: cache-ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             .ccache
@@ -66,7 +66,7 @@ jobs:
           GEN=ninja make release -j 4
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-release-${{ github.sha }}
           path: |
@@ -76,7 +76,7 @@ jobs:
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             .ccache
@@ -87,10 +87,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-release-${{ github.sha }}
           path: build/release
@@ -108,10 +108,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-release-${{ github.sha }}
           path: build/release
