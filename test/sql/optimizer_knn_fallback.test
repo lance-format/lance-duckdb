@@ -1,0 +1,464 @@
+# name: test/sql/optimizer_knn_fallback.test
+# description: Cases where the KNN optimizer must NOT rewrite (original plan kept)
+# group: [sql]
+
+require lance
+
+# ===================================================================
+# Setup: indexed L2 dataset (FLOAT[16]) for most cases;
+# also an UNINDEXED copy for the "no vector index" case.
+# ===================================================================
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO 'test/.tmp/knn_fb_l2.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX vec_idx ON 'test/.tmp/knn_fb_l2.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO 'test/.tmp/knn_fb_noindex.lance' (FORMAT lance, mode 'overwrite');
+
+# ===================================================================
+# Fallback: ORDER BY ... DESC -> no rewrite
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16]) DESC
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16]) DESC
+LIMIT 5;
+----
+physical_plan	<REGEX>:[\s\S]*TOP_N[\s\S]*
+
+# Original plan still executes
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16]) DESC
+  LIMIT 5
+);
+----
+5
+
+# ===================================================================
+# Fallback: OFFSET > 0 -> no rewrite
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5 OFFSET 10;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 5 OFFSET 10
+);
+----
+5
+
+# ===================================================================
+# Fallback: multiple ORDER BY keys -> no rewrite
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16]), id
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16]), id
+LIMIT 5;
+----
+physical_plan	<REGEX>:[\s\S]*TOP_N[\s\S]*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16]), id
+  LIMIT 5
+);
+----
+5
+
+# ===================================================================
+# Fallback: distance has no constant query (both args are column refs)
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, vec)
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, vec)
+  LIMIT 5
+);
+----
+5
+
+# ===================================================================
+# Fallback: k literal too large (> 10000)
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 100000;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) > 0 FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 100000
+);
+----
+true
+
+# ===================================================================
+# Fallback: no vector index on the column
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_noindex.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_noindex.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 5
+);
+----
+5
+
+# After the fallback above, the metric cache must NOT have negative-cached
+# the "no index" answer: a subsequent CREATE INDEX in the same session
+# should make the next plan pick up the index and rewrite. CREATE INDEX
+# invalidates the dataset cache entry today, but we also rely on the
+# metric cache only storing positive lookups so any future index DDL path
+# that forgets to invalidate still recovers on the next plan.
+statement ok
+CREATE INDEX vec_idx_late ON 'test/.tmp/knn_fb_noindex.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_noindex.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<REGEX>:[\s\S]*__LANCE_KNN_SCAN[\s\S]*
+
+# ===================================================================
+# Fallback: metric mismatch (L2 index, cosine query)
+# Original plan kept; DuckDB still computes the correct result.
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_cosine_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_cosine_distance(vec, [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+  ]::FLOAT[16])
+  LIMIT 5
+);
+----
+5
+
+# ===================================================================
+# Fallback: session var disables the rewrite
+# ===================================================================
+
+statement ok
+SET lance_knn_use_index = false;
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 5
+);
+----
+5
+
+# The kill switch is also the exact SQL fallback: it must return the
+# same ids as a materialized full-scan distance + DuckDB TopN plan.
+query I
+SELECT count(*) FROM (
+  (SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+   ORDER BY array_distance(vec, [
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+   ]::FLOAT[16])
+   LIMIT 5)
+  EXCEPT
+  (SELECT id FROM (
+     SELECT id, array_distance(vec, [
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+     ]::FLOAT[16]) AS dist
+     FROM 'test/.tmp/knn_fb_l2.lance'
+   ) baseline
+   ORDER BY dist
+   LIMIT 5)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT id FROM (
+     SELECT id, array_distance(vec, [
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+     ]::FLOAT[16]) AS dist
+     FROM 'test/.tmp/knn_fb_l2.lance'
+   ) baseline
+   ORDER BY dist
+   LIMIT 5)
+  EXCEPT
+  (SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+   ORDER BY array_distance(vec, [
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+   ]::FLOAT[16])
+   LIMIT 5)
+);
+----
+0
+
+statement ok
+SET lance_knn_use_index = true;
+
+# ===================================================================
+# Fallback: WHERE contains a non-deterministic expression
+# (random() cannot be encoded as Filter IR -> no rewrite)
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+WHERE random() < 0.5
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+# Sanity: query executes (the row count is non-deterministic since random()
+# may filter everything; just assert that it does not error and returns <= k rows)
+query I
+SELECT count(*) <= 5 FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  WHERE random() < 0.5
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 5
+);
+----
+true
+
+# ===================================================================
+# Fallback: ORDER BY is not a supported distance function
+# (length(text) over the search_test_data fixture)
+# ===================================================================
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/data/search_test_data.lance'
+ORDER BY length(text)
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/data/search_test_data.lance'
+  ORDER BY length(text)
+  LIMIT 5
+);
+----
+5
+
+# ===================================================================
+# Session var: lance_knn_max_k lowers the rewrite ceiling.
+#
+# Test scope note: we only assert the lowering path and the "0 = default"
+# fallback, not "raising the ceiling unlocks larger LIMIT" or "hard
+# ceiling clamps to 1M". Those branches would need a LIMIT large enough
+# to *not* also trip DuckDB's own switch from LogicalTopN to
+# STREAMING_LIMIT + ORDER_BY (which happens once LIMIT exceeds the
+# estimated input cardinality, ~2048 here). With a tiny test dataset
+# any "raise max_k to 100000, LIMIT 50000" assertion would actually be
+# testing that DuckDB-side switch, not our path. The hard-ceiling
+# clamp is exercised by code review and the absolute_max_k constant.
+# ===================================================================
+
+# Lowering below the literal LIMIT forces fallback even though the
+# default ceiling would have allowed the rewrite.
+statement ok
+SET lance_knn_max_k = 3;
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<!REGEX>:.*__LANCE_KNN_SCAN.*
+
+# Sanity: the query still returns correct row count via the DuckDB
+# fallback path.
+query I
+SELECT count(*) FROM (
+  SELECT id FROM 'test/.tmp/knn_fb_l2.lance'
+  ORDER BY array_distance(vec, [
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]::FLOAT[16])
+  LIMIT 5
+);
+----
+5
+
+statement ok
+RESET lance_knn_max_k;
+
+# Setting to 0 falls back to the documented default (10000): LIMIT 5
+# still rewrites because 5 <= 10000.
+statement ok
+SET lance_knn_max_k = 0;
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM 'test/.tmp/knn_fb_l2.lance'
+ORDER BY array_distance(vec, [
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+]::FLOAT[16])
+LIMIT 5;
+----
+physical_plan	<REGEX>:[\s\S]*__LANCE_KNN_SCAN[\s\S]*
+
+statement ok
+RESET lance_knn_max_k;

@@ -30,6 +30,8 @@ set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
                       src/lance_truncate.cpp
                       src/lance_index.cpp
                       src/lance_arrow_compat.cpp
+                      src/lance_knn_scan.cpp
+                      src/lance_knn_optimizer.cpp
                       src/lance_resolver.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

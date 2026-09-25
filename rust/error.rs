@@ -67,6 +67,7 @@ pub enum ErrorCode {
     Exec = 52,
     DatasetMerge = 53,
     NamespaceQueryTable = 54,
+    DatasetGetIndexMetric = 55,
 }
 
 struct LastError {
