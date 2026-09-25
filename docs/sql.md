@@ -59,7 +59,7 @@ Named parameters:
 - `refine_factor` (BIGINT, optional): Over-fetch factor for re-ranking using original vectors. Must be > 0. A value of `1` still enables re-ranking.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
-- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table.
+- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
 
 Output:
 - Dataset columns plus `_distance` (smaller is closer).
@@ -67,7 +67,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
-- For attached namespace tables, DuckDB `WHERE` filters are applied after the namespace search result. Use the explicit `filter` parameter to send a filter expression to Lance Namespace `query_table`; `prefilter=true` on namespace tables requires this explicit `filter`.
+- `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
 
 ### Full-text search: `lance_fts`
 
@@ -88,7 +88,7 @@ Positional arguments:
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table.
+- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
 
 Output:
 - Dataset columns plus `_score` (larger is better).
@@ -96,7 +96,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
-- For attached namespace tables, DuckDB `WHERE` filters are applied after the namespace search result. Use the explicit `filter` parameter to send a filter expression to Lance Namespace `query_table`; `prefilter=true` on namespace tables requires this explicit `filter`.
+- `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
 
 ### Hybrid search: `lance_hybrid_search`
 
@@ -120,7 +120,7 @@ ORDER BY _hybrid_score DESC;
 Signature: `lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)`
 
 Positional arguments:
-- `uri` (VARCHAR): Dataset root path or object store URI (e.g. `s3://...`).
+- `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
 - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
 - `text_column` (VARCHAR): Text column name.
@@ -141,6 +141,18 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
+- `WHERE` predicates push down for both dataset paths and attached namespace tables.
+
+### Filter pushdown notes
+
+These notes apply to all three search functions.
+
+- Comparison predicates (`=`, `>`, numeric `IN`, ...) and string predicates (`starts_with`, `LIKE`, `regexp_matches`) push down into Lance.
+- Containment predicates over list columns — `array_has_any` and `array_has_all` — push down. With `prefilter=true` and a `LABEL_LIST` index on the list column, Lance answers them from the index; without one, Lance evaluates them with a scan. The index is used for `VARCHAR[]` and `BIGINT[]` element types; narrower integer widths still push and prefilter, but scan.
+- `IS NULL` / `IS NOT NULL` on list columns push down. No scalar index answers them.
+- Containment forms that cannot push — empty or non-constant needles, needles containing `NULL`, `array_has` / `array_contains`, and the `&&` / `@>` / `<@` aliases — are evaluated by DuckDB after the search.
+- Datasets whose list columns have a child field named `l` (written by older versions of this extension) push and prefilter correctly, but the `LABEL_LIST` index is not used. A metadata-only rename fixes this without rewriting data: `ALTER TABLE ns.main.t RENAME COLUMN "tags.l" TO item;`
+- Known limitation: `IN` over a `VARCHAR` column with two or more values currently raises an error from the search functions when it must prefilter. Apply it after the search, or use a scan.
 
 ## Namespaces
 

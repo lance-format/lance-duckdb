@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -95,6 +96,7 @@ public:
       ArrowConverter::ToArrowSchema(&gstate.schema_root.arrow_schema,
                                     gstate.column_types, gstate.column_names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&gstate.schema_root.arrow_schema);
 
       if (!gstate.table) {
         throw InternalException("Lance INSERT missing table reference");

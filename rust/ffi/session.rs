@@ -87,6 +87,14 @@ fn create_session_inner(
 }
 
 fn clear_session_caches(handle: &SessionHandle) {
+    // Skip during process teardown: a C++ static destructor can close a session after
+    // this thread's TLS is destroyed, and `block_on` would then panic inside tokio's
+    // context thread-local and wedge shutdown. The caches die with the process anyway.
+    if let Err(err) = tokio::runtime::Handle::try_current() {
+        if err.is_thread_local_destroyed() {
+            return;
+        }
+    }
     if let Some(runtime) = crate::runtime::initialized_runtime() {
         runtime.block_on(async {
             handle.index_cache.clear().await;

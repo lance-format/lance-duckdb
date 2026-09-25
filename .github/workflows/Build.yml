@@ -127,7 +127,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-01-20T14-49-07Z \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z \
             server /data
 
       - name: Wait for MinIO

@@ -3198,8 +3198,8 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       make_uniq<LanceExecLocalState>(std::move(chunk), context.client);
   result->global_state = &global;
   LanceExecContext exec_ctx;
-  exec_ctx.threads =
-      NumericCast<uint32_t>(DBConfig::GetConfig(context.client).options.maximum_threads);
+  exec_ctx.threads = NumericCast<uint32_t>(
+      DBConfig::GetConfig(context.client).options.maximum_threads);
   result->stream = lance_create_dataset_exec_stream_ir(
       bind_data.dataset,
       bind_data.exec_ir.empty()
@@ -3621,6 +3621,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto props = context.GetClientProperties();
       ArrowConverter::ToArrowSchema(&new_schema_root.arrow_schema, types, names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_schema_root.arrow_schema);
 
       vector<string> expressions;
       if (add.new_column.HasDefaultValue()) {
@@ -3716,6 +3717,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
                                     {cast.target_type}, {cast.column_name},
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_type_schema.arrow_schema);
 
       auto rc = lance_dataset_alter_columns_cast(
           dataset, cast.column_name.c_str(), &new_type_schema.arrow_schema);
