@@ -1,0 +1,17 @@
+# name: test/sql/json_extension_scan.test
+# description: JSON Arrow extension columns are readable as text
+# group: [sql]
+
+require lance
+
+query TTTTTT
+DESCRIBE SELECT * FROM 'test/data/json_data.lance';
+----
+id	BIGINT	YES	NULL	NULL	NULL
+payload	VARCHAR	YES	NULL	NULL	NULL
+
+query TI
+SELECT payload, id FROM 'test/data/json_data.lance' ORDER BY id;
+----
+{"a":1}	1
+{"a":2}	2
