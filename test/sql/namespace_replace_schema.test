@@ -1,0 +1,97 @@
+# name: test/sql/namespace_replace_schema.test
+# description: CREATE OR REPLACE TABLE replaces schema after INSERT (directory namespace)
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/.tmp/nsroot_replace_schema_126' AS ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.replace_schema_t (id BIGINT);
+
+statement ok
+INSERT INTO ns.main.replace_schema_t VALUES (42);
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.untouched_t (id BIGINT);
+
+statement ok
+INSERT INTO ns.main.untouched_t VALUES (7);
+
+query I
+SELECT count(*) FROM ns.main.replace_schema_t
+----
+1
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.replace_schema_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.untouched_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.untouched_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+statement error
+CREATE OR REPLACE TABLE ns.main.replace_schema_t (id BIGINT, label VARCHAR)
+  WITH (data_storage_version = 'bad_version');
+----
+IO Error: Failed to open Lance writer:
+
+query I
+SELECT count(*) FROM ns.main.replace_schema_t
+----
+1
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'ns' AND schema_name = 'main' AND table_name = 'replace_schema_t'
+ORDER BY column_index
+----
+id	BIGINT
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.replace_schema_t (id BIGINT, label VARCHAR);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.replace_schema_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query I
+SELECT count(*) FROM ns.main.replace_schema_t
+----
+0
+
+query I
+SELECT count(label) FROM ns.main.replace_schema_t
+----
+0
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.replace_schema_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ns.main.untouched_t;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'ns' AND schema_name = 'main' AND table_name = 'replace_schema_t'
+ORDER BY column_index
+----
+id	BIGINT
+label	VARCHAR
+
+statement ok
+DETACH ns;
