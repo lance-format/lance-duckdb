@@ -229,6 +229,11 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   return out;
 }
 
+// Mirrors ErrorCode::NamespaceTableNotFound in rust/error.rs: the namespace
+// reported that the addressed table (or its parent namespace) does not
+// exist, as opposed to auth/network/server failures.
+static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 56;
+
 static vector<string>
 ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
                         const string &bearer_token, const string &api_key,
@@ -411,25 +416,6 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const string &entry_name) override {
-    // Only resolve names that are real tables in this namespace. DuckDB probes
-    // the active catalog for system names (e.g. duckdb_tables when SHOW TABLES
-    // runs under `USE <lance_catalog>`); without this guard we'd try to open
-    // those as Lance datasets and throw, aborting the statement. Returning
-    // nullptr (not found) lets resolution fall through to the system catalog.
-    {
-      auto known = GetDefaultEntries();
-      bool found = false;
-      for (auto &k : known) {
-        if (k == entry_name) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return nullptr;
-      }
-    }
-
     unordered_map<string, Value> overrides;
     if (!bearer_token_override.empty()) {
       overrides["bearer_token"] = Value(bearer_token_override);
@@ -449,21 +435,122 @@ public:
       resolved_api_key = api_key;
     }
 
-    // Build candidate table IDs (bare name + optional namespace-prefixed).
-    vector<string> candidates = {entry_name};
-    if (!namespace_id.empty()) {
-      auto delim = delimiter.empty() ? "$" : delimiter;
-      auto prefix = namespace_id + delim;
-      if (!StringUtil::StartsWith(entry_name, prefix)) {
-        candidates.push_back(prefix + entry_name);
-      }
+    // Build candidate table IDs with the CANONICAL id FIRST. With a
+    // non-empty namespace_id the namespace-qualified id is the canonical
+    // form; the bare name is only an alias for server dialects that store
+    // unprefixed ids.
+    auto delim = delimiter.empty() ? "$" : delimiter;
+    auto prefix = namespace_id.empty() ? string() : namespace_id + delim;
+    vector<string> candidates;
+    if (prefix.empty() || StringUtil::StartsWith(entry_name, prefix)) {
+      candidates.push_back(entry_name);
+    } else {
+      candidates.push_back(prefix + entry_name);
+      candidates.push_back(entry_name);
     }
+    constexpr idx_t canonical_idx = 0;
+
+    // Existence is decided by the point lookups below, never by listing the
+    // namespace up front: REST credentials may permit describing/opening
+    // specific tables without list permission, and a namespace may
+    // intentionally omit directly accessible tables from listings. DuckDB
+    // also probes the active catalog for system names (e.g. duckdb_tables
+    // when SHOW TABLES runs under `USE <lance_catalog>`).
+    //
+    // Existence precedence — only the CANONICAL candidate is authoritative,
+    // and it is probed FIRST. On a hierarchical server a one-segment id
+    // addresses the ROOT namespace, so the bare alias is doubly guarded:
+    //   - once the canonical id proves existence (describe Found or open
+    //     succeeded, even with an unconvertible schema) the alias is never
+    //     consulted — a same-named root table must not shadow this
+    //     namespace's table;
+    //   - an alias describe/open success only counts after the membership
+    //     listing confirms the name belongs to this namespace (checked
+    //     lazily AFTER the success so system-name probes never pay a list
+    //     round trip); otherwise the alias result is discarded outright;
+    //   - alias NotFound/Error outcomes are never authoritative (arity
+    //     noise from strict multi-level servers must not force the
+    //     membership fallback or an IOException under list-denied
+    //     credentials).
+    // Tail precedence on the canonical outcome ("unconvertible" = describe
+    // or open succeeded but the schema cannot be exposed, tracked across
+    // BOTH loops):
+    //   found but unconvertible -> empty entry (table exists)
+    //   canonical NotFound      -> nullptr: authoritative typed miss
+    //   canonical Error         -> membership fallback below (broken auth
+    //     must surface as an error, not "not found")
+    auto canonical_outcome = DescribeTableOutcome::Error;
+    string canonical_describe_error = "namespace describe_table did not run";
+    // The canonical id proved the table exists (describe Found or open
+    // succeeded, schema convertibility aside): the alias must not be
+    // consulted at all once this is set.
+    bool canonical_exists = false;
+    // A describe or open SUCCEEDED but the schema could not be converted to
+    // DuckDB columns: the table provably exists, so the not-found and
+    // membership branches below must not run for it.
+    bool found_but_unconvertible = false;
+
+    // Memoized membership probe shared by the alias gate and the
+    // canonical-Error fallback tail: at most one list round trip per call.
+    enum class Membership { Listed, NotListed, Unavailable };
+    bool membership_checked = false;
+    auto membership = Membership::Unavailable;
+    auto CheckMembership = [&]() -> Membership {
+      if (membership_checked) {
+        return membership;
+      }
+      membership_checked = true;
+      try {
+        auto known =
+            ListRestNamespaceTables(endpoint, namespace_id, resolved_bearer,
+                                    resolved_api_key, delimiter, headers_tsv);
+        membership = Membership::NotListed;
+        for (auto &k : known) {
+          // Listings may report bare or namespace-prefixed names and the
+          // caller may reference either form; accept any pairing that names
+          // the same table id.
+          if (k == entry_name ||
+              (!prefix.empty() &&
+               (prefix + k == entry_name || k == prefix + entry_name))) {
+            membership = Membership::Listed;
+            break;
+          }
+        }
+      } catch (...) {
+        membership = Membership::Unavailable;
+      }
+      return membership;
+    };
 
     // Fast path: describe_table with schema from REST API (skips S3 open).
-    for (auto &table_id : candidates) {
+    for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
+         candidate_idx++) {
+      const bool is_canonical = candidate_idx == canonical_idx;
+      if (!is_canonical && canonical_exists) {
+        // The table exists at the canonical id; the alias must neither
+        // resolve nor set flags.
+        break;
+      }
+      auto &table_id = candidates[candidate_idx];
       string schema_json;
-      if (!TryDescribeTableWithSchema(table_id, resolved_bearer,
-                                      resolved_api_key, schema_json)) {
+      string describe_error;
+      auto outcome = TryDescribeTableWithSchema(table_id, resolved_bearer,
+                                                resolved_api_key, schema_json,
+                                                describe_error);
+      if (is_canonical) {
+        canonical_outcome = outcome;
+        canonical_describe_error = describe_error;
+        canonical_exists = outcome == DescribeTableOutcome::Found;
+      }
+      if (outcome == DescribeTableOutcome::NotFound ||
+          outcome == DescribeTableOutcome::Error) {
+        continue;
+      }
+      if (!is_canonical && CheckMembership() != Membership::Listed) {
+        // The alias described, but the name is not confirmed to belong to
+        // this namespace (not listed, or listing unavailable): discard the
+        // result — on a hierarchical server the bare id addressed the root
+        // namespace.
         continue;
       }
       CreateTableInfo info(schema, entry_name);
@@ -474,14 +561,23 @@ public:
         PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
                                                 info.columns, &coerced);
       } catch (...) {
-        continue; // Schema conversion failed, try next candidate.
+        // Schema conversion failed on an EXISTING table; try next candidate.
+        found_but_unconvertible = true;
+        continue;
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
                                 std::move(coerced));
     }
 
     // Slow fallback: open dataset from S3.
-    for (auto &table_id : candidates) {
+    for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
+         candidate_idx++) {
+      const bool is_canonical = candidate_idx == canonical_idx;
+      if (!is_canonical && canonical_exists) {
+        // Same exclusion as the fast path: canonical existence is proven.
+        break;
+      }
+      auto &table_id = candidates[candidate_idx];
       string table_uri;
       void *dataset = nullptr;
       try {
@@ -492,10 +588,24 @@ public:
         // Unresolvable candidate (e.g. a DuckDB system name like
         // duckdb_tables that SHOW TABLES resolves against the active catalog,
         // or an invalid 1-segment id) — skip it instead of aborting the
-        // whole statement.
+        // whole statement. The FFI may have recorded a thread-local error
+        // before the exception surfaced; consume it so it cannot leak into
+        // an unrelated LanceFormatErrorSuffix() later.
+        (void)LanceConsumeLastError();
         continue;
       }
       if (!dataset) {
+        // A failed open leaves a thread-local FFI error behind; consume it
+        // so it cannot leak into an unrelated LanceFormatErrorSuffix() later.
+        (void)LanceConsumeLastError();
+        continue;
+      }
+      if (is_canonical) {
+        canonical_exists = true;
+      }
+      if (!is_canonical && CheckMembership() != Membership::Listed) {
+        // Alias gate mirrors the fast path; the dataset is not ours to keep.
+        lance_close_dataset(dataset);
         continue;
       }
       CreateTableInfo info(schema, entry_name);
@@ -506,6 +616,8 @@ public:
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
                                              &coerced);
       } catch (...) {
+        // The dataset opened, so the table exists; only its schema failed.
+        found_but_unconvertible = true;
         lance_close_dataset(dataset);
         continue;
       }
@@ -514,12 +626,57 @@ public:
                                 std::move(coerced));
     }
 
-    // All paths failed — return an empty entry to prevent DuckDB crash.
+    // Neither describe nor open resolved any candidate.
+    if (found_but_unconvertible) {
+      // The table exists but its schema cannot be exposed as DuckDB columns.
+      // Fall through to the empty-entry tail below (the pre-existing
+      // contract for unconvertible-but-existing tables): enumeration keeps
+      // working, and using the entry surfaces the real incompatibility with
+      // proper context instead of a misleading "does not exist".
+    } else if (canonical_outcome == DescribeTableOutcome::NotFound) {
+      // Authoritative typed not-found from the canonical id (alias errors,
+      // if any, suppressed per the precedence above): the name is not a
+      // table in this namespace. Fall through to the system catalog —
+      // system-name probes land here, and genuinely missing tables surface
+      // the caller's usual "does not exist" error. (A server that lists a
+      // name it persistently 404s on describe would make the enumeration
+      // path (CreateDefaultEntries) throw on this nullptr; that pathology —
+      // and the delete-between-list-and-describe race, which predates this
+      // code — is accepted rather than second-guessing the server's own
+      // existence answer with a list round trip.)
+      return nullptr;
+    } else {
+      // The canonical describe failed for infrastructure-ish reasons, so
+      // existence is still unknown: some server dialects report not-found
+      // through non-spec error bodies that deserialize as generic errors.
+      // Disambiguate with the (memoized) membership listing when we are
+      // allowed to list.
+      auto member = CheckMembership();
+      if (member == Membership::Unavailable) {
+        // No list access either: surface the real describe failure on the
+        // canonical id instead of reporting a possibly-existing table as
+        // not found.
+        throw IOException("Failed to describe Lance namespace table '" +
+                          entry_name + "': " + canonical_describe_error);
+      }
+      if (member == Membership::NotListed) {
+        // The namespace lists fine and the name is not there: treat the
+        // ambiguous describe errors as this server's not-found dialect.
+        return nullptr;
+      }
+    }
+    // The table exists (found_but_unconvertible) or is listed but cannot be
+    // described or opened right now. Return an empty entry: the enumeration
+    // path (SHOW TABLES via CatalogSet::CreateDefaultEntries) requires a
+    // non-null entry for every listed name — nullptr would raise an
+    // InternalException — matching the pre-existing behavior for
+    // listed-but-unreadable and unconvertible-but-existing tables.
     CreateTableInfo info(schema, entry_name);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {});
+    // table_id stays the bare entry_name — the value candidates.front()
+    // carried before the canonical-first reordering.
+    return MakeNamespaceEntry(entry_name, entry_name, std::move(info), {});
   }
 
   vector<string> GetDefaultEntries() override {
@@ -557,10 +714,17 @@ private:
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  bool TryDescribeTableWithSchema(const string &table_id,
-                                  const string &resolved_bearer,
-                                  const string &resolved_api_key,
-                                  string &out_schema_json) {
+  // Outcome of a point describe: existence questions must not conflate a
+  // genuine "table not found" with infrastructure failures (auth, network,
+  // server errors) — CreateDefaultEntry fails soft on the former and keeps
+  // the latter visible.
+  enum class DescribeTableOutcome { Found, NotFound, Error };
+
+  DescribeTableOutcome
+  TryDescribeTableWithSchema(const string &table_id,
+                             const string &resolved_bearer,
+                             const string &resolved_api_key,
+                             string &out_schema_json, string &out_error) {
     const char *bearer_ptr =
         resolved_bearer.empty() ? nullptr : resolved_bearer.c_str();
     const char *api_key_ptr =
@@ -574,11 +738,24 @@ private:
         endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
         delimiter_ptr, headers_ptr, &schema_ptr);
     if (rc != 0 || !schema_ptr) {
-      return false;
+      auto not_found =
+          lance_last_error_code() == LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND;
+      // Consume the thread-local error either way so it cannot leak into an
+      // unrelated LanceFormatErrorSuffix() later.
+      auto message = LanceConsumeLastError();
+      if (not_found) {
+        return DescribeTableOutcome::NotFound;
+      }
+      out_error = message.empty() ? "namespace describe_table failed" : message;
+      return DescribeTableOutcome::Error;
     }
     out_schema_json = schema_ptr;
     lance_free_string(schema_ptr);
-    return !out_schema_json.empty();
+    if (out_schema_json.empty()) {
+      out_error = "namespace describe_table returned an empty schema";
+      return DescribeTableOutcome::Error;
+    }
+    return DescribeTableOutcome::Found;
   }
 
   SchemaCatalogEntry &schema;
