@@ -303,6 +303,8 @@ static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
 static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
 static constexpr const char *LANCE_DEFERRED_SETTING =
     "lance_deferred_materialization";
+static constexpr const char *LANCE_NAMESPACE_QUERY_TABLE_SETTING =
+    "lance_namespace_query_table";
 static constexpr uint64_t DEFERRED_AVG_BYTES_THRESHOLD = 1024;
 
 static bool IsLanceVirtualRowIdColumnId(column_t col_id) {
@@ -350,6 +352,17 @@ static bool IsLikelyHeavyColumnType(const LogicalType &type) {
 static bool LanceDeferredMaterializationEnabled(ClientContext &context) {
   Value val;
   if (context.TryGetCurrentSetting(LANCE_DEFERRED_SETTING, val)) {
+    return val.GetValue<bool>();
+  }
+  return true; // default on
+}
+
+// When disabled, REST namespace table scans skip the query_table API and open
+// the underlying dataset directly (the pre-query_table behaviour), which is
+// required against namespace servers that do not implement query_table.
+static bool LanceNamespaceQueryTableEnabled(ClientContext &context) {
+  Value val;
+  if (context.TryGetCurrentSetting(LANCE_NAMESPACE_QUERY_TABLE_SETTING, val)) {
     return val.GetValue<bool>();
   }
   return true; // default on
@@ -515,6 +528,11 @@ struct LanceExecBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+
+  // Pins a dataset handle checked out at bind time; force a rebind per
+  // execution so prepared statements observe external commits (see
+  // LanceScanBindData::SupportStatementCache).
+  bool SupportStatementCache() const override { return false; }
 };
 
 static bool LanceSupportsPushdownType(const FunctionData &bind_data,
@@ -3184,12 +3202,15 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   auto result =
       make_uniq<LanceExecLocalState>(std::move(chunk), context.client);
   result->global_state = &global;
+  LanceExecContext exec_ctx;
+  exec_ctx.threads = NumericCast<uint32_t>(
+      DBConfig::GetConfig(context.client).options.maximum_threads);
   result->stream = lance_create_dataset_exec_stream_ir(
       bind_data.dataset,
       bind_data.exec_ir.empty()
           ? nullptr
           : reinterpret_cast<const uint8_t *>(bind_data.exec_ir.data()),
-      bind_data.exec_ir.size());
+      bind_data.exec_ir.size(), &exec_ctx);
   if (!result->stream) {
     throw IOException("Failed to create Lance exec stream" +
                       LanceFormatErrorSuffix());
@@ -3572,6 +3593,17 @@ LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
     throw InternalException(
         "LanceTableEntry::AlterEntry missing client context");
   }
+  // Internal stale-entry refresh marker (see ReplaceStaleTableEntry in
+  // lance_storage.cpp): rebuild this entry from the current dataset state
+  // without touching the dataset itself. CatalogSet::AlterEntry chains the
+  // rebuilt entry over this one in the version chain, so this (old)
+  // generation stays alive until undo-buffer cleanup and holders of raw
+  // references to it remain safe. Bypasses the autocommit gate below on
+  // purpose: the refresh is a catalog-only, fully transactional operation
+  // (rollback restores this entry), unlike Lance dataset DDL.
+  if (dynamic_cast<LanceRefreshTableAlterInfo *>(&info)) {
+    return BuildUpdatedLanceTableEntry(*transaction.context, *this, internal);
+  }
   return AlterEntry(*transaction.context, info);
 }
 
@@ -3605,6 +3637,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto props = context.GetClientProperties();
       ArrowConverter::ToArrowSchema(&new_schema_root.arrow_schema, types, names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_schema_root.arrow_schema);
 
       vector<string> expressions;
       if (add.new_column.HasDefaultValue()) {
@@ -3700,6 +3733,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
                                     {cast.target_type}, {cast.column_name},
                                     props);
+      LanceNormalizeArrowListFieldNames(&new_type_schema.arrow_schema);
 
       auto rc = lance_dataset_alter_columns_cast(
           dataset, cast.column_name.c_str(), &new_type_schema.arrow_schema);
@@ -3802,6 +3836,162 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 
+// Collect the logical column indexes carrying NOT NULL constraints. Both the
+// entry side (constraints built from Arrow flags during discovery/rebuild)
+// and the live side (Arrow flags of the coerced schema) are produced by the
+// same population pipeline, so the resulting index sets are comparable.
+static vector<idx_t> NotNullIndexesFromConstraints(
+    const vector<unique_ptr<Constraint>> &constraints) {
+  vector<idx_t> indexes;
+  for (auto &constraint : constraints) {
+    if (constraint->type == ConstraintType::NOT_NULL) {
+      indexes.push_back(constraint->Cast<NotNullConstraint>().index.index);
+    }
+  }
+  std::sort(indexes.begin(), indexes.end());
+  return indexes;
+}
+
+static vector<idx_t>
+NotNullIndexesFromArrowSchema(const ArrowSchema &schema_root) {
+  vector<idx_t> indexes;
+  for (int64_t child_idx = 0; child_idx < schema_root.n_children; child_idx++) {
+    auto *child = schema_root.children[child_idx];
+    if (child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
+      indexes.push_back(NumericCast<idx_t>(child_idx));
+    }
+  }
+  return indexes;
+}
+
+// External writers can evolve the dataset schema behind this catalog entry
+// (same-connection ALTERs rebuild the entry via AlterEntry, but external
+// commits do not). DuckDB binds column ids against this entry's columns
+// while scans and writers resolve state through the live dataset schema;
+// serving a mismatched pair would mislabel columns, read the wrong fields,
+// or apply stale write gates. Fail closed instead: replace the stale entry
+// through the catalog version chain (the same mechanism ALTER TABLE uses)
+// so the next access serves the entry rebuilt from the current schema, and
+// surface an explicit error for this statement.
+//
+// The comparison covers, beyond top-level names/types:
+// - the coerced-column state: Arrow types that the reader-boundary layer
+//   maps to the same DuckDB type (e.g. float16 and float32 both surface as
+//   FLOAT) are indistinguishable by name/type, yet the entry's
+//   coerced-column list gates writes (INSERT/UPDATE/MERGE reject coerced
+//   columns);
+// - the nullability state: external ALTER SET/DROP NOT NULL changes only
+//   the Arrow flags, which the entry mirrors as NOT NULL constraints.
+// All compared states come from the same population pipeline over the
+// (entry-build vs live) schema, so the comparison is exact.
+bool LanceTableEntry::MatchesLiveSchemaState(
+    const vector<string> &live_names, const vector<LogicalType> &live_types,
+    const std::vector<std::string> &live_coerced_columns,
+    const ArrowSchema &live_schema_root) const {
+  bool schema_matches = columns.LogicalColumnCount() == live_names.size() &&
+                        CoercedColumnNames() == live_coerced_columns &&
+                        NotNullIndexesFromConstraints(constraints) ==
+                            NotNullIndexesFromArrowSchema(live_schema_root);
+  if (schema_matches) {
+    idx_t col_idx = 0;
+    for (auto &col : columns.Logical()) {
+      if (col.Name() != live_names[col_idx] ||
+          col.Type() != live_types[col_idx]) {
+        schema_matches = false;
+        break;
+      }
+      col_idx++;
+    }
+  }
+  return schema_matches;
+}
+
+void LanceTableEntry::ValidateLiveSchemaOrReplace(
+    ClientContext &context, const vector<string> &live_names,
+    const vector<LogicalType> &live_types,
+    const std::vector<std::string> &live_coerced_columns,
+    const ArrowSchema &live_schema_root, const string &display_uri) {
+  if (MatchesLiveSchemaState(live_names, live_types, live_coerced_columns,
+                             live_schema_root)) {
+    return;
+  }
+  // The replace supersedes this entry in the catalog version chain, but this
+  // (old) generation stays alive until undo-buffer cleanup, so reading
+  // members of `this` for the error message below remains safe. The heal is
+  // best-effort (fail-open); the error is thrown regardless so this
+  // statement never runs against a mismatched binding.
+  (void)LanceTryReplaceStaleTableEntry(context, *this);
+  throw CatalogException(
+      "Lance table \"%s\" was changed externally: the dataset schema at "
+      "'%s' no longer matches the catalog entry. The entry has been "
+      "refreshed from the current schema - please re-run the query.",
+      name, display_uri);
+}
+
+// Fetch the (revalidated) dataset handle and compare its live schema state
+// against this entry. Returns true when the entry is current. Throws on
+// infrastructure errors (dataset unreachable etc.).
+bool LanceTableEntry::FetchLiveSchemaMatches(ClientContext &context,
+                                             string &out_display_uri) {
+  auto entry =
+      LanceGetOrOpenDatasetEntryForTable(context, *this, out_display_uri);
+  auto *dataset = entry ? entry->Handle() : nullptr;
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + out_display_uri +
+                      LanceFormatErrorSuffix());
+  }
+
+  auto *schema_handle = lance_get_schema(dataset);
+  if (!schema_handle) {
+    throw IOException("Failed to get schema from Lance dataset: " +
+                      out_display_uri + LanceFormatErrorSuffix());
+  }
+  ArrowSchemaWrapper schema_root;
+  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
+  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
+    lance_free_schema(schema_handle);
+    throw IOException(
+        "Failed to export Lance schema to Arrow C Data Interface" +
+        LanceFormatErrorSuffix());
+  }
+  lance_free_schema(schema_handle);
+  auto live_coerced_columns =
+      LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
+  ArrowTableSchema arrow_table;
+  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
+                                               schema_root.arrow_schema);
+  return MatchesLiveSchemaState(arrow_table.GetNames(), arrow_table.GetTypes(),
+                                live_coerced_columns, schema_root.arrow_schema);
+}
+
+// Non-throwing-on-mismatch staleness probe for catalog resolution: reports
+// whether this entry's declared schema state diverged from the dataset on
+// storage without replacing anything. Infrastructure errors still propagate.
+bool LanceTableEntry::IsSchemaStale(ClientContext &context) {
+  string display_uri;
+  return !FetchLiveSchemaMatches(context, display_uri);
+}
+
+// Freshness validation entry point for statements that do not bind a scan of
+// the table (e.g. plain INSERT): fetches the (revalidated) dataset handle and
+// compares its live schema state against this entry, replacing the entry and
+// failing closed on mismatch just like the scan bind path.
+void LanceTableEntry::VerifySchemaFreshness(ClientContext &context) {
+  string display_uri;
+  if (FetchLiveSchemaMatches(context, display_uri)) {
+    return;
+  }
+  // As in ValidateLiveSchemaOrReplace: the superseded generation (`this`)
+  // stays alive in the version chain until undo-buffer cleanup, so using its
+  // members for the error message remains safe after the best-effort heal.
+  (void)LanceTryReplaceStaleTableEntry(context, *this);
+  throw CatalogException(
+      "Lance table \"%s\" was changed externally: the dataset schema at "
+      "'%s' no longer matches the catalog entry. The entry has been "
+      "refreshed from the current schema - please re-run the query.",
+      name, display_uri);
+}
+
 static void PopulateNamespaceQueryScanSchema(ClientContext &context,
                                              const LanceTableEntry &table,
                                              LanceScanBindData &result) {
@@ -3843,7 +4033,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->table_entry = this;
   result->file_path = dataset_uri;
 
-  if (IsNamespaceBacked() && NamespaceConfig().IsRest()) {
+  if (IsNamespaceBacked() && NamespaceConfig().IsRest() &&
+      LanceNamespaceQueryTableEnabled(context)) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
     PopulateNamespaceQueryScanSchema(context, *this, *result);
@@ -3880,11 +4071,16 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto live_coerced_columns =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+
+  ValidateLiveSchemaOrReplace(
+      context, result->names, result->types, live_coerced_columns,
+      result->schema_root.arrow_schema, result->file_path);
 
   auto *scan_schema_handle = lance_get_schema_for_scan(result->dataset);
   if (!scan_schema_handle) {

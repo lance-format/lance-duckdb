@@ -31,6 +31,17 @@ fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
         .filter(|v| *v > 0)
 }
 
+/// Treat a zero size/count option as unset so Lance applies its own default.
+///
+/// `docs/sql.md` documents `OPTIMIZE ... WITH (max_bytes_per_file = 0,
+/// num_threads = 0, batch_size = 0)`, i.e. zero reads as "use the default".
+/// Forwarding `Some(0)` instead is not merely ignored: `num_threads` becomes
+/// `buffer_unordered(0)`, which never polls a task, so compaction of a dataset
+/// with two or more compactable fragments never completes.
+fn zero_as_unset(value: Option<usize>) -> Option<usize> {
+    value.filter(|v| *v > 0)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CompactFilesOptionsInput {
@@ -89,13 +100,13 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
     })?;
 
     let mut options = CompactionOptions::default();
-    if let Some(v) = input.target_rows_per_fragment {
+    if let Some(v) = zero_as_unset(input.target_rows_per_fragment) {
         options.target_rows_per_fragment = v;
     }
-    if let Some(v) = input.max_rows_per_group {
+    if let Some(v) = zero_as_unset(input.max_rows_per_group) {
         options.max_rows_per_group = v;
     }
-    if let Some(v) = input.max_bytes_per_file {
+    if let Some(v) = zero_as_unset(input.max_bytes_per_file) {
         options.max_bytes_per_file = Some(v);
     }
     if let Some(v) = input.materialize_deletions {
@@ -104,10 +115,10 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
     if let Some(v) = input.materialize_deletions_threshold {
         options.materialize_deletions_threshold = v;
     }
-    if let Some(v) = input.num_threads {
+    if let Some(v) = zero_as_unset(input.num_threads) {
         options.num_threads = Some(v);
     }
-    if let Some(v) = input.batch_size {
+    if let Some(v) = zero_as_unset(input.batch_size) {
         options.batch_size = Some(v);
     }
     if let Some(v) = input.defer_index_remap {
@@ -1109,5 +1120,44 @@ fn dataset_create_scalar_index_inner(
             format!("dataset create_index(scalar): {err}"),
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn compaction_options_from_json(json: &str) -> CompactionOptions {
+        let owned = CString::new(json).expect("json holds no interior nul");
+        parse_compaction_options_json(owned.as_ptr()).expect("options parse")
+    }
+
+    #[test]
+    fn zero_sizes_and_counts_fall_back_to_lance_defaults() {
+        // docs/sql.md spells all three of these as 0 in the OPTIMIZE example.
+        let options = compaction_options_from_json(
+            r#"{"max_bytes_per_file": 0, "num_threads": 0, "batch_size": 0}"#,
+        );
+        let defaults = CompactionOptions::default();
+
+        // Some(0) here reaches buffer_unordered(0), which never polls a task.
+        assert_eq!(options.num_threads, defaults.num_threads);
+        assert_eq!(options.batch_size, defaults.batch_size);
+        assert_eq!(options.max_bytes_per_file, defaults.max_bytes_per_file);
+    }
+
+    #[test]
+    fn positive_sizes_and_counts_are_forwarded() {
+        let options = compaction_options_from_json(
+            r#"{"target_rows_per_fragment": 1024, "max_rows_per_group": 128,
+                "max_bytes_per_file": 4096, "num_threads": 4, "batch_size": 512}"#,
+        );
+
+        assert_eq!(options.target_rows_per_fragment, 1024);
+        assert_eq!(options.max_rows_per_group, 128);
+        assert_eq!(options.max_bytes_per_file, Some(4096));
+        assert_eq!(options.num_threads, Some(4));
+        assert_eq!(options.batch_size, Some(512));
     }
 }

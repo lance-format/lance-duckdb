@@ -42,6 +42,12 @@ void LanceExtension::Load(ExtensionLoader &loader) {
                             "Enable deferred materialization for heavy columns "
                             "when filter pushdown fails",
                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+  config.AddExtensionOption(
+      "lance_namespace_query_table",
+      "Route REST namespace table scans through the Lance Namespace "
+      "query_table API. Disable to open the underlying dataset directly, "
+      "e.g. against namespace servers that do not implement query_table",
+      LogicalType::BOOLEAN, Value::BOOLEAN(true));
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
