@@ -11,6 +11,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use datafusion_expr::Expr;
 use futures::StreamExt;
+use lance_table::format::Fragment;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::exec_ir::{agg_ir_to_df_expr, output_type_to_arrow, parse_exec_ir_v1};
@@ -25,6 +26,7 @@ struct LanceExecPartition {
     schema: Arc<Schema>,
     projection: Arc<[String]>,
     filter: Option<Expr>,
+    fragments: Option<Vec<Fragment>>,
 }
 
 impl PartitionStream for LanceExecPartition {
@@ -55,6 +57,7 @@ impl PartitionStream for LanceExecPartition {
         let dataset = self.dataset.clone();
         let projection = self.projection.clone();
         let filter = self.filter.clone();
+        let fragments = self.fragments.clone();
 
         builder.spawn_on(
             async move {
@@ -63,6 +66,9 @@ impl PartitionStream for LanceExecPartition {
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 if let Some(filter) = &filter {
                     scan.filter_expr(filter.clone());
+                }
+                if let Some(fragments) = &fragments {
+                    scan.with_fragments(fragments.clone());
                 }
                 scan.scan_in_order(false);
 
@@ -100,7 +106,7 @@ impl PartitionStream for LanceExecPartition {
 #[derive(Debug)]
 struct LanceExecTableProvider {
     schema: Arc<Schema>,
-    partition: Arc<LanceExecPartition>,
+    partitions: Vec<Arc<LanceExecPartition>>,
 }
 
 #[async_trait::async_trait]
@@ -120,15 +126,56 @@ impl TableProvider for LanceExecTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let partitions: Vec<Arc<dyn PartitionStream>> = self
+            .partitions
+            .iter()
+            .map(|p| p.clone() as Arc<dyn PartitionStream>)
+            .collect();
         Ok(Arc::new(StreamingTableExec::try_new(
             self.schema(),
-            vec![self.partition.clone()],
+            partitions,
             projection,
             vec![],
             false,
             limit,
         )?))
     }
+}
+
+fn split_fragments(
+    dataset: Arc<lance::Dataset>,
+    schema: Arc<Schema>,
+    projection: Arc<[String]>,
+    filter: Option<Expr>,
+    target_partitions: usize,
+) -> Vec<Arc<LanceExecPartition>> {
+    let all_fragments = dataset.fragments().as_ref().clone();
+    let n = target_partitions.min(all_fragments.len());
+    if n <= 1 {
+        return vec![Arc::new(LanceExecPartition {
+            dataset: dataset.clone(),
+            schema: schema.clone(),
+            projection: projection.clone(),
+            filter: filter.clone(),
+            fragments: None,
+        })];
+    }
+    let mut buckets: Vec<Vec<Fragment>> = vec![Vec::new(); n];
+    for (i, frag) in all_fragments.iter().enumerate() {
+        buckets[i % n].push(frag.clone());
+    }
+    buckets
+        .into_iter()
+        .map(|fragments| {
+            Arc::new(LanceExecPartition {
+                dataset: dataset.clone(),
+                schema: schema.clone(),
+                projection: projection.clone(),
+                filter: filter.clone(),
+                fragments: Some(fragments),
+            })
+        })
+        .collect()
 }
 
 fn projected_schema(handle: &DatasetHandle, projection: &[String]) -> Result<Arc<Schema>, String> {
@@ -148,7 +195,11 @@ fn projected_schema(handle: &DatasetHandle, projection: &[String]) -> Result<Arc
     Ok(Arc::new(Schema::new(fields)))
 }
 
-async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFrame, String> {
+async fn build_exec_df(
+    handle: &DatasetHandle,
+    exec_ir: &[u8],
+    threads: usize,
+) -> Result<DataFrame, String> {
     let exec_ir = parse_exec_ir_v1(exec_ir).map_err(|e| format!("exec_ir parse: {e}"))?;
 
     let filter = if exec_ir.filter_ir.is_empty() {
@@ -163,19 +214,25 @@ async fn build_exec_df(handle: &DatasetHandle, exec_ir: &[u8]) -> Result<DataFra
     let projection: Arc<[String]> = exec_ir.scan_projection.clone().into();
     let schema = projected_schema(handle, projection.as_ref())?;
 
-    let partition = Arc::new(LanceExecPartition {
-        dataset: handle.dataset.clone(),
-        schema: schema.clone(),
+    let ctx = SessionContext::new();
+    let target_partitions = if threads > 0 {
+        threads
+    } else {
+        ctx.copied_config().target_partitions()
+    };
+    let partitions = split_fragments(
+        handle.dataset.clone(),
+        schema.clone(),
         projection,
         filter,
-    });
+        target_partitions,
+    );
 
     let provider = LanceExecTableProvider {
         schema: schema.clone(),
-        partition,
+        partitions,
     };
 
-    let ctx = SessionContext::new();
     ctx.register_table("t", Arc::new(provider))
         .map_err(|e| e.to_string())?;
     let df = ctx.table("t").await.map_err(|e| e.to_string())?;
@@ -269,7 +326,7 @@ fn get_exec_schema_inner(
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
 
     let schema_res = runtime::block_on(async {
-        let df = build_exec_df(handle, bytes).await?;
+        let df = build_exec_df(handle, bytes, 0).await?;
         let plan = df.create_physical_plan().await.map_err(|e| e.to_string())?;
         Ok::<_, String>(plan.schema())
     })
@@ -280,13 +337,20 @@ fn get_exec_schema_inner(
     Ok(Arc::new(Schema::new(schema.fields().clone())))
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LanceExecContext {
+    pub threads: u32,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_dataset_exec_stream_ir(
     dataset: *mut c_void,
     exec_ir: *const u8,
     exec_ir_len: usize,
+    exec_ctx: *const LanceExecContext,
 ) -> *mut c_void {
-    match create_dataset_exec_stream_ir_inner(dataset, exec_ir, exec_ir_len) {
+    match create_dataset_exec_stream_ir_inner(dataset, exec_ir, exec_ir_len, exec_ctx) {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -302,12 +366,14 @@ fn create_dataset_exec_stream_ir_inner(
     dataset: *mut c_void,
     exec_ir: *const u8,
     exec_ir_len: usize,
+    exec_ctx: *const LanceExecContext,
 ) -> FfiResult<StreamHandle> {
     let handle = unsafe { dataset_handle(dataset)? };
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
+    let threads = unsafe { exec_ctx.as_ref() }.map(|c| c.threads as usize).unwrap_or(0);
 
     let stream_res = runtime::block_on(async {
-        let df = build_exec_df(handle, bytes).await?;
+        let df = build_exec_df(handle, bytes, threads).await?;
         df.execute_stream().await.map_err(|e| e.to_string())
     })
     .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;

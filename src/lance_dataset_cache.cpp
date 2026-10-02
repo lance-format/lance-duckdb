@@ -6,6 +6,7 @@
 #include "lance_table_entry.hpp"
 
 #include "duckdb/common/types/hash.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context_state.hpp"
 
 #include <functional>
@@ -15,16 +16,21 @@ namespace duckdb {
 static constexpr const char *LANCE_DATASET_CACHE_STATE_KEY =
     "lance_dataset_cache_state";
 
+// All methods take the state lock per-call; compound sequences (Get +
+// revalidate + Replace, or the memo check followed by MarkRevalidated) run
+// unlocked in between. Statement binds are single-threaded, so those
+// check-then-act windows are benign; the per-call lock keeps the individual
+// container accesses safe against execution-time users of the same
+// connection-local state (e.g. maintenance table functions invalidating
+// entries from executor threads).
 class LanceDatasetCacheState final : public ClientContextState {
 public:
   shared_ptr<LanceDatasetCacheEntry> Get(const string &key) {
     lock_guard<mutex> guard(lock);
     auto entry = entries.find(key);
     if (entry == entries.end()) {
-      query_misses++;
       return nullptr;
     }
-    query_hits++;
     return entry->second;
   }
 
@@ -40,28 +46,74 @@ public:
     return entry;
   }
 
+  void Replace(const string &key, shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    entries[key] = std::move(entry);
+  }
+
+  void RecordHit() {
+    lock_guard<mutex> guard(lock);
+    query_hits++;
+  }
+
+  void RecordMiss() {
+    lock_guard<mutex> guard(lock);
+    query_misses++;
+  }
+
+  void RecordRevalidation() {
+    lock_guard<mutex> guard(lock);
+    query_revalidations++;
+  }
+
+  // Statement-scoped revalidation memo. Invariant: within one statement,
+  // every reference to the same cache key shares one immutable dataset
+  // generation - the first reference revalidates (or freshly opens) the
+  // entry and pins it for the statement; later references reuse the pinned
+  // generation. External commits landing mid-statement are observed by the
+  // NEXT statement, whose QueryBegin clears the memo.
+  bool WasRevalidatedThisStatement(const string &key) {
+    lock_guard<mutex> guard(lock);
+    return revalidated_keys.count(key) > 0;
+  }
+
+  void MarkRevalidatedThisStatement(const string &key) {
+    lock_guard<mutex> guard(lock);
+    revalidated_keys.insert(key);
+  }
+
   void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
     entries.erase(key);
+    // A key without a cached entry has no pinned generation: the next access
+    // in this statement takes the miss path and pins whatever it opens.
+    revalidated_keys.erase(key);
   }
 
   void QueryBegin(ClientContext &) override {
     lock_guard<mutex> guard(lock);
     query_hits = 0;
     query_misses = 0;
+    query_revalidations = 0;
+    revalidated_keys.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
     lock_guard<mutex> guard(lock);
     ss << "Lance Dataset Cache: entries=" << entries.size()
-       << " hits=" << query_hits << " misses=" << query_misses << "\n";
+       << " hits=" << query_hits << " misses=" << query_misses
+       << " revalidations=" << query_revalidations << "\n";
   }
 
 private:
   mutex lock;
   unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
+  // Keys whose entry has already been revalidated (or freshly opened) during
+  // the current statement; cleared in QueryBegin.
+  unordered_set<string> revalidated_keys;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
+  idx_t query_revalidations = 0;
 };
 
 LanceDatasetCacheEntry::LanceDatasetCacheEntry(void *dataset_p,
@@ -227,19 +279,113 @@ static void *OpenDirNamespaceDataset(ClientContext &context, const string &root,
   return dataset;
 }
 
+// Revalidation callback for cache hits: given the cached dataset handle,
+// writes a refreshed handle (or nullptr when the cached handle is current) to
+// `out_new_dataset` and optionally a new display URI when the dataset moved.
+// Returns 0 on success and -1 on error (details via lance_last_error_*).
+using LanceDatasetRevalidateFn = std::function<int32_t(
+    void *dataset, void **out_new_dataset, string &out_new_display_uri)>;
+
+// Default revalidation: compare the cached handle's manifest identity with the
+// latest committed manifest at the dataset's resolved URI.
+static int32_t RevalidateDatasetHandle(void *dataset, void **out_new_dataset,
+                                       string &out_new_display_uri) {
+  out_new_display_uri.clear();
+  return lance_dataset_checkout_latest_if_stale(dataset, out_new_dataset);
+}
+
+// Revalidate a cached dataset against the latest committed version. Writes
+// through this connection invalidate the touched entries eagerly, but commits
+// made by external writers (another process or another connection) would
+// otherwise never be observed and the cached entry would serve stale data
+// forever. The check is metadata-only (it resolves the latest manifest
+// version) and therefore cheap relative to a scan, so it is performed on the
+// first cache hit per key per statement: correctness of latest-intent reads
+// takes precedence over the micro-cost of one version lookup per query,
+// while the statement-scoped memo (see GetOrOpenDatasetCacheEntry) keeps all
+// references within one statement on a single dataset generation.
+// Returns the (possibly refreshed) entry, or throws if the latest version
+// cannot be determined.
+static shared_ptr<LanceDatasetCacheEntry> RevalidateDatasetCacheEntry(
+    LanceDatasetCacheState &state, const string &cache_key,
+    shared_ptr<LanceDatasetCacheEntry> entry,
+    const LanceDatasetRevalidateFn &revalidate, bool &out_refreshed) {
+  // Counted even when the check fails below: the version lookup did run.
+  // The counter makes the statement-scoped memoization observable in tests
+  // (a self-join must report one revalidation, not one per reference).
+  state.RecordRevalidation();
+  void *refreshed_dataset = nullptr;
+  string refreshed_display_uri;
+  if (revalidate(entry->Handle(), &refreshed_dataset, refreshed_display_uri) !=
+      0) {
+    // The entry can no longer be trusted (e.g. the dataset was dropped by an
+    // external writer); drop it so the next access retries a fresh open.
+    state.Invalidate(cache_key);
+    throw IOException("Failed to check latest version of Lance dataset: " +
+                      entry->DisplayUri() + LanceFormatErrorSuffix());
+  }
+  if (!refreshed_dataset) {
+    // Already at the latest committed version.
+    out_refreshed = false;
+    return entry;
+  }
+  // A newer version was committed externally: replace the cached entry with
+  // the refreshed handle. The old entry stays alive for existing holders via
+  // shared ownership. The display URI only changes when the revalidation
+  // resolved a new physical location (namespace-backed tables).
+  auto refreshed_entry = make_shared_ptr<LanceDatasetCacheEntry>(
+      refreshed_dataset, refreshed_display_uri.empty()
+                             ? entry->DisplayUri()
+                             : std::move(refreshed_display_uri));
+  state.Replace(cache_key, refreshed_entry);
+  out_refreshed = true;
+  return refreshed_entry;
+}
+
 static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
     ClientContext &context, const string &cache_key,
     const std::function<shared_ptr<LanceDatasetCacheEntry>()> &open_dataset,
-    bool *out_cache_hit) {
+    bool *out_cache_hit,
+    const LanceDatasetRevalidateFn &revalidate = RevalidateDatasetHandle) {
   auto state = GetOrCreateLanceDatasetCacheState(context);
   auto entry = state->Get(cache_key);
   if (entry) {
+    // Statement-scoped memoization: revalidating independently on every hit
+    // would let two references to the same table in one statement (e.g. a
+    // self-join's two binds) pin different dataset versions if an external
+    // commit lands between their binds. The first reference in a statement
+    // revalidates and pins the entry for the key; every later reference in
+    // the same statement shares that one immutable dataset generation.
+    // External commits landing mid-statement are observed by the NEXT
+    // statement, which starts with a cleared memo.
+    if (state->WasRevalidatedThisStatement(cache_key)) {
+      state->RecordHit();
+      if (out_cache_hit) {
+        *out_cache_hit = true;
+      }
+      return entry;
+    }
+    bool refreshed = false;
+    entry = RevalidateDatasetCacheEntry(*state, cache_key, std::move(entry),
+                                        revalidate, refreshed);
+    // Mark only after a successful revalidation: the failure path above
+    // drops the entry and throws, and the next access must retry a fresh
+    // open instead of trusting a memo for an entry that no longer exists.
+    state->MarkRevalidatedThisStatement(cache_key);
+    // A stale hit had to be refreshed from storage, so report it as a miss
+    // both in the profiling counters and in the per-scan cache-hit flag.
+    if (refreshed) {
+      state->RecordMiss();
+    } else {
+      state->RecordHit();
+    }
     if (out_cache_hit) {
-      *out_cache_hit = true;
+      *out_cache_hit = !refreshed;
     }
     return entry;
   }
 
+  state->RecordMiss();
   auto opened = open_dataset();
   if (!opened) {
     return nullptr;
@@ -247,7 +393,13 @@ static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
   if (out_cache_hit) {
     *out_cache_hit = false;
   }
-  return state->PutOrGetExisting(cache_key, opened);
+  auto result = state->PutOrGetExisting(cache_key, opened);
+  // A dataset opened by this statement is already the statement's pinned
+  // generation for its key: later references in the same statement must
+  // reuse it rather than revalidate it against storage (which could observe
+  // a newer external commit and split the statement across two versions).
+  state->MarkRevalidatedThisStatement(cache_key);
+  return result;
 }
 
 shared_ptr<LanceDatasetCacheEntry>
@@ -280,6 +432,32 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     const string &headers_tsv, string &out_display_uri, bool *out_cache_hit) {
   auto cache_key = LanceBuildNamespaceDatasetCacheKey(
       endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv);
+  // Namespace tables are cached by endpoint/table id rather than by physical
+  // URI, so cache hits must be revalidated through the namespace: an external
+  // drop/re-create can re-point the table to a new location, which a checkout
+  // against the already-resolved handle would never observe. The re-describe
+  // costs one namespace round trip per hit — the same order as the namespace
+  // open path itself, which also starts with a describe.
+  auto namespace_revalidate = [&](void *dataset, void **out_new_dataset,
+                                  string &out_new_display_uri) -> int32_t {
+    out_new_display_uri.clear();
+    const char *bearer_ptr =
+        bearer_token.empty() ? nullptr : bearer_token.c_str();
+    const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
+    const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
+    const char *headers_ptr =
+        headers_tsv.empty() ? nullptr : headers_tsv.c_str();
+    const char *uri_ptr = nullptr;
+    auto rc = lance_dataset_namespace_checkout_latest_if_stale(
+        dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+        delimiter_ptr, headers_ptr, LanceGetSessionHandle(context),
+        out_new_dataset, &uri_ptr);
+    if (uri_ptr) {
+      out_new_display_uri = uri_ptr;
+      lance_free_string(uri_ptr);
+    }
+    return rc;
+  };
   auto entry = GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
@@ -296,7 +474,7 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
         return make_shared_ptr<LanceDatasetCacheEntry>(dataset,
                                                        std::move(display_uri));
       },
-      out_cache_hit);
+      out_cache_hit, namespace_revalidate);
   if (entry) {
     out_display_uri = entry->DisplayUri();
   } else {

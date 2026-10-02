@@ -376,6 +376,34 @@ static string EscapeJsonString(const string &s) {
   return out;
 }
 
+static bool TryParseWithBool(const string &raw_val, const char *key, bool &out,
+                             string &out_error) {
+  string val = raw_val;
+  // Honor a single-quoted literal (e.g. replace='true') like a bare token,
+  // matching the spellings the DuckDB-native ValueToBoolOrThrow accepts.
+  if (StartsWithQuotedString(val)) {
+    string lit;
+    idx_t lit_consumed = 0;
+    if (!TryParseSqlStringLiteral(val, lit, lit_consumed) ||
+        !TrimCopy(val.substr(lit_consumed)).empty()) {
+      out_error = string("WITH ") + key + " must be a boolean";
+      return false;
+    }
+    val = lit;
+  }
+  auto lowered = StringUtil::Lower(val);
+  if (lowered == "true" || lowered == "1") {
+    out = true;
+    return true;
+  }
+  if (lowered == "false" || lowered == "0") {
+    out = false;
+    return true;
+  }
+  out_error = string("WITH ") + key + " must be a boolean";
+  return false;
+}
+
 static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
                                              bool &out_replace, bool &out_train,
                                              bool &out_retrain,
@@ -428,15 +456,21 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
     }
     auto key_lower = StringUtil::Lower(key);
     if (key_lower == "replace") {
-      out_replace = StringUtil::Lower(val) == "true" || val == "1";
+      if (!TryParseWithBool(val, "replace", out_replace, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "train") {
-      out_train = !(StringUtil::Lower(val) == "false" || val == "0");
+      if (!TryParseWithBool(val, "train", out_train, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "retrain") {
-      out_retrain = StringUtil::Lower(val) == "true" || val == "1";
+      if (!TryParseWithBool(val, "retrain", out_retrain, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "params") {

@@ -1,4 +1,5 @@
 use datafusion::execution::context::SessionContext;
+use datafusion_common::utils::SingleRowListArrayBuilder;
 use datafusion_common::{Column, ScalarValue};
 use datafusion_expr::expr::{BinaryExpr, Case, InList, Like, ScalarFunction};
 use datafusion_expr::registry::FunctionRegistry;
@@ -6,6 +7,7 @@ use datafusion_expr::{Expr, Operator, ScalarUDF};
 use std::sync::{Arc, OnceLock};
 
 use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_functions_nested::array_has::{array_has_all_udf, array_has_any_udf};
 
 const MAGIC: &[u8; 4] = b"LUE1";
 
@@ -34,6 +36,7 @@ const LIT_STRING: u8 = 6;
 const LIT_DATE32: u8 = 7;
 const LIT_TIMESTAMP: u8 = 8;
 const LIT_DECIMAL128: u8 = 9;
+const LIT_LIST: u8 = 10;
 
 const TYPE_BOOL: u8 = 1;
 const TYPE_INT8: u8 = 2;
@@ -406,6 +409,8 @@ fn resolve_scalar_function(
         "contains" => Ok(contains_udf()),
         "lower" => Ok(lower_udf()),
         "upper" => Ok(upper_udf()),
+        "array_has_any" => Ok(array_has_any_udf()),
+        "array_has_all" => Ok(array_has_all_udf()),
         _ => match ctx {
             Some(ctx) => ctx
                 .udf(name)
@@ -515,6 +520,10 @@ fn parse_regexp(cursor: &mut Cursor<'_>, ctx: Option<&SessionContext>) -> Result
 }
 
 fn parse_literal(cursor: &mut Cursor<'_>) -> Result<Expr, String> {
+    Ok(Expr::Literal(parse_literal_value(cursor)?, None))
+}
+
+fn parse_literal_value(cursor: &mut Cursor<'_>) -> Result<ScalarValue, String> {
     let lit = match cursor.read_u8()? {
         LIT_NULL => ScalarValue::Null,
         LIT_BOOL => ScalarValue::Boolean(Some(cursor.read_u8()? != 0)),
@@ -540,9 +549,22 @@ fn parse_literal(cursor: &mut Cursor<'_>) -> Result<Expr, String> {
             let scale = cursor.read_u8()? as i8;
             ScalarValue::Decimal128(Some(cursor.read_i128()?), precision, scale)
         }
+        LIT_LIST => {
+            let element_count = cursor.read_u32()? as usize;
+            if element_count == 0 {
+                return Err("expr_ir list literal has no elements".to_string());
+            }
+            let mut elements = Vec::with_capacity(element_count);
+            for _ in 0..element_count {
+                elements.push(parse_literal_value(cursor)?);
+            }
+            let element_array = ScalarValue::iter_to_array(elements)
+                .map_err(|e| format!("expr_ir list literal: {e}"))?;
+            SingleRowListArrayBuilder::new(element_array).build_list_scalar()
+        }
         other => return Err(format!("invalid expr_ir literal tag: {other}")),
     };
-    Ok(Expr::Literal(lit, None))
+    Ok(lit)
 }
 
 fn parse_type(cursor: &mut Cursor<'_>) -> Result<arrow::datatypes::DataType, String> {

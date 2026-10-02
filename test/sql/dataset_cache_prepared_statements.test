@@ -1,0 +1,97 @@
+# name: test/sql/dataset_cache_prepared_statements.test
+# description: Prepared statements observe external commits like ad-hoc statements
+# group: [sql]
+
+require lance
+
+# The scan bind data pins a dataset handle checked out at bind time. Without
+# forcing a rebind per execution, a prepared statement would keep scanning the
+# version captured at PREPARE time and never pass through the cache
+# revalidation that ad-hoc statements get at bind.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+PREPARE prepared_path_count AS SELECT count(*) FROM 'test/.tmp/cache_prepared.lance';
+
+query I con1
+EXECUTE prepared_path_count;
+----
+3
+
+# External append committed through con2.
+statement ok con2
+COPY (SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s)
+TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'append');
+
+# The prepared statement must observe the external commit on re-execution.
+query I con1
+EXECUTE prepared_path_count;
+----
+4
+
+# Same for catalog-attached tables.
+statement ok con1
+ATTACH 'test/.tmp' AS prep_reader_ns (TYPE LANCE);
+
+statement ok con1
+PREPARE prepared_table_count AS SELECT count(*) FROM prep_reader_ns.main.cache_prepared;
+
+query I con1
+EXECUTE prepared_table_count;
+----
+4
+
+statement ok con2
+COPY (SELECT 5::BIGINT AS id, 'e'::VARCHAR AS s)
+TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'append');
+
+query I con1
+EXECUTE prepared_table_count;
+----
+5
+
+# External schema evolution behind a prepared statement: the forced rebind
+# runs the freshness check and fails closed instead of serving the stale
+# binding; re-execution after the entry is replaced succeeds with the new
+# schema.
+statement ok con2
+ATTACH 'test/.tmp' AS prep_writer_ns (TYPE LANCE);
+
+statement ok con1
+PREPARE prepared_table_s AS SELECT s FROM prep_reader_ns.main.cache_prepared ORDER BY id;
+
+query T con1
+EXECUTE prepared_table_s;
+----
+a
+b
+c
+d
+e
+
+statement ok con2
+ALTER TABLE prep_writer_ns.main.cache_prepared DROP COLUMN s;
+
+statement error con1
+EXECUTE prepared_table_s;
+----
+<REGEX>:.*(changed externally|does not exist|not found).*
+
+query I con1
+EXECUTE prepared_table_count;
+----
+5
+
+statement ok con1
+DETACH prep_reader_ns;
+
+statement ok con2
+DETACH prep_writer_ns;

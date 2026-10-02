@@ -294,4 +294,24 @@ void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
   array->release = ArrayReleaseWrapper;
 }
 
+void LanceNormalizeArrowListFieldNames(ArrowSchema *schema) {
+  if (!schema || schema->release == nullptr) {
+    return;
+  }
+  static constexpr const char ARROW_LIST_ITEM_NAME[] = "item";
+  if (schema->format &&
+      (std::strcmp(schema->format, "+l") == 0 ||
+       std::strcmp(schema->format, "+L") == 0) &&
+      schema->n_children == 1 && schema->children && schema->children[0]) {
+    // DuckDB assigns a string literal here, so overwriting the pointer with
+    // another literal keeps the producer's release callback correct.
+    schema->children[0]->name = ARROW_LIST_ITEM_NAME;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (schema->children && schema->children[i]) {
+      LanceNormalizeArrowListFieldNames(schema->children[i]);
+    }
+  }
+}
+
 } // namespace duckdb

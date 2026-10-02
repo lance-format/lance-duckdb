@@ -63,6 +63,11 @@ static bool TryEncodeLanceFilterIRLiteral(const Value &value, string &out_ir) {
   return TryEncodeLanceExprIRLiteral(value, out_ir);
 }
 
+static bool TryEncodeLanceFilterIRListLiteral(const Value &value,
+                                              string &out_ir) {
+  return TryEncodeLanceExprIRListLiteral(value, out_ir);
+}
+
 static bool TryEncodeLanceFilterIRComparisonOp(ExpressionType type,
                                                uint8_t &out_op) {
   return TryEncodeLanceExprIRComparisonOp(type, out_op);
@@ -166,6 +171,60 @@ static bool TryGetNonNullVarcharConstant(const Expression &expr,
   return false;
 }
 
+static bool TryGetNonNullListConstant(const Expression &expr,
+                                      Value &out_value) {
+  if (expr.expression_class == ExpressionClass::BOUND_CONSTANT) {
+    auto &c = expr.Cast<BoundConstantExpression>();
+    if (c.value.IsNull() || c.value.type().id() != LogicalTypeId::LIST) {
+      return false;
+    }
+    out_value = c.value;
+    return true;
+  }
+  if (expr.expression_class == ExpressionClass::BOUND_CAST) {
+    auto &cast = expr.Cast<BoundCastExpression>();
+    if (cast.try_cast) {
+      return false;
+    }
+    if (!cast.child ||
+        cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
+      return false;
+    }
+    auto &c = cast.child->Cast<BoundConstantExpression>();
+    if (c.value.IsNull()) {
+      return false;
+    }
+    try {
+      auto casted = c.value.DefaultCastAs(cast.return_type);
+      if (casted.IsNull() || casted.type().id() != LogicalTypeId::LIST) {
+        return false;
+      }
+      out_value = std::move(casted);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+  return false;
+}
+
+// DuckDB exposes the containment predicates under both a `list_*` and an
+// `array_*` name; Lance's scalar-index planner matches DataFusion's
+// `array_has_*` names, so the IR always carries the DataFusion spelling. The
+// `&&` / `@>` / `<@` operator aliases are deliberately excluded.
+static bool TryGetLanceContainmentFunctionName(const string &duckdb_name,
+                                               string &out_name) {
+  if (duckdb_name == "array_has_any" || duckdb_name == "list_has_any") {
+    out_name = "array_has_any";
+    return true;
+  }
+  if (duckdb_name == "array_has_all" || duckdb_name == "list_has_all") {
+    out_name = "array_has_all";
+    return true;
+  }
+  return false;
+}
+
 static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
                                            const TableFilter &filter,
                                            string &out_ir) {
@@ -224,6 +283,34 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
         args.push_back(std::move(input_ir));
         args.push_back(std::move(needle_ir));
         return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                    out_expr_ir);
+      }
+
+      string containment_name;
+      if (TryGetLanceContainmentFunctionName(func.function.name,
+                                             containment_name)) {
+        if (func.children.size() != 2) {
+          return false;
+        }
+
+        string input_ir;
+        if (!build_from_expr(*func.children[0], input_ir)) {
+          return false;
+        }
+
+        Value needle_value;
+        if (!TryGetNonNullListConstant(*func.children[1], needle_value)) {
+          return false;
+        }
+        string needle_ir;
+        if (!TryEncodeLanceFilterIRListLiteral(needle_value, needle_ir)) {
+          return false;
+        }
+
+        vector<string> args;
+        args.push_back(std::move(input_ir));
+        args.push_back(std::move(needle_ir));
+        return TryEncodeLanceFilterIRScalarFunction(containment_name, args,
                                                     out_expr_ir);
       }
 
@@ -803,6 +890,35 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       args.push_back(std::move(input_ir));
       args.push_back(std::move(needle_ir));
       return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
+                                                  out_ir);
+    }
+
+    string containment_name;
+    if (TryGetLanceContainmentFunctionName(func.function.name,
+                                           containment_name)) {
+      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.children[0], input_ir)) {
+        return false;
+      }
+
+      Value needle_value;
+      if (!TryGetNonNullListConstant(*func.children[1], needle_value)) {
+        return false;
+      }
+      string needle_ir;
+      if (!TryEncodeLanceFilterIRListLiteral(needle_value, needle_ir)) {
+        return false;
+      }
+
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      args.push_back(std::move(needle_ir));
+      return TryEncodeLanceFilterIRScalarFunction(containment_name, args,
                                                   out_ir);
     }
 

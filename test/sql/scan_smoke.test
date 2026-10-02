@@ -14,6 +14,23 @@ SELECT 1;
 statement ok
 SELECT * FROM 'test/data/test_data.lance' LIMIT 1;
 
+# A dataset is a directory, so the path may carry a trailing separator
+query I
+SELECT count(*) FROM 'test/data/test_data.lance/';
+----
+5
+
+query I
+SELECT count(*) FROM 'test/data/test_data.lance//';
+----
+5
+
+# Trimming separators must not widen the .lance suffix test
+statement error
+SELECT * FROM 'test/data/';
+----
+Catalog Error: Table with name test/data/ does not exist!
+
 # Error handling: invalid dataset root
 statement error
 SELECT * FROM 'dummy_path.lance';
