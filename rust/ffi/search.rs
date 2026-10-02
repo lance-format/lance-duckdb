@@ -64,6 +64,7 @@ fn get_fts_schema_inner(
     scan.prefilter(prefilter != 0);
     scan.full_text_search(fts_query)
         .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema search: {err}")))?;
+    scan.with_row_id();
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref())
         .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema project: {err}")))?;
@@ -145,6 +146,7 @@ fn create_fts_stream_ir_inner(
             format!("fts scan search: {err}"),
         )
     })?;
+    scan.with_row_id();
     scan.disable_scoring_autoprojection();
     scan.project(projection.as_ref()).map_err(|err| {
         FfiError::new(
@@ -483,6 +485,7 @@ fn create_hybrid_batch(
     cols.push(Arc::new(dist_builder.finish()) as Arc<dyn Array>);
     cols.push(Arc::new(score_builder.finish()) as Arc<dyn Array>);
     cols.push(Arc::new(hybrid_builder.finish()) as Arc<dyn Array>);
+    cols.push(Arc::new(UInt64Array::from(row_ids.clone())) as Arc<dyn Array>);
 
     let mut fields = rows.schema().fields().iter().cloned().collect::<Vec<_>>();
     fields.push(Arc::new(Field::new(
@@ -496,6 +499,7 @@ fn create_hybrid_batch(
         DataType::Float32,
         true,
     )));
+    fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
 
     let out_schema = Arc::new(Schema::new(fields));
     RecordBatch::try_new(out_schema, cols).map_err(|err| {
