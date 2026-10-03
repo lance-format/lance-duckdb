@@ -345,6 +345,16 @@ COPY (
   SELECT 3::BIGINT AS id, 'other text'::VARCHAR AS text
 ) TO 'test/.tmp/index_ddl_text.lance' (FORMAT lance, mode 'overwrite');
 
+# Mis-cased WITH keys are normalized to lower case so they actually reach Lance
+# instead of being silently dropped. Here the normalized `base_tokenizer` makes
+# Lance validate the (bogus) tokenizer value; without normalization the mis-cased
+# key is dropped and the index is silently built with the default tokenizer.
+statement error
+CREATE INDEX text_badcase_idx ON 'test/.tmp/index_ddl_text.lance' (text)
+USING INVERTED WITH (Base_Tokenizer='nonexistent_tok_xyz');
+----
+unknown base tokenizer
+
 statement ok
 CREATE INDEX text_idx ON 'test/.tmp/index_ddl_text.lance' (text)
 USING INVERTED;

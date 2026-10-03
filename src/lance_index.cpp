@@ -490,7 +490,11 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
       }
       continue;
     }
-    passthrough.emplace_back(std::move(key), std::move(val));
+    // Lance matches index parameter keys case-sensitively (serde snake_case),
+    // and DuckDB treats WITH option keys case-insensitively, so normalize the
+    // key to lower case. Otherwise a mis-cased key (e.g. Num_Partitions) is
+    // silently dropped by Lance and the index is built with defaults instead.
+    passthrough.emplace_back(std::move(key_lower), std::move(val));
   }
 
   if (has_raw_params_json) {
@@ -658,7 +662,9 @@ static void BuildLanceParamsJsonFromDuckdbWithOptions(
       has_raw_params_json = true;
       continue;
     }
-    passthrough.emplace_back(kv.first, kv.second);
+    // Normalize the key to lower case to match Lance's case-sensitive
+    // parameter names (see the SQL-string path above).
+    passthrough.emplace_back(std::move(key_lower), kv.second);
   }
 
   if (has_raw_params_json) {
