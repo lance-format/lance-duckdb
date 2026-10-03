@@ -494,6 +494,13 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
   }
 
   if (has_raw_params_json) {
+    // A raw `params` JSON is the complete parameter set. Silently dropping any
+    // sibling index options (e.g. metric_type) would build a different index
+    // than the user asked for, so reject the combination instead.
+    if (!passthrough.empty()) {
+      out_error = "WITH params cannot be combined with other index options";
+      return false;
+    }
     out_params_json = raw_params_json;
     return true;
   }
@@ -662,6 +669,12 @@ static void BuildLanceParamsJsonFromDuckdbWithOptions(
   }
 
   if (has_raw_params_json) {
+    // Mirror the SQL-string path: a raw `params` JSON is authoritative, so a
+    // sibling option would be silently dropped. Reject rather than mislead.
+    if (!passthrough.empty()) {
+      throw BinderException(
+          "WITH params cannot be combined with other index options");
+    }
     out_params_json = raw_params_json;
     return;
   }

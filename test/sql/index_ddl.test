@@ -34,8 +34,23 @@ USING BTREE WITH (replace=maybe);
 ----
 WITH replace must be a boolean
 
+# A raw params JSON is the complete parameter set, so combining it with sibling
+# options would silently drop those siblings and build a different index.
+statement error
+CREATE INDEX bad_params_combo_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
+USING IVF_FLAT WITH (params='{"num_partitions":1}', metric_type='cosine');
+----
+WITH params cannot be combined with other index options
+
 statement ok
 ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+
+# Same rule when the target is an attached-namespace table name, not a path.
+statement error
+CREATE INDEX bad_params_combo_native_idx ON ns.main.index_ddl_base (label)
+USING BTREE WITH (params='{"foo":1}', metric_type='cosine');
+----
+WITH params cannot be combined with other index options
 
 statement ok
 CREATE INDEX attached_label_idx ON ns.main.index_ddl_base (label) USING BTREE;
