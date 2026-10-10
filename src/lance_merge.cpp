@@ -20,7 +20,6 @@
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
-#include <algorithm>
 #include <cstdint>
 
 namespace duckdb {
@@ -1026,8 +1025,6 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
 
   map<MergeActionCondition, vector<unique_ptr<LanceMergeAction>>>
       planned_actions;
-  vector<string> json_columns;
-  bool json_columns_loaded = false;
 
   for (auto &entry : op.actions) {
     vector<unique_ptr<LanceMergeAction>> actions_for_condition;
@@ -1042,16 +1039,10 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
 
       switch (bound_action->action_type) {
       case MergeActionType::MERGE_UPDATE: {
-        if (!json_columns_loaded) {
-          json_columns =
-              LanceGetJsonExtensionColumnsForTable(context, *lance_table);
-          json_columns_loaded = true;
-        }
         vector<string> updated_json_columns;
         for (const auto &column_idx : bound_action->columns) {
           auto &target_col = op.table.GetColumns().GetColumn(column_idx);
-          if (std::find(json_columns.begin(), json_columns.end(),
-                        target_col.Name()) != json_columns.end()) {
+          if (lance_table->IsJsonExtensionColumn(target_col.Name())) {
             updated_json_columns.push_back(target_col.Name());
           }
         }
@@ -1071,16 +1062,13 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         break;
       }
       case MergeActionType::MERGE_INSERT:
-        if (!json_columns_loaded) {
-          json_columns =
-              LanceGetJsonExtensionColumnsForTable(context, *lance_table);
-          json_columns_loaded = true;
-        }
-        if (!json_columns.empty()) {
+        if (lance_table->HasJsonExtensionColumns()) {
           throw NotImplementedException(
               "MERGE INTO Lance table '" + lance_table->name +
               "' is not supported because it writes JSON column(s) [" +
-              StringUtil::Join(json_columns, ", ") + "]");
+              StringUtil::Join(lance_table->GetJsonExtensionColumnNames(),
+                               ", ") +
+              "]");
         }
         action->expressions = BuildMergeInsertExpressions(op, *bound_action);
         break;

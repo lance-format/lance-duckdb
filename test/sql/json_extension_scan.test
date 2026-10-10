@@ -83,6 +83,15 @@ WHEN MATCHED THEN UPDATE SET payload = source.payload;
 writes JSON column(s) [payload]
 
 statement error
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 3::BIGINT AS id, '{"a":3}'::VARCHAR AS payload) AS source
+ON target.id = source.id
+WHEN NOT MATCHED THEN INSERT (id, payload)
+VALUES (source.id, source.payload);
+----
+writes JSON column(s) [payload]
+
+statement error
 INSERT INTO json_ns.main.json_data VALUES (3, '{"a":3}');
 ----
 writes JSON column(s) [payload]

@@ -1,6 +1,5 @@
 #include "lance_common.hpp"
 
-#include "lance_arrow_compat.hpp"
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
@@ -632,37 +631,6 @@ void *LanceOpenDatasetForTable(ClientContext &context,
     out_display_uri = cfg.endpoint + "/" + cfg.table_id;
   }
   return dataset;
-}
-
-vector<string>
-LanceGetJsonExtensionColumnsForTable(ClientContext &context,
-                                     const LanceTableEntry &table) {
-  string display_uri;
-  auto *dataset = LanceOpenDatasetForTable(context, table, display_uri);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + display_uri +
-                      LanceFormatErrorSuffix());
-  }
-
-  auto *schema_handle = lance_get_schema(dataset);
-  if (!schema_handle) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to get schema from Lance dataset: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
-    lance_free_schema(schema_handle);
-    lance_close_dataset(dataset);
-    throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface: " +
-        display_uri + LanceFormatErrorSuffix());
-  }
-  lance_free_schema(schema_handle);
-  lance_close_dataset(dataset);
-  return LanceGetJsonExtensionColumnNames(&schema_root.arrow_schema);
 }
 
 void ResolveLanceStorageOptionsForTable(ClientContext &context,

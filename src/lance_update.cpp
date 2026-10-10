@@ -27,7 +27,6 @@
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
 
-#include <algorithm>
 #include <cstdint>
 
 namespace duckdb {
@@ -381,13 +380,10 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw InternalException("Lance UPDATE projection has no child");
   }
   auto &set_expr_scope = *parts.projection->children[0];
-  auto json_columns =
-      LanceGetJsonExtensionColumnsForTable(context, *lance_table);
 
   for (idx_t i = 0; i < op.columns.size(); i++) {
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
-    if (std::find(json_columns.begin(), json_columns.end(),
-                  target_col.Name()) != json_columns.end()) {
+    if (lance_table->IsJsonExtensionColumn(target_col.Name())) {
       throw NotImplementedException(
           "UPDATE on Lance table '" + lance_table->name +
           "' is not supported because it writes JSON column(s) [" +
