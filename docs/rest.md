@@ -111,6 +111,15 @@ reads the Arrow IPC response. Reads therefore do not require DuckDB to open the
 underlying object-store location directly. Unsupported predicates remain in
 DuckDB, and an `OFFSET` without a `LIMIT` is also evaluated by DuckDB.
 
+If the namespace server does not implement `query_table`, disable the
+`lance_namespace_query_table` setting to scan by opening the underlying
+dataset directly (table locations are still resolved through the namespace,
+and reads then require direct storage access):
+
+```sql
+SET lance_namespace_query_table = false;
+```
+
 ```sql
 -- Select all rows
 SELECT * FROM users;

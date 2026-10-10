@@ -17,6 +17,10 @@ typedef struct LanceDebugCounters {
   uint64_t commit_count;
 } LanceDebugCounters;
 
+typedef struct LanceExecContext {
+  uint32_t threads;
+} LanceExecContext;
+
 void *lance_create_session(uint64_t index_cache_size_bytes,
                            uint64_t metadata_cache_size_bytes);
 void lance_close_session(void *session);
@@ -79,6 +83,13 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
+int32_t lance_dataset_checkout_latest_if_stale(void *dataset,
+                                               void **out_new_dataset);
+int32_t lance_dataset_namespace_checkout_latest_if_stale(
+    void *dataset, const char *endpoint, const char *table_id,
+    const char *bearer_token, const char *api_key, const char *delimiter,
+    const char *headers_tsv, void *session, void **out_new_dataset,
+    const char **out_table_uri);
 void lance_close_dataset(void *dataset);
 
 void *lance_get_schema(void *dataset);
@@ -92,7 +103,8 @@ void lance_close_stream(void *stream);
 void *lance_get_exec_schema(void *dataset, const uint8_t *exec_ir,
                             size_t exec_ir_len);
 void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
-                                          size_t exec_ir_len);
+                                          size_t exec_ir_len,
+                                          const LanceExecContext *exec_ctx);
 
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
@@ -307,10 +319,12 @@ typedef struct LanceNamespaceFtsSearchOptions {
 
 void *lance_create_namespace_vector_search_stream(
     const LanceNamespaceQueryConfig *config,
-    const LanceNamespaceVectorSearchOptions *options);
+    const LanceNamespaceVectorSearchOptions *options, const uint8_t *filter_ir,
+    size_t filter_ir_len);
 void *lance_create_namespace_fts_search_stream(
     const LanceNamespaceQueryConfig *config,
-    const LanceNamespaceFtsSearchOptions *options);
+    const LanceNamespaceFtsSearchOptions *options, const uint8_t *filter_ir,
+    size_t filter_ir_len);
 void *lance_create_namespace_scan_stream_ir(
     const LanceNamespaceQueryConfig *config, const uint8_t *filter_ir,
     size_t filter_ir_len, int64_t limit, int64_t offset, uint8_t with_row_id);

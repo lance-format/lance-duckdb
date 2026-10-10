@@ -1,0 +1,200 @@
+# name: test/sql/dataset_cache_prepared_dml.test
+# description: Prepared DML observes external commits instead of reusing stale plans
+# group: [sql]
+
+require lance
+
+# Target-only DML (INSERT ... VALUES and friends) binds no scan of the
+# target, so the scan bind data never forces a rebind for it; a reused
+# prepared plan would pin a stale LanceTableEntry and a freshness check that
+# only ran at plan time. LanceDuckCatalog::GetCatalogVersion opts the catalog
+# out of prepared-plan reuse, so every EXECUTE rebinds against the latest
+# state like an ad-hoc statement. UPDATE/DELETE/MERGE bind a scan of the
+# target and were already forced to rebind through the scan bind data; they
+# are covered below as regression guards for the same contract.
+
+statement ok con1
+COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
+TO 'test/.tmp/prep_dml_ins.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 10::BIGINT AS v
+  UNION ALL
+  SELECT 2::BIGINT AS id, 20::BIGINT AS v
+) TO 'test/.tmp/prep_dml_upd.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 10::BIGINT AS v
+  UNION ALL
+  SELECT 2::BIGINT AS id, 20::BIGINT AS v
+) TO 'test/.tmp/prep_dml_del.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
+TO 'test/.tmp/prep_dml_mrg.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok con1
+ATTACH 'test/.tmp' AS prep_dml_reader (TYPE LANCE);
+
+statement ok con2
+ATTACH 'test/.tmp' AS prep_dml_writer (TYPE LANCE);
+
+# ---------------------------------------------------------------------------
+# INSERT: target-only, external schema evolution
+# ---------------------------------------------------------------------------
+
+statement ok con1
+PREPARE prep_dml_insert AS INSERT INTO prep_dml_reader.main.prep_dml_ins VALUES (2, 20);
+
+statement ok con1
+EXECUTE prep_dml_insert;
+
+query I con1
+SELECT count(*) FROM prep_dml_reader.main.prep_dml_ins;
+----
+2
+
+# External schema evolution committed through the writer catalog.
+statement ok con2
+ALTER TABLE prep_dml_writer.main.prep_dml_ins ADD COLUMN extra BIGINT;
+
+# An ad-hoc read on con1 heals the reader's stale entry. The prepared plan
+# still references the superseded entry generation: before the version-chain
+# replace, healing destroyed that catalog object outright and the next
+# EXECUTE dereferenced freed memory; now the old generation stays alive until
+# undo-buffer cleanup, and the EXECUTE below never touches it anyway because
+# it is forced to rebind.
+query I con1
+SELECT count(*) FROM prep_dml_reader.main.prep_dml_ins;
+----
+2
+
+# The forced rebind re-resolves the target: the two-value VALUES list no
+# longer matches the evolved three-column schema, so EXECUTE fails against
+# the current schema instead of appending through the stale plan.
+statement error con1
+EXECUTE prep_dml_insert;
+----
+<REGEX>:.*(3 columns but 2 values|changed externally).*
+
+# A statement prepared against the evolved schema goes through.
+statement ok con1
+PREPARE prep_dml_insert_v2 AS INSERT INTO prep_dml_reader.main.prep_dml_ins VALUES (3, 30, 300);
+
+statement ok con1
+EXECUTE prep_dml_insert_v2;
+
+query I con1
+SELECT count(*) FROM prep_dml_reader.main.prep_dml_ins;
+----
+3
+
+# ---------------------------------------------------------------------------
+# UPDATE: external data commit between EXECUTEs
+# ---------------------------------------------------------------------------
+
+statement ok con1
+PREPARE prep_dml_update AS UPDATE prep_dml_reader.main.prep_dml_upd SET v = v + 1 WHERE id >= 1;
+
+query I con1
+EXECUTE prep_dml_update;
+----
+2
+
+statement ok con2
+INSERT INTO prep_dml_writer.main.prep_dml_upd VALUES (3, 30);
+
+# The re-executed statement must observe the externally inserted row: three
+# rows match the predicate now, not the two known at PREPARE time.
+query I con1
+EXECUTE prep_dml_update;
+----
+3
+
+query I con1
+SELECT sum(v) FROM prep_dml_reader.main.prep_dml_upd;
+----
+65
+
+# ---------------------------------------------------------------------------
+# DELETE: external data commit between EXECUTEs
+# ---------------------------------------------------------------------------
+
+statement ok con1
+PREPARE prep_dml_delete AS DELETE FROM prep_dml_reader.main.prep_dml_del WHERE id >= 1;
+
+query I con1
+EXECUTE prep_dml_delete;
+----
+2
+
+statement ok con2
+INSERT INTO prep_dml_writer.main.prep_dml_del VALUES (3, 30), (4, 40);
+
+# Only the externally inserted rows remain; deleting them proves the
+# re-executed statement observed the external commit.
+query I con1
+EXECUTE prep_dml_delete;
+----
+2
+
+query I con1
+SELECT count(*) FROM prep_dml_reader.main.prep_dml_del;
+----
+0
+
+# ---------------------------------------------------------------------------
+# MERGE: matched-vs-not-matched flips on external data commit
+# ---------------------------------------------------------------------------
+# DuckDB's SQL-level PREPARE does not accept MERGE (the parser's
+# PreparableStmt rule covers SELECT/INSERT/UPDATE/DELETE/COPY only), so MERGE
+# cannot pin a stale plan through PREPARE/EXECUTE. API-level prepared MERGE
+# statements go through the same RequireRebind machinery exercised above
+# (invalid catalog version) plus the target-scan bind data that already
+# forces rebinds; assert the resulting contract - re-running the identical
+# MERGE observes external commits - with repeated ad-hoc executions.
+
+# id 5 is absent: NOT MATCHED inserts (5, 50).
+query I con1
+MERGE INTO prep_dml_reader.main.prep_dml_mrg AS t
+USING (SELECT 5::BIGINT AS id, 50::BIGINT AS v) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET v = 999
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v);
+----
+1
+
+query II con1
+SELECT id, v FROM prep_dml_reader.main.prep_dml_mrg WHERE id = 5;
+----
+5	50
+
+# External commit touching the row the merge matches on.
+statement ok con2
+UPDATE prep_dml_writer.main.prep_dml_mrg SET v = 1 WHERE id = 5;
+
+# The re-executed merge must match the externally updated row: a binding
+# pinned before the first execution would consider id 5 absent and insert a
+# duplicate row instead of updating.
+query I con1
+MERGE INTO prep_dml_reader.main.prep_dml_mrg AS t
+USING (SELECT 5::BIGINT AS id, 50::BIGINT AS v) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET v = 999
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v);
+----
+1
+
+query II con1
+SELECT id, v FROM prep_dml_reader.main.prep_dml_mrg ORDER BY id;
+----
+1	10
+5	999
+
+statement ok con1
+DETACH prep_dml_reader;
+
+statement ok con2
+DETACH prep_dml_writer;

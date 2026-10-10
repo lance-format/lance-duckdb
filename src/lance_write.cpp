@@ -5,6 +5,7 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -135,6 +136,7 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
          sizeof(state->schema_root.arrow_schema));
   ArrowConverter::ToArrowSchema(&state->schema_root.arrow_schema,
                                 bind_data.types, bind_data.names, props);
+  LanceNormalizeArrowListFieldNames(&state->schema_root.arrow_schema);
 
   vector<string> option_keys;
   vector<string> option_values;

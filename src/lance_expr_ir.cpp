@@ -50,6 +50,7 @@ bool LanceExprIRSupportsLogicalType(const LogicalType &type) {
   case LogicalTypeId::TIMESTAMP_TZ:
   case LogicalTypeId::DECIMAL:
   case LogicalTypeId::STRUCT:
+  case LogicalTypeId::LIST:
     return true;
   default:
     return false;
@@ -86,6 +87,7 @@ enum class LanceUpdateExprIRLiteralTag : uint8_t {
   DATE32 = 7,
   TIMESTAMP = 8,
   DECIMAL128 = 9,
+  LIST = 10,
 };
 
 enum class LanceUpdateExprIRTimestampUnit : uint8_t {
@@ -232,10 +234,7 @@ static void EncodeColumnRef(const string &name, string &out) {
   EncodeColumnRef(vector<string>{name}, out);
 }
 
-static void EncodeLiteral(const Value &value, string &out) {
-  out.clear();
-  AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRTag::LITERAL));
-
+static void AppendLiteralPayload(const Value &value, string &out) {
   if (value.IsNull()) {
     AppendU8(out,
              static_cast<uint8_t>(LanceUpdateExprIRLiteralTag::NULL_VALUE));
@@ -374,6 +373,45 @@ static void EncodeLiteral(const Value &value, string &out) {
     throw NotImplementedException("Lance UPDATE does not support literal type "
                                   "%s in SET expressions",
                                   value.type().ToString());
+  }
+}
+
+static void EncodeLiteral(const Value &value, string &out) {
+  out.clear();
+  AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRTag::LITERAL));
+  AppendLiteralPayload(value, out);
+}
+
+static void EncodeListLiteral(const Value &value, string &out) {
+  if (value.IsNull() || value.type().id() != LogicalTypeId::LIST) {
+    throw NotImplementedException(
+        "Lance expression IR list literals require a non-null LIST value");
+  }
+  auto &children = ListValue::GetChildren(value);
+  // Lance's LABEL_LIST query parser rejects an empty needle, and DuckDB's
+  // `list_has_all([], ...)` short-circuits to `true` where DataFusion combines
+  // the row-level NULL mask instead. Refuse the degenerate case so DuckDB keeps
+  // evaluating it.
+  if (children.empty()) {
+    throw NotImplementedException(
+        "Lance expression IR does not support empty list literals");
+  }
+  if (children.size() > std::numeric_limits<uint32_t>::max()) {
+    throw InvalidInputException("ExprIR list literal too large");
+  }
+  out.clear();
+  AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRTag::LITERAL));
+  AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRLiteralTag::LIST));
+  AppendU32(out, static_cast<uint32_t>(children.size()));
+  for (auto &child : children) {
+    // DuckDB's containment predicates ignore NULL elements while
+    // DataFusion/Lance compare them as values, so a NULL element is not
+    // pushable.
+    if (child.IsNull()) {
+      throw NotImplementedException(
+          "Lance expression IR does not support NULL list literal elements");
+    }
+    AppendLiteralPayload(child, out);
   }
 }
 
@@ -661,6 +699,15 @@ bool TryEncodeLanceExprIRColumnRef(const vector<string> &segments,
 bool TryEncodeLanceExprIRLiteral(const Value &value, string &out_ir) {
   try {
     EncodeLiteral(value, out_ir);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool TryEncodeLanceExprIRListLiteral(const Value &value, string &out_ir) {
+  try {
+    EncodeListLiteral(value, out_ir);
     return true;
   } catch (...) {
     return false;

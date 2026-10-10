@@ -1,0 +1,73 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+version: 2
+updates:
+  # GitHub Actions - semiannually updates with groups
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    open-pull-requests-limit: 2
+    # GitHub Actions have a steady update interval. Update semiannually to reduce update PRs.
+    schedule:
+      interval: "semiannually"
+    groups:
+      github-actions:
+        patterns:
+          - "actions/*"
+      third-party-actions:
+        patterns:
+          - "*"
+
+  # Core dependencies - semiannual updates with groups
+  - package-ecosystem: "cargo"
+    directory: "/"
+    open-pull-requests-limit: 4
+    # Update core dependencies semiannually because core dependencies are somewhat stable.
+    #
+    # Developers can update dependencies via dependabot manually by:
+    # 1. Go to Dependabot page https://github.com/dentiny/lance-duckdb/network/updates
+    # 2. Choose a project by "Recent update jobs"
+    # 3. Click "Check for updates"
+    schedule:
+      interval: "semiannually"
+    groups:
+      # Lance and its compatible Arrow and DataFusion dependencies
+      lance-stack:
+        patterns:
+          - "lance*"
+          - "arrow*"
+          - "datafusion*"
+      # Serialization and date/time utilities
+      serialization-utils:
+        patterns:
+          - "chrono"
+          - "serde*"
+      # Async runtime and runtime tools
+      async-runtime:
+        patterns:
+          - "tokio*"
+          - "async-*"
+          - "futures*"
+      # Error handling
+      error-handling:
+        patterns:
+          - "anyhow"
+          - "snafu"
+      others:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "lance*"
+          - "arrow*"
+          - "datafusion*"
+          # Please upgrade to new APIs when updating "rand"
+          - "rand"

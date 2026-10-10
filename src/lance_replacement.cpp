@@ -11,7 +11,11 @@ namespace duckdb {
 static unique_ptr<TableRef>
 LanceReplacementScan(ClientContext &, ReplacementScanInput &input,
                      optional_ptr<ReplacementScanData>) {
-  const auto &table_name = input.table_name;
+  // A Lance dataset is a directory, so paths copied from shells and
+  // object-store consoles often carry a trailing separator. __lance_scan hands
+  // the path straight to Lance, which accepts it, so trim rather than reject.
+  auto table_name = input.table_name;
+  StringUtil::RTrim(table_name, "/\\");
   if (!StringUtil::EndsWith(table_name, ".lance")) {
     return nullptr;
   }

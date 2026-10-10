@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -95,6 +96,7 @@ public:
       ArrowConverter::ToArrowSchema(&gstate.schema_root.arrow_schema,
                                     gstate.column_types, gstate.column_names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&gstate.schema_root.arrow_schema);
 
       if (!gstate.table) {
         throw InternalException("Lance INSERT missing table reference");
@@ -229,6 +231,15 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
   }
+  // Plain INSERT does not bind a scan of the target, so the scan-bind
+  // freshness check never runs for it; validate here so a stale entry (e.g.
+  // a coerced-column list outdated by an external type evolution) fails
+  // closed instead of gating the write on stale state. Throws and replaces
+  // the entry on mismatch. This is defense-in-depth rather than the only
+  // guard for prepared INSERT: LanceDuckCatalog::GetCatalogVersion opts the
+  // catalog out of prepared-plan reuse, so every EXECUTE rebinds and reaches
+  // this check with a freshly resolved entry instead of a cached plan.
+  lance_table->VerifySchemaFreshness(context);
   if (lance_table->HasCoercedColumns()) {
     throw NotImplementedException(
         "INSERT into Lance table '" + lance_table->name +
