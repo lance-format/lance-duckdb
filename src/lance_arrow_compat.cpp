@@ -90,6 +90,54 @@ constexpr CoercionRule kRules[] = {
      ConvertFloat16ToFloat32},
 };
 
+constexpr char kUtf8FormatLiteral[] = "u";
+
+bool ReadArrowMetadataInt32(const uint8_t *&ptr, int32_t &out) {
+  std::memcpy(&out, ptr, sizeof(out));
+  ptr += sizeof(out);
+  return out >= 0;
+}
+
+bool ArrowMetadataHasValue(const char *metadata, const char *key,
+                           const char *value) {
+  if (!metadata) {
+    return false;
+  }
+  const auto *ptr = reinterpret_cast<const uint8_t *>(metadata);
+  int32_t pairs = 0;
+  if (!ReadArrowMetadataInt32(ptr, pairs)) {
+    return false;
+  }
+  for (int32_t i = 0; i < pairs; i++) {
+    int32_t key_size = 0;
+    if (!ReadArrowMetadataInt32(ptr, key_size)) {
+      return false;
+    }
+    std::string current_key(reinterpret_cast<const char *>(ptr), key_size);
+    ptr += key_size;
+
+    int32_t value_size = 0;
+    if (!ReadArrowMetadataInt32(ptr, value_size)) {
+      return false;
+    }
+    std::string current_value(reinterpret_cast<const char *>(ptr), value_size);
+    ptr += value_size;
+
+    if (current_key == key && current_value == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsJsonExtension(const ArrowSchema *schema) {
+  return schema &&
+         (ArrowMetadataHasValue(schema->metadata, "ARROW:extension:name",
+                                "arrow.json") ||
+          ArrowMetadataHasValue(schema->metadata, "ARROW:extension:name",
+                                "lance.json"));
+}
+
 const CoercionRule *FindRule(const char *format) {
   for (const auto &rule : kRules) {
     if (rule.matches(format)) {
@@ -107,6 +155,9 @@ bool SchemaNeedsCoercion(const ArrowSchema *schema) {
   if (!schema) {
     return false;
   }
+  if (IsJsonExtension(schema)) {
+    return true;
+  }
   if (FindRule(schema->format)) {
     return true;
   }
@@ -116,6 +167,36 @@ bool SchemaNeedsCoercion(const ArrowSchema *schema) {
     }
   }
   return SchemaNeedsCoercion(schema->dictionary);
+}
+
+bool SchemaContainsJsonExtension(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (IsJsonExtension(schema)) {
+    return true;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (SchemaContainsJsonExtension(schema->children[i])) {
+      return true;
+    }
+  }
+  return SchemaContainsJsonExtension(schema->dictionary);
+}
+
+bool SchemaNeedsStorageCoercion(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (FindRule(schema->format)) {
+    return true;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (SchemaNeedsStorageCoercion(schema->children[i])) {
+      return true;
+    }
+  }
+  return SchemaNeedsStorageCoercion(schema->dictionary);
 }
 
 // --- Array buffer rewrite ---------------------------------------------------
@@ -190,6 +271,7 @@ struct SchemaOverride {
   struct Entry {
     ArrowSchema *schema;
     const char *original_format;
+    const char *original_metadata;
   };
   std::vector<Entry> entries;
   void (*original_release)(ArrowSchema *) = nullptr;
@@ -203,6 +285,7 @@ void SchemaReleaseWrapper(ArrowSchema *schema) {
   auto *state = static_cast<SchemaOverride *>(schema->private_data);
   for (auto &e : state->entries) {
     e.schema->format = e.original_format;
+    e.schema->metadata = e.original_metadata;
   }
   auto *original_release = state->original_release;
   schema->release = original_release;
@@ -217,10 +300,20 @@ void CoerceSchemaRecursive(ArrowSchema *schema, SchemaOverride &state) {
   if (!schema) {
     return;
   }
+  if (IsJsonExtension(schema)) {
+    SchemaOverride::Entry entry;
+    entry.schema = schema;
+    entry.original_format = schema->format;
+    entry.original_metadata = schema->metadata;
+    state.entries.push_back(entry);
+    schema->format = kUtf8FormatLiteral;
+    schema->metadata = nullptr;
+  }
   if (const auto *rule = FindRule(schema->format)) {
     SchemaOverride::Entry entry;
     entry.schema = schema;
     entry.original_format = schema->format;
+    entry.original_metadata = schema->metadata;
     state.entries.push_back(entry);
     schema->format = rule->coerced_format;
   }
@@ -236,6 +329,21 @@ bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema) {
   return SchemaNeedsCoercion(schema);
 }
 
+std::vector<std::string>
+LanceGetJsonExtensionColumnNames(const ArrowSchema *schema) {
+  std::vector<std::string> json_columns;
+  if (!schema) {
+    return json_columns;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    auto *child = schema->children[i];
+    if (SchemaContainsJsonExtension(child) && child && child->name) {
+      json_columns.emplace_back(child->name);
+    }
+  }
+  return json_columns;
+}
+
 std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   std::vector<std::string> coerced_top_level;
   if (!schema || !SchemaNeedsCoercion(schema)) {
@@ -247,7 +355,7 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   // whether the coercion lives at the top or inside a nested type.
   for (int64_t i = 0; i < schema->n_children; i++) {
     auto *child = schema->children[i];
-    if (SchemaNeedsCoercion(child) && child && child->name) {
+    if (SchemaNeedsStorageCoercion(child) && child && child->name) {
       coerced_top_level.emplace_back(child->name);
     }
   }
@@ -260,6 +368,7 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   } catch (...) {
     for (auto &e : state->entries) {
       e.schema->format = e.original_format;
+      e.schema->metadata = e.original_metadata;
     }
     delete state;
     throw;

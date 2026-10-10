@@ -179,6 +179,7 @@ static void PopulateColumnsFromArrowSchema(
 static void PopulateLanceTableColumnsFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
     vector<string> *out_coerced_columns = nullptr,
+    vector<string> *out_json_columns = nullptr,
     vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
@@ -195,9 +196,14 @@ static void PopulateLanceTableColumnsFromDataset(
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  auto json_columns =
+      LanceGetJsonExtensionColumnNames(&schema_root.arrow_schema);
   auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
+  }
+  if (out_json_columns) {
+    *out_json_columns = std::move(json_columns);
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
                                  out_constraints);
@@ -324,9 +330,11 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
+    vector<string> json_columns;
     try {
       PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced, &info.constraints);
+                                           &coerced, &json_columns,
+                                           &info.constraints);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -346,6 +354,7 @@ public:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
+    entry->SetJsonExtensionColumnNames(std::move(json_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
@@ -390,6 +399,7 @@ private:
 static void PopulateLanceTableColumnsFromJsonSchema(
     ClientContext &context, const string &schema_json, ColumnList &out_columns,
     vector<string> *out_coerced_columns = nullptr,
+    vector<string> *out_json_columns = nullptr,
     vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
   ArrowSchemaWrapper schema_root;
   memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
@@ -399,9 +409,14 @@ static void PopulateLanceTableColumnsFromJsonSchema(
                       "Interface" +
                       LanceFormatErrorSuffix());
   }
+  auto json_columns =
+      LanceGetJsonExtensionColumnNames(&schema_root.arrow_schema);
   auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
+  }
+  if (out_json_columns) {
+    *out_json_columns = std::move(json_columns);
   }
   PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
                                  out_constraints);
@@ -484,14 +499,16 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
       try {
         PopulateLanceTableColumnsFromJsonSchema(
-            context, schema_json, info.columns, &coerced, &info.constraints);
+            context, schema_json, info.columns, &coerced, &json_columns,
+            &info.constraints);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(json_columns));
     }
 
     // Slow fallback: open dataset from S3.
@@ -516,16 +533,18 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
       try {
         PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced, &info.constraints);
+                                             &coerced, &json_columns,
+                                             &info.constraints);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(json_columns));
     }
 
     // All paths failed — return an empty entry to prevent DuckDB crash.
@@ -533,7 +552,7 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {});
+                              {}, {});
   }
 
   vector<string> GetDefaultEntries() override {
@@ -556,7 +575,8 @@ private:
   unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
                                               const string &table_id,
                                               CreateTableInfo info,
-                                              vector<string> coerced_columns) {
+                                              vector<string> coerced_columns,
+                                              vector<string> json_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -568,6 +588,7 @@ private:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
+    entry->SetJsonExtensionColumnNames(std::move(json_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 

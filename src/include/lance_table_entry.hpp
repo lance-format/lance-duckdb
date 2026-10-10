@@ -128,6 +128,24 @@ public:
     coerced_column_names = std::move(names);
   }
 
+  bool HasJsonExtensionColumns() const {
+    return !json_extension_column_names.empty();
+  }
+  bool IsJsonExtensionColumn(const string &name) const {
+    for (const auto &json_name : json_extension_column_names) {
+      if (json_name == name) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const vector<string> &GetJsonExtensionColumnNames() const {
+    return json_extension_column_names;
+  }
+  void SetJsonExtensionColumnNames(vector<string> names) {
+    json_extension_column_names = std::move(names);
+  }
+
 private:
   // Pure comparison of this entry's declared schema state against a live
   // dataset schema produced by the shared population pipeline.
@@ -154,6 +172,7 @@ private:
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;
+  vector<string> json_extension_column_names;
 };
 
 // Replace a catalog table entry whose declared schema state no longer

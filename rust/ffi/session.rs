@@ -108,10 +108,21 @@ fn clear_session_caches(handle: &SessionHandle) {
         }
     }
     if let Some(runtime) = crate::runtime::initialized_runtime() {
-        runtime.block_on(async {
-            handle.index_cache.clear().await;
-            handle.session.file_metadata_cache().clear().await;
-        });
+        let index_cache = handle.index_cache.clone();
+        let metadata_cache = handle.session.file_metadata_cache().clone();
+        // DuckDB can release the session after the main thread's Tokio
+        // context has been destroyed during process teardown.
+        if let Ok(cleanup_thread) = std::thread::Builder::new()
+            .name("lance-session-cleanup".to_string())
+            .spawn(move || {
+                runtime.block_on(async {
+                    index_cache.clear().await;
+                    metadata_cache.clear().await;
+                });
+            })
+        {
+            let _ = cleanup_thread.join();
+        }
     }
 }
 

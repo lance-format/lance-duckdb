@@ -383,6 +383,12 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
 
   for (idx_t i = 0; i < op.columns.size(); i++) {
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
+    if (lance_table->IsJsonExtensionColumn(target_col.Name())) {
+      throw NotImplementedException(
+          "UPDATE on Lance table '" + lance_table->name +
+          "' is not supported because it writes JSON column(s) [" +
+          target_col.Name() + "]");
+    }
     set_columns.push_back(target_col.Name());
 
     if (!op.expressions[i]) {

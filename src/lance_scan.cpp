@@ -3417,7 +3417,8 @@ static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
 static void PopulateLanceTableSchemaFromDataset(
     ClientContext &context, void *dataset, ColumnList &out_columns,
     vector<unique_ptr<Constraint>> &out_constraints,
-    vector<string> *out_coerced_columns = nullptr) {
+    vector<string> *out_coerced_columns = nullptr,
+    vector<string> *out_json_columns = nullptr) {
   auto *schema_handle = lance_get_schema(dataset);
   if (!schema_handle) {
     throw IOException("Failed to get schema from Lance dataset" +
@@ -3433,9 +3434,14 @@ static void PopulateLanceTableSchemaFromDataset(
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
+  auto json_columns =
+      LanceGetJsonExtensionColumnNames(&schema_root.arrow_schema);
   auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
   if (out_coerced_columns) {
     *out_coerced_columns = std::move(coerced);
+  }
+  if (out_json_columns) {
+    *out_json_columns = std::move(json_columns);
   }
 
   ArrowTableSchema arrow_table;
@@ -3491,9 +3497,11 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
   vector<string> coerced;
+  vector<string> json_columns;
   try {
     PopulateLanceTableSchemaFromDataset(context, dataset, create_info.columns,
-                                        create_info.constraints, &coerced);
+                                        create_info.constraints, &coerced,
+                                        &json_columns);
   } catch (...) {
     lance_close_dataset(dataset);
     throw;
@@ -3508,6 +3516,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
                                        base.DatasetUri());
   }
   entry->SetCoercedColumnNames(std::move(coerced));
+  entry->SetJsonExtensionColumnNames(std::move(json_columns));
 
   auto *table_md = lance_dataset_list_table_metadata(dataset);
   if (!table_md) {
@@ -3833,6 +3842,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
         make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
+  copy->SetJsonExtensionColumnNames(json_extension_column_names);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 

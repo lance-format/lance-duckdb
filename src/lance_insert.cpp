@@ -249,6 +249,13 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
         "catalog exposes a coerced type. Writing in the coerced type would "
         "silently change the on-disk storage.");
   }
+  if (lance_table->HasJsonExtensionColumns()) {
+    throw NotImplementedException(
+        "INSERT into Lance table '" + lance_table->name +
+        "' is not supported because it writes JSON column(s) [" +
+        StringUtil::Join(lance_table->GetJsonExtensionColumnNames(), ", ") +
+        "]");
+  }
 
   vector<string> column_names;
   vector<LogicalType> column_types;
