@@ -169,6 +169,36 @@ bool SchemaNeedsCoercion(const ArrowSchema *schema) {
   return SchemaNeedsCoercion(schema->dictionary);
 }
 
+bool SchemaContainsJsonExtension(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (IsJsonExtension(schema)) {
+    return true;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (SchemaContainsJsonExtension(schema->children[i])) {
+      return true;
+    }
+  }
+  return SchemaContainsJsonExtension(schema->dictionary);
+}
+
+bool SchemaNeedsStorageCoercion(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (FindRule(schema->format)) {
+    return true;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    if (SchemaNeedsStorageCoercion(schema->children[i])) {
+      return true;
+    }
+  }
+  return SchemaNeedsStorageCoercion(schema->dictionary);
+}
+
 // --- Array buffer rewrite ---------------------------------------------------
 
 struct ArrayOverride {
@@ -299,6 +329,21 @@ bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema) {
   return SchemaNeedsCoercion(schema);
 }
 
+std::vector<std::string>
+LanceGetJsonExtensionColumnNames(const ArrowSchema *schema) {
+  std::vector<std::string> json_columns;
+  if (!schema) {
+    return json_columns;
+  }
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    auto *child = schema->children[i];
+    if (SchemaContainsJsonExtension(child) && child && child->name) {
+      json_columns.emplace_back(child->name);
+    }
+  }
+  return json_columns;
+}
+
 std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   std::vector<std::string> coerced_top_level;
   if (!schema || !SchemaNeedsCoercion(schema)) {
@@ -310,7 +355,7 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   // whether the coercion lives at the top or inside a nested type.
   for (int64_t i = 0; i < schema->n_children; i++) {
     auto *child = schema->children[i];
-    if (SchemaNeedsCoercion(child) && child && child->name) {
+    if (SchemaNeedsStorageCoercion(child) && child && child->name) {
       coerced_top_level.emplace_back(child->name);
     }
   }

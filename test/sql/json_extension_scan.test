@@ -15,3 +15,77 @@ SELECT payload, id FROM 'test/data/json_data.lance' ORDER BY id;
 ----
 {"a":1}	1
 {"a":2}	2
+
+statement ok
+ATTACH 'test/data' AS json_ns (TYPE LANCE);
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 1::BIGINT AS id) AS source
+ON target.id = source.id
+WHEN MATCHED THEN DELETE;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM json_ns.main.json_data ORDER BY id;
+----
+1
+2
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE json_ns.main.json_data SET id = id + 10 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query TI
+SELECT payload, id FROM json_ns.main.json_data ORDER BY id;
+----
+{"a":2}	2
+{"a":1}	11
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE json_ns.main.json_data SET id = id - 10 WHERE id = 11;
+
+statement ok
+COMMIT;
+
+query TI
+SELECT payload, id FROM json_ns.main.json_data ORDER BY id;
+----
+{"a":1}	1
+{"a":2}	2
+
+statement error
+UPDATE json_ns.main.json_data SET payload = '{"a":3}' WHERE id = 1;
+----
+writes JSON column(s) [payload]
+
+statement error
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 1::BIGINT AS id, '{"a":3}'::VARCHAR AS payload) AS source
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET payload = source.payload;
+----
+writes JSON column(s) [payload]
+
+statement error
+INSERT INTO json_ns.main.json_data VALUES (3, '{"a":3}');
+----
+writes JSON column(s) [payload]
+
+statement ok
+DETACH json_ns;

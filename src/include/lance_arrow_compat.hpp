@@ -16,10 +16,10 @@ namespace duckdb {
 // shape at the reader boundary:
 //
 //   * `LanceCoerceArrowSchemaForDuckDB` — in-place rewrite of the Arrow schema
-//     so DuckDB's type mapper accepts it. Returns the top-level column names
-//     whose declared type had to be coerced (empty if none). Callers should
-//     store this list on the catalog entry so write paths can refuse to
-//     silently re-encode.
+//     so DuckDB's type mapper accepts it. Returns top-level columns whose
+//     storage type was coerced (empty if none). Metadata-only JSON
+//     normalization is excluded so write paths can validate the columns they
+//     actually modify.
 //
 //   * `LanceCoerceArrowArrayForDuckDB` — per-batch mirror: rewrite buffers of
 //     the same coerced fields so values DuckDB reads match the coerced schema.
@@ -35,6 +35,9 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
 
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
                                     ArrowArray *array);
+
+std::vector<std::string>
+LanceGetJsonExtensionColumnNames(const ArrowSchema *schema);
 
 // Quick predicate — true when the schema contains any type that the coercion
 // helpers above would rewrite.

@@ -341,6 +341,11 @@ fn rewrite_rows_update_transaction_inner(
         let Some(first_batch) = first_batch else {
             return Ok::<_, String>((None, 0));
         };
+        let output_schema = first_batch
+            .clone()
+            .drop_column(ROW_ID)
+            .map_err(|e| e.to_string())?
+            .schema();
 
         let base_stream = futures::stream::iter(Some(Ok(first_batch)))
             .chain(input_stream)
@@ -385,7 +390,7 @@ fn rewrite_rows_update_transaction_inner(
             .boxed();
 
         let updated_stream: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(arrow_schema.clone(), stream));
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, stream));
 
         let write_params = WriteParams {
             mode: WriteMode::Append,

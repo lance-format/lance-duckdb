@@ -111,6 +111,10 @@ void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri);
 
+vector<string>
+LanceGetJsonExtensionColumnsForTable(ClientContext &context,
+                                     const LanceTableEntry &table);
+
 void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         const LanceTableEntry &table,
                                         string &out_open_path,
