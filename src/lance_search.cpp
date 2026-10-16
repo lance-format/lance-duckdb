@@ -1,7 +1,5 @@
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -12,7 +10,6 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -83,33 +80,6 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
   out_plan = plan_ptr;
   lance_free_string(plan_ptr);
   return true;
-}
-
-// TryResolveLanceTableEntry() is now defined in lance_common.cpp so that
-// the maintenance helpers (compact / cleanup / optimize_index /
-// auto_cleanup) can share the same "catalog.schema.table" -> entry
-// resolution logic.
-
-static shared_ptr<LanceDatasetCacheEntry>
-OpenSearchDatasetEntry(ClientContext &context, const Value &input,
-                       const string &function_name, string &out_display_uri,
-                       bool *out_cache_hit) {
-  out_display_uri = ResolveLanceDatasetUri(
-      context, input, LanceResolvePolicy::FALLBACK_TO_PATH, function_name);
-  auto input_str = input.GetValue<string>();
-  if (auto *table = TryResolveLanceTableEntry(context, input_str)) {
-    if (StringUtil::CIEquals(out_display_uri, table->DatasetUri())) {
-      return LanceGetOrOpenDatasetEntryForTable(context, *table,
-                                                out_display_uri, out_cache_hit);
-    }
-  }
-
-  auto entry =
-      LanceGetOrOpenDatasetEntry(context, out_display_uri, out_cache_hit);
-  if (entry) {
-    out_display_uri = entry->DisplayUri();
-  }
-  return entry;
 }
 
 static vector<float> ParseQueryVector(const Value &value,
@@ -193,17 +163,6 @@ static string ParseOptionalNamedString(const TableFunctionBindInput &input,
     return string();
   }
   return it->second.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
-}
-
-static LanceTableEntry *
-TryResolveNamespaceBackedSearchTable(ClientContext &context,
-                                     const Value &input) {
-  auto input_str = input.GetValue<string>();
-  auto *table = TryResolveLanceTableEntry(context, input_str);
-  if (!table || !table->IsNamespaceBacked()) {
-    return nullptr;
-  }
-  return table;
 }
 
 static string RequireNamespaceSearchColumn(const LanceTableEntry &table,
@@ -557,8 +516,11 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto target = ResolveLanceDataset(context, input.inputs[0],
+                                    LanceResolvePolicy::FALLBACK_TO_PATH,
+                                    "lance_vector_search");
+  auto table = target.table;
+  if (table && table->IsNamespaceBacked()) {
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
@@ -577,9 +539,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_vector_search",
-                             result->file_path, &result->dataset_cache_hit);
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -1185,8 +1146,11 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
             .GetValue<bool>();
   }
 
-  if (auto *table =
-          TryResolveNamespaceBackedSearchTable(context, input.inputs[0])) {
+  auto target =
+      ResolveLanceDataset(context, input.inputs[0],
+                          LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
+  auto table = target.table;
+  if (table && table->IsNamespaceBacked()) {
     result->namespace_backed = true;
     result->namespace_config = table->NamespaceConfig();
     result->file_path = table->DatasetUri();
@@ -1205,9 +1169,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   }
 
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_fts",
-                             result->file_path, &result->dataset_cache_hit);
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -1278,9 +1241,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
   result->file_path.clear();
-  result->dataset_entry =
-      OpenSearchDatasetEntry(context, input.inputs[0], "lance_hybrid_search",
-                             result->file_path, &result->dataset_cache_hit);
+  auto target = ResolveLanceDataset(context, input.inputs[0],
+                                    LanceResolvePolicy::FALLBACK_TO_PATH,
+                                    "lance_hybrid_search");
+  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
+                                                 &result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->vector_column = input.inputs[1].GetValue<string>();

@@ -24,6 +24,10 @@ test-env LANCE_S3_NS_PREFIX ns_attach_test
 
 require lance
 
+# Binding a path must not capture credentials before they exist.
+statement ok
+PREPARE resolved_s3_path AS SELECT * FROM __lance_show_auto_cleanup('s3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance');
+
 statement ok
 CREATE SECRET (
   TYPE LANCE,
@@ -46,6 +50,11 @@ statement ok
 COPY (SELECT 10::BIGINT AS id UNION ALL SELECT 20::BIGINT UNION ALL SELECT 30::BIGINT)
 TO 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/beta.lance' (FORMAT lance, mode 'overwrite');
 
+query TT
+EXECUTE resolved_s3_path;
+----
+enabled	false
+
 # ATTACH the prefix as a directory namespace and verify that the tables are
 # visible through the catalog. Before the fix, this catalog was always empty
 # on non-AWS S3-compatible endpoints because dataset open returned NULL for
@@ -59,6 +68,17 @@ WHERE database_name = 'ns' ORDER BY table_name;
 ----
 alpha	ns
 beta	ns
+
+# Catalog targets use the namespace-aware open path for config and maintenance.
+query TT
+SHOW MAINTENANCE ON ns.main.alpha;
+----
+enabled	false
+
+query T
+SELECT Operation FROM __lance_compact_files('ns.main.alpha', '{}');
+----
+compact
 
 query I
 SELECT count(*) FROM ns.main.alpha;

@@ -30,7 +30,7 @@ require lance
 # *virtual* "<endpoint>/<table_id>" handle, which lance-io cannot open
 # directly.  The maintenance bind path used to forward that virtual URI to
 # LanceOpenDataset() and fail with an IO error -- this test guards the fix
-# that re-resolves the original input via LanceOpenDatasetForTable() so the
+# that retains catalog identity and uses LanceOpenDatasetForTable() so the
 # namespace REST API can produce the real cos:// / file:// location.
 # ---------------------------------------------------------------------------
 
@@ -44,7 +44,7 @@ SELECT count(*) >= 0 AS ok FROM maintenance_rest_ns.main.{LANCE_NAMESPACE_MAINT_
 true
 
 # ---------------------------------------------------------------------------
-# OPTIMIZE (compact) — exercises LanceMaintenanceFunc fallback path.
+# OPTIMIZE (compact) — exercises LanceMaintenanceFunc namespace open path.
 # ---------------------------------------------------------------------------
 
 query TTT
@@ -53,7 +53,7 @@ OPTIMIZE maintenance_rest_ns.main.{LANCE_NAMESPACE_MAINT_TABLE};
 compact	<REGEX>:.*	<REGEX>:\{.*\}
 
 # ---------------------------------------------------------------------------
-# VACUUM LANCE (cleanup) — exercises the same fallback path with options.
+# VACUUM LANCE (cleanup) — exercises the same namespace open path with options.
 # ---------------------------------------------------------------------------
 
 query TTT
@@ -66,7 +66,7 @@ VACUUM LANCE maintenance_rest_ns.main.{LANCE_NAMESPACE_MAINT_TABLE} WITH (
 cleanup	<REGEX>:.*	<REGEX>:\{.*\}
 
 # ---------------------------------------------------------------------------
-# SHOW MAINTENANCE — exercises LanceShowAutoCleanupInitGlobal fallback path.
+# SHOW MAINTENANCE — exercises LanceShowAutoCleanupInitGlobal namespace open path.
 # Reset to a known state first so the row count is deterministic.
 # ---------------------------------------------------------------------------
 
