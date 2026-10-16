@@ -105,7 +105,8 @@ private:
   // Pure comparison of this entry's declared schema state against a live
   // dataset schema produced by the shared population pipeline.
   bool
-  MatchesLiveSchemaState(const vector<string> &live_names,
+  MatchesLiveSchemaState(ClientContext &context,
+                         const vector<string> &live_names,
                          const vector<LogicalType> &live_types,
                          const std::vector<std::string> &live_coerced_columns,
                          const ArrowSchema &live_schema_root) const;

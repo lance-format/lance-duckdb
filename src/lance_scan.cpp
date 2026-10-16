@@ -4002,11 +4002,13 @@ NotNullIndexesFromArrowSchema(const ArrowSchema &schema_root) {
 //   coerced-column list gates writes (INSERT/UPDATE/MERGE reject coerced
 //   columns);
 // - the nullability state: external ALTER SET/DROP NOT NULL changes only
-//   the Arrow flags, which the entry mirrors as NOT NULL constraints.
+//   the Arrow flags, which the entry mirrors as NOT NULL constraints;
+// - stored defaults, which native INSERT/UPDATE binding reads from this entry.
 // All compared states come from the same population pipeline over the
 // (entry-build vs live) schema, so the comparison is exact.
 bool LanceTableEntry::MatchesLiveSchemaState(
-    const vector<string> &live_names, const vector<LogicalType> &live_types,
+    ClientContext &context, const vector<string> &live_names,
+    const vector<LogicalType> &live_types,
     const std::vector<std::string> &live_coerced_columns,
     const ArrowSchema &live_schema_root) const {
   bool schema_matches = columns.LogicalColumnCount() == live_names.size() &&
@@ -4021,6 +4023,15 @@ bool LanceTableEntry::MatchesLiveSchemaState(
         schema_matches = false;
         break;
       }
+      ColumnDefinition live_column(col.Name(), col.Type());
+      LanceRestoreColumnDefault(context, *live_schema_root.children[col_idx],
+                                live_column);
+      if (col.HasDefaultValue() != live_column.HasDefaultValue() ||
+          (col.HasDefaultValue() &&
+           !col.DefaultValue().Equals(live_column.DefaultValue()))) {
+        schema_matches = false;
+        break;
+      }
       col_idx++;
     }
   }
@@ -4032,8 +4043,8 @@ void LanceTableEntry::ValidateLiveSchemaOrReplace(
     const vector<LogicalType> &live_types,
     const std::vector<std::string> &live_coerced_columns,
     const ArrowSchema &live_schema_root, const string &display_uri) {
-  if (MatchesLiveSchemaState(live_names, live_types, live_coerced_columns,
-                             live_schema_root)) {
+  if (MatchesLiveSchemaState(context, live_names, live_types,
+                             live_coerced_columns, live_schema_root)) {
     return;
   }
   // The query pins this generation until QueryEnd, so reading
@@ -4080,8 +4091,9 @@ bool LanceTableEntry::FetchLiveSchemaMatches(ClientContext &context,
   ArrowTableSchema arrow_table;
   ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
                                                schema_root.arrow_schema);
-  return MatchesLiveSchemaState(arrow_table.GetNames(), arrow_table.GetTypes(),
-                                live_coerced_columns, schema_root.arrow_schema);
+  return MatchesLiveSchemaState(context, arrow_table.GetNames(),
+                                arrow_table.GetTypes(), live_coerced_columns,
+                                schema_root.arrow_schema);
 }
 
 // Non-throwing-on-mismatch staleness probe for catalog resolution: reports
