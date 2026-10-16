@@ -116,8 +116,8 @@ private:
   bool FetchLiveSchemaMatches(ClientContext &context, string &out_display_uri);
 
   // Shared freshness comparator for the scan bind path and
-  // VerifySchemaFreshness; replaces this entry through the catalog version
-  // chain and throws on mismatch.
+  // VerifySchemaFreshness; refreshes the metadata cache and throws on mismatch
+  // while the current query keeps this entry pinned.
   void ValidateLiveSchemaOrReplace(
       ClientContext &context, const vector<string> &live_names,
       const vector<LogicalType> &live_types,

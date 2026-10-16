@@ -115,8 +115,9 @@ Typical keys:
 
 The extension also accepts `AWS_*` aliases (e.g. `AWS_ACCESS_KEY_ID`, `AWS_REGION`, ...).
 
-Note: DuckDB requires `INSTALL httpfs;` and `LOAD httpfs;` before running
-`ATTACH 's3://...' AS ... (TYPE LANCE, ...)`.
+Lance reads and writes object stores through its own storage implementation.
+`ATTACH 's3://...' AS ... (TYPE LANCE, ...)` uses the same `TYPE LANCE` secret
+as scans and writes; it does not require the `httpfs` extension.
 
 Example (MinIO):
 

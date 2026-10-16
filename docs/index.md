@@ -32,9 +32,9 @@ COPY (
   SELECT *
   FROM (
     VALUES
-      ('duck', 'quack', [0.9, 0.7, 0.1]::FLOAT[]),
-      ('horse', 'neigh', [0.3, 0.1, 0.5]::FLOAT[]),
-      ('dragon', 'roar', [0.5, 0.2, 0.7]::FLOAT[])
+      ('duck', 'quack', [0.9, 0.7, 0.1]::FLOAT[3]),
+      ('horse', 'neigh', [0.3, 0.1, 0.5]::FLOAT[3]),
+      ('dragon', 'roar', [0.5, 0.2, 0.7]::FLOAT[3])
   ) AS t(animal, noise, vector)
 ) TO './lance_duck.lance' (FORMAT lance, mode 'overwrite');
 ```
@@ -54,7 +54,7 @@ This returns:
 ```
 ┌─────────┬─────────┬─────────────────┐
 │ animal  │  noise  │     vector      │
-│ varchar │ varchar │     float[]     │
+│ varchar │ varchar │     float[3]    │
 ├─────────┼─────────┼─────────────────┤
 │ duck    │ quack   │ [0.9, 0.7, 0.1] │
 │ horse   │ neigh   │ [0.3, 0.1, 0.5] │
@@ -79,6 +79,8 @@ SELECT *
 
 ### Vector search
 
+The examples use fixed-size `FLOAT[3]` vectors. Search scores below are rounded.
+
 The extension lets you run fast vector search on the Lance table. This returns the `_distance` (smaller is closer, so sort in ascending order for nearest neighbors). The example vector here is similar to the query "duck".
 
 ```sql
@@ -86,7 +88,7 @@ SELECT animal, noise, vector, _distance
   FROM lance_vector_search(
     './lance_duck.lance',
     'vector',
-    [0.8, 0.7, 0.2]::FLOAT[],
+    [0.8, 0.7, 0.2]::FLOAT[3],
     k = 1,
     prefilter = true
   )
@@ -94,12 +96,8 @@ SELECT animal, noise, vector, _distance
 ```
 
 ```
-┌─────────┬─────────┬─────────────────┐
-│ animal  │  noise  │     vector      │
-│ varchar │ varchar │     float[]     │
-├─────────┼─────────┼─────────────────┤
-│ duck    │ quack   │ [0.9, 0.7, 0.1] │
-└─────────┴─────────┴─────────────────┘
+animal  noise  vector           _distance
+duck    quack  [0.9, 0.7, 0.1]  0.02
 ```
 
 From a performance standpoint, the extension pushes down projections, filters and more to the Lance level where possible. This ensures that you get all the performance benefits of using Lance as the vector store.
@@ -122,12 +120,8 @@ SELECT animal, noise, vector, _score
 ```
 
 ```
-┌─────────┬─────────┬─────────────────┐
-│ animal  │  noise  │     vector      │
-│ varchar │ varchar │     float[]     │
-├─────────┼─────────┼─────────────────┤
-│ dragon  │ roar    │ [0.5, 0.2, 0.7] │
-└─────────┴─────────┴─────────────────┘
+animal  noise  vector           _score
+dragon  roar   [0.5, 0.2, 0.7]  0.9808292
 ```
 
 Just like in the case with vector search, the search operations are happening at the Lance level, although the instructions came in from DuckDB via SQL.
@@ -142,7 +136,7 @@ SELECT animal, noise, vector, _hybrid_score, _distance, _score
   FROM lance_hybrid_search(
     './lance_duck.lance',
     'vector',
-    [0.8, 0.7, 0.2]::FLOAT[],
+    [0.8, 0.7, 0.2]::FLOAT[3],
     'animal',
     'the duck surprised the dragon',
     k = 2,
@@ -154,13 +148,9 @@ SELECT animal, noise, vector, _hybrid_score, _distance, _score
 ```
 
 ```
-┌─────────┬─────────┬─────────────────┐
-│ animal  │  noise  │     vector      │
-│ varchar │ varchar │     float[]     │
-├─────────┼─────────┼─────────────────┤
-│ duck    │ quack   │ [0.9, 0.7, 0.1] │
-│ dragon  │ roar    │ [0.5, 0.2, 0.7] │
-└─────────┴─────────┴─────────────────┘
+animal  noise  vector           _hybrid_score  _distance  _score
+duck    quack  [0.9, 0.7, 0.1]  0.75           0.02       0.9808292
+dragon  roar   [0.5, 0.2, 0.7]  0.33088228     0.59       0.9808292
 ```
 
 ### Organize tables via Lance namespaces
@@ -177,9 +167,9 @@ CREATE TABLE lance_ns.main.duck_animals AS
   SELECT *
   FROM (
     VALUES
-      ('duck', 'quack', [0.9, 0.7, 0.1]::FLOAT[]),
-      ('horse', 'neigh', [0.3, 0.1, 0.5]::FLOAT[]),
-      ('dragon', 'roar', [0.5, 0.2, 0.7]::FLOAT[])
+      ('duck', 'quack', [0.9, 0.7, 0.1]::FLOAT[3]),
+      ('horse', 'neigh', [0.3, 0.1, 0.5]::FLOAT[3]),
+      ('dragon', 'roar', [0.5, 0.2, 0.7]::FLOAT[3])
   ) AS t(animal, noise, vector);
 ```
 

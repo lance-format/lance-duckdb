@@ -31,8 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Show inputs
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          echo "tag = ${{ inputs.tag || 'latest' }}"
+          echo "tag = ${TAG:-latest}"
 
       - name: Checkout Repo
         uses: actions/checkout@v7

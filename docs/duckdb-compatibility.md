@@ -9,14 +9,14 @@ extension, its C++ integration, and the official build configuration.
 
 | Branch | DuckDB target | Policy |
 | --- | --- | --- |
-| `main` after the 2.0 migration | `v2.0-cyanoptera` | Feature development and fixes compatible with DuckDB 2.0 |
+| `main` | `v2.0-cyanoptera` | Feature development and fixes compatible with DuckDB 2.0 |
 | `v1.5-variegata` | `v1.5-variegata` | Selected correctness, security, and build fixes for DuckDB 1.5 |
 | `v1.4-andium` | Existing 1.4 target | Historical maintenance line; retain its existing scope |
 
 The 1.5 branch preserves the source tree from the last verified pre-migration
-main commit, `c886612ab517e7821487b209804f3a23dfe15ac6`. The 2.0 migration must
-pass acceptance before main switches targets. During migration, main still has
-its existing 1.5 behavior.
+main commit, `c886612ab517e7821487b209804f3a23dfe15ac6`. Main targets DuckDB 2.0;
+use `v1.5-variegata` for DuckDB 1.5 builds. Official artifact availability is
+tracked separately from source compatibility in issue #265.
 
 Use DuckDB's release branch for compatibility work. DuckDB `main` may already
 target the next release. Update both the actual `duckdb` and

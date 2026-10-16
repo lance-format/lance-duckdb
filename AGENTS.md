@@ -70,10 +70,12 @@ cargo clippy --manifest-path Cargo.toml --all-targets
 This repository is configured with `uv`, so you can run formatting via:
 
 ```bash
+uv run make format-fix
 uv run make format
+cargo fmt -- --check
 ```
 
-PR requirement: Before submitting a PR, run `uv run make format` and commit any resulting formatting changes (as a separate commit if it helps review).
+PR requirement: Before submitting a PR, run `uv run make format` (check only). Use `uv run make format-fix` to apply C++/SQL formatting, and `cargo fmt` for Rust. Commit any resulting changes.
 
 ### Commit & PR Conventions
 
@@ -93,12 +95,13 @@ type[(scope)]: short description
 The `release` build can be slow. For fast iteration, prefer `test_debug` when available.
 
 ```bash
-# Run all tests (builds and runs sqllogictest)
-GEN=ninja make test
+# Build first, then run all SQLLogicTests
+GEN=ninja make release
+make test
 
-# Run with specific build
-GEN=ninja make test_debug     # Test with debug build
-GEN=ninja make test_release   # Test with release build
+# Run with a previously built configuration
+make test_debug     # Test with debug build
+make test_release   # Test with release build
 
 # Run DuckDB with extension for manual testing
 ./build/release/duckdb -c "SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
@@ -120,11 +123,12 @@ DuckDB SQL → C++ Extension (src/) → FFI calls → Rust (rust/) → Lance cra
 
 See [docs/rust_guidelines.md](docs/rust_guidelines.md) for the FFI function patterns, error propagation, and memory ownership conventions.
 
-### Key Concepts: Filter IR & Exec IR
+### Key Concepts: Filter, Expression, and Exec IR
 
-The extension uses two custom binary wire formats to push work from C++ into Rust:
+The extension uses three custom binary wire formats to push work from C++ into Rust:
 
 - **Filter IR** (magic `LFT1`): Serializes DuckDB bound filter expressions into a compact binary format that Rust deserializes into DataFusion `Expr`. This avoids passing expression trees through C function signatures.
+- **Expression IR** (magic `LUE1`): Serializes expressions for updates and computed columns into DataFusion expressions.
 - **Exec IR** (magic `LEX1`): Encodes aggregate/projection plans so that Rust can execute them entirely inside Lance/DataFusion, returning only pre-aggregated results to C++.
 
 When modifying filter or aggregate pushdown, changes typically span both sides: C++ serialization (`lance_filter_ir.cpp` / `lance_exec_ir.cpp`) and Rust deserialization (`rust/filter_ir.rs` / `rust/exec_ir.rs`). The magic bytes and version numbers must stay in sync.
@@ -135,7 +139,7 @@ When modifying filter or aggregate pushdown, changes typically span both sides: 
 
 ## Testing Conventions
 
-Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
+Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test` and `namespace_attach_s3_minio.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
 
 ## Common Gotchas
 

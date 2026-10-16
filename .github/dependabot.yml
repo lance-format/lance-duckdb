@@ -34,7 +34,7 @@ updates:
     # Update core dependencies semiannually because core dependencies are somewhat stable.
     #
     # Developers can update dependencies via dependabot manually by:
-    # 1. Go to Dependabot page https://github.com/dentiny/lance-duckdb/network/updates
+    # 1. Go to Dependabot page https://github.com/lance-format/lance-duckdb/network/updates
     # 2. Choose a project by "Recent update jobs"
     # 3. Click "Check for updates"
     schedule:

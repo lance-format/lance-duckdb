@@ -35,10 +35,11 @@ git submodule update --init --recursive
 GEN=ninja make release
 ```
 
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
+3. Use the matching DuckDB binary from the same build. A standalone DuckDB must
+match the extension's DuckDB version and platform; local builds require unsigned extensions:
 
 ```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
+./build/release/duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
 ```
 
 ## Usage
@@ -172,7 +173,7 @@ See the SQL reference for full parameter documentation: [docs/sql.md#search](doc
 
 ## DuckDB compatibility
 
-The 2.0 migration targets DuckDB's `v2.0-cyanoptera` branch. The
+Main targets DuckDB's `v2.0-cyanoptera` branch. The
 `v1.5-variegata` branch preserves DuckDB 1.5 support. See
 [compatibility and release branches](docs/duckdb-compatibility.md) for cutover,
 backport, and official publication requirements.

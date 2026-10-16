@@ -9,7 +9,8 @@ INSTALL lance;
 LOAD lance;
 ```
 
-For local development builds, load the extension artifact directly:
+For local development builds, start the matching DuckDB binary with `-unsigned`
+(e.g. `./build/release/duckdb -unsigned`) and load the extension artifact directly:
 
 ```sql
 LOAD 'build/release/extension/lance/lance.duckdb_extension';
@@ -24,6 +25,12 @@ SELECT *
 FROM 'path/to/dataset.lance'
 LIMIT 10;
 ```
+
+Float16 columns are exposed as `FLOAT`, including values nested in arrays, lists,
+and structs. `INSERT`, `UPDATE`, and `MERGE` reject tables with coerced columns
+to avoid silently changing their on-disk types. For a scalar float16 column,
+`ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
+and makes it writable.
 
 ## Search
 
@@ -220,9 +227,13 @@ COPY (
 ```
 
 Notes:
-- `mode` supports at least `overwrite` and `append`.
+- `mode` accepts `create` (the default), `overwrite`, or `append`.
+  `create` fails if the dataset already exists.
 - `data_storage_version` defaults to `2.2` when `COPY` creates or overwrites a dataset. Appends preserve the existing storage version.
-- `write_empty_file` controls whether an empty dataset is materialized when the input produces zero rows.
+- `write_empty_file` defaults to `true` and controls whether an empty dataset is materialized when the input produces zero rows.
+- Floating-point list columns with consistent, nonzero dimensions are written as
+  fixed-size vectors. Prefer explicit `FLOAT[N]` / `DOUBLE[N]` types when writing
+  vectors; inconsistent list dimensions raise an error.
 
 ### `CREATE TABLE` / `CTAS` in an attached namespace
 
@@ -359,6 +370,8 @@ ALTER TABLE ns.main.my_table RENAME COLUMN score TO score2;
 ALTER TABLE ns.main.my_table ALTER COLUMN age TYPE BIGINT;
 ALTER TABLE ns.main.my_table ALTER COLUMN embedding TYPE FLOAT[128];
 ALTER TABLE ns.main.my_table DROP COLUMN score2;
+ALTER TABLE ns.main.my_table ALTER COLUMN age SET NOT NULL;
+ALTER TABLE ns.main.my_table ALTER COLUMN age DROP NOT NULL;
 
 DETACH ns;
 ```
@@ -375,7 +388,8 @@ DETACH ns;
 ```
 
 Notes:
-- `ALTER COLUMN ... SET NOT NULL` is currently not supported.
+- `ALTER COLUMN ... SET NOT NULL` and `DROP NOT NULL` update Lance nullability metadata.
+  `SET NOT NULL` rejects a column containing NULL values; subsequent writes enforce the constraint.
 
 ## Index DDL
 
