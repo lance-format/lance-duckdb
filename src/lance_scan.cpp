@@ -3484,7 +3484,9 @@ static TableFunction LanceTableScanFunction() {
 LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                  CreateTableInfo &info, string dataset_uri)
     : TableCatalogEntry(catalog, schema, info),
-      columns(std::move(info.columns)), dataset_uri(std::move(dataset_uri)) {}
+      columns(std::move(info.columns)), dataset_uri(std::move(dataset_uri)) {
+  timestamp = 0;
+}
 
 static string
 LanceNamespaceDisplayUri(const LanceNamespaceTableConfig &config) {
@@ -3504,7 +3506,9 @@ LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
       columns(std::move(info.columns)),
       dataset_uri(LanceNamespaceDisplayUri(config)),
       namespace_config(
-          make_uniq<LanceNamespaceTableConfig>(std::move(config))) {}
+          make_uniq<LanceNamespaceTableConfig>(std::move(config))) {
+  timestamp = 0;
+}
 
 static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
   unordered_map<string, string> out;
@@ -3703,23 +3707,8 @@ static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
 }
 
 unique_ptr<CatalogEntry>
-LanceTableEntry::AlterEntry(CatalogTransaction transaction, AlterInfo &info) {
-  if (!transaction.context) {
-    throw InternalException(
-        "LanceTableEntry::AlterEntry missing client context");
-  }
-  // Internal stale-entry refresh marker (see ReplaceStaleTableEntry in
-  // lance_storage.cpp): rebuild this entry from the current dataset state
-  // without touching the dataset itself. CatalogSet::AlterEntry chains the
-  // rebuilt entry over this one in the version chain, so this (old)
-  // generation stays alive until undo-buffer cleanup and holders of raw
-  // references to it remain safe. Bypasses the autocommit gate below on
-  // purpose: the refresh is a catalog-only, fully transactional operation
-  // (rollback restores this entry), unlike Lance dataset DDL.
-  if (dynamic_cast<LanceRefreshTableAlterInfo *>(&info)) {
-    return BuildUpdatedLanceTableEntry(*transaction.context, *this, internal);
-  }
-  return AlterEntry(*transaction.context, info);
+LanceTableEntry::Rebuild(ClientContext &context) const {
+  return BuildUpdatedLanceTableEntry(context, *this, internal);
 }
 
 unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
@@ -4002,7 +3991,7 @@ NotNullIndexesFromArrowSchema(const ArrowSchema &schema_root) {
 // while scans and writers resolve state through the live dataset schema;
 // serving a mismatched pair would mislabel columns, read the wrong fields,
 // or apply stale write gates. Fail closed instead: replace the stale entry
-// through the catalog version chain (the same mechanism ALTER TABLE uses)
+// in the metadata cache, retaining the old generation for executing queries,
 // so the next access serves the entry rebuilt from the current schema, and
 // surface an explicit error for this statement.
 //
@@ -4047,8 +4036,7 @@ void LanceTableEntry::ValidateLiveSchemaOrReplace(
                              live_schema_root)) {
     return;
   }
-  // The replace supersedes this entry in the catalog version chain, but this
-  // (old) generation stays alive until undo-buffer cleanup, so reading
+  // The query pins this generation until QueryEnd, so reading
   // members of `this` for the error message below remains safe. The heal is
   // best-effort (fail-open); the error is thrown regardless so this
   // statement never runs against a mismatched binding.
@@ -4114,7 +4102,7 @@ void LanceTableEntry::VerifySchemaFreshness(ClientContext &context) {
     return;
   }
   // As in ValidateLiveSchemaOrReplace: the superseded generation (`this`)
-  // stays alive in the version chain until undo-buffer cleanup, so using its
+  // stays alive until QueryEnd, so using its
   // members for the error message remains safe after the best-effort heal.
   (void)LanceTryReplaceStaleTableEntry(context, *this);
   throw CatalogException(

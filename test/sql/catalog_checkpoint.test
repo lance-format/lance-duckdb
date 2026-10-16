@@ -31,3 +31,73 @@ SELECT sum(id) FROM checkpoint_ns.main.items
 
 statement ok
 DETACH checkpoint_ns;
+
+# Refresh external metadata inside an explicit transaction, then roll back.
+# Refreshing the cache must not enter native table commit/checkpoint machinery.
+statement ok reader
+SET checkpoint_threshold='1 B';
+
+statement ok reader
+ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_reader (TYPE LANCE);
+
+statement ok writer
+ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_writer (TYPE LANCE);
+
+statement ok reader
+PREPARE checkpoint_read AS SELECT sum(id) FROM checkpoint_reader.items;
+
+statement ok writer
+ALTER TABLE checkpoint_writer.items ADD COLUMN extra BIGINT DEFAULT 7;
+
+statement ok reader
+BEGIN;
+
+query I reader
+SELECT sum(extra) FROM checkpoint_reader.items;
+----
+14
+
+statement ok reader
+ROLLBACK;
+
+query I reader
+EXECUTE checkpoint_read;
+----
+3
+
+statement ok reader
+FORCE CHECKPOINT checkpoint_reader;
+
+# DuckDB-owned views remain visible alongside Lance-owned table metadata.
+statement ok reader
+CREATE VIEW checkpoint_reader.ids AS SELECT id FROM checkpoint_reader.items;
+
+query I reader
+SELECT sum(id) FROM checkpoint_reader.ids;
+----
+3
+
+statement ok reader
+CHECKPOINT checkpoint_reader;
+
+statement error reader
+CREATE OR REPLACE VIEW checkpoint_reader.items AS SELECT 99 AS id;
+----
+Cannot replace a Lance table with a view
+
+statement ok reader
+CREATE VIEW IF NOT EXISTS checkpoint_reader.items AS SELECT 99 AS id;
+
+query I reader
+SELECT sum(id) FROM checkpoint_reader.items;
+----
+3
+
+statement ok reader
+DROP VIEW checkpoint_reader.ids;
+
+statement ok reader
+DETACH checkpoint_reader;
+
+statement ok writer
+DETACH checkpoint_writer;

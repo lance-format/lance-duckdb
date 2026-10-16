@@ -34,35 +34,6 @@ struct LanceNamespaceTableConfig {
   bool IsRest() const { return kind == LanceNamespaceKind::Rest; }
 };
 
-// C++-only ALTER marker (never produced by SQL) that asks a LanceTableEntry
-// to rebuild itself from the current dataset state; used to replace a stale
-// entry through DuckDB's transactional catalog version chain (see
-// LanceTableEntry::AlterEntry and LanceSchemaEntry::ReplaceStaleTableEntry).
-// It must derive from a stock AlterTableInfo subclass because
-// CatalogSet::AlterEntry serializes the info into the undo buffer and the
-// commit path deserializes it through the stock registry; the payload must
-// also report an empty GetColumnName(), since the commit path casts the old
-// entry to DuckTableEntry only for column-affecting alters (see
-// CommitState::CommitEntryDrop). SET_PARTITIONED_BY with no keys satisfies
-// both: the inherited Serialize() emits a valid stock encoding and the base
-// GetColumnName() stays empty; the deserialized stock object is discarded at
-// commit. Detected via dynamic_cast in LanceTableEntry::AlterEntry.
-// (SET_COMMENT is unsuitable: CatalogSet::AlterEntry special-cases it with
-// entry->Copy instead of calling the entry's AlterEntry.)
-struct LanceRefreshTableAlterInfo final : SetPartitionedByInfo {
-  explicit LanceRefreshTableAlterInfo(AlterEntryData data)
-      : SetPartitionedByInfo(std::move(data),
-                             vector<unique_ptr<ParsedExpression>>()) {}
-
-  // Preserve the marker type across Copy() so a copied info still triggers
-  // the refresh path instead of a stock (rejected) SET_PARTITIONED_BY.
-  unique_ptr<AlterInfo> Copy() const override {
-    auto result = make_uniq<LanceRefreshTableAlterInfo>(GetAlterEntryData());
-    result->allow_internal = allow_internal;
-    return std::move(result);
-  }
-};
-
 // LanceTableEntry represents a Lance dataset as a DuckDB base table entry.
 // It supports scanning via a Lance-backed table scan function and appending via
 // DuckDB's INSERT planning path (implemented at the catalog level).
@@ -75,8 +46,9 @@ public:
 
   unique_ptr<CatalogEntry> AlterEntry(ClientContext &context,
                                       AlterInfo &info) override;
-  unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction transaction,
-                                      AlterInfo &info) override;
+  // Rebuild metadata without changing storage. Executing queries retain their
+  // previous generation until QueryEnd; prepared statements rebind on EXECUTE.
+  unique_ptr<CatalogEntry> Rebuild(ClientContext &context) const;
 
   unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
 
@@ -87,9 +59,8 @@ public:
   // columns, NOT NULL constraints) still matches the dataset on storage.
   // Statements that bind a scan get this implicitly via GetScanFunction;
   // write-only statements (e.g. plain INSERT) must call it before planning.
-  // On mismatch the stale entry is replaced through the catalog version
-  // chain (this object stays alive until undo-buffer cleanup, so existing
-  // references remain valid) and a "changed externally" error is thrown; the
+  // On mismatch the cache entry is replaced (executing queries retain the old
+  // generation) and a "changed externally" error is thrown; the
   // next access serves the entry rebuilt from the current schema.
   void VerifySchemaFreshness(ClientContext &context);
 
@@ -159,18 +130,10 @@ private:
   vector<string> coerced_column_names;
 };
 
-// Replace a catalog table entry whose declared schema state no longer
-// matches the dataset on storage (external schema evolution) with an entry
-// rebuilt from the current dataset state. The replacement goes through
-// DuckDB's transactional catalog version chain (CatalogSet::AlterEntry with
-// the caller's real transaction), so the old generation - `table` itself -
-// stays alive, and raw references held by active scans, DML operators, or
-// prepared plans stay valid, until normal undo-buffer cleanup reclaims it
-// once no active transaction can reference it. Returns false (serving the
-// existing entry unchanged) when the entry is not part of a Lance-attached
-// schema, was already replaced or dropped, the caller has no real
-// transaction to own the undo entry, or the replace lost a write-write
-// conflict; the replacement is best-effort and always fail-open.
+// Rebuild a stale cache entry without changing storage. Executing queries pin
+// their bound generations until QueryEnd; prepared statements rebind before
+// execution. Return false if the entry was superseded, is not Lance-owned,
+// or cannot be rebuilt because storage is unavailable.
 bool LanceTryReplaceStaleTableEntry(ClientContext &context,
                                     LanceTableEntry &table);
 

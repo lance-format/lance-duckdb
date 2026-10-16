@@ -5,7 +5,7 @@ This document lists the SQL surface currently supported by the `lance` DuckDB ex
 ## Loading
 
 ```sql
-INSTALL lance FROM community;
+INSTALL lance;
 LOAD lance;
 ```
 
