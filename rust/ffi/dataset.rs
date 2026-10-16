@@ -9,7 +9,7 @@ use arrow_array::types::UInt64Type;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::scalar::ScalarValue;
-use datafusion_sql::unparser::expr_to_sql;
+use datafusion_sql::unparser::{dialect::CustomDialectBuilder, Unparser};
 use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
@@ -27,6 +27,22 @@ use super::util::{
     cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
 };
+
+// Quote identifiers with the backticks required by Lance filter SQL. The default
+// dialect builds a regex for each identifier; in debug builds this can exhaust
+// the small native worker-thread stack on macOS before stacker grows it.
+fn delete_predicate_to_sql(filter: Option<Expr>) -> FfiResult<String> {
+    let Some(expr) = filter else {
+        return Ok("true".to_string());
+    };
+    let dialect = CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build();
+    Unparser::new(&dialect)
+        .expr_to_sql(&expr)
+        .map(|sql| sql.to_string())
+        .map_err(|err| FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}")))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -815,14 +831,7 @@ fn delete_transaction_with_storage_options_inner(
             "delete filter_ir",
         )?
     };
-    let predicate = match filter {
-        Some(expr) => expr_to_sql(&expr)
-            .map_err(|err| {
-                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
-            })?
-            .to_string(),
-        None => "true".to_string(),
-    };
+    let predicate = delete_predicate_to_sql(filter)?;
     let session = unsafe { optional_session_handle(session)? };
 
     let (maybe_txn, deleted_rows) = match runtime::block_on(async {
@@ -967,14 +976,7 @@ fn dataset_delete_inner(
             "delete filter_ir",
         )?
     };
-    let predicate = match filter {
-        Some(expr) => expr_to_sql(&expr)
-            .map_err(|err| {
-                FfiError::new(ErrorCode::DatasetDelete, format!("predicate sql: {err}"))
-            })?
-            .to_string(),
-        None => "true".to_string(),
-    };
+    let predicate = delete_predicate_to_sql(filter)?;
 
     let mut ds = (*handle.dataset).clone();
 

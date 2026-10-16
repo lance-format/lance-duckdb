@@ -145,3 +145,23 @@ true
 
 statement ok
 DETACH del_ns;
+
+# Identifier quoting survives the DELETE predicate's SQL conversion.
+statement ok
+ATTACH 'test/.tmp/delete_quoted_namespace' AS quoted_delete (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE quoted_delete.items AS SELECT 1::BIGINT AS "a b", 2::BIGINT AS "select", 3::BIGINT AS "CamelCase";
+
+query I
+DELETE FROM quoted_delete.items WHERE "a b"=1 AND "select"=2 AND "CamelCase"=3;
+----
+1
+
+query I
+SELECT count(*) FROM quoted_delete.items;
+----
+0
+
+statement ok
+DETACH quoted_delete;
