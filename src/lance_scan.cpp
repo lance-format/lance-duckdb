@@ -1742,24 +1742,9 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-
-  lance_free_batch(batch);
-
-  // Widen any Float16 columns to Float32 before DuckDB consumes the batch.
-  // `tmp_schema` still carries the original "e" format codes, so do this
-  // before it is released.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
+  auto &tmp_schema = exported.schema.arrow_schema;
 
   if (local_state.global_state && tmp_schema.n_children > 0 &&
       new_chunk->arrow_array.n_children == tmp_schema.n_children &&
@@ -1798,10 +1783,6 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
     local_state.global_state->record_batch_rows.fetch_add(rows);
-  }
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
   }
 
   local_state.chunk = std::move(new_chunk);
@@ -1844,28 +1825,21 @@ static void LanceFillDeferredColumns(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
+  std::unique_ptr<void, decltype(&lance_close_stream)> stream_owner(
+      take_stream, lance_close_stream);
+
   void *batch = nullptr;
   auto rc = lance_stream_next(take_stream, &batch);
   if (rc != 0 || !batch) {
-    lance_close_stream(take_stream);
     throw IOException(rc == 1 ? "Deferred take returned no data for " +
                                     to_string(surviving_count) + " row IDs"
                               : "Failed to read deferred take batch" +
                                     LanceFormatErrorSuffix());
   }
 
-  auto take_arrow = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&take_arrow->arrow_array, 0, sizeof(take_arrow->arrow_array));
-  ArrowSchema take_schema;
-  memset(&take_schema, 0, sizeof(take_schema));
-  if (lance_batch_to_arrow(batch, &take_arrow->arrow_array, &take_schema) !=
-      0) {
-    lance_free_batch(batch);
-    lance_close_stream(take_stream);
-    throw IOException("Failed to export deferred take batch" +
-                      LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
+  LanceArrowBatch exported(batch, "Failed to export deferred take batch");
+  auto &take_arrow = exported.array;
+  auto &take_schema = exported.schema.arrow_schema;
 
   // Verify take stream is exhausted (take_rows should return exactly one
   // batch).
@@ -1873,16 +1847,11 @@ static void LanceFillDeferredColumns(ClientContext &context,
   auto extra_rc = lance_stream_next(take_stream, &extra_batch);
   if (extra_rc == 0 && extra_batch) {
     lance_free_batch(extra_batch);
-    lance_close_stream(take_stream);
     throw InternalException(
         "Deferred take returned multiple batches (expected one)");
   }
-  lance_close_stream(take_stream);
+  stream_owner.reset();
 
-  // Widen Float16 columns before PopulateArrowTableSchema and the deferred
-  // ArrowToDuckDB extraction. Convert buffers first (while `take_schema`
-  // still has "e" formats), then rewrite the schema formats to "f".
-  LanceCoerceArrowArrayForDuckDB(&take_schema, &take_arrow->arrow_array);
   LanceCoerceArrowSchemaForDuckDB(&take_schema);
 
   ArrowTableSchema take_table;
@@ -1899,9 +1868,6 @@ static void LanceFillDeferredColumns(ClientContext &context,
     local_state.chunk = saved_chunk;
     local_state.chunk_offset = saved_offset;
     local_state.column_ids = saved_column_ids;
-    if (take_schema.release) {
-      take_schema.release(&take_schema);
-    }
   };
 
   local_state.chunk = std::move(take_arrow);
@@ -3351,31 +3317,13 @@ static bool LanceExecLoadNextBatch(LanceExecLocalState &local_state) {
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
-
-  // Widen any Float16 columns to Float32 before DuckDB consumes the batch.
-  // `tmp_schema` still carries the original "e" format codes.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
     local_state.global_state->record_batch_rows.fetch_add(rows);
-  }
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
   }
 
   local_state.chunk = std::move(new_chunk);

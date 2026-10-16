@@ -1,6 +1,6 @@
 #pragma once
 
-#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 
 #include <string>
 #include <vector>
@@ -35,6 +35,22 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
 
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
                                     ArrowArray *array);
+
+// Consumes the opaque Rust batch, including when export or coercion throws.
+// The schema retains its original formats for column mapping. Arrays have
+// already been widened for DuckDB; callers that consume the schema must coerce
+// it separately. Keep array alive while DuckDB vectors reference its buffers.
+struct LanceArrowBatch {
+  explicit LanceArrowBatch(
+      void *batch,
+      const char *export_error =
+          "Failed to export Lance RecordBatch to Arrow C Data Interface");
+  LanceArrowBatch(const LanceArrowBatch &) = delete;
+  LanceArrowBatch &operator=(const LanceArrowBatch &) = delete;
+
+  ArrowSchemaWrapper schema;
+  shared_ptr<ArrowArrayWrapper> array;
+};
 
 // Quick predicate — true when the schema contains any type that the coercion
 // helpers above would rewrite.

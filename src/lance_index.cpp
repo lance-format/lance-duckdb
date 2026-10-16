@@ -19,6 +19,7 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 
 #include "lance_common.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_table_entry.hpp"
@@ -905,26 +906,12 @@ static bool LanceIndexListLoadNextBatch(LanceIndexListLocalState &local_state,
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   global.record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   global.record_batch_rows.fetch_add(rows);
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
 
   local_state.chunk = std::move(new_chunk);
   local_state.chunk_offset = 0;

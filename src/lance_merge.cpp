@@ -500,6 +500,9 @@ void LanceMergeGlobalState::ForEachTakenChunk(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
+  std::unique_ptr<void, decltype(&lance_close_stream)> stream_owner(
+      stream, lance_close_stream);
+
   idx_t taken_rows = 0;
   while (true) {
     void *batch = nullptr;
@@ -508,42 +511,25 @@ void LanceMergeGlobalState::ForEachTakenChunk(ClientContext &context,
       break;
     }
     if (rc != 0) {
-      lance_close_stream(stream);
       throw IOException("Failed to read Lance take stream for MERGE" +
                         LanceFormatErrorSuffix());
     }
 
-    auto arrow_chunk = make_uniq<ArrowArrayWrapper>();
-    memset(&arrow_chunk->arrow_array, 0, sizeof(arrow_chunk->arrow_array));
-    ArrowSchema schema;
-    memset(&schema, 0, sizeof(schema));
-
-    if (lance_batch_to_arrow(batch, &arrow_chunk->arrow_array, &schema) != 0) {
-      lance_free_batch(batch);
-      lance_close_stream(stream);
-      throw IOException("Failed to export Lance MERGE take batch to Arrow" +
-                        LanceFormatErrorSuffix());
-    }
-    lance_free_batch(batch);
-
-    // Widen Float16 columns to Float32 so PopulateArrowTableSchema and
-    // DuckDB consumers see a supported type.
-    LanceCoerceArrowArrayForDuckDB(&schema, &arrow_chunk->arrow_array);
+    LanceArrowBatch exported(
+        batch, "Failed to export Lance MERGE take batch to Arrow");
+    auto &arrow_chunk = exported.array;
+    auto &schema = exported.schema.arrow_schema;
     LanceCoerceArrowSchemaForDuckDB(&schema);
 
     DataChunk taken;
     ConvertArrowArrayToDuckDataChunk(context, *arrow_chunk, schema, taken,
                                      op.table_column_types);
 
-    if (schema.release) {
-      schema.release(&schema);
-    }
-
     fn(taken, taken_rows);
     taken_rows += taken.size();
   }
 
-  lance_close_stream(stream);
+  stream_owner.reset();
 
   if (taken_rows != row_ids.size()) {
     throw IOException("Lance MERGE take returned unexpected row count: " +

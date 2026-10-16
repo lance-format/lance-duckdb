@@ -754,31 +754,13 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-
-  lance_free_batch(batch);
-
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
     local_state.global_state->record_batch_rows.fetch_add(rows);
-  }
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
   }
 
   local_state.chunk = std::move(new_chunk);
@@ -1148,29 +1130,12 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
-
-  // Widen Float16 columns before DuckDB consumes the batch.
-  LanceCoerceArrowArrayForDuckDB(&tmp_schema, &new_chunk->arrow_array);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   local_state.global_state->record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   local_state.global_state->record_batch_rows.fetch_add(rows);
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
 
   local_state.chunk = std::move(new_chunk);
   local_state.Reset();
