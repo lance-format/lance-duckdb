@@ -14,10 +14,10 @@ COPY (
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
   UNION ALL
   SELECT 3::BIGINT AS id, NULL::VARCHAR AS s
-) TO 'test/.tmp/lance_update_basic.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_update_basic.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 query II
 SELECT id, s IS NULL FROM ns.main.lance_update_basic ORDER BY id;
@@ -158,7 +158,7 @@ COPY (
   SELECT 2::BIGINT AS id, 'AxA'::VARCHAR AS s
   UNION ALL
   SELECT 3::BIGINT AS id, NULL::VARCHAR AS s
-) TO 'test/.tmp/lance_update_exprs.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_update_exprs.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 BEGIN TRANSACTION;

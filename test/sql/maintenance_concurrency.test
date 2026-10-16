@@ -6,10 +6,10 @@ require lance
 
 statement ok
 COPY (SELECT * FROM 'test/data/test_data.lance')
-TO 'test/.tmp/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS maintenance_cc (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS maintenance_cc (TYPE LANCE);
 
 statement ok
 CREATE INDEX id_idx_cc
@@ -22,10 +22,10 @@ loop i 0 8
 
 statement maybe
 INSERT INTO maintenance_cc.main.maintenance_concurrency VALUES (
-  100000 + ${threadid} * 1000 + ${i},
+  100000 + {threadid} * 1000 + {i},
   'worker',
-  ${i},
-  ${i}::DOUBLE
+  {i},
+  {i}::DOUBLE
 )
 ----
 <REGEX>:.*
@@ -47,13 +47,13 @@ loop i 0 8
 statement maybe
 UPDATE maintenance_cc.main.maintenance_concurrency
 SET age = age + 1
-WHERE id % 8 = ${i}
+WHERE id % 8 = {i}
 ----
 <REGEX>:.*
 
 statement maybe
 DELETE FROM maintenance_cc.main.maintenance_concurrency
-WHERE id = 100000 + ${threadid} * 1000 + ${i}
+WHERE id = 100000 + {threadid} * 1000 + {i}
 ----
 <REGEX>:.*
 

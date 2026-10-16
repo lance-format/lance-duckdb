@@ -107,6 +107,11 @@ jobs:
             echo "Lance did not load; extension tests were skipped" >&2
             exit 1
           fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
+            exit 1
+          fi
 
   test_s3:
     name: Test S3 (MinIO)
@@ -163,6 +168,11 @@ jobs:
           ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
           if grep -Eq '^require lance: [0-9]+' test-results.log; then
             echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
             exit 1
           fi
 

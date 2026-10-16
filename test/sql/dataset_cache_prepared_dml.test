@@ -15,31 +15,31 @@ require lance
 
 statement ok con1
 COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
-TO 'test/.tmp/prep_dml_ins.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/prep_dml_ins.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (
   SELECT 1::BIGINT AS id, 10::BIGINT AS v
   UNION ALL
   SELECT 2::BIGINT AS id, 20::BIGINT AS v
-) TO 'test/.tmp/prep_dml_upd.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/prep_dml_upd.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (
   SELECT 1::BIGINT AS id, 10::BIGINT AS v
   UNION ALL
   SELECT 2::BIGINT AS id, 20::BIGINT AS v
-) TO 'test/.tmp/prep_dml_del.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/prep_dml_del.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
-TO 'test/.tmp/prep_dml_mrg.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/prep_dml_mrg.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-ATTACH 'test/.tmp' AS prep_dml_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_dml_reader (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/.tmp' AS prep_dml_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_dml_writer (TYPE LANCE);
 
 # ---------------------------------------------------------------------------
 # INSERT: target-only, external schema evolution

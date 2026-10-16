@@ -5,7 +5,7 @@
 require lance
 
 statement ok
-ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}/checkpoint_namespace' AS checkpoint_ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE checkpoint_ns.main.items AS SELECT 1::BIGINT AS id;
@@ -38,10 +38,10 @@ statement ok reader
 SET checkpoint_threshold='1 B';
 
 statement ok reader
-ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}/checkpoint_namespace' AS checkpoint_reader (TYPE LANCE);
 
 statement ok writer
-ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}/checkpoint_namespace' AS checkpoint_writer (TYPE LANCE);
 
 statement ok reader
 PREPARE checkpoint_read AS SELECT sum(id) FROM checkpoint_reader.items;

@@ -4,6 +4,28 @@
 
 require lance
 
+# Copy the fixture byte-for-byte into this test's private directory. A Lance
+# SQL round trip would normalize its Arrow types and erase the condition under test.
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/float16_dml_fixture.lance' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+foreach directory _versions _transactions data
+
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/float16_dml_fixture.lance/{directory}' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+endloop
+
+foreach file _transactions/0-b59216a0-fc78-4d4f-a876-69559ffebb33.txn _versions/18446744073709551614.manifest _versions/latest_version_hint.json data/11110100110010100100011030db544065b1f38c588619e6d5.lance
+
+statement ok
+COPY (SELECT content FROM read_blob('test/data/float16_dml_fixture.lance/{file}'))
+TO '{TEST_DIR}/float16_dml_fixture.lance/{file}' (FORMAT BLOB);
+
+endloop
+
 # Plain INSERT does not bind a scan of the target, so it never passes through
 # the scan-bind freshness check. Without validating freshness in the INSERT
 # planning path, a stale entry keeps gating writes on outdated state: after an
@@ -11,15 +33,12 @@ require lance
 # column as coerced until the user happens to run a SELECT first.
 #
 # Fixture: test/data/float16_dml_fixture.lance stores column "h" as float16.
-# NOTE: like dml_alter_table_vector_schema_evolution.test, this test evolves
-# a checked-in fixture in place; re-running on a dirty tree requires
-# restoring test/data first (fresh CI checkouts are unaffected).
 
 statement ok con1
-ATTACH 'test/data' AS dml_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS dml_reader (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/data' AS dml_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS dml_writer (TYPE LANCE);
 
 # The reader discovers the table with h coerced; writes are gated.
 query I con1

@@ -8,7 +8,7 @@ statement ok
 PRAGMA threads=4;
 
 statement ok
-ATTACH 'test/.tmp' AS merge_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS merge_ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE merge_ns.main.lance_merge_upsert AS

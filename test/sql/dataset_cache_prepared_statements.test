@@ -16,10 +16,10 @@ COPY (
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
   UNION ALL
   SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
-) TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/cache_prepared.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-PREPARE prepared_path_count AS SELECT count(*) FROM 'test/.tmp/cache_prepared.lance';
+PREPARE prepared_path_count AS SELECT count(*) FROM '{TEST_DIR}/cache_prepared.lance';
 
 query I con1
 EXECUTE prepared_path_count;
@@ -29,7 +29,7 @@ EXECUTE prepared_path_count;
 # External append committed through con2.
 statement ok con2
 COPY (SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s)
-TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'append');
+TO '{TEST_DIR}/cache_prepared.lance' (FORMAT lance, mode 'append');
 
 # The prepared statement must observe the external commit on re-execution.
 query I con1
@@ -39,7 +39,7 @@ EXECUTE prepared_path_count;
 
 # Same for catalog-attached tables.
 statement ok con1
-ATTACH 'test/.tmp' AS prep_reader_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_reader_ns (TYPE LANCE);
 
 statement ok con1
 PREPARE prepared_table_count AS SELECT count(*) FROM prep_reader_ns.main.cache_prepared;
@@ -51,7 +51,7 @@ EXECUTE prepared_table_count;
 
 statement ok con2
 COPY (SELECT 5::BIGINT AS id, 'e'::VARCHAR AS s)
-TO 'test/.tmp/cache_prepared.lance' (FORMAT lance, mode 'append');
+TO '{TEST_DIR}/cache_prepared.lance' (FORMAT lance, mode 'append');
 
 query I con1
 EXECUTE prepared_table_count;
@@ -59,11 +59,10 @@ EXECUTE prepared_table_count;
 5
 
 # External schema evolution behind a prepared statement: the forced rebind
-# runs the freshness check and fails closed instead of serving the stale
-# binding; re-execution after the entry is replaced succeeds with the new
-# schema.
+# refreshes the catalog entry. A query referencing the removed column fails
+# binding, while a prepared count continues against the current schema.
 statement ok con2
-ATTACH 'test/.tmp' AS prep_writer_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_writer_ns (TYPE LANCE);
 
 statement ok con1
 PREPARE prepared_table_s AS SELECT s FROM prep_reader_ns.main.cache_prepared ORDER BY id;

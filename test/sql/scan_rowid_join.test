@@ -5,7 +5,7 @@
 require lance
 
 statement ok
-ATTACH 'test/.tmp/rowid_join' AS rowid_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}/rowid_join' AS rowid_ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE rowid_ns.main.items AS

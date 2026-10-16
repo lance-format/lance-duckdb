@@ -5,10 +5,10 @@
 require lance
 
 statement ok
-ATTACH 'test/.tmp/cache_default_ns' AS default_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}/cache_default_ns' AS default_writer (TYPE LANCE);
 
 statement ok
-ATTACH 'test/.tmp/cache_default_ns' AS default_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}/cache_default_ns' AS default_reader (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE default_writer.items (id BIGINT, v INTEGER DEFAULT 42);

@@ -4,8 +4,30 @@
 
 require lance
 
+# Copy the fixture byte-for-byte into this test's private directory. A Lance
+# SQL round trip would normalize its Arrow types and erase the condition under test.
 statement ok
-ATTACH 'test/data' AS ns (TYPE LANCE);
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/issue184_list_float.lance' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+foreach directory _versions _transactions data
+
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/issue184_list_float.lance/{directory}' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+endloop
+
+foreach file _transactions/0-5ae7ab90-86eb-4792-8161-2dc1d5f6abfc.txn _versions/18446744073709551614.manifest data/1101011010010010100101009ee8ad4ae5acb77d1a99811fb8.lance
+
+statement ok
+COPY (SELECT content FROM read_blob('test/data/issue184_list_float.lance/{file}'))
+TO '{TEST_DIR}/issue184_list_float.lance/{file}' (FORMAT BLOB);
+
+endloop
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 query T
 SELECT typeof(embedding) FROM ns.main.issue184_list_float LIMIT 1;

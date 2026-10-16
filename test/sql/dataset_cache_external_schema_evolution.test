@@ -17,13 +17,13 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 10::BIGINT AS extra
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s, 20::BIGINT AS extra
-) TO 'test/.tmp/cache_schema_evo.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/cache_schema_evo.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-ATTACH 'test/.tmp' AS evo_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS evo_reader (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/.tmp' AS evo_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS evo_writer (TYPE LANCE);
 
 # con1 discovers the table with the original three-column schema.
 query ITI con1
@@ -58,7 +58,7 @@ SELECT * FROM evo_reader.main.cache_schema_evo ORDER BY id;
 1	10
 2	20
 
-# External rename: same fail-closed + self-heal cycle.
+# External rename: entry resolution refreshes the schema before binding.
 statement ok con2
 ALTER TABLE evo_writer.main.cache_schema_evo RENAME extra TO score;
 
