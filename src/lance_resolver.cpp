@@ -9,6 +9,18 @@
 
 namespace duckdb {
 
+static bool HasUnquotedPathSeparator(const string &input) {
+  bool quoted = false;
+  for (auto c : input) {
+    if (c == '"') {
+      quoted = !quoted;
+    } else if (!quoted && (c == '/' || c == '\\')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 LanceResolvedDataset ResolveLanceDataset(ClientContext &context,
                                          const Value &input,
                                          LanceResolvePolicy policy,
@@ -21,6 +33,14 @@ LanceResolvedDataset ResolveLanceDataset(ClientContext &context,
   if (input_str.empty()) {
     throw InvalidInputException(
         function_name + " requires a non-empty dataset path or table name");
+  }
+
+  // QualifiedName accepts filesystem separators as identifier characters.
+  // Do not send paths to catalog discovery; quoted identifiers may contain
+  // the same separators and must still be resolved as table names.
+  if (policy == LanceResolvePolicy::FALLBACK_TO_PATH &&
+      HasUnquotedPathSeparator(input_str)) {
+    return {std::move(input_str), nullptr};
   }
 
   QualifiedName name;

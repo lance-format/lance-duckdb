@@ -69,6 +69,18 @@ WHERE database_name = 'ns' ORDER BY table_name;
 alpha	ns
 beta	ns
 
+# URI paths also bypass discovery in the active Lance catalog.
+statement ok
+USE ns;
+
+query TT
+SELECT * FROM __lance_show_auto_cleanup('s3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance');
+----
+enabled	false
+
+statement ok
+USE memory;
+
 # Catalog targets use the namespace-aware open path for config and maintenance.
 query TT
 SHOW MAINTENANCE ON ns.main.alpha;
