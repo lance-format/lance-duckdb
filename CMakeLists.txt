@@ -133,34 +133,12 @@ set(RUST_DEBUG_LIB
 set(RUST_RELEASE_LIB
     "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/release/${RUST_STATICLIB_NAME}")
 
-set(RUST_FFI_DEPENDS
-    ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
-    ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
-    ${CMAKE_CURRENT_LIST_DIR}/rust/constants.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/datafusion_stream.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/error.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/exec_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/exec.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/index.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/query_table.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
+# Cargo discovers Rust modules; CMake must notice changes to every module before
+# deciding whether to invoke Cargo, including newly added FFI modules.
+file(GLOB_RECURSE RUST_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_LIST_DIR}/rust/*.rs")
+set(RUST_FFI_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
+                     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock ${RUST_SOURCES})
 
 set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}
                    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
