@@ -432,10 +432,7 @@ fn convert_list_array_to_fixed_size(
 
 /// Best-effort read of the destination dataset's schema; `None` when the
 /// dataset does not exist yet, in which case an append behaves like a create.
-fn existing_dataset_schema(
-    path: &str,
-    storage_options: &HashMap<String, String>,
-) -> Option<Schema> {
+fn existing_dataset_schema(path: &str, storage_options: &HashMap<String, String>) -> Option<Schema> {
     let builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
         .with_storage_options(storage_options.clone());
     let dataset = runtime::block_on(builder.load()).ok()?.ok()?;
@@ -1571,11 +1568,7 @@ mod align_tests {
     fn descends_into_struct_columns() {
         let incoming = Fields::from(vec![Field::new(
             "meta",
-            DataType::Struct(Fields::from(vec![Field::new(
-                "tags",
-                list_of("item"),
-                true,
-            )])),
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_of("item"), true)])),
             true,
         )]);
         let existing = Fields::from(vec![Field::new(

@@ -61,23 +61,4 @@ DuckDB rather than tying delivery to an unrelated lance-duckdb tag.
 See DuckDB's [extension release cycle](https://duckdb.org/docs/preview/dev/release_cycle#the-main-extension-release-cycle)
 for source selection and release-branch conventions.
 
-## Extension-owned storage lifecycles
-
-Lance table entries are metadata cached by the namespace schema, outside DuckDB's
-native table catalog set. Each executing query pins its bound entry generations
-until query completion. Refresh, ALTER and DROP replace or evict cache entries
-without reclaiming objects used by other queries. Prepared statements rebind
-before execution. Refresh observes already-committed external metadata; rolling
-back a DuckDB transaction does not roll back that metadata cache. Lance writes
-still use their existing commit/rollback paths.
-
-COPY uses DuckDB's `CopyFunction::plan` hook. COPY and directory CTAS share a
-Lance dataset sink: input batches produce an uncommitted Lance write, and a
-successful finalize publishes its manifest. A failed pipeline closes the writer
-without publishing a partial dataset or deleting an existing dataset. Uncommitted
-objects remain subject to Lance's normal cleanup. DuckDB's file ownership probes
-are not involved, so S3 writes use TYPE LANCE credentials without requiring
-httpfs. Generic COPY file-layout options are rejected; `write_empty_file` remains
-supported for controlling empty-dataset publication.
-
 Track upstream fixes and release acceptance in [issue #265](https://github.com/lance-format/lance-duckdb/issues/265).

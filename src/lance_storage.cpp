@@ -810,10 +810,8 @@ public:
     return SchemaCatalogEntry::GetSimilarEntry(transaction, info);
   }
 
-  void Scan(ClientContext &context, CatalogType type,
-            const std::function<void(CatalogEntry &)> &callback) override {
-    Scan(GetCatalogTransaction(context), type, callback);
-  }
+  // Keep the native context-free scan used by DuckDB checkpoints.
+  using DuckSchemaEntry::Scan;
 
   void Scan(CatalogTransaction transaction, CatalogType type,
             const std::function<void(CatalogEntry &)> &callback) override {
@@ -833,13 +831,6 @@ public:
         callback(*entry);
       }
     }
-  }
-
-  // Context-free scans enumerate DuckDB-managed objects for persistence.
-  // Lance table metadata and data are persisted by Lance, not checkpoints.
-  void Scan(CatalogType type,
-            const std::function<void(CatalogEntry &)> &callback) override {
-    DuckSchemaEntry::Scan(type, callback);
   }
 
   optional_ptr<CatalogEntry> CreateView(CatalogTransaction transaction,

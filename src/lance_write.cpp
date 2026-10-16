@@ -8,7 +8,6 @@
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
-#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -22,7 +21,7 @@
 
 namespace duckdb {
 
-struct LanceWriteBindData : public FunctionData {
+struct LanceWriteBindData {
   string mode = "create";
   bool write_empty_file = true;
   string data_storage_version = LANCE_DEFAULT_DATA_STORAGE_VERSION;
@@ -32,33 +31,12 @@ struct LanceWriteBindData : public FunctionData {
 
   vector<string> names;
   vector<LogicalType> types;
-
-  unique_ptr<FunctionData> Copy() const override {
-    auto result = make_uniq<LanceWriteBindData>();
-    result->mode = mode;
-    result->write_empty_file = write_empty_file;
-    result->data_storage_version = data_storage_version;
-    result->max_rows_per_file = max_rows_per_file;
-    result->max_rows_per_group = max_rows_per_group;
-    result->max_bytes_per_file = max_bytes_per_file;
-    result->names = names;
-    result->types = types;
-    return std::move(result);
-  }
-
-  bool Equals(const FunctionData &other_p) const override {
-    auto &other = other_p.Cast<LanceWriteBindData>();
-    return mode == other.mode && write_empty_file == other.write_empty_file &&
-           data_storage_version == other.data_storage_version &&
-           max_rows_per_file == other.max_rows_per_file &&
-           max_rows_per_group == other.max_rows_per_group &&
-           max_bytes_per_file == other.max_bytes_per_file &&
-           names == other.names && types == other.types;
-  }
 };
 
-struct LanceWriteGlobalState : public GlobalFunctionData {
-  explicit LanceWriteGlobalState() = default;
+// A failed pipeline closes the uncommitted writer without publishing its
+// manifest. Only successful finalization commits the dataset.
+struct LanceWriteGlobalState : public GlobalSinkState {
+  idx_t count = 0;
 
   string cache_key;
   string open_path;
@@ -75,8 +53,6 @@ struct LanceWriteGlobalState : public GlobalFunctionData {
   }
 };
 
-struct LanceWriteLocalState : public LocalFunctionData {};
-
 static void LanceWriteCopyOptions(ClientContext &, CopyOptionsInput &input) {
   auto &options = input.options;
   options["mode"] =
@@ -91,17 +67,17 @@ static void LanceWriteCopyOptions(ClientContext &, CopyOptionsInput &input) {
       CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
 }
 
-static unique_ptr<FunctionData>
-LanceWriteBind(ClientContext &context, CopyFunctionBindInput &input,
-               const vector<Identifier> &names,
-               const vector<LogicalType> &sql_types) {
-  auto bind_data = make_uniq<LanceWriteBindData>();
+static LanceWriteBindData LanceWriteBind(ClientContext &context,
+                                         const CopyInfo &info,
+                                         const vector<Identifier> &names,
+                                         const vector<LogicalType> &sql_types) {
+  LanceWriteBindData bind_data;
   for (const auto &name : names) {
-    bind_data->names.push_back(name.GetIdentifierName());
+    bind_data.names.push_back(name.GetIdentifierName());
   }
-  bind_data->types = sql_types;
+  bind_data.types = sql_types;
 
-  for (auto &option : input.info.options) {
+  for (auto &option : info.options) {
     const auto key = StringUtil::Lower(option.first.GetIdentifierName());
     if (option.second.size() != 1) {
       throw BinderException("%s requires exactly one argument",
@@ -118,24 +94,24 @@ LanceWriteBind(ClientContext &context, CopyFunctionBindInput &input,
         throw BinderException(
             "mode must be one of [create, append, overwrite]");
       }
-      bind_data->mode = std::move(mode);
+      bind_data.mode = std::move(mode);
     } else if (key == "write_empty_file") {
-      bind_data->write_empty_file =
+      bind_data.write_empty_file =
           value.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>();
     } else if (key == "data_storage_version") {
-      bind_data->data_storage_version =
+      bind_data.data_storage_version =
           value.CastAs(context, LogicalType::VARCHAR).GetValue<string>();
-      if (bind_data->data_storage_version.empty()) {
+      if (bind_data.data_storage_version.empty()) {
         throw BinderException("data_storage_version cannot be empty");
       }
     } else if (key == "max_rows_per_file") {
-      bind_data->max_rows_per_file =
+      bind_data.max_rows_per_file =
           value.CastAs(context, LogicalType::UBIGINT).GetValue<uint64_t>();
     } else if (key == "max_rows_per_group") {
-      bind_data->max_rows_per_group =
+      bind_data.max_rows_per_group =
           value.CastAs(context, LogicalType::UBIGINT).GetValue<uint64_t>();
     } else if (key == "max_bytes_per_file") {
-      bind_data->max_bytes_per_file =
+      bind_data.max_bytes_per_file =
           value.CastAs(context, LogicalType::UBIGINT).GetValue<uint64_t>();
     } else {
       throw BinderException("Unsupported option for COPY FORMAT lance: %s",
@@ -143,13 +119,13 @@ LanceWriteBind(ClientContext &context, CopyFunctionBindInput &input,
     }
   }
 
-  return std::move(bind_data);
+  return bind_data;
 }
 
-static unique_ptr<GlobalFunctionData>
-LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
+static unique_ptr<LanceWriteGlobalState>
+LanceWriteInitGlobal(ClientContext &context,
+                     const LanceWriteBindData &bind_data,
                      const string &file_path) {
-  auto &bind_data = bind_data_p.Cast<LanceWriteBindData>();
   auto state = make_uniq<LanceWriteGlobalState>();
 
   auto props = context.GetClientProperties();
@@ -192,14 +168,11 @@ LanceWriteInitGlobal(ClientContext &context, FunctionData &bind_data_p,
   return std::move(state);
 }
 
-static void LanceWriteSink(ExecutionContext &context, FunctionData &,
-                           GlobalFunctionData &gstate_p, LocalFunctionData &,
-                           DataChunk &input) {
+static void LanceWriteSink(ExecutionContext &context,
+                           LanceWriteGlobalState &gstate, DataChunk &input) {
   if (input.size() == 0) {
     return;
   }
-
-  auto &gstate = gstate_p.Cast<LanceWriteGlobalState>();
 
   auto props = context.client.GetClientProperties();
   unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
@@ -219,9 +192,8 @@ static void LanceWriteSink(ExecutionContext &context, FunctionData &,
   }
 }
 
-static void LanceWriteFinalize(ClientContext &context, FunctionData &,
-                               GlobalFunctionData &gstate_p) {
-  auto &gstate = gstate_p.Cast<LanceWriteGlobalState>();
+static void LanceWriteFinalize(ClientContext &context,
+                               LanceWriteGlobalState &gstate) {
   if (!gstate.writer) {
     return;
   }
@@ -248,57 +220,38 @@ static void LanceWriteFinalize(ClientContext &context, FunctionData &,
   LanceInvalidateDatasetCache(context, gstate.cache_key);
 }
 
-// Lance commits a dataset manifest, rather than a DuckDB-managed output file.
-// Keep the writer alive until finalize; destruction after a failed pipeline
-// closes it without publishing the pending write or deleting an existing
-// dataset.
-struct LanceCopyGlobalState : public GlobalSinkState {
-  unique_ptr<GlobalFunctionData> writer;
-  idx_t count = 0;
-};
-
 class PhysicalLanceCopy final : public PhysicalOperator {
 public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceCopy(PhysicalPlan &plan, string path_p,
-                    unique_ptr<FunctionData> bind_data_p, idx_t cardinality)
+                    LanceWriteBindData bind_data_p, idx_t cardinality)
       : PhysicalOperator(plan, TYPE, {LogicalType::BIGINT}, cardinality),
         path(std::move(path_p)), bind_data(std::move(bind_data_p)) {}
 
   bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
-  bool ParallelSink() const override { return false; }
   bool SinkOrderDependent() const override { return true; }
 
   unique_ptr<GlobalSinkState>
   GetGlobalSinkState(ClientContext &context) const override {
-    auto state = make_uniq<LanceCopyGlobalState>();
-    state->writer = LanceWriteInitGlobal(context, *bind_data, path);
-    return std::move(state);
+    return LanceWriteInitGlobal(context, bind_data, path);
   }
 
   SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
                       OperatorSinkInput &input) const override {
-    auto &state = input.global_state.Cast<LanceCopyGlobalState>();
-    LanceWriteLocalState local;
-    LanceWriteSink(context, *bind_data, *state.writer, local, chunk);
+    auto &state = input.global_state.Cast<LanceWriteGlobalState>();
+    LanceWriteSink(context, state, chunk);
     state.count += chunk.size();
     return SinkResultType::NEED_MORE_INPUT;
   }
 
-  SinkCombineResultType Combine(ExecutionContext &,
-                                OperatorSinkCombineInput &) const override {
-    return SinkCombineResultType::FINISHED;
-  }
-
   SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
                             OperatorSinkFinalizeInput &input) const override {
-    auto &state = input.global_state.Cast<LanceCopyGlobalState>();
-    if (state.count > 0 ||
-        bind_data->Cast<LanceWriteBindData>().write_empty_file) {
-      LanceWriteFinalize(context, *bind_data, *state.writer);
+    auto &state = input.global_state.Cast<LanceWriteGlobalState>();
+    if (state.count > 0 || bind_data.write_empty_file) {
+      LanceWriteFinalize(context, state);
     }
     return SinkFinalizeType::READY;
   }
@@ -308,7 +261,7 @@ public:
     chunk.SetCardinality(1);
     chunk.SetValue(0, 0,
                    Value::BIGINT(NumericCast<int64_t>(
-                       sink_state->Cast<LanceCopyGlobalState>().count)));
+                       sink_state->Cast<LanceWriteGlobalState>().count)));
     return SourceResultType::FINISHED;
   }
 
@@ -316,7 +269,7 @@ public:
 
 private:
   string path;
-  unique_ptr<FunctionData> bind_data;
+  LanceWriteBindData bind_data;
 };
 
 PhysicalOperator &PlanLanceCopy(ClientContext &context,
@@ -324,9 +277,8 @@ PhysicalOperator &PlanLanceCopy(ClientContext &context,
                                 const vector<Identifier> &names,
                                 const vector<LogicalType> &types,
                                 PhysicalOperator &child) {
-  CopyFunctionBindInput input(info);
   auto &copy = planner.Make<PhysicalLanceCopy>(
-      info.file_path, LanceWriteBind(context, input, names, types),
+      info.file_path, LanceWriteBind(context, info, names, types),
       child.estimated_cardinality);
   copy.children.push_back(child);
   return copy;
@@ -334,10 +286,10 @@ PhysicalOperator &PlanLanceCopy(ClientContext &context,
 
 class LogicalLanceCopy final : public LogicalExtensionOperator {
 public:
-  LogicalLanceCopy(TableIndex index_p, unique_ptr<CopyInfo> info_p,
-                   vector<Identifier> names_p, vector<LogicalType> types_p)
-      : index(index_p), info(std::move(info_p)), names(std::move(names_p)),
-        input_types(std::move(types_p)) {}
+  LogicalLanceCopy(TableIndex index_p, string path_p,
+                   LanceWriteBindData bind_data_p)
+      : index(index_p), path(std::move(path_p)),
+        bind_data(std::move(bind_data_p)) {}
 
   vector<ColumnBinding> GetColumnBindings() override {
     return {ColumnBinding(index, ProjectionIndex(0))};
@@ -345,10 +297,13 @@ public:
   vector<TableIndex> GetTableIndex() const override { return {index}; }
   string GetName() const override { return "LanceCopy"; }
   string GetExtensionName() const override { return "lance"; }
-  PhysicalOperator &CreatePlan(ClientContext &context,
+  PhysicalOperator &CreatePlan(ClientContext &,
                                PhysicalPlanGenerator &planner) override {
     auto &child = planner.CreatePlan(*children[0]);
-    return PlanLanceCopy(context, planner, *info, names, input_types, child);
+    auto &copy = planner.Make<PhysicalLanceCopy>(
+        std::move(path), std::move(bind_data), child.estimated_cardinality);
+    copy.children.push_back(child);
+    return copy;
   }
 
 protected:
@@ -356,9 +311,8 @@ protected:
 
 private:
   TableIndex index;
-  unique_ptr<CopyInfo> info;
-  vector<Identifier> names;
-  vector<LogicalType> input_types;
+  string path;
+  LanceWriteBindData bind_data;
 };
 
 static BoundStatement BindLanceCopy(Binder &binder, CopyStatement &statement) {
@@ -367,10 +321,9 @@ static BoundStatement BindLanceCopy(Binder &binder, CopyStatement &statement) {
   // Validate before execution, including on empty inputs.
   auto node = info.select_statement->Copy();
   auto select = binder.Bind(*node);
-  CopyFunctionBindInput input(info);
-  (void)LanceWriteBind(binder.context, input, select.names, select.types);
   auto copy = make_uniq<LogicalLanceCopy>(
-      binder.GenerateTableIndex(), info.Copy(), select.names, select.types);
+      binder.GenerateTableIndex(), info.file_path,
+      LanceWriteBind(binder.context, info, select.names, select.types));
   copy->children.push_back(std::move(select.plan));
   BoundStatement result;
   result.names = {Identifier("Count")};
