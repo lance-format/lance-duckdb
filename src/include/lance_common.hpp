@@ -5,9 +5,6 @@
 struct LanceNamespaceQueryConfig;
 
 namespace duckdb {
-class ColumnDefinition;
-void LanceRestoreColumnDefault(ClientContext &context, const ArrowSchema &field,
-                               ColumnDefinition &column);
 
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();

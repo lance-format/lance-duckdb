@@ -149,5 +149,43 @@ SELECT score2 FROM ns.main.alter_table_schema_evolution LIMIT 1;
 ----
 Binder Error:
 
+# Re-discovery and ALTER rebuild must expose the same binding schema.
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col SET NOT NULL;
+
+statement ok
+CREATE TEMP TABLE expected_catalog_schema AS
+SELECT column_name, data_type, column_default, is_nullable
+FROM duckdb_columns()
+WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution';
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM expected_catalog_schema
+  EXCEPT ALL
+  SELECT column_name, data_type, column_default, is_nullable
+  FROM duckdb_columns()
+  WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution'
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT column_name, data_type, column_default, is_nullable
+  FROM duckdb_columns()
+  WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution'
+  EXCEPT ALL
+  SELECT * FROM expected_catalog_schema
+);
+----
+0
+
 statement ok
 DETACH ns;

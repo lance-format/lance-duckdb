@@ -24,7 +24,6 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -146,61 +145,6 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
     }
   }
   return headers_tsv;
-}
-
-static void PopulateColumnsFromArrowSchema(
-    ClientContext &context, ArrowSchema &arrow_schema, ColumnList &out_columns,
-    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
-  ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               arrow_schema);
-  const auto names = arrow_table.GetNames();
-  const auto types = arrow_table.GetTypes();
-  if (names.size() != types.size()) {
-    throw InternalException(
-        "Arrow table schema returned mismatched names/types sizes");
-  }
-  for (idx_t i = 0; i < names.size(); i++) {
-    ColumnDefinition column(Identifier(names[i]), types[i]);
-    LanceRestoreColumnDefault(context, *arrow_schema.children[i], column);
-    out_columns.AddColumn(std::move(column));
-
-    // Reflect not-null constraints from the Arrow flags so discovered entries
-    // carry the same nullability state as entries rebuilt after ALTER (see
-    // PopulateLanceTableSchemaFromDataset); the schema freshness check
-    // compares this state against the live dataset schema.
-    auto *child = arrow_schema.children[i];
-    if (out_constraints && child && (child->flags & ARROW_FLAG_NULLABLE) == 0) {
-      out_constraints->push_back(make_uniq<NotNullConstraint>(LogicalIndex(i)));
-    }
-  }
-}
-
-static void PopulateLanceTableColumnsFromDataset(
-    ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr,
-    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
-  auto *schema_handle = lance_get_schema(dataset);
-  if (!schema_handle) {
-    throw IOException("Failed to get schema from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
-    lance_free_schema(schema_handle);
-    throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_schema(schema_handle);
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  if (out_coerced_columns) {
-    *out_coerced_columns = std::move(coerced);
-  }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
-                                 out_constraints);
 }
 
 static string JoinNamespacePath(const string &root, const string &child) {
@@ -326,8 +270,10 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
     try {
-      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced, &info.constraints);
+      auto live = LanceTableSchema::FromDataset(context, dataset);
+      info.columns = std::move(live.columns);
+      info.constraints = std::move(live.constraints);
+      coerced = std::move(live.coerced_columns);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -388,24 +334,18 @@ private:
   shared_ptr<LanceDirectoryNamespaceConfig> ns;
 };
 
-static void PopulateLanceTableColumnsFromJsonSchema(
-    ClientContext &context, const string &schema_json, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr,
-    vector<unique_ptr<Constraint>> *out_constraints = nullptr) {
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_json_arrow_schema_to_c(schema_json.c_str(),
-                                   &schema_root.arrow_schema) != 0) {
-    throw IOException("Failed to convert JSON Arrow schema to C Data "
-                      "Interface" +
-                      LanceFormatErrorSuffix());
+static LanceTableSchema LanceTableSchemaFromJson(ClientContext &context,
+                                                 const string &schema_json) {
+  ArrowSchemaWrapper root;
+  root.arrow_schema = {};
+  if (lance_json_arrow_schema_to_c(schema_json.c_str(), &root.arrow_schema) !=
+      0) {
+    throw IOException(
+        "Failed to convert JSON Arrow schema to C Data Interface" +
+        LanceFormatErrorSuffix());
   }
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  if (out_coerced_columns) {
-    *out_coerced_columns = std::move(coerced);
-  }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema, out_columns,
-                                 out_constraints);
+  ArrowTableSchema arrow_table;
+  return LanceTableSchema::FromArrow(context, root.arrow_schema, arrow_table);
 }
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -487,8 +427,10 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       try {
-        PopulateLanceTableColumnsFromJsonSchema(
-            context, schema_json, info.columns, &coerced, &info.constraints);
+        auto live = LanceTableSchemaFromJson(context, schema_json);
+        info.columns = std::move(live.columns);
+        info.constraints = std::move(live.constraints);
+        coerced = std::move(live.coerced_columns);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
@@ -519,8 +461,10 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       try {
-        PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced, &info.constraints);
+        auto live = LanceTableSchema::FromDataset(context, dataset);
+        info.columns = std::move(live.columns);
+        info.constraints = std::move(live.constraints);
+        coerced = std::move(live.coerced_columns);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;

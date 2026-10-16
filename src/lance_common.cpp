@@ -1,5 +1,3 @@
-#include "duckdb/common/arrow/schema_metadata.hpp"
-#include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
@@ -21,20 +19,6 @@
 #include <cstring>
 
 namespace duckdb {
-void LanceRestoreColumnDefault(ClientContext &context, const ArrowSchema &field,
-                               ColumnDefinition &column) {
-  ArrowSchemaMetadata metadata(field.metadata);
-  auto sql = metadata.GetOption("duckdb_default_expr");
-  if (sql.empty()) {
-    return;
-  }
-  auto expressions = Parser(context).ParseExpressionList(sql);
-  if (expressions.size() != 1) {
-    throw InvalidInputException(
-        "Lance column has an invalid stored DEFAULT expression");
-  }
-  column.SetDefaultValue(std::move(expressions[0]));
-}
 
 string LanceConsumeLastError() {
   auto code = lance_last_error_code();

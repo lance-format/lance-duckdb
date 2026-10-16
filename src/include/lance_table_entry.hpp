@@ -12,6 +12,21 @@ struct AlterInfo;
 struct CatalogTransaction;
 class CatalogEntry;
 class ClientContext;
+struct ArrowTableSchema;
+
+// A transient interpretation shared by catalog discovery, rebuild, and
+// freshness checks. Comments are loaded separately and never affect binding.
+struct LanceTableSchema {
+  // Read original Arrow formats, coerce the schema in place, and populate
+  // the same Arrow mapping that scan binding uses.
+  static LanceTableSchema FromArrow(ClientContext &context, ArrowSchema &schema,
+                                    ArrowTableSchema &arrow_table);
+  static LanceTableSchema FromDataset(ClientContext &context, void *dataset);
+
+  ColumnList columns;
+  vector<unique_ptr<Constraint>> constraints;
+  vector<string> coerced_columns;
+};
 
 enum class LanceNamespaceKind { Directory, Rest };
 
@@ -102,27 +117,17 @@ public:
   }
 
 private:
-  // Pure comparison of this entry's declared schema state against a live
-  // dataset schema produced by the shared population pipeline.
-  bool
-  MatchesLiveSchemaState(ClientContext &context,
-                         const vector<string> &live_names,
-                         const vector<LogicalType> &live_types,
-                         const std::vector<std::string> &live_coerced_columns,
-                         const ArrowSchema &live_schema_root) const;
+  bool MatchesLiveSchemaState(const LanceTableSchema &live) const;
 
-  // Fetch the (revalidated) dataset handle and compare; shared by
-  // IsSchemaStale and VerifySchemaFreshness.
-  bool FetchLiveSchemaMatches(ClientContext &context, string &out_display_uri);
+  // Uses the revalidated dataset handle; infrastructure errors propagate.
+  LanceTableSchema FetchLiveSchema(ClientContext &context,
+                                   string &out_display_uri);
 
-  // Shared freshness comparator for the scan bind path and
-  // VerifySchemaFreshness; refreshes the metadata cache and throws on mismatch
-  // while the current query keeps this entry pinned.
-  void ValidateLiveSchemaOrReplace(
-      ClientContext &context, const vector<string> &live_names,
-      const vector<LogicalType> &live_types,
-      const std::vector<std::string> &live_coerced_columns,
-      const ArrowSchema &live_schema_root, const string &display_uri);
+  // Best-effort cache replacement followed by a fail-closed error on mismatch.
+  // The current query keeps this entry's generation pinned.
+  void ValidateLiveSchemaOrReplace(ClientContext &context,
+                                   const LanceTableSchema &live,
+                                   const string &display_uri);
 
 private:
   ColumnList columns;

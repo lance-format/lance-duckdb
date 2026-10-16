@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/lance_exec_ir.cpp
     src/lance_logical_exec.cpp
     src/lance_storage.cpp
+    src/lance_table_entry.cpp
     src/lance_metadata.cpp
     src/lance_maintenance.cpp
     src/lance_replacement.cpp
