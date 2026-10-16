@@ -121,11 +121,4 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         vector<string> &out_option_values,
                                         string &out_display_uri);
 
-int64_t LanceTruncateDatasetWithStorageOptions(
-    ClientContext &context, const string &open_path,
-    const vector<string> &option_keys, const vector<string> &option_values,
-    const string &display_uri);
-
-int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
-
 } // namespace duckdb

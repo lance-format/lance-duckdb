@@ -604,6 +604,7 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   auto src_data = UnifiedVectorFormat::GetData<uint64_t>(format);
 
   dst.SetVectorType(VectorType::FLAT_VECTOR);
+  FlatVector::SetSize(dst, count);
   auto dst_data = FlatVector::GetDataMutable<int64_t>(dst);
   auto &dst_validity = FlatVector::ValidityMutable(dst);
   dst_validity.SetAllValid(count);
@@ -1957,7 +1958,10 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     }
     auto output_size = MinValue<idx_t>(
         STANDARD_VECTOR_SIZE, global_state.count_only_total_rows - start);
-    output.SetCardinality(output_size);
+    for (auto &column : output.data) {
+      column.Reference(Value::BOOLEAN(true), count_t(output_size));
+    }
+    output.CheckCardinality(output_size);
     output.Verify();
     return;
   }
@@ -2012,8 +2016,8 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                   DConstants::INVALID_INDEX) {
             // Deferred column: init to constant NULL so Slice in
             // ApplyDuckDBFilters operates on a valid vector.
-            target.data[i].SetVectorType(VectorType::CONSTANT_VECTOR);
-            ConstantVector::SetNull(target.data[i], true);
+            target.data[i].Reference(Value(target.data[i].GetType()),
+                                     count_t(output_size));
             continue;
           }
           throw InternalException(

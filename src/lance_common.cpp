@@ -11,7 +11,6 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
-#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -705,87 +704,6 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
 
   ResolveLanceStorageOptions(context, location, out_open_path, out_option_keys,
                              out_option_values);
-}
-
-int64_t LanceTruncateDatasetWithStorageOptions(
-    ClientContext &context, const string &open_path,
-    const vector<string> &option_keys, const vector<string> &option_values,
-    const string &display_uri) {
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-
-  void *dataset = nullptr;
-  if (option_keys.empty()) {
-    dataset = lance_open_dataset(open_path.c_str());
-  } else {
-    dataset = lance_open_dataset_with_storage_options(
-        open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
-        option_keys.size());
-  }
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + display_uri +
-                      LanceFormatErrorSuffix());
-  }
-
-  auto row_count = lance_dataset_count_rows(dataset);
-  if (row_count < 0) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to count rows from Lance dataset: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  auto *schema_handle = lance_get_schema(dataset);
-  if (!schema_handle) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to get schema from Lance dataset: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
-    lance_free_schema(schema_handle);
-    lance_close_dataset(dataset);
-    throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-
-  lance_free_schema(schema_handle);
-  lance_close_dataset(dataset);
-
-  auto *writer = lance_open_writer_with_storage_options(
-      open_path.c_str(), "overwrite",
-      key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, LanceGetSessionHandle(context),
-      &schema_root.arrow_schema);
-  if (!writer) {
-    throw IOException("Failed to open Lance writer: " + open_path +
-                      LanceFormatErrorSuffix());
-  }
-  auto rc = lance_writer_finish(writer);
-  lance_close_writer(writer);
-  if (rc != 0) {
-    throw IOException("Failed to finalize Lance dataset write" +
-                      LanceFormatErrorSuffix());
-  }
-
-  return row_count;
-}
-
-int64_t LanceTruncateDataset(ClientContext &context,
-                             const string &dataset_uri) {
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-  ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
-                             option_values);
-  return LanceTruncateDatasetWithStorageOptions(context, open_path, option_keys,
-                                                option_values, dataset_uri);
 }
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
