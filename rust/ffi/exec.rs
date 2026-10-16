@@ -370,7 +370,9 @@ fn create_dataset_exec_stream_ir_inner(
 ) -> FfiResult<StreamHandle> {
     let handle = unsafe { dataset_handle(dataset)? };
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
-    let threads = unsafe { exec_ctx.as_ref() }.map(|c| c.threads as usize).unwrap_or(0);
+    let threads = unsafe { exec_ctx.as_ref() }
+        .map(|c| c.threads as usize)
+        .unwrap_or(0);
 
     let stream_res = runtime::block_on(async {
         let df = build_exec_df(handle, bytes, threads).await?;
