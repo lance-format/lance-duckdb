@@ -115,6 +115,84 @@ struct WriterState {
     output_join: Option<JoinHandle<Result<WriterResult, String>>>,
 }
 
+impl WriterState {
+    fn start(
+        &mut self,
+        input_schema: &SchemaRef,
+        write_empty: bool,
+    ) -> Result<Vec<RecordBatch>, String> {
+        let conversions: Vec<VectorConversion> = self
+            .vector_candidates
+            .iter()
+            .filter(|c| c.dim != 0)
+            .cloned()
+            .collect();
+        let output_schema = build_output_schema(input_schema, &conversions)?;
+        // Validate buffered input before starting a task that can publish a dataset.
+        let mut batches = self
+            .buffered_batches
+            .iter()
+            .map(|batch| convert_record_batch(batch, &output_schema, &conversions))
+            .collect::<Result<Vec<_>, _>>()?;
+        if write_empty {
+            batches.push(RecordBatch::new_empty(output_schema.clone()));
+        }
+        let (sender, receiver) = sync_channel::<RecordBatch>(2);
+        let join = spawn_writer_thread(
+            self.kind,
+            self.path.clone(),
+            self.params.clone(),
+            output_schema.clone(),
+            receiver,
+        );
+        self.buffered_batches.clear();
+        self.output_schema = Some(output_schema);
+        self.output_sender = Some(sender);
+        self.output_join = Some(join);
+        Ok(batches)
+    }
+}
+
+impl WriterHandle {
+    fn finish(&self) -> Result<WriterResult, String> {
+        let (sender, join, batches) = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let batches = if state.output_sender.is_none() {
+                state.start(
+                    &self.input_schema,
+                    self.batches_sent.load(Ordering::Acquire) == 0,
+                )?
+            } else {
+                Vec::new()
+            };
+            let sender = state
+                .output_sender
+                .take()
+                .ok_or("writer is not initialized")?;
+            let join = state
+                .output_join
+                .take()
+                .ok_or("writer is already finished")?;
+            (sender, join, batches)
+        };
+        let sent = batches.into_iter().try_for_each(|batch| {
+            sender
+                .send(batch)
+                .map_err(|_| "writer background task exited".to_string())
+        });
+        drop(sender);
+        // Always join, including when the worker stopped accepting buffered input.
+        let result = join
+            .join()
+            .map_err(|_| "writer thread panicked".to_string())?;
+        sent?;
+        result
+    }
+}
+
 impl Drop for WriterHandle {
     fn drop(&mut self) {
         let (sender, join) = {
@@ -609,6 +687,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     schema: *const c_void,
 ) -> *mut c_void {
     match open_writer_inner(
+        WriterKind::Committed,
         path,
         mode,
         option_keys,
@@ -646,7 +725,8 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     session: *mut c_void,
     schema: *const c_void,
 ) -> *mut c_void {
-    match open_uncommitted_writer_inner(
+    match open_writer_inner(
+        WriterKind::Uncommitted,
         path,
         mode,
         option_keys,
@@ -697,170 +777,8 @@ fn parse_data_storage_version_arg(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn open_uncommitted_writer_inner(
-    path: *const c_char,
-    mode: *const c_char,
-    option_keys: *const *const c_char,
-    option_values: *const *const c_char,
-    options_len: usize,
-    max_rows_per_file: u64,
-    max_rows_per_group: u64,
-    max_bytes_per_file: u64,
-    data_storage_version: *const c_char,
-    session: *mut c_void,
-    schema: *const c_void,
-) -> FfiResult<WriterHandle> {
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-    let mode = unsafe { cstr_to_str(mode, "mode")? };
-
-    if schema.is_null() {
-        return Err(FfiError::new(ErrorCode::InvalidArgument, "schema is null"));
-    }
-
-    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "option_keys/option_values is null with non-zero length",
-        ));
-    }
-
-    let keys = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
-    };
-    let values = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
-    };
-
-    let mut storage_options = HashMap::<String, String>::new();
-    for (idx, (&key_ptr, &val_ptr)) in keys.iter().zip(values.iter()).enumerate() {
-        if key_ptr.is_null() || val_ptr.is_null() {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                format!("option key/value is null at index {idx}"),
-            ));
-        }
-        let key = unsafe { CStr::from_ptr(key_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
-        })?;
-        let value = unsafe { CStr::from_ptr(val_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
-        })?;
-        storage_options.insert(key.to_string(), value.to_string());
-    }
-
-    let ffi_schema = unsafe { &*(schema as *const arrow_schema::ffi::FFI_ArrowSchema) };
-    let data_type = DataType::try_from(ffi_schema).map_err(|err| {
-        FfiError::new(ErrorCode::DatasetWriteOpen, format!("schema import: {err}"))
-    })?;
-    let DataType::Struct(fields) = &data_type else {
-        return Err(FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            "schema must be a struct",
-        ));
-    };
-    let mut schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
-
-    let write_mode = WriteMode::try_from(mode).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            format!("invalid write mode '{mode}': {err}"),
-        )
-    })?;
-
-    // The incoming Arrow arrays are imported against `data_type`, so realigning
-    // the schema without it would fail RecordBatch validation.
-    let mut data_type = data_type.clone();
-    if matches!(write_mode, WriteMode::Append) {
-        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
-            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
-                data_type = DataType::Struct(fields.clone());
-                schema = Arc::new(Schema::new(fields));
-            }
-        }
-    }
-
-    let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            format!("invalid max_rows_per_file: {err}"),
-        )
-    })?;
-    let max_rows_per_group = usize::try_from(max_rows_per_group).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            format!("invalid max_rows_per_group: {err}"),
-        )
-    })?;
-    let max_bytes_per_file = usize::try_from(max_bytes_per_file).map_err(|err| {
-        FfiError::new(
-            ErrorCode::DatasetWriteOpen,
-            format!("invalid max_bytes_per_file: {err}"),
-        )
-    })?;
-    let data_storage_version = parse_data_storage_version_arg(data_storage_version)?
-        .map(|value| {
-            value.parse().map_err(|err| {
-                FfiError::new(
-                    ErrorCode::DatasetWriteOpen,
-                    format!("invalid data_storage_version '{value}': {err}"),
-                )
-            })
-        })
-        .transpose()?;
-    let session = unsafe { optional_session_handle(session)? };
-
-    let mut store_params = ObjectStoreParams::default();
-    if !storage_options.is_empty() {
-        store_params.storage_options_accessor = Some(Arc::new(
-            StorageOptionsAccessor::with_static_options(storage_options),
-        ));
-    }
-
-    let params = WriteParams {
-        mode: write_mode,
-        max_rows_per_file,
-        max_rows_per_group,
-        max_bytes_per_file,
-        data_storage_version,
-        session,
-        store_params: Some(store_params),
-        ..Default::default()
-    };
-    let mut vector_candidates = Vec::<VectorConversion>::new();
-    for (idx, field) in schema.fields().iter().enumerate() {
-        if let Some((list_kind, element_type)) = is_variable_list_vector_type(field.data_type()) {
-            vector_candidates.push(VectorConversion {
-                col_idx: idx,
-                dim: 0,
-                list_kind,
-                element_type,
-            });
-        }
-    }
-
-    Ok(WriterHandle {
-        input_schema: schema.clone(),
-        data_type,
-        state: Mutex::new(WriterState {
-            kind: WriterKind::Uncommitted,
-            path,
-            params,
-            vector_candidates,
-            buffered_batches: Vec::new(),
-            output_schema: None,
-            output_sender: None,
-            output_join: None,
-        }),
-        batches_sent: AtomicU64::new(0),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn open_writer_inner(
+    kind: WriterKind,
     path: *const c_char,
     mode: *const c_char,
     option_keys: *const *const c_char,
@@ -1010,7 +928,7 @@ fn open_writer_inner(
         input_schema: schema.clone(),
         data_type,
         state: Mutex::new(WriterState {
-            kind: WriterKind::Committed,
+            kind,
             path,
             params,
             vector_candidates,
@@ -1118,36 +1036,10 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
             let can_start = guard.vector_candidates.iter().all(|c| c.dim != 0)
                 || guard.buffered_batches.len() >= MAX_VECTOR_DIM_INFERENCE_BATCHES;
             if can_start {
-                let conversions: Vec<VectorConversion> = guard
-                    .vector_candidates
-                    .iter()
-                    .filter(|c| c.dim != 0)
-                    .cloned()
-                    .collect();
-
-                let output_schema = build_output_schema(&handle.input_schema, &conversions)
+                let out_batches = guard
+                    .start(&handle.input_schema, false)
                     .map_err(|e| FfiError::new(ErrorCode::DatasetWriteBatch, e))?;
-                let (sender, receiver) = sync_channel::<RecordBatch>(2);
-                let join = spawn_writer_thread(
-                    guard.kind,
-                    guard.path.clone(),
-                    guard.params.clone(),
-                    output_schema.clone(),
-                    receiver,
-                );
-
-                let buffered = std::mem::take(&mut guard.buffered_batches);
-                let mut out_batches = Vec::with_capacity(buffered.len());
-                for b in buffered.iter() {
-                    let out = convert_record_batch(b, &output_schema, &conversions)
-                        .map_err(|e| FfiError::new(ErrorCode::DatasetWriteBatch, e))?;
-                    out_batches.push(out);
-                }
-
-                guard.output_schema = Some(output_schema);
-                guard.output_sender = Some(sender.clone());
-                guard.output_join = Some(join);
-                (Some(sender), out_batches)
+                (guard.output_sender.clone(), out_batches)
             } else {
                 (None, Vec::new())
             }
@@ -1208,75 +1100,14 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
-    let (sender, join, to_send) = {
-        let mut guard = handle
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.output_sender.is_none() {
-            let conversions: Vec<VectorConversion> = guard
-                .vector_candidates
-                .iter()
-                .filter(|c| c.dim != 0)
-                .cloned()
-                .collect();
-            let output_schema = build_output_schema(&handle.input_schema, &conversions)
-                .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?;
-            let (sender, receiver) = sync_channel::<RecordBatch>(2);
-            let join = spawn_writer_thread(
-                guard.kind,
-                guard.path.clone(),
-                guard.params.clone(),
-                output_schema.clone(),
-                receiver,
-            );
-            let buffered = std::mem::take(&mut guard.buffered_batches);
-            let mut out_batches = Vec::with_capacity(buffered.len() + 1);
-            for b in buffered.iter() {
-                let out = convert_record_batch(b, &output_schema, &conversions)
-                    .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?;
-                out_batches.push(out);
-            }
-            if handle.batches_sent.load(Ordering::Acquire) == 0 {
-                out_batches.push(RecordBatch::new_empty(output_schema.clone()));
-            }
-            guard.output_schema = Some(output_schema);
-            guard.output_sender = Some(sender.clone());
-            guard.output_join = Some(join);
-            guard.buffered_batches = out_batches;
-        }
-
-        let sender = guard.output_sender.as_ref().cloned().ok_or_else(|| {
-            FfiError::new(ErrorCode::DatasetWriteFinish, "writer is not initialized")
-        })?;
-        let join = guard.output_join.take().ok_or_else(|| {
-            FfiError::new(ErrorCode::DatasetWriteFinish, "writer is already finished")
-        })?;
-        let to_send = std::mem::take(&mut guard.buffered_batches);
-        guard.output_sender = None;
-        (sender, join, to_send)
-    };
-
-    for b in to_send {
-        sender.send(b).map_err(|_| {
-            FfiError::new(
-                ErrorCode::DatasetWriteFinish,
-                "writer background task exited",
-            )
-        })?;
-    }
-    drop(sender);
-
-    match join.join() {
-        Ok(Ok(WriterResult::Committed)) => Ok(()),
-        Ok(Ok(WriterResult::Uncommitted(_))) => Err(FfiError::new(
+    match handle
+        .finish()
+        .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?
+    {
+        WriterResult::Committed => Ok(()),
+        WriterResult::Uncommitted(_) => Err(FfiError::new(
             ErrorCode::DatasetWriteFinish,
             "writer returned an uncommitted transaction",
-        )),
-        Ok(Err(message)) => Err(FfiError::new(ErrorCode::DatasetWriteFinish, message)),
-        Err(_) => Err(FfiError::new(
-            ErrorCode::DatasetWriteFinish,
-            "writer thread panicked",
         )),
     }
 }
@@ -1313,89 +1144,15 @@ fn writer_finish_uncommitted_inner(
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
-    let (sender, join, to_send) = {
-        let mut guard = handle
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.output_sender.is_none() {
-            let conversions: Vec<VectorConversion> = guard
-                .vector_candidates
-                .iter()
-                .filter(|c| c.dim != 0)
-                .cloned()
-                .collect();
-            let output_schema = build_output_schema(&handle.input_schema, &conversions)
-                .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?;
-            let (sender, receiver) = sync_channel::<RecordBatch>(2);
-            let join = spawn_writer_thread(
-                guard.kind,
-                guard.path.clone(),
-                guard.params.clone(),
-                output_schema.clone(),
-                receiver,
-            );
-            let buffered = std::mem::take(&mut guard.buffered_batches);
-            let mut out_batches = Vec::with_capacity(buffered.len() + 1);
-            for b in buffered.iter() {
-                let out = convert_record_batch(b, &output_schema, &conversions)
-                    .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?;
-                out_batches.push(out);
-            }
-            if handle.batches_sent.load(Ordering::Acquire) == 0 {
-                out_batches.push(RecordBatch::new_empty(output_schema.clone()));
-            }
-            guard.output_schema = Some(output_schema);
-            guard.output_sender = Some(sender.clone());
-            guard.output_join = Some(join);
-            guard.buffered_batches = out_batches;
-        }
-
-        let sender = guard.output_sender.as_ref().cloned().ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                "writer is not initialized",
-            )
-        })?;
-        let join = guard.output_join.take().ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                "writer is already finished",
-            )
-        })?;
-        let to_send = std::mem::take(&mut guard.buffered_batches);
-        guard.output_sender = None;
-        (sender, join, to_send)
-    };
-
-    for b in to_send {
-        sender.send(b).map_err(|_| {
-            FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                "writer background task exited",
-            )
-        })?;
-    }
-    drop(sender);
-
-    let txn = match join.join() {
-        Ok(Ok(WriterResult::Uncommitted(txn))) => txn,
-        Ok(Ok(WriterResult::Committed)) => {
+    let txn = match handle
+        .finish()
+        .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?
+    {
+        WriterResult::Uncommitted(txn) => txn,
+        WriterResult::Committed => {
             return Err(FfiError::new(
                 ErrorCode::DatasetWriteFinishUncommitted,
                 "writer did not return an uncommitted transaction",
-            ))
-        }
-        Ok(Err(message)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                message,
-            ))
-        }
-        Err(_) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                "writer thread panicked",
             ))
         }
     };
@@ -1589,5 +1346,109 @@ mod align_tests {
             panic!("expected a struct");
         };
         assert_eq!(children[0].data_type(), &list_of("l"));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use arrow_array::types::Float32Type;
+    use std::ffi::CString;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn check_publication(batch: RecordBatch, write_batch: bool) {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        for kind in [WriterKind::Committed, WriterKind::Uncommitted] {
+            let directory = TestDirectory(
+                std::env::temp_dir().join(format!("ffi-writer-{}", rand::random::<u64>())),
+            );
+            let path = CString::new(directory.0.to_str().unwrap()).unwrap();
+            let schema =
+                super::super::util::schema_to_ffi_arrow_schema(batch.schema().as_ref()).unwrap();
+            let mut writer = open_writer_inner(
+                kind,
+                path.as_ptr(),
+                c"create".as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                1024,
+                1024,
+                1024 * 1024,
+                ptr::null(),
+                ptr::null_mut(),
+                &schema as *const _ as *const c_void,
+            )
+            .unwrap();
+            let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
+            if write_batch {
+                let array = StructArray::from(batch.clone());
+                let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
+                writer_write_batch_inner(writer_ptr, &mut exported as *mut _ as *mut c_void)
+                    .unwrap();
+            }
+            match kind {
+                WriterKind::Committed => writer_finish_inner(writer_ptr).unwrap(),
+                WriterKind::Uncommitted => {
+                    let mut transaction = ptr::null_mut();
+                    writer_finish_uncommitted_inner(writer_ptr, &mut transaction).unwrap();
+                    assert!(!transaction.is_null());
+                    // Finishing an uncommitted writer must not publish a manifest.
+                    assert!(runtime::block_on(Dataset::open(path.to_str().unwrap()))
+                        .unwrap()
+                        .is_err());
+                    commit_transaction_inner(
+                        path.as_ptr(),
+                        ptr::null(),
+                        ptr::null(),
+                        0,
+                        ptr::null_mut(),
+                        transaction,
+                    )
+                    .unwrap();
+                }
+            }
+            let dataset = runtime::block_on(Dataset::open(path.to_str().unwrap()))
+                .unwrap()
+                .unwrap();
+            let count = runtime::block_on(dataset.count_rows(None))
+                .unwrap()
+                .unwrap();
+            assert_eq!(count, if write_batch { batch.num_rows() } else { 0 });
+            if write_batch && batch.column(0).null_count() == 0 {
+                let schema: Schema = dataset.schema().into();
+                assert!(matches!(
+                    schema.field(0).data_type(),
+                    DataType::FixedSizeList(_, 2)
+                ));
+            }
+        }
+    }
+
+    fn vector_batch(values: Vec<Option<Vec<Option<f32>>>>) -> RecordBatch {
+        let array = ListArray::from_iter_primitive::<Float32Type, _, _>(values);
+        RecordBatch::try_from_iter(vec![("vector", Arc::new(array) as Arc<dyn Array>)]).unwrap()
+    }
+
+    #[test]
+    fn empty_finish_preserves_publication_mode() {
+        check_publication(vector_batch(vec![]), false);
+    }
+
+    #[test]
+    fn finish_flushes_buffered_null_vectors() {
+        check_publication(vector_batch(vec![None]), true);
+    }
+
+    #[test]
+    fn finish_joins_started_vector_writer() {
+        check_publication(vector_batch(vec![Some(vec![Some(1.0), Some(2.0)])]), true);
     }
 }
