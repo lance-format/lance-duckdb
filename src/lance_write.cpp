@@ -7,6 +7,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/config.hpp"
 
 #include "duckdb/parser/statement/copy_statement.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -140,6 +142,15 @@ LanceWriteInitGlobal(ClientContext &context,
   auto &open_path = state->open_path;
   ResolveLanceStorageOptions(context, file_path, open_path, option_keys,
                              option_values);
+  // Enforce DuckDB policy without probing storage or loading a filesystem.
+  // Check at execution so a prepared COPY observes later policy restrictions.
+  if (!DBConfig::GetConfig(context).CanAccessFile(
+          open_path, FileType::FILE_TYPE_DIR,
+          ClientData::Get(context).file_opener.get())) {
+    throw PermissionException("Cannot access directory \"%s\" - file system "
+                              "operations are disabled by configuration",
+                              open_path);
+  }
   state->cache_key = LanceBuildResolvedPathDatasetCacheKey(
       open_path, option_keys, option_values);
 
