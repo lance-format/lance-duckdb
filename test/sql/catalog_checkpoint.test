@@ -1,0 +1,33 @@
+# name: test/sql/catalog_checkpoint.test
+# description: Checkpoints preserve extension-owned tables in an attached Lance catalog
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/.tmp/checkpoint_namespace' AS checkpoint_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE checkpoint_ns.main.items AS SELECT 1::BIGINT AS id;
+
+statement ok
+FORCE CHECKPOINT checkpoint_ns;
+
+query I
+SELECT id FROM checkpoint_ns.main.items
+----
+1
+
+statement ok
+INSERT INTO checkpoint_ns.main.items VALUES (2);
+
+statement ok
+CHECKPOINT checkpoint_ns;
+
+query I
+SELECT sum(id) FROM checkpoint_ns.main.items
+----
+3
+
+statement ok
+DETACH checkpoint_ns;

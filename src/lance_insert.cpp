@@ -1,5 +1,6 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -253,7 +254,7 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   vector<string> column_names;
   vector<LogicalType> column_types;
   for (auto &col : op.table.GetColumns().Physical()) {
-    column_names.push_back(col.Name());
+    column_names.push_back(col.Name().GetIdentifierName());
     column_types.push_back(col.Type());
   }
 

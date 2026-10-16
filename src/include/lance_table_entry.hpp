@@ -104,6 +104,8 @@ public:
     return nullptr;
   }
 
+  const ColumnList &GetColumns() const override { return columns; }
+
   TableStorageInfo GetStorageInfo(ClientContext &) override { return {}; }
 
   const string &DatasetUri() const { return dataset_uri; }
@@ -151,6 +153,7 @@ private:
       const ArrowSchema &live_schema_root, const string &display_uri);
 
 private:
+  ColumnList columns;
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;

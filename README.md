@@ -170,6 +170,13 @@ ORDER BY _hybrid_score DESC;
 
 See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
 
+## DuckDB compatibility
+
+The 2.0 migration targets DuckDB's `v2.0-cyanoptera` branch. The
+`v1.5-variegata` branch preserves DuckDB 1.5 support. See
+[compatibility and release branches](docs/duckdb-compatibility.md) for cutover,
+backport, and official publication requirements.
+
 ## Contributing
 
 Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.

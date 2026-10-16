@@ -6,11 +6,8 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -30,74 +27,6 @@
 #include <cstdint>
 
 namespace duckdb {
-
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
-
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
-    }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
-  }
-  return out;
-}
-
-static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
-                                        LanceTableEntry &table,
-                                        const string &field_name,
-                                        string &out_default_expr) {
-  out_default_expr.clear();
-
-  string display_uri;
-  auto *dataset = LanceOpenDatasetForTable(context, table, display_uri);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset for UPDATE planning: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
-  lance_close_dataset(dataset);
-
-  for (auto &entry : rows) {
-    if (entry.first == "duckdb_default_expr") {
-      out_default_expr = std::move(entry.second);
-      return true;
-    }
-  }
-  return false;
-}
-
-static unique_ptr<Expression>
-BindStoredDefaultExpr(ClientContext &context, const string &catalog_name,
-                      const string &schema_name, const string &default_expr_sql,
-                      const LogicalType &target_type) {
-  auto expr_list =
-      Parser::ParseExpressionList(default_expr_sql, context.GetParserOptions());
-  if (expr_list.size() != 1 || !expr_list[0]) {
-    throw InternalException(
-        "Lance UPDATE stored default expression is invalid");
-  }
-
-  (void)catalog_name;
-  (void)schema_name;
-  auto binder = Binder::CreateBinder(context);
-  ConstantBinder default_binder(*binder, context, "DEFAULT value");
-  default_binder.target_type = target_type;
-  return default_binder.Bind(expr_list[0]);
-}
 
 struct LanceUpdatePlanParts {
   LogicalProjection *projection = nullptr;
@@ -317,14 +246,13 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw InternalException("Lance UPDATE is missing Lance scan bind data");
   }
 
-  vector<string> predicate_ir_parts;
-  if (!parts.get->table_filters.filters.empty() &&
-      !TryBuildLanceTableFilterIRParts(scan_bind->names, scan_bind->types,
-                                       parts.get->table_filters,
-                                       predicate_ir_parts)) {
+  auto table_filters =
+      ProbeLanceTableFilterIR(*parts.get, scan_bind->names, scan_bind->types);
+  if (!table_filters.all_filters_pushed) {
     throw NotImplementedException(
         "Lance UPDATE does not support one or more pushed table filters");
   }
+  auto predicate_ir_parts = std::move(table_filters.parts);
 
   for (auto &part : scan_bind->lance_pushed_filter_ir_parts) {
     if (!part.empty()) {
@@ -383,45 +311,16 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
 
   for (idx_t i = 0; i < op.columns.size(); i++) {
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
-    set_columns.push_back(target_col.Name());
+    set_columns.push_back(target_col.Name().GetIdentifierName());
 
     if (!op.expressions[i]) {
       throw InternalException("Lance UPDATE has null SET expression");
     }
 
-    if (op.expressions[i]->GetExpressionType() ==
-        ExpressionType::VALUE_DEFAULT) {
-      unique_ptr<Expression> target_default;
-      string stored_default_expr;
-      if (TryGetLanceFieldDefaultExpr(context, *lance_table, target_col.Name(),
-                                      stored_default_expr)) {
-        target_default = BindStoredDefaultExpr(
-            context, op.table.catalog.GetName(), op.table.ParentSchema().name,
-            stored_default_expr, target_col.Type());
-      } else {
-        auto storage_idx = target_col.StorageOid();
-        if (storage_idx >= op.bound_defaults.size()) {
-          throw InternalException(
-              "Lance UPDATE default expression is missing for target column");
-        }
-        auto &bound_default = op.bound_defaults[storage_idx];
-        if (!bound_default) {
-          throw InternalException(
-              "Lance UPDATE default expression is missing for target column");
-        }
-        target_default = bound_default->Copy();
-      }
-      string expr_ir;
-      EncodeLanceExprIR(*parts.get, *scan_bind, set_expr_scope, *target_default,
-                        expr_ir);
-      set_expr_irs.push_back(std::move(expr_ir));
-      continue;
-    }
-
     unique_ptr<Expression> set_expr;
     if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_REF) {
       auto &ref = op.expressions[i]->Cast<BoundReferenceExpression>();
-      auto idx = NumericCast<idx_t>(ref.index);
+      auto idx = NumericCast<idx_t>(ref.Index());
       if (idx >= parts.projection->expressions.size()) {
         throw InternalException(
             "Lance UPDATE SET expression has invalid projection index");
@@ -430,16 +329,16 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     } else if (op.expressions[i]->GetExpressionClass() ==
                ExpressionClass::BOUND_COLUMN_REF) {
       auto &ref = op.expressions[i]->Cast<BoundColumnRefExpression>();
-      if (ref.binding.table_index != parts.projection->table_index) {
+      if (ref.Binding().table_index != parts.projection->table_index) {
         throw NotImplementedException(
             "Lance UPDATE does not support UPDATE with joins or FROM");
       }
-      if (ref.binding.column_index >= parts.projection->expressions.size()) {
+      if (ref.Binding().column_index >= parts.projection->expressions.size()) {
         throw InternalException(
             "Lance UPDATE SET expression has invalid projection index");
       }
       set_expr =
-          parts.projection->expressions[ref.binding.column_index]->Copy();
+          parts.projection->expressions[ref.Binding().column_index]->Copy();
     } else {
       set_expr = op.expressions[i]->Copy();
     }

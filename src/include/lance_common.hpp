@@ -5,6 +5,9 @@
 struct LanceNamespaceQueryConfig;
 
 namespace duckdb {
+class ColumnDefinition;
+void LanceRestoreColumnDefault(ClientContext &context, const ArrowSchema &field,
+                               ColumnDefinition &column);
 
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
@@ -40,7 +43,7 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
-                               const named_parameter_map_t &options,
+                               const named_argument_map_t &options,
                                string &out_bearer_token, string &out_api_key);
 void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,

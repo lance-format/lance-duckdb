@@ -1,5 +1,6 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/copy_function.hpp"
@@ -81,14 +82,16 @@ static void LanceWriteCopyOptions(ClientContext &, CopyOptionsInput &input) {
 
 static unique_ptr<FunctionData>
 LanceWriteBind(ClientContext &, CopyFunctionBindInput &input,
-               const vector<string> &names,
+               const vector<Identifier> &names,
                const vector<LogicalType> &sql_types) {
   auto bind_data = make_uniq<LanceWriteBindData>();
-  bind_data->names = names;
+  for (const auto &name : names) {
+    bind_data->names.push_back(name.GetIdentifierName());
+  }
   bind_data->types = sql_types;
 
   for (auto &option : input.info.options) {
-    const auto key = StringUtil::Lower(option.first);
+    const auto key = StringUtil::Lower(option.first.GetIdentifierName());
     if (option.second.size() != 1) {
       throw BinderException("%s requires exactly one argument",
                             StringUtil::Upper(key));
@@ -236,6 +239,10 @@ void RegisterLanceWrite(ExtensionLoader &loader) {
   function.copy_to_initialize_global = LanceWriteInitGlobal;
   function.copy_to_initialize_local = LanceWriteInitLocal;
   function.copy_to_sink = LanceWriteSink;
+  // Each sink call writes directly to the shared Lance writer. There is no
+  // per-batch buffered state for DuckDB's legacy COPY adapter to combine.
+  function.copy_to_combine = [](ExecutionContext &, FunctionData &,
+                                GlobalFunctionData &, LocalFunctionData &) {};
   function.copy_to_finalize = LanceWriteFinalize;
   function.execution_mode = LanceWriteExecutionMode;
 

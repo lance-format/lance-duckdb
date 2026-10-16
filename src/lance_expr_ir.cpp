@@ -274,7 +274,7 @@ static void AppendLiteralPayload(const Value &value, string &out) {
     return;
   case LogicalTypeId::DATE: {
     auto d = value.GetValue<date_t>();
-    if (!Date::IsFinite(d)) {
+    if (!d.IsFinite()) {
       throw NotImplementedException(
           "Lance UPDATE does not support infinite DATE literals");
     }
@@ -288,7 +288,7 @@ static void AppendLiteralPayload(const Value &value, string &out) {
   case LogicalTypeId::TIMESTAMP_NS:
   case LogicalTypeId::TIMESTAMP_TZ: {
     auto v = value.GetValue<int64_t>();
-    if (!Timestamp::IsFinite(timestamp_t(v))) {
+    if (!timestamp_t(v).IsFinite()) {
       throw NotImplementedException(
           "Lance UPDATE does not support infinite TIMESTAMP literals");
     }
@@ -947,64 +947,102 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
                                  const LogicalOperator &expression_scope,
                                  const Expression &expr, string &out) {
 
-  switch (expr.GetExpressionClass()) {
-  case ExpressionClass::BOUND_COLUMN_REF: {
-    auto &ref = expr.Cast<BoundColumnRefExpression>();
-    return EncodeScopeColumnBinding(scan_get, scan_bind, expression_scope,
-                                    ref.binding, out);
-  }
-  case ExpressionClass::BOUND_REF: {
-    auto &ref = expr.Cast<BoundReferenceExpression>();
-    if (!ref.alias.empty()) {
-      return EncodeColumnRef(ref.alias, out);
-    }
-    return EncodeScopeColumnRef(scan_get, scan_bind, expression_scope,
-                                ref.index, out);
-  }
-  case ExpressionClass::BOUND_CONSTANT: {
-    auto &constant = expr.Cast<BoundConstantExpression>();
-    return EncodeLiteral(constant.value, out);
-  }
-  case ExpressionClass::BOUND_CAST: {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (!cast.child) {
+  if (BoundCastExpression::IsCast(expr)) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (!cast.GetChildren()[0]) {
       throw InternalException("Lance UPDATE cast expression is missing child");
     }
-    if (cast.try_cast) {
+    if (BoundCastExpression::IsTryCast(cast)) {
       throw NotImplementedException(
           "Lance UPDATE does not support TRY_CAST in SET expressions");
     }
     string child_ir;
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *cast.child,
-                         child_ir);
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *cast.GetChildren()[0], child_ir);
     string type_ir;
-    EncodeTypeHint(cast.return_type, type_ir);
+    EncodeTypeHint(cast.GetReturnType(), type_ir);
     out.clear();
     AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRTag::CAST));
     AppendBytes(out, type_ir);
     AppendLenPrefixed(out, child_ir);
     return;
   }
+  if (BoundComparisonExpression::IsComparison(expr)) {
+    auto &cmp = expr.Cast<BoundFunctionExpression>();
+    string lhs_ir, rhs_ir;
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *cmp.GetChildren()[0], lhs_ir);
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *cmp.GetChildren()[1], rhs_ir);
+    uint8_t op = 0;
+    EncodeComparisonOp(cmp.GetExpressionType(), op);
+    return EncodeComparisonNode(op, lhs_ir, rhs_ir, out);
+  }
+  if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+    auto &between = expr.Cast<BoundFunctionExpression>();
+    string input_ir, lower_ir, upper_ir;
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *between.GetChildren()[0], input_ir);
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *between.GetChildren()[1], lower_ir);
+    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
+                         *between.GetChildren()[2], upper_ir);
+    uint8_t lower_op = 0;
+    uint8_t upper_op = 0;
+    EncodeComparisonOp(BoundBetweenExpression::LowerComparisonType(between),
+                       lower_op);
+    EncodeComparisonOp(BoundBetweenExpression::UpperComparisonType(between),
+                       upper_op);
+    string lower_cmp_ir, upper_cmp_ir;
+    EncodeComparisonNode(lower_op, input_ir, lower_ir, lower_cmp_ir);
+    EncodeComparisonNode(upper_op, input_ir, upper_ir, upper_cmp_ir);
+    vector<string> children;
+    children.push_back(std::move(lower_cmp_ir));
+    children.push_back(std::move(upper_cmp_ir));
+    return EncodeConjunctionNode(LanceUpdateExprIRConjunctionOp::AND, children,
+                                 out);
+  }
+  switch (expr.GetExpressionClass()) {
+  case ExpressionClass::BOUND_COLUMN_REF: {
+    auto &ref = expr.Cast<BoundColumnRefExpression>();
+    return EncodeScopeColumnBinding(scan_get, scan_bind, expression_scope,
+                                    ref.Binding(), out);
+  }
+  case ExpressionClass::BOUND_REF: {
+    auto &ref = expr.Cast<BoundReferenceExpression>();
+    if (!ref.GetAlias().empty()) {
+      return EncodeColumnRef(ref.GetAlias().GetIdentifierName(), out);
+    }
+    return EncodeScopeColumnRef(scan_get, scan_bind, expression_scope,
+                                ref.Index(), out);
+  }
+  case ExpressionClass::BOUND_CONSTANT: {
+    auto &constant = expr.Cast<BoundConstantExpression>();
+    return EncodeLiteral(constant.GetValue(), out);
+  }
+
   case ExpressionClass::BOUND_FUNCTION: {
     auto &fn = expr.Cast<BoundFunctionExpression>();
-    if (fn.children.size() == 2) {
-      auto lowered = StringUtil::Lower(fn.function.name);
+    if (fn.GetChildren().size() == 2) {
+      auto lowered =
+          StringUtil::Lower(fn.Function().GetName().GetIdentifierName());
       if (lowered == "+" || lowered == "add" || lowered == "-" ||
           lowered == "subtract" || lowered == "*" || lowered == "multiply" ||
           lowered == "/" || lowered == "divide") {
         string lhs_ir, rhs_ir;
         EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                             *fn.children[0], lhs_ir);
+                             *fn.GetChildren()[0], lhs_ir);
         EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                             *fn.children[1], rhs_ir);
-        return EncodeBinaryNode(MapBinaryOpName(fn.function.name), lhs_ir,
-                                rhs_ir, out);
+                             *fn.GetChildren()[1], rhs_ir);
+        return EncodeBinaryNode(
+            MapBinaryOpName(fn.Function().GetName().GetIdentifierName()),
+            lhs_ir, rhs_ir, out);
       }
     }
 
     vector<string> args;
-    args.reserve(fn.children.size());
-    for (auto &child : fn.children) {
+    args.reserve(fn.GetChildren().size());
+    for (auto &child : fn.GetChildren()) {
       if (!child) {
         throw InternalException(
             "Lance UPDATE function expression has null child");
@@ -1014,87 +1052,81 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
                            child_ir);
       args.push_back(std::move(child_ir));
     }
-    return EncodeFunctionNode(fn.function.name, args, out);
+    return EncodeFunctionNode(fn.Function().GetName().GetIdentifierName(), args,
+                              out);
   }
   case ExpressionClass::BOUND_OPERATOR: {
     auto &op = expr.Cast<BoundOperatorExpression>();
-    if (op.type == ExpressionType::OPERATOR_NOT) {
-      if (op.children.size() != 1 || !op.children[0]) {
+    if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+      if (op.GetChildren().size() != 1 || !op.GetChildren()[0]) {
         throw InternalException("Lance UPDATE NOT expression is malformed");
       }
       string child_ir;
       EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                           *op.children[0], child_ir);
+                           *op.GetChildren()[0], child_ir);
       return EncodeUnaryNode(LanceUpdateExprIRTag::NOT, child_ir, out);
     }
-    if (op.type == ExpressionType::OPERATOR_IS_NULL ||
-        op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-      if (op.children.size() != 1 || !op.children[0]) {
+    if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+        op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+      if (op.GetChildren().size() != 1 || !op.GetChildren()[0]) {
         throw InternalException("Lance UPDATE IS NULL expression is malformed");
       }
       string child_ir;
       EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                           *op.children[0], child_ir);
-      return EncodeUnaryNode(op.type == ExpressionType::OPERATOR_IS_NULL
+                           *op.GetChildren()[0], child_ir);
+      return EncodeUnaryNode(op.GetExpressionType() ==
+                                     ExpressionType::OPERATOR_IS_NULL
                                  ? LanceUpdateExprIRTag::IS_NULL
                                  : LanceUpdateExprIRTag::IS_NOT_NULL,
                              child_ir, out);
     }
-    if (op.type == ExpressionType::COMPARE_IN ||
-        op.type == ExpressionType::COMPARE_NOT_IN) {
-      if (op.children.size() < 2 || !op.children[0]) {
+    if (op.GetExpressionType() == ExpressionType::COMPARE_IN ||
+        op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+      if (op.GetChildren().size() < 2 || !op.GetChildren()[0]) {
         throw InternalException("Lance UPDATE IN expression is malformed");
       }
       string lhs_ir;
       EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                           *op.children[0], lhs_ir);
+                           *op.GetChildren()[0], lhs_ir);
       out.clear();
       AppendU8(out, static_cast<uint8_t>(LanceUpdateExprIRTag::IN_LIST));
-      AppendU8(out, op.type == ExpressionType::COMPARE_NOT_IN ? 1 : 0);
+      AppendU8(out, op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN
+                        ? 1
+                        : 0);
       AppendLenPrefixed(out, lhs_ir);
-      AppendU32(out, static_cast<uint32_t>(op.children.size() - 1));
-      for (idx_t i = 1; i < op.children.size(); i++) {
-        if (!op.children[i]) {
+      AppendU32(out, static_cast<uint32_t>(op.GetChildren().size() - 1));
+      for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+        if (!op.GetChildren()[i]) {
           throw InternalException(
               "Lance UPDATE IN expression has null list element");
         }
         string item_ir;
         EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                             *op.children[i], item_ir);
+                             *op.GetChildren()[i], item_ir);
         AppendLenPrefixed(out, item_ir);
       }
       return;
     }
     throw NotImplementedException(
         "Lance UPDATE does not support operator %s in SET expressions",
-        ExpressionTypeToString(op.type));
+        ExpressionTypeToString(op.GetExpressionType()));
   }
-  case ExpressionClass::BOUND_COMPARISON: {
-    auto &cmp = expr.Cast<BoundComparisonExpression>();
-    string lhs_ir, rhs_ir;
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *cmp.left,
-                         lhs_ir);
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *cmp.right,
-                         rhs_ir);
-    uint8_t op = 0;
-    EncodeComparisonOp(cmp.type, op);
-    return EncodeComparisonNode(op, lhs_ir, rhs_ir, out);
-  }
+
   case ExpressionClass::BOUND_CONJUNCTION: {
     auto &conj = expr.Cast<BoundConjunctionExpression>();
     LanceUpdateExprIRConjunctionOp op;
-    if (conj.type == ExpressionType::CONJUNCTION_AND) {
+    if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
       op = LanceUpdateExprIRConjunctionOp::AND;
-    } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
+    } else if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
       op = LanceUpdateExprIRConjunctionOp::OR;
     } else {
       throw NotImplementedException(
           "Lance UPDATE does not support conjunction %s in SET expressions",
-          ExpressionTypeToString(conj.type));
+          ExpressionTypeToString(conj.GetExpressionType()));
     }
     vector<string> children;
-    children.reserve(conj.children.size());
-    for (auto &child : conj.children) {
+    children.reserve(conj.GetChildren().size());
+    for (auto &child : conj.GetChildren()) {
       if (!child) {
         throw InternalException(
             "Lance UPDATE conjunction expression has null child");
@@ -1109,8 +1141,8 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
   case ExpressionClass::BOUND_CASE: {
     auto &case_expr = expr.Cast<BoundCaseExpression>();
     vector<std::pair<string, string>> checks;
-    checks.reserve(case_expr.case_checks.size());
-    for (auto &check : case_expr.case_checks) {
+    checks.reserve(case_expr.CaseChecks().size());
+    for (auto &check : case_expr.CaseChecks()) {
       if (!check.when_expr || !check.then_expr) {
         throw InternalException("Lance UPDATE CASE expression has null branch");
       }
@@ -1123,35 +1155,14 @@ static void EncodeUpdateExprNode(const LogicalGet &scan_get,
     }
     string else_ir_storage;
     string *else_ir = nullptr;
-    if (case_expr.else_expr) {
+    if (case_expr.ElseExpression()) {
       EncodeUpdateExprNode(scan_get, scan_bind, expression_scope,
-                           *case_expr.else_expr, else_ir_storage);
+                           *case_expr.ElseExpression(), else_ir_storage);
       else_ir = &else_ir_storage;
     }
     return EncodeCaseNode(checks, else_ir, out);
   }
-  case ExpressionClass::BOUND_BETWEEN: {
-    auto &between = expr.Cast<BoundBetweenExpression>();
-    string input_ir, lower_ir, upper_ir;
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *between.input,
-                         input_ir);
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *between.lower,
-                         lower_ir);
-    EncodeUpdateExprNode(scan_get, scan_bind, expression_scope, *between.upper,
-                         upper_ir);
-    uint8_t lower_op = 0;
-    uint8_t upper_op = 0;
-    EncodeComparisonOp(between.LowerComparisonType(), lower_op);
-    EncodeComparisonOp(between.UpperComparisonType(), upper_op);
-    string lower_cmp_ir, upper_cmp_ir;
-    EncodeComparisonNode(lower_op, input_ir, lower_ir, lower_cmp_ir);
-    EncodeComparisonNode(upper_op, input_ir, upper_ir, upper_cmp_ir);
-    vector<string> children;
-    children.push_back(std::move(lower_cmp_ir));
-    children.push_back(std::move(upper_cmp_ir));
-    return EncodeConjunctionNode(LanceUpdateExprIRConjunctionOp::AND, children,
-                                 out);
-  }
+
   default:
     throw NotImplementedException(
         "Lance UPDATE does not support expression class %s in SET expressions",

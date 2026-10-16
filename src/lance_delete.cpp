@@ -51,9 +51,9 @@ static bool TryFindDeleteLogicalGet(LogicalOperator &node, LogicalGet *&out_get,
                                     string &out_error) {
   if (node.type == LogicalOperatorType::LOGICAL_GET) {
     auto &get = node.Cast<LogicalGet>();
-    if (get.function.name != "__lance_table_scan") {
+    if (get.function.GetName().GetIdentifierName() != "__lance_table_scan") {
       out_error = "unsupported DELETE plan: expected __lance_table_scan, got " +
-                  get.function.name;
+                  get.function.GetName().GetIdentifierName();
       return false;
     }
     out_get = &get;
@@ -93,16 +93,17 @@ static bool TryBuildLanceDeleteFilterIR(LogicalDelete &op,
   names.reserve(op.table.GetColumns().PhysicalColumnCount());
   types.reserve(op.table.GetColumns().PhysicalColumnCount());
   for (auto &col : op.table.GetColumns().Physical()) {
-    names.push_back(col.Name());
+    names.push_back(col.Name().GetIdentifierName());
     types.push_back(col.Type());
   }
 
   vector<string> parts;
 
   vector<ColumnIndex> column_indexes = get->GetColumnIds();
-  TableFunctionInitInput init_input(get->bind_data.get(),
-                                    std::move(column_indexes),
-                                    get->projection_ids, &get->table_filters);
+  TableFunctionInitInput init_input(
+      get->bind_data.get(), std::move(column_indexes),
+      vector<idx_t>(get->projection_ids.begin(), get->projection_ids.end()),
+      &get->table_filters);
   auto table_filters =
       BuildLanceTableFilterIRParts(names, types, init_input, false);
   parts = std::move(table_filters.parts);

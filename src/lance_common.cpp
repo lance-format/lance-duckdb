@@ -1,3 +1,8 @@
+#include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "lance_common.hpp"
 
 #include "lance_ffi.hpp"
@@ -17,6 +22,20 @@
 #include <cstring>
 
 namespace duckdb {
+void LanceRestoreColumnDefault(ClientContext &context, const ArrowSchema &field,
+                               ColumnDefinition &column) {
+  ArrowSchemaMetadata metadata(field.metadata);
+  auto sql = metadata.GetOption("duckdb_default_expr");
+  if (sql.empty()) {
+    return;
+  }
+  auto expressions = Parser(context).ParseExpressionList(sql);
+  if (expressions.size() != 1) {
+    throw InvalidInputException(
+        "Lance column has an invalid stored DEFAULT expression");
+  }
+  column.SetDefaultValue(std::move(expressions[0]));
+}
 
 string LanceConsumeLastError() {
   auto code = lance_last_error_code();
@@ -172,7 +191,7 @@ void LanceFillStorageOptionsFromSecrets(ClientContext &context,
     if (kv.second.IsNull()) {
       continue;
     }
-    out_keys.push_back(kv.first);
+    out_keys.push_back(kv.first.GetIdentifierName());
     out_values.push_back(kv.second.ToString());
   }
 }
@@ -226,7 +245,7 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
 }
 
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
-                               const named_parameter_map_t &options,
+                               const named_argument_map_t &options,
                                string &out_bearer_token, string &out_api_key) {
   FillLanceNamespaceAuthFromSecrets(context, endpoint, out_bearer_token,
                                     out_api_key);
@@ -569,9 +588,9 @@ LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
     return nullptr;
   }
 
-  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
-  auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema,
-                                 lookup_info, OnEntryNotFound::RETURN_NULL);
+  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname);
+  auto entry =
+      Catalog::GetEntry(context, lookup_info, OnEntryNotFound::RETURN_NULL);
   if (!entry) {
     return nullptr;
   }
@@ -775,22 +794,55 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
     return;
   }
   unique_ptr<Expression> combined;
-  for (auto &it : filters.filters) {
-    auto scan_col_idx = it.first;
+  for (auto &it : filters) {
+    auto scan_col_idx = it.GetIndex();
     if (scan_col_idx >= chunk.ColumnCount()) {
-      continue;
+      throw InternalException("Lance filter refers to a missing scan column");
     }
-    BoundReferenceExpression col_expr(chunk.data[scan_col_idx].GetType(),
-                                      NumericCast<storage_t>(scan_col_idx));
-    auto expr = it.second->ToExpression(col_expr);
+    BoundReferenceExpression col_expr(
+        chunk.data[scan_col_idx].GetType(),
+        NumericCast<storage_t>(scan_col_idx.GetIndex()));
+    auto expr = it.Filter().ToExpression(col_expr);
     if (!combined) {
       combined = std::move(expr);
     } else {
       auto conj = make_uniq<BoundConjunctionExpression>(
           ExpressionType::CONJUNCTION_AND);
-      conj->children.push_back(std::move(combined));
-      conj->children.push_back(std::move(expr));
+      conj->GetChildrenMutable().push_back(std::move(combined));
+      conj->GetChildrenMutable().push_back(std::move(expr));
       combined = std::move(conj);
+    }
+  }
+  for (const auto &filter : filters.GetMultiColumnFilters()) {
+    const auto &expression_filter =
+        ExpressionFilter::GetExpressionFilter(*filter, "Lance residual filter");
+    auto expr = expression_filter.expr->Copy();
+    std::function<void(Expression &)> remap = [&](Expression &node) {
+      if (node.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+        auto &ref = node.Cast<BoundReferenceExpression>();
+        if (ref.Index() >= expression_filter.column_indexes.size()) {
+          throw InternalException(
+              "Lance multi-column filter reference is out of bounds");
+        }
+        auto projection = expression_filter.column_indexes[ref.Index()];
+        if (projection >= chunk.ColumnCount()) {
+          throw InternalException(
+              "Lance multi-column filter refers to a missing scan column");
+        }
+        ref.IndexMutable() = projection.GetIndex();
+      }
+      ExpressionIterator::EnumerateChildren(
+          node, [&](Expression &child) { remap(child); });
+    };
+    remap(*expr);
+    if (!combined) {
+      combined = std::move(expr);
+    } else {
+      auto conjunction = make_uniq<BoundConjunctionExpression>(
+          ExpressionType::CONJUNCTION_AND);
+      conjunction->GetChildrenMutable().push_back(std::move(combined));
+      conjunction->GetChildrenMutable().push_back(std::move(expr));
+      combined = std::move(conjunction);
     }
   }
   if (!combined) {

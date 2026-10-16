@@ -167,7 +167,7 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
 
 static unique_ptr<FunctionData>
 LanceKvUpdateBind(ClientContext &context, TableFunctionBindInput &input,
-                  vector<LogicalType> &return_types, vector<string> &names,
+                  vector<LogicalType> &return_types, vector<Identifier> &names,
                   LanceKvTarget target, idx_t expected_inputs) {
   if (input.inputs.size() != expected_inputs) {
     throw BinderException("invalid argument count");
@@ -307,7 +307,7 @@ static void LanceKvListFunc(ClientContext &, TableFunctionInput &data,
 
 static unique_ptr<FunctionData>
 LanceKvListBind(ClientContext &context, TableFunctionBindInput &input,
-                vector<LogicalType> &return_types, vector<string> &names,
+                vector<LogicalType> &return_types, vector<Identifier> &names,
                 LanceKvTarget target, idx_t expected_inputs) {
   if (input.inputs.size() != expected_inputs) {
     throw BinderException("invalid argument count");
@@ -335,91 +335,93 @@ LanceKvListBind(ClientContext &context, TableFunctionBindInput &input,
 
 static unique_ptr<FunctionData>
 LanceSetConfigBind(ClientContext &context, TableFunctionBindInput &input,
-                   vector<LogicalType> &return_types, vector<string> &names) {
+                   vector<LogicalType> &return_types,
+                   vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::CONFIG, 3);
 }
 static unique_ptr<FunctionData>
 LanceUnsetConfigBind(ClientContext &context, TableFunctionBindInput &input,
-                     vector<LogicalType> &return_types, vector<string> &names) {
+                     vector<LogicalType> &return_types,
+                     vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::CONFIG, 2);
 }
 static unique_ptr<FunctionData>
 LanceSetTableMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                           vector<LogicalType> &return_types,
-                          vector<string> &names) {
+                          vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::TABLE_METADATA, 3);
 }
 static unique_ptr<FunctionData> LanceUnsetTableMetadataBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::TABLE_METADATA, 2);
 }
 static unique_ptr<FunctionData> LanceSetSchemaMetadataBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::SCHEMA_METADATA, 3);
 }
 static unique_ptr<FunctionData> LanceUnsetSchemaMetadataBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::SCHEMA_METADATA, 2);
 }
 static unique_ptr<FunctionData> LanceSetColumnMetadataBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::FIELD_METADATA, 4);
 }
 static unique_ptr<FunctionData> LanceUnsetColumnMetadataBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::FIELD_METADATA, 3);
 }
 
 static unique_ptr<FunctionData>
 LanceConfigBind(ClientContext &context, TableFunctionBindInput &input,
-                vector<LogicalType> &return_types, vector<string> &names) {
+                vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvListBind(context, input, return_types, names,
                          LanceKvTarget::CONFIG, 1);
 }
 static unique_ptr<FunctionData>
 LanceTableMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                        vector<LogicalType> &return_types,
-                       vector<string> &names) {
+                       vector<Identifier> &names) {
   return LanceKvListBind(context, input, return_types, names,
                          LanceKvTarget::TABLE_METADATA, 1);
 }
 static unique_ptr<FunctionData>
 LanceSchemaMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   return LanceKvListBind(context, input, return_types, names,
                          LanceKvTarget::SCHEMA_METADATA, 1);
 }
 static unique_ptr<FunctionData>
 LanceColumnMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   return LanceKvListBind(context, input, return_types, names,
                          LanceKvTarget::FIELD_METADATA, 2);
 }
 
 static unique_ptr<FunctionData> LanceCreateScalarIndexBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvUpdateBind(context, input, return_types, names,
                            LanceKvTarget::INDICES, 3);
 }
 static unique_ptr<FunctionData>
 LanceIndicesBind(ClientContext &context, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
+                 vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceKvListBind(context, input, return_types, names,
                          LanceKvTarget::INDICES, 1);
 }
@@ -451,7 +453,7 @@ struct LanceMaintenanceBindData final : public FunctionData {
 static unique_ptr<FunctionData>
 LanceCompactFilesBind(ClientContext &context, TableFunctionBindInput &input,
                       vector<LogicalType> &return_types,
-                      vector<string> &names) {
+                      vector<Identifier> &names) {
   if (input.inputs.size() != 1) {
     throw BinderException("lance_compact_files requires 1 argument");
   }
@@ -465,7 +467,7 @@ LanceCompactFilesBind(ClientContext &context, TableFunctionBindInput &input,
 
 static unique_ptr<FunctionData> LanceCleanupOldVersionsBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   if (input.inputs.size() != 3) {
     throw BinderException("lance_cleanup_old_versions requires 3 arguments");
   }

@@ -17,8 +17,7 @@ LanceResolveResult DefaultCatalogResolver::TryResolve(ClientContext &context,
                                                       const string &input) {
   try {
     auto qname = QualifiedName::Parse(input);
-    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
-                                    qname.catalog, qname.schema, qname.name);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname);
     auto &table_entry = entry.Cast<TableCatalogEntry>();
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
     if (lance_entry) {

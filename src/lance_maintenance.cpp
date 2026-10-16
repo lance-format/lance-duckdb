@@ -1,3 +1,4 @@
+#include "lance_parser.hpp"
 #include "duckdb.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -126,8 +127,9 @@ LanceMaintenanceInitGlobal(ClientContext &, TableFunctionInitInput &) {
 
 static unique_ptr<FunctionData>
 LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
-                     vector<LogicalType> &return_types, vector<string> &names,
-                     LanceMaintenanceOp op, idx_t expected_inputs) {
+                     vector<LogicalType> &return_types,
+                     vector<Identifier> &names, LanceMaintenanceOp op,
+                     idx_t expected_inputs) {
   if (input.inputs.size() != expected_inputs) {
     throw BinderException("invalid argument count");
   }
@@ -171,14 +173,14 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
 
 static unique_ptr<FunctionData>
 LanceCompactBind(ClientContext &context, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
+                 vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::COMPACT, 2);
 }
 
 static unique_ptr<FunctionData>
 LanceCleanupBind(ClientContext &context, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
+                 vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::CLEANUP, 2);
 }
@@ -186,7 +188,7 @@ LanceCleanupBind(ClientContext &context, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceOptimizeIndexBind(ClientContext &context, TableFunctionBindInput &input,
                        vector<LogicalType> &return_types,
-                       vector<string> &names) {
+                       vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::OPTIMIZE_INDEX, 3);
 }
@@ -346,7 +348,7 @@ struct LanceAutoCleanupShowGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<FunctionData>
 LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   if (input.inputs.size() != 5) {
     throw BinderException(
         "__lance_set_auto_cleanup requires (dataset, interval, older_than, "
@@ -409,7 +411,7 @@ LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceShowAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                          vector<LogicalType> &return_types,
-                         vector<string> &names) {
+                         vector<Identifier> &names) {
   if (input.inputs.size() != 1) {
     throw BinderException("__lance_show_auto_cleanup requires 1 argument");
   }
@@ -1320,13 +1322,10 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     target = parse_data->dataset_uri;
   } else {
     auto qname = QualifiedName::Parse(parse_data->target_sql);
-    if (qname.catalog.empty()) {
-      qname.catalog = DatabaseManager::GetDefaultDatabase(context);
-    }
-    if (qname.schema.empty()) {
-      qname.schema = DEFAULT_SCHEMA;
-    }
-    target = qname.catalog + "." + qname.schema + "." + qname.name;
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname)
+                      .Cast<TableCatalogEntry>();
+    qname = entry.schema.GetQualifiedName(entry.name);
+    target = qname.ToString();
   }
 
   ParserExtensionPlanResult result;
@@ -1385,7 +1384,10 @@ void RegisterLanceMaintenance(ExtensionLoader &loader) {
 
 void RegisterLanceMaintenanceParser(DBConfig &config) {
   ParserExtension extension;
-  extension.parse_function = LanceMaintenanceParse;
+  extension.parse_function = [](ParserExtensionInfo *info,
+                                const vector<SimpleToken> &tokens) {
+    return ParseLanceStatement(info, tokens, LanceMaintenanceParse);
+  };
   extension.plan_function = LanceMaintenancePlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
   ParserExtension::Register(config, std::move(extension));

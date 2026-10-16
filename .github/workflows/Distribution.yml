@@ -1,10 +1,20 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches:
+      - main
     tags:
       - "*"
   pull_request:
     paths:
+      - "src/**"
+      - "rust/**"
+      - "test/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "duckdb"
+      - "extension-ci-tools"
+      - ".gitmodules"
       - "CMakeLists.txt"
       - "Makefile"
       - "extension_config.cmake"
@@ -19,10 +29,9 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v2.0-cyanoptera
       extension_name: lance
       extra_toolchains: "rust"
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;osx_amd64"

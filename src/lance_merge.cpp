@@ -1,3 +1,4 @@
+#include "duckdb/parser/query_node/merge_query_node.hpp"
 #include "duckdb.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -155,7 +156,8 @@ static void AppendMergeReturningRows(ClientContext &context,
   for (idx_t c = 0; c < rows.ColumnCount(); c++) {
     out.data[c].Reference(rows.data[c]);
   }
-  out.data[rows.ColumnCount()].Reference(Value(merge_action));
+  out.data[rows.ColumnCount()].Reference(Value(merge_action),
+                                         count_t(rows.size()));
 
   collection.Append(out);
 }
@@ -569,7 +571,7 @@ LanceMergeLocalState::LanceMergeLocalState(ExecutionContext &context,
       vector<LogicalType> value_types;
       value_types.reserve(action->expressions.size());
       for (auto &expr : action->expressions) {
-        value_types.push_back(expr->return_type);
+        value_types.push_back(expr->GetReturnType());
       }
       action_state.value_chunk = make_uniq<DataChunk>();
       action_state.value_chunk->Initialize(context.client, value_types);
@@ -793,7 +795,7 @@ void PhysicalLanceMergeInto::HandleMergeErrorRows(
     const LanceMergeAction &action, LanceMergeActionLocalState &action_state,
     MergeActionCondition condition) const {
   string merge_condition;
-  merge_condition += MergeIntoStatement::ActionConditionToString(condition);
+  merge_condition += MergeQueryNode::ActionConditionToString(condition);
   if (action.condition) {
     merge_condition += " AND " + action.condition->ToString();
   }
@@ -1043,8 +1045,10 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         action->update_columns = std::move(bound_action->columns);
         action->update_column_names.reserve(action->update_columns.size());
         for (auto &col_idx : action->update_columns) {
-          action->update_column_names.push_back(
-              op.table.GetColumns().GetColumn(col_idx).Name());
+          action->update_column_names.push_back(op.table.GetColumns()
+                                                    .GetColumn(col_idx)
+                                                    .Name()
+                                                    .GetIdentifierName());
         }
         break;
       }
@@ -1101,7 +1105,7 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
   table_column_names.reserve(op.table.GetColumns().PhysicalColumnCount());
   table_column_types.reserve(op.table.GetColumns().PhysicalColumnCount());
   for (auto &col : op.table.GetColumns().Physical()) {
-    table_column_names.push_back(col.Name());
+    table_column_names.push_back(col.Name().GetIdentifierName());
     table_column_types.push_back(col.Type());
   }
 

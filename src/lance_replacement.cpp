@@ -23,8 +23,8 @@ LanceReplacementScan(ClientContext &, ReplacementScanInput &input,
   auto table_function = make_uniq<TableFunctionRef>();
   auto function_expr = make_uniq<FunctionExpression>(
       "__lance_scan", vector<unique_ptr<ParsedExpression>>());
-  function_expr->children.push_back(
-      make_uniq<ConstantExpression>(Value(table_name)));
+  function_expr->GetArgumentsMutable().emplace_back(
+      ConstantExpression::String(table_name));
   table_function->function = std::move(function_expr);
   return std::move(table_function);
 }

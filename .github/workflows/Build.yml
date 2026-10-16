@@ -101,7 +101,12 @@ jobs:
 
       - name: Run tests
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
 
   test_s3:
     name: Test S3 (MinIO)
@@ -154,7 +159,12 @@ jobs:
         env:
           LANCE_TEST_S3: "1"
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
 
       - name: Cleanup MinIO
         if: always()
