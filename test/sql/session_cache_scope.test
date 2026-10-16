@@ -1,0 +1,30 @@
+# name: test/sql/session_cache_scope.test
+# description: Lance session cache is shared per database while dataset cache remains connection-local
+# group: [sql]
+
+require lance
+
+# DuckDB iterates ClientContextState entries from an unordered_map, so the
+# relative order of the "Lance Session Cache" and "Lance Dataset Cache" lines
+# depends on STL hash layout (MSVC prints Dataset first, libstdc++/libc++
+# prints Session first). Match either ordering.
+
+query II con1
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/data/test_data.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*(Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=false[\s\S]*Lance Dataset Cache: entries=1 hits=0 misses=1|Lance Dataset Cache: entries=1 hits=0 misses=1[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=false)[\s\S]*
+
+query II con2
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/data/test_data.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*(Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=true[\s\S]*Lance Dataset Cache: entries=1 hits=0 misses=1|Lance Dataset Cache: entries=1 hits=0 misses=1[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=true)[\s\S]*
+
+query II con1
+EXPLAIN ANALYZE COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/session_cache_scope_write.lance' (FORMAT lance, mode 'overwrite');
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=false[\s\S]*
+
+query II con2
+EXPLAIN ANALYZE COPY (SELECT 2::BIGINT AS id) TO 'test/.tmp/session_cache_scope_write.lance' (FORMAT lance, mode 'append');
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Session Cache: scope=database_shared[\s\S]*object_cache_hit=true[\s\S]*

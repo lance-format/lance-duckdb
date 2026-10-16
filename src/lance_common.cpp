@@ -1,12 +1,16 @@
 #include "lance_common.hpp"
 
 #include "lance_ffi.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
@@ -46,6 +50,69 @@ bool IsComputedSearchColumn(const string &name) {
   return name == "_distance" || name == "_score" || name == "_hybrid_score";
 }
 
+static void BuildStringPointerArray(const vector<string> &values,
+                                    vector<const char *> &out_ptrs) {
+  out_ptrs.clear();
+  out_ptrs.reserve(values.size());
+  for (auto &value : values) {
+    out_ptrs.push_back(value.c_str());
+  }
+}
+
+void FillLanceNamespaceQueryConfig(
+    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
+    bool prefilter, const string &filter, const vector<string> &columns,
+    vector<const char *> &option_key_ptrs,
+    vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
+    string &bearer_token, string &api_key,
+    LanceNamespaceQueryConfig &out_config) {
+  static constexpr uint8_t NAMESPACE_KIND_DIRECTORY = 0;
+  static constexpr uint8_t NAMESPACE_KIND_REST = 1;
+
+  out_config = {};
+  out_config.table_id = cfg.table_id.c_str();
+  out_config.k = k;
+  out_config.prefilter = prefilter ? 1 : 0;
+  out_config.filter = filter.empty() ? nullptr : filter.c_str();
+
+  BuildStringPointerArray(columns, column_ptrs);
+  out_config.columns = column_ptrs.empty() ? nullptr : column_ptrs.data();
+  out_config.columns_len = column_ptrs.size();
+
+  if (cfg.IsDirectory()) {
+    out_config.namespace_kind = NAMESPACE_KIND_DIRECTORY;
+    out_config.root = cfg.root.c_str();
+    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
+                                    option_key_ptrs, option_value_ptrs);
+    out_config.option_keys =
+        option_key_ptrs.empty() ? nullptr : option_key_ptrs.data();
+    out_config.option_values =
+        option_value_ptrs.empty() ? nullptr : option_value_ptrs.data();
+    out_config.options_len = option_key_ptrs.size();
+    return;
+  }
+
+  out_config.namespace_kind = NAMESPACE_KIND_REST;
+  out_config.endpoint = cfg.endpoint.c_str();
+  out_config.delimiter =
+      cfg.delimiter.empty() ? nullptr : cfg.delimiter.c_str();
+  out_config.headers_tsv =
+      cfg.headers_tsv.empty() ? nullptr : cfg.headers_tsv.c_str();
+
+  unordered_map<string, Value> overrides;
+  if (!cfg.bearer_token_override.empty()) {
+    overrides["bearer_token"] = Value(cfg.bearer_token_override);
+  }
+  if (!cfg.api_key_override.empty()) {
+    overrides["api_key"] = Value(cfg.api_key_override);
+  }
+  ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
+                            api_key);
+  out_config.bearer_token =
+      bearer_token.empty() ? nullptr : bearer_token.c_str();
+  out_config.api_key = api_key.empty() ? nullptr : api_key.c_str();
+}
+
 string LanceNormalizeS3Scheme(const string &path) {
   if (StringUtil::StartsWith(path, "s3a://")) {
     return "s3://" + path.substr(6);
@@ -54,6 +121,26 @@ string LanceNormalizeS3Scheme(const string &path) {
     return "s3://" + path.substr(6);
   }
   return path;
+}
+
+string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg) {
+  if (!cfg.display_uri.empty()) {
+    return LanceNormalizeS3Scheme(cfg.display_uri);
+  }
+
+  auto child = cfg.table_id;
+  if (!StringUtil::EndsWith(child, ".lance")) {
+    child += ".lance";
+  }
+  string uri;
+  if (cfg.root.empty()) {
+    uri = std::move(child);
+  } else if (cfg.root.back() == '/' || cfg.root.back() == '\\') {
+    uri = cfg.root + child;
+  } else {
+    uri = cfg.root + "/" + child;
+  }
+  return LanceNormalizeS3Scheme(uri);
 }
 
 static string SecretValueToString(const Value &value) {
@@ -412,8 +499,8 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &table_id, const string &bearer_token,
                             const string &api_key, const string &delimiter,
                             const string &headers_tsv, string &out_table_uri) {
-  (void)context;
   out_table_uri.clear();
+  auto *session = LanceGetSessionHandle(context);
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
@@ -421,9 +508,9 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *uri_ptr = nullptr;
-  auto *dataset = lance_open_dataset_in_namespace(
+  auto *dataset = lance_open_dataset_in_namespace_with_session(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr, &uri_ptr);
+      delimiter_ptr, headers_ptr, session, &uri_ptr);
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -437,18 +524,19 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
+  auto *session = LanceGetSessionHandle(context);
 
   if (option_keys.empty()) {
-    return lance_open_dataset(open_path.c_str());
+    return lance_open_dataset_with_session(open_path.c_str(), session);
   }
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
-  return lance_open_dataset_with_storage_options(
-      open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
-      option_keys.size());
+  return lance_open_dataset_with_storage_options_and_session(
+      open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
+      session);
 }
 
 static unordered_map<string, Value>
@@ -464,6 +552,36 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
   return options;
 }
 
+LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
+                                           const string &input) {
+  // Fast-path bail-out: obvious filesystem / URL literals can never match a
+  // qualified catalog identifier.  Avoids parsing attempts and potential
+  // secondary lookups that would just end up throwing ParserException.
+  if (input.empty() || input.find('/') != string::npos ||
+      input.find('\\') != string::npos || input.find("://") != string::npos) {
+    return nullptr;
+  }
+
+  QualifiedName qname;
+  try {
+    qname = QualifiedName::Parse(input);
+  } catch (ParserException &) {
+    return nullptr;
+  }
+
+  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
+  auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema,
+                                 lookup_info, OnEntryNotFound::RETURN_NULL);
+  if (!entry) {
+    return nullptr;
+  }
+  auto *table_entry = dynamic_cast<TableCatalogEntry *>(entry.get());
+  if (!table_entry) {
+    return nullptr;
+  }
+  return dynamic_cast<LanceTableEntry *>(table_entry);
+}
+
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri) {
@@ -473,6 +591,29 @@ void *LanceOpenDatasetForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    vector<const char *> key_ptrs;
+    vector<const char *> value_ptrs;
+    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
+                                    key_ptrs, value_ptrs);
+
+    const char *uri_ptr = nullptr;
+    auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
+        cfg.root.c_str(), cfg.table_id.c_str(),
+        key_ptrs.empty() ? nullptr : key_ptrs.data(),
+        value_ptrs.empty() ? nullptr : value_ptrs.data(),
+        cfg.option_keys.size(), LanceGetSessionHandle(context), &uri_ptr);
+    if (uri_ptr) {
+      out_display_uri = uri_ptr;
+      lance_free_string(uri_ptr);
+    } else if (!cfg.display_uri.empty()) {
+      out_display_uri = cfg.display_uri;
+    } else {
+      out_display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
+    }
+    return dataset;
+  }
+
   unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
       cfg.bearer_token_override, cfg.api_key_override);
   string bearer_token;
@@ -506,6 +647,14 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
   }
 
   auto &cfg = table.NamespaceConfig();
+  if (cfg.IsDirectory()) {
+    out_display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
+    out_open_path = out_display_uri;
+    out_option_keys = cfg.option_keys;
+    out_option_values = cfg.option_values;
+    return;
+  }
+
   unordered_map<string, Value> overrides = BuildNamespaceAuthOverrideOptions(
       cfg.bearer_token_override, cfg.api_key_override);
   string bearer_token;
@@ -540,8 +689,9 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
 }
 
 int64_t LanceTruncateDatasetWithStorageOptions(
-    const string &open_path, const vector<string> &option_keys,
-    const vector<string> &option_values, const string &display_uri) {
+    ClientContext &context, const string &open_path,
+    const vector<string> &option_keys, const vector<string> &option_values,
+    const string &display_uri) {
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
@@ -592,7 +742,8 @@ int64_t LanceTruncateDatasetWithStorageOptions(
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, &schema_root.arrow_schema);
+      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, LanceGetSessionHandle(context),
+      &schema_root.arrow_schema);
   if (!writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());
@@ -614,7 +765,7 @@ int64_t LanceTruncateDataset(ClientContext &context,
   vector<string> option_values;
   ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
                              option_values);
-  return LanceTruncateDatasetWithStorageOptions(open_path, option_keys,
+  return LanceTruncateDatasetWithStorageOptions(context, open_path, option_keys,
                                                 option_values, dataset_uri);
 }
 

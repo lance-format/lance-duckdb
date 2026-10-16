@@ -1,0 +1,105 @@
+# name: test/sql/scan_limit_through_filter.test
+# description: LIMIT pushdown through LOGICAL_FILTER nodes (e.g. LIKE patterns)
+# group: [sql]
+
+require lance
+
+# --- LIKE creates a LOGICAL_FILTER that Lance can handle ---
+# Non-prefix LIKE patterns (e.g. '%li%') are kept as LOGICAL_FILTER by DuckDB
+# because LancePushdownExpression rejects them. Our optimizer should traverse
+# through the FILTER, verify Lance can handle the expression, and push LIMIT.
+
+# LIKE + LIMIT: limit should be pushed down
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE name LIKE '%li%' LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+# Correctness: LIKE '%li%' matches Alice and Charlie, LIMIT 1 returns 1 row
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name LIKE '%li%' LIMIT 1);
+----
+1
+
+# LIKE + LIMIT + OFFSET correctness
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name LIKE '%li%' LIMIT 1 OFFSET 1);
+----
+1
+
+# Verify all matching rows without LIMIT
+query I
+SELECT count(*) FROM 'test/data/test_data.lance' WHERE name LIKE '%li%';
+----
+2
+
+# ILIKE + LIMIT: case-insensitive LIKE should also push down
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE '%LI%' LIMIT 2;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE '%LI%' LIMIT 2);
+----
+2
+
+# --- Simple WHERE + LIMIT (no LOGICAL_FILTER, absorbed into TableFilterSet) ---
+# These test the existing LIMIT pushdown path still works
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE age > 30 LIMIT 2;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE age > 30 LIMIT 2);
+----
+2
+
+# WHERE + LIMIT with all rows filtered
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE age > 100 LIMIT 5);
+----
+0
+
+# --- Non-pushable FILTER: LIMIT must NOT be pushed ---
+# When a LOGICAL_FILTER contains expressions Lance cannot convert to filter IR
+# (e.g. LIKE with a non-constant pattern), the optimizer must keep the LIMIT
+# node in the plan so DuckDB applies it after its own filtering.
+
+# Non-constant LIKE pattern: Lance cannot build filter IR for col LIKE col
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE name LIKE name LIMIT 2;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+# Correctness: every name matches itself, all 5 rows pass, LIMIT 2 returns 2
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name LIKE name LIMIT 2);
+----
+2
+
+# Non-constant ILIKE pattern: same bail-out
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE name LIMIT 3;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE name LIMIT 3);
+----
+3
+
+# Mix: non-pushable FILTER + simple WHERE. Simple filter goes to TableFilterSet
+# but the non-pushable LIKE stays as LOGICAL_FILTER, blocking LIMIT pushdown.
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE age > 30 AND name LIKE name LIMIT 2;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+# age > 30 matches Charlie(35), David(40), Eve(45). All pass name LIKE name. LIMIT 2 → 2.
+query I
+SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE age > 30 AND name LIKE name LIMIT 2);
+----
+2

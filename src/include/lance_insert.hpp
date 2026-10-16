@@ -15,7 +15,7 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
 
 void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
                                 string dataset_uri, vector<string> option_keys,
-                                vector<string> option_values,
+                                vector<string> option_values, string cache_key,
                                 void *lance_transaction);
 
 } // namespace duckdb

@@ -44,7 +44,6 @@ pub enum ErrorCode {
     DatasetDropIndex = 30,
     DatasetDescribeIndices = 31,
     DatasetOptimizeIndices = 32,
-    IndexSchema = 33,
     IndexStreamCreate = 34,
 
     DatasetAddColumns = 35,
@@ -66,6 +65,9 @@ pub enum ErrorCode {
     NamespaceCreateEmptyTable = 50,
     NamespaceDropTable = 51,
     Exec = 52,
+    DatasetMerge = 53,
+    NamespaceQueryTable = 54,
+    DatasetCheckoutLatest = 55,
 }
 
 struct LastError {

@@ -1,0 +1,110 @@
+# name: test/sql/namespace_rest_maintenance.test
+# description: Maintenance SQL surface works against tables resolved through a REST Lance namespace (requires external service)
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
+# Use a dedicated namespace ID and table so we don't collide with
+# namespace_rest_attach.test, which asserts the exact contents of
+# `SHOW TABLES FROM ns.main`.
+test-env LANCE_NAMESPACE_MAINT_ID default_maint
+
+# Use a single-segment table name (no dots) because the lance-namespace REST
+# API treats '.' as its own namespace/table separator.  The maintenance parser
+# extension itself does accept dotted bare identifiers (e.g.
+# `OPTIMIZE cat.sch.tbl`); it just does not accept quoted identifiers.
+test-env LANCE_NAMESPACE_MAINT_TABLE maint_table
+
+require lance
+
+# ---------------------------------------------------------------------------
+# Setup expected by this test:
+#
+#   * REST namespace server reachable at $LANCE_NAMESPACE_ENDPOINT.
+#   * Namespace $LANCE_NAMESPACE_MAINT_ID exists and contains a writable
+#     Lance table named $LANCE_NAMESPACE_MAINT_TABLE.
+#
+# Tables resolved through this catalog have their dataset_uri set to the
+# *virtual* "<endpoint>/<table_id>" handle, which lance-io cannot open
+# directly.  The maintenance bind path used to forward that virtual URI to
+# LanceOpenDataset() and fail with an IO error -- this test guards the fix
+# that re-resolves the original input via LanceOpenDatasetForTable() so the
+# namespace REST API can produce the real cos:// / file:// location.
+# ---------------------------------------------------------------------------
+
+statement ok
+ATTACH '${LANCE_NAMESPACE_MAINT_ID}' AS maintenance_rest_ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+# Sanity check: we can read the table through the namespace.
+query I
+SELECT count(*) >= 0 AS ok FROM maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE}
+----
+true
+
+# ---------------------------------------------------------------------------
+# OPTIMIZE (compact) — exercises LanceMaintenanceFunc fallback path.
+# ---------------------------------------------------------------------------
+
+query TTT
+OPTIMIZE maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE};
+----
+compact	<REGEX>:.*	<REGEX>:\{.*\}
+
+# ---------------------------------------------------------------------------
+# VACUUM LANCE (cleanup) — exercises the same fallback path with options.
+# ---------------------------------------------------------------------------
+
+query TTT
+VACUUM LANCE maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE} WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true
+);
+----
+cleanup	<REGEX>:.*	<REGEX>:\{.*\}
+
+# ---------------------------------------------------------------------------
+# SHOW MAINTENANCE — exercises LanceShowAutoCleanupInitGlobal fallback path.
+# Reset to a known state first so the row count is deterministic.
+# ---------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE} UNSET AUTO_CLEANUP;
+
+query TT
+SHOW MAINTENANCE ON maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE};
+----
+enabled	false
+
+# ---------------------------------------------------------------------------
+# ALTER TABLE ... SET/UNSET AUTO_CLEANUP — exercises LanceSetAutoCleanupFunc.
+# Round-trip set + unset so we leave the table in a clean state.
+# ---------------------------------------------------------------------------
+
+query TTT
+ALTER TABLE maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE}
+SET AUTO_CLEANUP WITH (
+  interval = 1,
+  older_than = '1s',
+  retain_versions = 2
+);
+----
+set_auto_cleanup	<REGEX>:.*	<REGEX>:\{.*"enabled":true.*"interval":1.*"older_than":"1s".*"retain_versions":2.*\}
+
+query TT
+SHOW MAINTENANCE ON maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE};
+----
+enabled	true
+interval	1
+older_than	1s
+retain_versions	2
+
+query TTT
+ALTER TABLE maintenance_rest_ns.main.${LANCE_NAMESPACE_MAINT_TABLE} UNSET AUTO_CLEANUP;
+----
+unset_auto_cleanup	<REGEX>:.*	{"enabled":false}
+
+statement ok
+DETACH maintenance_rest_ns;

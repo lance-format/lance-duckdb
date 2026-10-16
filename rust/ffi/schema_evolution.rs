@@ -1,23 +1,27 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
+use std::ptr;
 use std::sync::Arc;
-
-use arrow::compute;
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
-use chrono::Duration;
-use lance::dataset::optimize::{compact_files, CompactionOptions};
-use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
-use lance::Dataset;
-use lance_index::scalar::ScalarIndexParams;
-use lance_index::DatasetIndexExt;
-use lance_index::IndexType;
-use snafu::location;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
+use arrow::compute;
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Schema as ArrowSchema};
+use chrono::{Duration, Utc};
+use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::optimize::{compact_files, CompactionOptions};
+use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
+use lance::index::DatasetIndexExt;
+use lance::Dataset;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::IndexType;
+use serde::{Deserialize, Serialize};
 
-use super::util::{cstr_to_str, optional_cstr_array, to_c_string, FfiError, FfiResult};
+use super::util::{
+    canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
+    FfiResult,
+};
 
 fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
     dataset
@@ -25,6 +29,148 @@ fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
         .get("lance.add_columns.batch_size")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| *v > 0)
+}
+
+/// Treat a zero size/count option as unset so Lance applies its own default.
+///
+/// `docs/sql.md` documents `OPTIMIZE ... WITH (max_bytes_per_file = 0,
+/// num_threads = 0, batch_size = 0)`, i.e. zero reads as "use the default".
+/// Forwarding `Some(0)` instead is not merely ignored: `num_threads` becomes
+/// `buffer_unordered(0)`, which never polls a task, so compaction of a dataset
+/// with two or more compactable fragments never completes.
+fn zero_as_unset(value: Option<usize>) -> Option<usize> {
+    value.filter(|v| *v > 0)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CompactFilesOptionsInput {
+    target_rows_per_fragment: Option<usize>,
+    max_rows_per_group: Option<usize>,
+    max_bytes_per_file: Option<usize>,
+    materialize_deletions: Option<bool>,
+    materialize_deletions_threshold: Option<f32>,
+    num_threads: Option<usize>,
+    batch_size: Option<usize>,
+    defer_index_remap: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CleanupOldVersionsOptionsInput {
+    older_than_seconds: i64,
+    delete_unverified: bool,
+    error_if_tagged_old_versions: bool,
+    retain_n_versions: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupOldVersionsMetricsOutput {
+    bytes_removed: u64,
+    old_versions: u64,
+}
+
+impl Default for CleanupOldVersionsOptionsInput {
+    fn default() -> Self {
+        Self {
+            older_than_seconds: 0,
+            delete_unverified: false,
+            error_if_tagged_old_versions: true,
+            retain_n_versions: None,
+        }
+    }
+}
+
+fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<CompactionOptions> {
+    if options_json.is_null() {
+        return Ok(CompactionOptions::default());
+    }
+    let text = unsafe { CStr::from_ptr(options_json) }
+        .to_str()
+        .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("options_json utf8: {err}")))?;
+    if text.trim().is_empty() {
+        return Ok(CompactionOptions::default());
+    }
+
+    let input: CompactFilesOptionsInput = serde_json::from_str(text).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("compact_files options_json parse: {err}"),
+        )
+    })?;
+
+    let mut options = CompactionOptions::default();
+    if let Some(v) = zero_as_unset(input.target_rows_per_fragment) {
+        options.target_rows_per_fragment = v;
+    }
+    if let Some(v) = zero_as_unset(input.max_rows_per_group) {
+        options.max_rows_per_group = v;
+    }
+    if let Some(v) = zero_as_unset(input.max_bytes_per_file) {
+        options.max_bytes_per_file = Some(v);
+    }
+    if let Some(v) = input.materialize_deletions {
+        options.materialize_deletions = v;
+    }
+    if let Some(v) = input.materialize_deletions_threshold {
+        options.materialize_deletions_threshold = v;
+    }
+    if let Some(v) = zero_as_unset(input.num_threads) {
+        options.num_threads = Some(v);
+    }
+    if let Some(v) = zero_as_unset(input.batch_size) {
+        options.batch_size = Some(v);
+    }
+    if let Some(v) = input.defer_index_remap {
+        options.defer_index_remap = v;
+    }
+    options.validate().map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("compact_files options validate: {err}"),
+        )
+    })?;
+    Ok(options)
+}
+
+fn parse_cleanup_options_json(
+    options_json: *const c_char,
+) -> FfiResult<CleanupOldVersionsOptionsInput> {
+    if options_json.is_null() {
+        return Ok(CleanupOldVersionsOptionsInput::default());
+    }
+    let text = unsafe { CStr::from_ptr(options_json) }
+        .to_str()
+        .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("options_json utf8: {err}")))?;
+    if text.trim().is_empty() {
+        return Ok(CleanupOldVersionsOptionsInput::default());
+    }
+    serde_json::from_str(text).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("cleanup_old_versions options_json parse: {err}"),
+        )
+    })
+}
+
+fn write_metrics_json<T: Serialize>(
+    value: &T,
+    out_metrics_json: *mut *const c_char,
+    context: &'static str,
+    code: ErrorCode,
+) -> FfiResult<()> {
+    if out_metrics_json.is_null() {
+        return Ok(());
+    }
+    let payload = serde_json::to_string(value)
+        .map_err(|err| FfiError::new(code, format!("{context} serialize: {err}")))?;
+    unsafe {
+        ptr::write_unaligned(
+            out_metrics_json,
+            to_c_string(payload).into_raw() as *const c_char,
+        );
+    }
+    Ok(())
 }
 
 fn parse_arrow_schema(schema: *const c_void, what: &'static str) -> FfiResult<Arc<ArrowSchema>> {
@@ -178,33 +324,23 @@ fn dataset_add_columns_inner(
                 let arr = expr
                     .evaluate(batch)
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] evaluate: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] evaluate: {err}"))
                     })?
                     .into_array(num_rows)
                     .map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] into_array: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] into_array: {err}"))
                     })?;
                 let arr = if arr.data_type() != field.data_type() {
                     compute::cast(&arr, field.data_type()).map_err(|err| {
-                        lance::Error::invalid_input(
-                            format!("expression[{idx}] cast: {err}"),
-                            location!(),
-                        )
+                        lance::Error::invalid_input(format!("expression[{idx}] cast: {err}"))
                     })?
                 } else {
                     arr
                 };
                 arrays.push(arr);
             }
-            RecordBatch::try_new(schema_ref.clone(), arrays).map_err(|err| {
-                lance::Error::invalid_input(format!("output batch: {err}"), location!())
-            })
+            RecordBatch::try_new(schema_ref.clone(), arrays)
+                .map_err(|err| lance::Error::invalid_input(format!("output batch: {err}")))
         };
 
         let transforms = NewColumnTransform::BatchUDF(BatchUDF {
@@ -601,7 +737,7 @@ fn dataset_update_field_metadata_inner(
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i32 {
-    match dataset_compact_files_inner(dataset) {
+    match dataset_compact_files_with_options_inner(dataset, ptr::null(), ptr::null_mut()) {
         Ok(()) => {
             clear_last_error();
             0
@@ -613,12 +749,45 @@ pub unsafe extern "C" fn lance_dataset_compact_files(dataset: *mut c_void) -> i3
     }
 }
 
-fn dataset_compact_files_inner(dataset: *mut c_void) -> FfiResult<()> {
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_compact_files_with_options(
+    dataset: *mut c_void,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+) -> i32 {
+    if !out_metrics_json.is_null() {
+        unsafe {
+            ptr::write_unaligned(out_metrics_json, ptr::null());
+        }
+    }
+    match dataset_compact_files_with_options_inner(dataset, options_json, out_metrics_json) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_compact_files_with_options_inner(
+    dataset: *mut c_void,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+) -> FfiResult<()> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let mut ds = (*handle.dataset).clone();
+    let options = parse_compaction_options_json(options_json)?;
 
-    match runtime::block_on(compact_files(&mut ds, CompactionOptions::default(), None)) {
-        Ok(Ok(_)) => Ok(()),
+    match runtime::block_on(compact_files(&mut ds, options, None)) {
+        Ok(Ok(metrics)) => write_metrics_json(
+            &metrics,
+            out_metrics_json,
+            "compact_files metrics_json",
+            ErrorCode::DatasetCompactFiles,
+        ),
         Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetCompactFiles,
             format!("dataset compact_files: {err}"),
@@ -633,7 +802,12 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     older_than_seconds: i64,
     delete_unverified: u8,
 ) -> i32 {
-    match dataset_cleanup_old_versions_inner(dataset, older_than_seconds, delete_unverified != 0) {
+    let options = CleanupOldVersionsOptionsInput {
+        older_than_seconds,
+        delete_unverified: delete_unverified != 0,
+        ..Default::default()
+    };
+    match dataset_cleanup_old_versions_with_options_struct(dataset, options, ptr::null_mut()) {
         Ok(()) => {
             clear_last_error();
             0
@@ -645,23 +819,89 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     }
 }
 
-fn dataset_cleanup_old_versions_inner(
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
-    older_than_seconds: i64,
-    delete_unverified: bool,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+) -> i32 {
+    if !out_metrics_json.is_null() {
+        unsafe {
+            ptr::write_unaligned(out_metrics_json, ptr::null());
+        }
+    }
+    match parse_cleanup_options_json(options_json).and_then(|options| {
+        dataset_cleanup_old_versions_with_options_struct(dataset, options, out_metrics_json)
+    }) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn dataset_cleanup_old_versions_with_options_struct(
+    dataset: *mut c_void,
+    options: CleanupOldVersionsOptionsInput,
+    out_metrics_json: *mut *const c_char,
 ) -> FfiResult<()> {
-    if older_than_seconds < 0 {
+    if options.older_than_seconds < 0 {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
             "older_than_seconds must be >= 0",
         ));
     }
+    if options.retain_n_versions == Some(0) {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "retain_n_versions must be > 0",
+        ));
+    }
+
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
+    let mut builder = CleanupPolicyBuilder::default()
+        .before_timestamp(Utc::now() - Duration::seconds(options.older_than_seconds))
+        .delete_unverified(options.delete_unverified)
+        .error_if_tagged_old_versions(options.error_if_tagged_old_versions);
 
-    let duration = Duration::seconds(older_than_seconds);
-    match runtime::block_on(ds.cleanup_old_versions(duration, Some(delete_unverified), None)) {
-        Ok(Ok(_)) => Ok(()),
+    if let Some(retain_n_versions) = options.retain_n_versions {
+        let retain_n_versions = usize::try_from(retain_n_versions).map_err(|err| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("retain_n_versions too large: {err}"),
+            )
+        })?;
+        builder = match runtime::block_on(builder.retain_n_versions(&ds, retain_n_versions)) {
+            Ok(Ok(updated)) => updated,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetCleanupOldVersions,
+                    format!("cleanup_old_versions retain_n_versions: {err}"),
+                ))
+            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        };
+    }
+
+    let policy = builder.build();
+    match runtime::block_on(ds.cleanup_with_policy(policy)) {
+        Ok(Ok(stats)) => {
+            let metrics = CleanupOldVersionsMetricsOutput {
+                bytes_removed: stats.bytes_removed,
+                old_versions: stats.old_versions,
+            };
+            write_metrics_json(
+                &metrics,
+                out_metrics_json,
+                "cleanup_old_versions metrics_json",
+                ErrorCode::DatasetCleanupOldVersions,
+            )
+        }
         Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetCleanupOldVersions,
             format!("dataset cleanup_old_versions: {err}"),
@@ -826,7 +1066,7 @@ fn dataset_list_indices_inner(dataset: *mut c_void) -> FfiResult<String> {
         let cols = idx
             .fields
             .iter()
-            .filter_map(|id| schema.field_by_id(*id).map(|f| f.name.as_str()))
+            .filter_map(|id| schema.field_path(*id).ok())
             .collect::<Vec<_>>()
             .join(",");
         out.push_str(&cols);
@@ -865,7 +1105,8 @@ fn dataset_create_scalar_index_inner(
     let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
 
     let mut ds = (*handle.dataset).clone();
-    let cols = [column];
+    let canonical_column = canonicalize_lance_field_path(ds.schema(), column, "index column")?;
+    let cols = [canonical_column.as_str()];
     match runtime::block_on(ds.create_index(
         &cols,
         IndexType::Scalar,
@@ -879,5 +1120,44 @@ fn dataset_create_scalar_index_inner(
             format!("dataset create_index(scalar): {err}"),
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn compaction_options_from_json(json: &str) -> CompactionOptions {
+        let owned = CString::new(json).expect("json holds no interior nul");
+        parse_compaction_options_json(owned.as_ptr()).expect("options parse")
+    }
+
+    #[test]
+    fn zero_sizes_and_counts_fall_back_to_lance_defaults() {
+        // docs/sql.md spells all three of these as 0 in the OPTIMIZE example.
+        let options = compaction_options_from_json(
+            r#"{"max_bytes_per_file": 0, "num_threads": 0, "batch_size": 0}"#,
+        );
+        let defaults = CompactionOptions::default();
+
+        // Some(0) here reaches buffer_unordered(0), which never polls a task.
+        assert_eq!(options.num_threads, defaults.num_threads);
+        assert_eq!(options.batch_size, defaults.batch_size);
+        assert_eq!(options.max_bytes_per_file, defaults.max_bytes_per_file);
+    }
+
+    #[test]
+    fn positive_sizes_and_counts_are_forwarded() {
+        let options = compaction_options_from_json(
+            r#"{"target_rows_per_fragment": 1024, "max_rows_per_group": 128,
+                "max_bytes_per_file": 4096, "num_threads": 4, "batch_size": 512}"#,
+        );
+
+        assert_eq!(options.target_rows_per_fragment, 1024);
+        assert_eq!(options.max_rows_per_group, 128);
+        assert_eq!(options.max_bytes_per_file, Some(4096));
+        assert_eq!(options.num_threads, Some(4));
+        assert_eq!(options.batch_size, Some(512));
     }
 }

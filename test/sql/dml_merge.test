@@ -1,0 +1,188 @@
+# name: test/sql/dml_merge.test
+# description: MERGE INTO supports matched/not-matched actions on Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+ATTACH 'test/.tmp' AS merge_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_upsert AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+UNION ALL
+SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+query I
+MERGE INTO merge_ns.main.lance_merge_upsert AS t
+USING (
+  SELECT 2::BIGINT AS id, 'bb'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
+----
+2
+
+query IT
+SELECT id, s FROM merge_ns.main.lance_merge_upsert ORDER BY id;
+----
+1	a
+2	bb
+3	c
+
+query I
+MERGE INTO merge_ns.main.lance_merge_upsert AS t
+USING (SELECT 1::BIGINT AS id) AS src
+ON t.id = src.id
+WHEN MATCHED THEN DELETE;
+----
+1
+
+query IT
+SELECT id, s FROM merge_ns.main.lance_merge_upsert ORDER BY id;
+----
+2	bb
+3	c
+
+query I
+MERGE INTO merge_ns.main.lance_merge_upsert AS t
+USING (SELECT 999::BIGINT AS id, 'noop'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN NOT MATCHED THEN DO NOTHING;
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_by_source_update AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+UNION ALL
+SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+UNION ALL
+SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s;
+
+query I
+MERGE INTO merge_ns.main.lance_merge_by_source_update AS t
+USING (SELECT 1::BIGINT AS id, 'aa'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED BY SOURCE THEN UPDATE SET s = 'orphan';
+----
+3
+
+query IT
+SELECT id, s FROM merge_ns.main.lance_merge_by_source_update ORDER BY id;
+----
+1	aa
+2	orphan
+3	orphan
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_by_source_delete AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+UNION ALL
+SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+UNION ALL
+SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s;
+
+query I
+MERGE INTO merge_ns.main.lance_merge_by_source_delete AS t
+USING (SELECT 2::BIGINT AS id) AS src
+ON t.id = src.id
+WHEN MATCHED THEN DO NOTHING
+WHEN NOT MATCHED BY SOURCE THEN DELETE;
+----
+2
+
+query IT
+SELECT id, s FROM merge_ns.main.lance_merge_by_source_delete ORDER BY id;
+----
+2	b
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_branch_order AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+UNION ALL
+SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s;
+
+query I
+MERGE INTO merge_ns.main.lance_merge_branch_order AS t
+USING (
+  SELECT 1::BIGINT AS id, 'x1'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'x2'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED AND t.id = 1 THEN DO NOTHING
+WHEN MATCHED THEN UPDATE SET s = src.s;
+----
+1
+
+query IT
+SELECT id, s FROM merge_ns.main.lance_merge_branch_order ORDER BY id;
+----
+1	a
+2	x2
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_error_case AS
+SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s;
+
+statement error
+MERGE INTO merge_ns.main.lance_merge_error_case AS t
+USING (SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN MATCHED THEN ERROR 'boom';
+----
+Constraint Error: Merge error condition WHEN MATCHED: boom
+
+query I
+MERGE INTO merge_ns.main.lance_merge_error_case AS t
+USING (
+  SELECT 1::BIGINT AS id, 'u1'::VARCHAR AS s
+  UNION ALL
+  SELECT 1::BIGINT AS id, 'u2'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s;
+----
+2
+
+query I
+SELECT count(*) FROM merge_ns.main.lance_merge_error_case;
+----
+1
+
+query I
+SELECT s IN ('u1', 'u2') FROM merge_ns.main.lance_merge_error_case WHERE id = 1;
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_duplicate_delete AS
+SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s;
+
+query I
+MERGE INTO merge_ns.main.lance_merge_duplicate_delete AS t
+USING (
+  SELECT 1::BIGINT AS id
+  UNION ALL
+  SELECT 1::BIGINT AS id
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN DELETE;
+----
+2
+
+query I
+SELECT count(*) FROM merge_ns.main.lance_merge_duplicate_delete;
+----
+0
+
+statement ok
+DETACH merge_ns;

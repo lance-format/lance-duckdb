@@ -1,0 +1,38 @@
+# name: test/sql/namespace_bad_table_resilience.test
+# description: SHOW TABLES does not crash when a namespace contains a bad table
+# group: [sql]
+
+require lance
+
+# Use __TEST_DIR__ so each test run gets a fresh directory.
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'hello'::VARCHAR AS msg)
+TO '__TEST_DIR__/nsroot_badtable/good_table.lance' (FORMAT lance, mode 'overwrite');
+
+# Create a bad table by writing a valid dataset then corrupting its manifest.
+statement ok
+COPY (SELECT 42::BIGINT AS x)
+TO '__TEST_DIR__/nsroot_badtable/bad_table.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 'corrupt'::VARCHAR AS garbage)
+TO '__TEST_DIR__/nsroot_badtable/bad_table.lance/_versions/1.manifest' (FORMAT csv, header false);
+
+statement ok
+ATTACH '__TEST_DIR__/nsroot_badtable' AS ns (TYPE LANCE);
+
+# SHOW TABLES should succeed and include the good table (bad table is
+# filtered out because its dataset cannot be opened).
+query I
+SELECT count(*) FROM (SHOW TABLES FROM ns.main) WHERE name = 'good_table'
+----
+1
+
+# Querying the good table must still work.
+query II
+SELECT * FROM ns.main.good_table
+----
+1	hello
+
+statement ok
+DETACH ns;

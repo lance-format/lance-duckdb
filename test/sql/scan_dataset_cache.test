@@ -1,0 +1,15 @@
+# name: test/sql/scan_dataset_cache.test
+# description: Dataset cache status is visible through DuckDB EXPLAIN output
+# group: [sql]
+
+require lance
+
+query II
+EXPLAIN (FORMAT JSON) SELECT name FROM 'test/data/test_data.lance' ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT name FROM 'test/data/test_data.lance' ORDER BY id LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*

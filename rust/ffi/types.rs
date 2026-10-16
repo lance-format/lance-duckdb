@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+use lance::session::Session;
 use lance::Dataset;
+use lance_core::cache::CacheBackend;
 
 use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
@@ -10,6 +12,12 @@ use crate::scanner::{LanceStream, LanceTakeStream};
 use super::projection;
 
 pub(crate) type SchemaHandle = Arc<Schema>;
+
+pub(crate) struct SessionHandle {
+    pub(crate) session: Arc<Session>,
+    // Lance does not expose clearing its index cache through Session.
+    pub(crate) index_cache: Arc<dyn CacheBackend>,
+}
 
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,

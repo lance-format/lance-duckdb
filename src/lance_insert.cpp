@@ -6,9 +6,12 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
+#include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
 #include <cstdint>
@@ -93,6 +96,7 @@ public:
       ArrowConverter::ToArrowSchema(&gstate.schema_root.arrow_schema,
                                     gstate.column_types, gstate.column_names,
                                     props);
+      LanceNormalizeArrowListFieldNames(&gstate.schema_root.arrow_schema);
 
       if (!gstate.table) {
         throw InternalException("Lance INSERT missing table reference");
@@ -112,6 +116,7 @@ public:
           value_ptrs.empty() ? nullptr : value_ptrs.data(),
           gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
           LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+          nullptr, LanceGetSessionHandle(context.client),
           &gstate.schema_root.arrow_schema);
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +
@@ -165,7 +170,8 @@ public:
 
     RegisterLancePendingAppend(
         context, table.catalog, std::move(gstate.open_path),
-        std::move(gstate.option_keys), std::move(gstate.option_values), txn);
+        std::move(gstate.option_keys), std::move(gstate.option_values),
+        LanceBuildDatasetCacheKeyForTable(context, table), txn);
     return SinkFinalizeType::READY;
   }
 
@@ -224,6 +230,24 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
+  }
+  // Plain INSERT does not bind a scan of the target, so the scan-bind
+  // freshness check never runs for it; validate here so a stale entry (e.g.
+  // a coerced-column list outdated by an external type evolution) fails
+  // closed instead of gating the write on stale state. Throws and replaces
+  // the entry on mismatch. This is defense-in-depth rather than the only
+  // guard for prepared INSERT: LanceDuckCatalog::GetCatalogVersion opts the
+  // catalog out of prepared-plan reuse, so every EXECUTE rebinds and reaches
+  // this check with a freshly resolved entry instead of a cached plan.
+  lance_table->VerifySchemaFreshness(context);
+  if (lance_table->HasCoercedColumns()) {
+    throw NotImplementedException(
+        "INSERT into Lance table '" + lance_table->name +
+        "' is not supported: column(s) [" +
+        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
+        "] have Arrow types DuckDB cannot represent natively, so the "
+        "catalog exposes a coerced type. Writing in the coerced type would "
+        "silently change the on-disk storage.");
   }
 
   vector<string> column_names;

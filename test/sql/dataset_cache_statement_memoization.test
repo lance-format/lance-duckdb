@@ -1,0 +1,64 @@
+# name: test/sql/dataset_cache_statement_memoization.test
+# description: All references to one table within a statement share one revalidated dataset generation
+# group: [sql]
+
+require lance
+
+# Cache-hit revalidation is memoized per cache key for the duration of one
+# statement. Without the memo, a self-join would revalidate once per table
+# reference, and an external commit landing between the two binds could pin
+# them to different dataset versions within the same statement. The
+# "revalidations" profiling counter makes the memo observable: it counts
+# actual version lookups, not memoized reuses.
+
+statement ok con1
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/cache_stmt_memo.lance' (FORMAT lance, mode 'overwrite');
+
+# Warm the cache: a miss opens the dataset fresh, and the freshly opened
+# dataset is already this statement's pinned generation - no revalidation.
+query II con1
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/.tmp/cache_stmt_memo.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Dataset Cache: entries=1 hits=0 misses=1 revalidations=0[\s\S]*
+
+# A single reference on a warmed cache revalidates exactly once.
+query II con1
+EXPLAIN ANALYZE SELECT count(*) FROM 'test/.tmp/cache_stmt_memo.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Dataset Cache: entries=1 hits=1 misses=0 revalidations=1[\s\S]*
+
+# A self-join binds two references to the same cache key but still
+# revalidates exactly once: the second reference reuses the generation the
+# first reference pinned for this statement (pre-memoization this reported
+# revalidations=2, and an external commit between the two binds could have
+# split the join across two dataset versions).
+query II con1
+EXPLAIN ANALYZE SELECT count(*)
+FROM 'test/.tmp/cache_stmt_memo.lance' a
+JOIN 'test/.tmp/cache_stmt_memo.lance' b ON a.id = b.id;
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Dataset Cache: entries=1 hits=2 misses=0 revalidations=1[\s\S]*
+
+# The memo is statement-scoped, not connection-scoped: the next statement
+# revalidates again and thereby observes external commits.
+statement ok con2
+COPY (SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s)
+TO 'test/.tmp/cache_stmt_memo.lance' (FORMAT lance, mode 'append');
+
+# The refreshed hit is reported as a miss (see the revalidation counters) but
+# still required exactly one revalidation for both join sides.
+query II con1
+EXPLAIN ANALYZE SELECT count(*)
+FROM 'test/.tmp/cache_stmt_memo.lance' a
+JOIN 'test/.tmp/cache_stmt_memo.lance' b ON a.id = b.id;
+----
+analyzed_plan	<REGEX>:[\s\S]*Lance Dataset Cache: entries=1 hits=1 misses=1 revalidations=1[\s\S]*
+
+query I con1
+SELECT count(*) FROM 'test/.tmp/cache_stmt_memo.lance';
+----
+3

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "lance_dataset_cache.hpp"
+
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -9,11 +11,14 @@
 
 namespace duckdb {
 class TableCatalogEntry;
+struct LanceNamespaceTableConfig;
 
 struct LanceScanBindData : public TableFunctionData {
   string file_path;
   bool explain_verbose = false;
+  shared_ptr<LanceDatasetCacheEntry> dataset_entry;
   void *dataset = nullptr;
+  bool dataset_cache_hit = false;
   ArrowSchemaWrapper schema_root;
   ArrowSchemaWrapper scan_schema_root;
   ArrowTableSchema arrow_table;
@@ -23,6 +28,7 @@ struct LanceScanBindData : public TableFunctionData {
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;
+  unique_ptr<LanceNamespaceTableConfig> namespace_query_config;
 
   bool sampling_pushed_down = false;
   double sample_percentage = 0.0;
@@ -33,6 +39,15 @@ struct LanceScanBindData : public TableFunctionData {
   bool limit_offset_pushed_down = false;
   optional_idx pushed_limit = optional_idx::Invalid();
   idx_t pushed_offset = 0;
+
+  bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
+
+  // The bind data pins a dataset handle checked out at bind time. Cached
+  // prepared statements would keep scanning that version forever, bypassing
+  // the cache revalidation that runs at bind; force a rebind per execution so
+  // prepared statements observe external commits like ad-hoc statements
+  // (same approach as DuckDB's multi-file scans).
+  bool SupportStatementCache() const override { return false; }
 
   ~LanceScanBindData() override;
 };

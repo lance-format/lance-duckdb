@@ -5,6 +5,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_resolver.hpp"
 
@@ -158,6 +159,7 @@ static void LanceKvUpdateFunc(ClientContext &context, TableFunctionInput &data,
     throw IOException("Failed to update Lance dataset: " +
                       bind_data.dataset_uri + LanceFormatErrorSuffix());
   }
+  LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(1));
@@ -454,7 +456,8 @@ LanceCompactFilesBind(ClientContext &context, TableFunctionBindInput &input,
     throw BinderException("lance_compact_files requires 1 argument");
   }
   auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::STRICT, "lance_metadata");
+      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
+      "lance_metadata");
   return_types = {LogicalType::BIGINT};
   names = {"Count"};
   return make_uniq<LanceMaintenanceBindData>(std::move(dataset_uri), 0, false);
@@ -467,7 +470,8 @@ static unique_ptr<FunctionData> LanceCleanupOldVersionsBind(
     throw BinderException("lance_cleanup_old_versions requires 3 arguments");
   }
   auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::STRICT, "lance_metadata");
+      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
+      "lance_metadata");
 
   int64_t older_than_seconds = 0;
   if (!input.inputs[1].IsNull()) {

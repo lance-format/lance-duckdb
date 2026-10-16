@@ -252,11 +252,7 @@ fn create_dataset_sample_stream_ir_inner(
     };
 
     let mut pct = sample_percentage / 100.0;
-    if pct < 0.0 {
-        pct = 0.0;
-    } else if pct > 1.0 {
-        pct = 1.0;
-    }
+    pct = pct.clamp(0.0, 1.0);
     let mut target = ((total_rows as f64) * pct).floor() as usize;
     if target > total_rows {
         target = total_rows;
@@ -331,6 +327,7 @@ pub unsafe extern "C" fn lance_explain_dataset_scan_ir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explain_dataset_scan_ir_inner(
     dataset: *mut c_void,
     columns: *const *const c_char,

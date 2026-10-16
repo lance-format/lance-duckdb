@@ -1,0 +1,19 @@
+# name: test/sql/search_dataset_cache.test
+# description: Search dataset cache status is visible through DuckDB EXPLAIN output
+# group: [sql]
+
+require lance
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM lance_fts('test/data/search_test_data.lance', 'text', 'puppy', k = 10);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT count(*)
+FROM lance_fts('test/data/search_test_data.lance', 'text', 'puppy', k = 10);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*

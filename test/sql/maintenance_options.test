@@ -1,0 +1,94 @@
+# name: test/sql/maintenance_options.test
+# description: Maintenance options parsing, metrics, and error semantics
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_options.lance' (FORMAT lance, mode 'overwrite');
+
+query TTT
+OPTIMIZE 'test/.tmp/maintenance_options.lance' WITH (
+  target_rows_per_fragment = 1024,
+  materialize_deletions = true,
+  materialize_deletions_threshold = 0.1,
+  num_threads = 1,
+  batch_size = 256,
+  defer_index_remap = false
+);
+----
+compact	test/.tmp/maintenance_options.lance	<REGEX>:\{.*"fragments_removed".*"files_added".*\}
+
+query TTT
+VACUUM LANCE 'test/.tmp/maintenance_options.lance' WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true,
+  retain_n_versions = 1
+);
+----
+cleanup	test/.tmp/maintenance_options.lance	<REGEX>:\{.*"bytes_removed".*"old_versions".*\}
+
+statement ok
+CREATE INDEX id_idx_opt
+ON 'test/.tmp/maintenance_options.lance' (id)
+USING BTREE;
+
+query TTT
+ALTER INDEX id_idx_opt
+ON 'test/.tmp/maintenance_options.lance'
+OPTIMIZE WITH (mode = 'append');
+----
+optimize_index	test/.tmp/maintenance_options.lance	<REGEX>:\{.*"index_name":"id_idx_opt".*"mode":"append".*\}
+
+query TTT
+ALTER INDEX id_idx_opt
+ON 'test/.tmp/maintenance_options.lance'
+OPTIMIZE WITH (mode = 'merge', num_indices_to_merge = 1);
+----
+optimize_index	test/.tmp/maintenance_options.lance	<REGEX>:\{.*"index_name":"id_idx_opt".*"mode":"merge".*"num_indices_to_merge":1.*\}
+
+statement error
+OPTIMIZE 'test/.tmp/maintenance_options.lance' WITH (unknown_key = 1);
+----
+compact_files options_json parse
+
+statement error
+VACUUM LANCE 'test/.tmp/maintenance_options.lance' WITH (retain_n_versions = 0);
+----
+retain_n_versions must be > 0
+
+statement error
+VACUUM LANCE 'test/.tmp/maintenance_options.lance' WITH (older_than_seconds = -1);
+----
+older_than_seconds must be >= 0
+
+statement error
+ALTER INDEX id_idx_opt ON 'test/.tmp/maintenance_options.lance' OPTIMIZE WITH (mode = 'invalid');
+----
+unsupported optimize mode: invalid
+
+statement error
+ALTER INDEX id_idx_opt ON 'test/.tmp/maintenance_options.lance' OPTIMIZE WITH (
+  mode = 'append',
+  num_indices_to_merge = 2
+);
+----
+num_indices_to_merge is only valid for mode='merge'
+
+statement error
+ALTER INDEX id_idx_opt ON 'test/.tmp/maintenance_options.lance' OPTIMIZE WITH (
+  mode = 'merge',
+  num_indices_to_merge = 0
+);
+----
+num_indices_to_merge must be > 0 for mode='merge'
+
+statement error
+ALTER INDEX id_idx_opt ON 'test/.tmp/maintenance_options.lance' OPTIMIZE WITH (
+  mode = 'retrain',
+  num_indices_to_merge = 2
+);
+----
+num_indices_to_merge is invalid for mode='retrain'

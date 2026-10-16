@@ -1,0 +1,147 @@
+# name: test/sql/scan_deferred_materialization.test
+# description: Deferred materialization for heavy columns when filter pushdown fails
+# group: [sql]
+
+require lance
+
+# Setup: create a dataset with light scalar columns + heavy BLOB column (>1KB/row).
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 10::INTEGER AS category, 'aaa'::VARCHAR AS name,
+         repeat('x', 2000)::BLOB AS blob_data
+  UNION ALL SELECT 2, 20, 'bbb', repeat('y', 2000)::BLOB
+  UNION ALL SELECT 3, 10, 'ccc', repeat('z', 2000)::BLOB
+  UNION ALL SELECT 4, 30, 'ddd', repeat('w', 2000)::BLOB
+  UNION ALL SELECT 5, 10, 'eee', repeat('x', 2000)::BLOB
+  UNION ALL SELECT 6, 40, 'fff', repeat('y', 2000)::BLOB
+  UNION ALL SELECT 7, 10, 'ggg', repeat('z', 2000)::BLOB
+  UNION ALL SELECT 8, 50, 'hhh', repeat('w', 2000)::BLOB
+) TO 'test/.tmp/deferred_mat.lance' (FORMAT lance, mode 'overwrite');
+
+# -----------------------------------------------------------------------
+# Plan: pushable filter -> deferred NOT activated
+# (Lance SDK handles late materialization internally when filter is pushed)
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE category = 10;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+# -----------------------------------------------------------------------
+# Plan: non-pushable filter -> deferred IS activated
+# (id::VARCHAR LIKE '%3%' uses CAST+LIKE, cannot be encoded as Lance filter IR)
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*"Lance Deferred Columns": "blob_data"[\s\S]*
+
+# -----------------------------------------------------------------------
+# Correctness: non-pushable filter returns correct rows and data
+# -----------------------------------------------------------------------
+
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
+----
+3	2000
+
+# -----------------------------------------------------------------------
+# Correctness: pushable filter returns correct data (deferred off)
+# -----------------------------------------------------------------------
+
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE category = 10 ORDER BY id;
+----
+1	2000
+3	2000
+5	2000
+7	2000
+
+# -----------------------------------------------------------------------
+# Setting: SET lance_deferred_materialization = false disables it
+# -----------------------------------------------------------------------
+
+statement ok
+SET lance_deferred_materialization = false;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+# Correctness still holds when disabled
+query II
+SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
+----
+3	2000
+
+# -----------------------------------------------------------------------
+# Setting: re-enable
+# -----------------------------------------------------------------------
+
+statement ok
+SET lance_deferred_materialization = true;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
+
+# -----------------------------------------------------------------------
+# Edge case: no filter -> deferred NOT activated
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+# -----------------------------------------------------------------------
+# Edge case: only light columns projected -> no heavy columns to defer
+# -----------------------------------------------------------------------
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, category FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
+
+# -----------------------------------------------------------------------
+# Multi-fragment correctness
+# -----------------------------------------------------------------------
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 10::INTEGER AS cat, repeat('a', 2000)::BLOB AS heavy
+  UNION ALL SELECT 2, 20, repeat('b', 2000)::BLOB
+  UNION ALL SELECT 3, 10, repeat('c', 2000)::BLOB
+  UNION ALL SELECT 4, 30, repeat('d', 2000)::BLOB
+) TO 'test/.tmp/deferred_multi.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (
+  SELECT 5::BIGINT AS id, 10::INTEGER AS cat, repeat('e', 2000)::BLOB AS heavy
+  UNION ALL SELECT 6, 40, repeat('f', 2000)::BLOB
+  UNION ALL SELECT 7, 10, repeat('g', 2000)::BLOB
+  UNION ALL SELECT 8, 50, repeat('h', 2000)::BLOB
+) TO 'test/.tmp/deferred_multi.lance' (FORMAT lance, mode 'append');
+
+# Multi-fragment with non-pushable filter: plan shows deferred
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
+
+# Multi-fragment correctness: correct row + data
+query II
+SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
+----
+1	2000
+
+# Multi-fragment: all matching rows across fragments
+query II
+SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%5%' OR id::VARCHAR LIKE '%7%' ORDER BY id;
+----
+5	2000
+7	2000

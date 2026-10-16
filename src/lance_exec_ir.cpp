@@ -41,15 +41,15 @@ static void WriteU8(string &out, uint8_t v) {
 }
 
 static void WriteU32(string &out, uint32_t v) {
-  for (int i = 0; i < 4; i++) {
-    out.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+  for (idx_t byte_idx = 0; byte_idx < 4; byte_idx++) {
+    out.push_back(static_cast<char>((v >> (byte_idx * 8)) & 0xFF));
   }
 }
 
 static void WriteI64(string &out, int64_t v) {
   auto u = static_cast<uint64_t>(v);
-  for (int i = 0; i < 8; i++) {
-    out.push_back(static_cast<char>((u >> (i * 8)) & 0xFF));
+  for (idx_t byte_idx = 0; byte_idx < 8; byte_idx++) {
+    out.push_back(static_cast<char>((u >> (byte_idx * 8)) & 0xFF));
   }
 }
 
@@ -58,33 +58,34 @@ static void WriteF64(string &out, double v) {
                 "double must be 64-bit IEEE754");
   uint64_t bits;
   memcpy(&bits, &v, sizeof(bits));
-  for (int i = 0; i < 8; i++) {
-    out.push_back(static_cast<char>((bits >> (i * 8)) & 0xFF));
+  for (idx_t byte_idx = 0; byte_idx < 8; byte_idx++) {
+    out.push_back(static_cast<char>((bits >> (byte_idx * 8)) & 0xFF));
   }
 }
 
-static void WriteBytes(string &out, const_data_ptr_t ptr, size_t len) {
-  out.append(reinterpret_cast<const char *>(ptr), len);
+static void WriteBytes(string &out, const_data_ptr_t ptr, idx_t len) {
+  out.append(reinterpret_cast<const char *>(ptr), NumericCast<size_t>(len));
 }
 
 static void WriteHugeint(string &out, hugeint_t v) {
   uint64_t lower = v.lower;
   int64_t upper = v.upper;
-  for (int i = 0; i < 8; i++) {
-    out.push_back(static_cast<char>((lower >> (i * 8)) & 0xFF));
+  for (idx_t byte_idx = 0; byte_idx < 8; byte_idx++) {
+    out.push_back(static_cast<char>((lower >> (byte_idx * 8)) & 0xFF));
   }
   auto upper_u = static_cast<uint64_t>(upper);
-  for (int i = 0; i < 8; i++) {
-    out.push_back(static_cast<char>((upper_u >> (i * 8)) & 0xFF));
+  for (idx_t byte_idx = 0; byte_idx < 8; byte_idx++) {
+    out.push_back(static_cast<char>((upper_u >> (byte_idx * 8)) & 0xFF));
   }
 }
 
 static void WriteString(string &out, const string &s) {
-  if (s.size() > NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  auto string_size = NumericCast<idx_t>(s.size());
+  if (string_size > NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     throw InvalidInputException("ExecIR string too large");
   }
-  WriteU32(out, NumericCast<uint32_t>(s.size()));
-  WriteBytes(out, reinterpret_cast<const_data_ptr_t>(s.data()), s.size());
+  WriteU32(out, NumericCast<uint32_t>(string_size));
+  WriteBytes(out, reinterpret_cast<const_data_ptr_t>(s.data()), string_size);
 }
 
 enum class ExecIrAggFunc : uint8_t {
@@ -884,17 +885,17 @@ bool TryEncodeLanceExecIRv1(
   WriteU32(out_exec_ir, 4); // version
   WriteU32(out_exec_ir, 0); // reserved flags
 
-  if (filter_ir_msg.size() >
-      NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  if (NumericCast<idx_t>(filter_ir_msg.size()) >
+      NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(filter_ir_msg.size()));
   WriteBytes(out_exec_ir,
              reinterpret_cast<const_data_ptr_t>(filter_ir_msg.data()),
-             filter_ir_msg.size());
+             NumericCast<idx_t>(filter_ir_msg.size()));
 
-  if (scan_projection.size() >
-      NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  if (NumericCast<idx_t>(scan_projection.size()) >
+      NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(scan_projection.size()));
@@ -902,7 +903,8 @@ bool TryEncodeLanceExecIRv1(
     WriteString(out_exec_ir, name);
   }
 
-  if (groups.size() > NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  if (NumericCast<idx_t>(groups.size()) >
+      NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(groups.size()));
@@ -911,16 +913,17 @@ bool TryEncodeLanceExecIRv1(
     if (!g.encoded_expr.empty()) {
       WriteBytes(out_exec_ir,
                  reinterpret_cast<const_data_ptr_t>(g.encoded_expr.data()),
-                 g.encoded_expr.size());
+                 NumericCast<idx_t>(g.encoded_expr.size()));
     }
     if (!g.output_type_hint.empty()) {
       WriteBytes(out_exec_ir,
                  reinterpret_cast<const_data_ptr_t>(g.output_type_hint.data()),
-                 g.output_type_hint.size());
+                 NumericCast<idx_t>(g.output_type_hint.size()));
     }
   }
 
-  if (aggs.size() > NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  if (NumericCast<idx_t>(aggs.size()) >
+      NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(aggs.size()));
@@ -931,13 +934,13 @@ bool TryEncodeLanceExecIRv1(
     if (!agg.encoded_args.empty()) {
       WriteBytes(out_exec_ir,
                  reinterpret_cast<const_data_ptr_t>(agg.encoded_args.data()),
-                 agg.encoded_args.size());
+                 NumericCast<idx_t>(agg.encoded_args.size()));
     }
     if (!agg.output_type_hint.empty()) {
       WriteBytes(
           out_exec_ir,
           reinterpret_cast<const_data_ptr_t>(agg.output_type_hint.data()),
-          agg.output_type_hint.size());
+          NumericCast<idx_t>(agg.output_type_hint.size()));
     }
   }
 
@@ -1105,8 +1108,8 @@ bool TryEncodeLanceExecIRv1(
     }
   }
 
-  if (order_by.size() >
-      NumericCast<size_t>(NumericLimits<uint32_t>::Maximum())) {
+  if (NumericCast<idx_t>(order_by.size()) >
+      NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
   WriteU32(out_exec_ir, NumericCast<uint32_t>(order_by.size()));

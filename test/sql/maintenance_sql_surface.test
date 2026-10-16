@@ -1,0 +1,58 @@
+# name: test/sql/maintenance_sql_surface.test
+# description: Standard SQL surface for Lance maintenance operations
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_sql_surface.lance' (FORMAT lance, mode 'overwrite');
+
+query TTT
+OPTIMIZE 'test/.tmp/maintenance_sql_surface.lance' WITH (
+  target_rows_per_fragment = 1024
+);
+----
+compact	test/.tmp/maintenance_sql_surface.lance	<REGEX>:\{.*"fragments_removed".*\}
+
+query TTT
+VACUUM LANCE 'test/.tmp/maintenance_sql_surface.lance' WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true
+);
+----
+cleanup	test/.tmp/maintenance_sql_surface.lance	<REGEX>:\{.*"bytes_removed".*\}
+
+statement ok
+CREATE INDEX id_btree_surface
+ON 'test/.tmp/maintenance_sql_surface.lance' (id)
+USING BTREE;
+
+query TTT
+ALTER INDEX id_btree_surface
+ON 'test/.tmp/maintenance_sql_surface.lance'
+OPTIMIZE WITH (mode = 'append');
+----
+optimize_index	test/.tmp/maintenance_sql_surface.lance	<REGEX>:\{.*"index_name":"id_btree_surface".*"mode":"append".*\}
+
+statement ok
+ATTACH 'test/.tmp' AS maintenance_surface_ns (TYPE LANCE);
+
+query TTT
+OPTIMIZE maintenance_surface_ns.main.maintenance_sql_surface;
+----
+compact	test/.tmp/maintenance_sql_surface.lance	<REGEX>:\{.*\}
+
+statement error
+OPTIMIZE;
+----
+expected dataset path or table identifier
+
+statement error
+ALTER INDEX id_btree_surface ON 'test/.tmp/maintenance_sql_surface.lance';
+----
+ALTER INDEX requires trailing OPTIMIZE
+
+statement ok
+DETACH maintenance_surface_ns;

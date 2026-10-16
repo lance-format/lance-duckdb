@@ -18,6 +18,25 @@ SELECT count(*) FROM ns.main.attach_create_table_empty
 ----
 0
 
+# 322E32 is the hexadecimal representation of "2.2" in the manifest.
+query I
+SELECT contains(hex(content), '322E32')::INTEGER
+FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_empty.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.attach_create_table_with_version
+  (id BIGINT, s VARCHAR)
+  WITH (data_storage_version = '2.0');
+
+query I
+SELECT count(*) FROM ns.main.attach_create_table_with_version
+----
+0
+
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas AS
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
@@ -34,6 +53,14 @@ SELECT count(*) FROM 'test/.tmp/nsroot_create_table_125/attach_create_table_ctas
 ----
 2
 
+query I
+SELECT contains(hex(content), '322E32')::INTEGER
+FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
+
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas AS
   SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s;
@@ -42,6 +69,23 @@ query I
 SELECT sum(id) FROM ns.main.attach_create_table_ctas
 ----
 3
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.attach_create_table_ctas_with_version
+  WITH (data_storage_version = '2.1')
+AS
+  SELECT 5::BIGINT AS id, 'v'::VARCHAR AS s;
+
+query I
+SELECT sum(id) FROM ns.main.attach_create_table_ctas_with_version
+----
+5
+
+statement error
+CREATE TABLE ns.main.attach_create_table_bad_version (id BIGINT)
+  WITH (data_storage_version = 'bad_version');
+----
+IO Error: Failed to open Lance writer:
 
 statement ok
 CREATE TABLE IF NOT EXISTS ns.main.attach_create_table_ctas AS
@@ -59,8 +103,10 @@ query T
 SHOW TABLES FROM ns.main
 ----
 attach_create_table_ctas
+attach_create_table_ctas_with_version
 attach_create_table_empty
 attach_create_table_seed
+attach_create_table_with_version
 
 statement ok
 CREATE TABLE ns.main.attach_create_table_after_show (id BIGINT);

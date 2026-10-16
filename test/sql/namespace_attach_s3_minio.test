@@ -1,0 +1,102 @@
+# name: test/sql/namespace_attach_s3_minio.test
+# description: ATTACH TYPE LANCE directory namespace against S3-compatible MinIO (regression for #206).
+# group: [sql]
+
+# Before the fix, the catalog was always empty on non-AWS S3-compatible endpoints:
+# `DatasetBuilder::from_namespace + load` opened the dataset with empty
+# storage_options, fell into AWS bucket-region resolution (`aws.rs:217`), and
+# failed with "Bucket '<name>' not found". The fix forwards the caller's
+# storage_options into the dataset builder after `from_namespace`.
+
+require-env LANCE_TEST_S3 1
+
+test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
+
+test-env LANCE_S3_REGION us-east-1
+
+test-env LANCE_S3_BUCKET lance-test
+
+test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+
+test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+
+test-env LANCE_S3_NS_PREFIX ns_attach_test
+
+require lance
+
+statement ok
+INSTALL httpfs;
+
+statement ok
+LOAD httpfs;
+
+statement ok
+CREATE SECRET (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://${LANCE_S3_BUCKET}/',
+  ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '${LANCE_S3_REGION}',
+  ENDPOINT '${LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+# Seed two datasets directly under the namespace prefix.
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s UNION ALL SELECT 2::BIGINT, 'b')
+TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}/alpha.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 10::BIGINT AS id UNION ALL SELECT 20::BIGINT UNION ALL SELECT 30::BIGINT)
+TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}/beta.lance' (FORMAT lance, mode 'overwrite');
+
+# ATTACH the prefix as a directory namespace and verify that the tables are
+# visible through the catalog. Before the fix, this catalog was always empty
+# on non-AWS S3-compatible endpoints because dataset open returned NULL for
+# every entry.
+statement ok
+ATTACH 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}' AS ns (TYPE LANCE, READ_ONLY false);
+
+query TT
+SELECT table_name, database_name FROM duckdb_tables()
+WHERE database_name = 'ns' ORDER BY table_name;
+----
+alpha	ns
+beta	ns
+
+query I
+SELECT count(*) FROM ns.main.alpha;
+----
+2
+
+query I
+SELECT sum(id) FROM ns.main.beta;
+----
+60
+
+# A name-resolved INSERT goes through the same open path; before the fix it
+# also failed with "Table with name beta does not exist".
+statement ok
+INSERT INTO ns.main.beta VALUES (40);
+
+query I
+SELECT sum(id) FROM ns.main.beta;
+----
+100
+
+statement ok
+DETACH ns;
+
+# Re-ATTACH and confirm the catalog still discovers the tables.
+statement ok
+ATTACH 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}' AS ns2 (TYPE LANCE, READ_ONLY false);
+
+query I
+SELECT count(*) FROM ns2.main.alpha;
+----
+2
+
+statement ok
+DETACH ns2;

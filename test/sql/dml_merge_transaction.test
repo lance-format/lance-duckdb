@@ -1,0 +1,109 @@
+# name: test/sql/dml_merge_transaction.test
+# description: MERGE INTO commit/rollback behavior on Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
+  UNION ALL
+  SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
+) TO 'test/.tmp/lance_merge_txn.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE merge_txn_versions AS
+  SELECT count(*)::BIGINT AS c
+  FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*');
+
+statement ok
+ATTACH 'test/.tmp' AS merge_txn_ns (TYPE LANCE);
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (
+  SELECT 2::BIGINT AS id, 'bb'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
+----
+2
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
+----
+1	a
+2	b
+
+query T
+SELECT (SELECT c FROM merge_txn_versions) =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+----
+true
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (
+  SELECT 2::BIGINT AS id, 'bb'::VARCHAR AS s
+  UNION ALL
+  SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
+) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+WHEN NOT MATCHED THEN INSERT (id, s) VALUES (src.id, src.s);
+----
+2
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
+----
+1	a
+2	bb
+3	c
+
+query T
+SELECT ((SELECT c FROM merge_txn_versions) + 1) =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+----
+true
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+MERGE INTO merge_txn_ns.main.lance_merge_txn AS t
+USING (SELECT 999::BIGINT AS id, 'noop'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN NOT MATCHED THEN DO NOTHING;
+----
+0
+
+statement ok
+COMMIT;
+
+query T
+SELECT ((SELECT c FROM merge_txn_versions) + 1) =
+       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+----
+true
+
+statement ok
+DETACH merge_txn_ns;

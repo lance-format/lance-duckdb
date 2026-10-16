@@ -1,23 +1,43 @@
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::index::vector::{IndexFileVersion, VectorIndexParams};
+use lance::index::DatasetIndexExt;
 use lance::Dataset;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::pq::PQBuildParams;
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::{SchemaHandle, StreamHandle};
-use super::util::{cstr_to_str, dataset_handle, FfiError, FfiResult};
+use super::util::{
+    canonicalize_lance_field_path, cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult,
+};
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OptimizeIndexOptionsInput {
+    mode: Option<String>,
+    retrain: Option<bool>,
+    num_indices_to_merge: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct OptimizeIndexMetricsOutput {
+    index_name: String,
+    mode: String,
+    retrain: bool,
+    num_indices_to_merge: Option<usize>,
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_index_list_schema(dataset: *mut c_void) -> *mut c_void {
@@ -94,11 +114,12 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
 
         let mut cols = Vec::new();
         for &field_id in d.field_ids() {
-            if let Some(field) = dataset.schema().field_by_id(field_id as i32) {
-                cols.push(field.name.clone());
-            } else {
-                cols.push(format!("_field_id_{field_id}"));
-            }
+            cols.push(
+                dataset
+                    .schema()
+                    .field_path(field_id as i32)
+                    .unwrap_or_else(|_| format!("_field_id_{field_id}")),
+            );
         }
         fields.push(cols.join(","));
 
@@ -133,6 +154,84 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
     })?;
 
     Ok(StreamHandle::Batches(vec![batch].into_iter()))
+}
+
+/// Returns an array of column names that have scalar indices.
+/// The caller must free the returned array with `lance_free_scalar_indexed_columns`.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
+    dataset: *mut c_void,
+    out_len: *mut usize,
+) -> *mut *mut c_char {
+    match list_scalar_indexed_columns_inner(dataset) {
+        Ok(cols) => {
+            clear_last_error();
+            unsafe { *out_len = cols.len() };
+            if cols.is_empty() {
+                return std::ptr::null_mut();
+            }
+            let ptrs: Vec<*mut c_char> = cols
+                .into_iter()
+                .map(|s| to_c_string(s).into_raw())
+                .collect();
+            let mut boxed = ptrs.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            unsafe { *out_len = 0 };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+        for &p in slice.iter() {
+            if !p.is_null() {
+                drop(std::ffi::CString::from_raw(p));
+            }
+        }
+    }
+}
+
+fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<String>> {
+    let handle = unsafe { dataset_handle(dataset)? };
+    let dataset = handle.dataset.as_ref().clone();
+
+    let descs = match runtime::block_on(async { dataset.describe_indices(None).await }) {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetDescribeIndices,
+                format!("dataset describe_indices: {err}"),
+            ))
+        }
+        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    };
+
+    let schema = dataset.schema();
+    let mut cols = Vec::new();
+    for d in descs {
+        let idx_type = d.index_type().to_string();
+        let normalized = normalize_index_type(&idx_type);
+        if is_vector_index_type(&normalized) {
+            continue;
+        }
+        for &field_id in d.field_ids() {
+            if let Ok(path) = schema.field_path(field_id as i32) {
+                cols.push(path);
+            }
+        }
+    }
+    Ok(cols)
 }
 
 fn estimate_rows_indexed(
@@ -271,6 +370,8 @@ fn dataset_create_index_inner(
         }
     };
 
+    let canonical_columns = canonicalize_index_columns(handle.dataset.schema(), &columns)?;
+
     let (lance_index_type, params) = build_index_params(&index_type_norm, params_json.as_deref())?;
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
@@ -279,7 +380,7 @@ fn dataset_create_index_inner(
 
     run_with_large_stack(move || {
         match runtime::block_on(async {
-            let cols: [&str; 1] = [columns[0].as_str()];
+            let cols: [&str; 1] = [canonical_columns[0].as_str()];
             let mut builder = ds.create_index_builder(&cols, lance_index_type, params.as_ref());
             if let Some(name) = index_name {
                 builder = builder.name(name);
@@ -340,7 +441,13 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     index_name: *const c_char,
     retrain: u8,
 ) -> i32 {
-    match dataset_optimize_index_inner(dataset, index_name, retrain) {
+    match dataset_optimize_index_with_options_inner(
+        dataset,
+        index_name,
+        ptr::null(),
+        ptr::null_mut(),
+        retrain != 0,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -352,10 +459,112 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     }
 }
 
-fn dataset_optimize_index_inner(
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_optimize_index_with_options(
     dataset: *mut c_void,
     index_name: *const c_char,
-    retrain: u8,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+) -> i32 {
+    if !out_metrics_json.is_null() {
+        unsafe {
+            ptr::write_unaligned(out_metrics_json, ptr::null());
+        }
+    }
+    match dataset_optimize_index_with_options_inner(
+        dataset,
+        index_name,
+        options_json,
+        out_metrics_json,
+        false,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn parse_optimize_index_options_json(
+    options_json: *const c_char,
+    legacy_retrain: bool,
+) -> FfiResult<(OptimizeOptions, String, bool, Option<usize>)> {
+    let input = if options_json.is_null() {
+        OptimizeIndexOptionsInput::default()
+    } else {
+        let text = unsafe { CStr::from_ptr(options_json) }
+            .to_str()
+            .map_err(|err| FfiError::new(ErrorCode::Utf8, format!("options_json utf8: {err}")))?;
+        if text.trim().is_empty() {
+            OptimizeIndexOptionsInput::default()
+        } else {
+            serde_json::from_str(text).map_err(|err| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("optimize_index options_json parse: {err}"),
+                )
+            })?
+        }
+    };
+
+    let mode = if let Some(mode) = input.mode.as_ref() {
+        mode.trim().to_ascii_lowercase()
+    } else if input.retrain.unwrap_or(false) || legacy_retrain {
+        String::from("retrain")
+    } else {
+        String::from("append")
+    };
+
+    let (options, retrain, num_indices_to_merge) = match mode.as_str() {
+        "append" => {
+            if input.num_indices_to_merge.is_some() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge is only valid for mode='merge'",
+                ));
+            }
+            (OptimizeOptions::append(), false, Some(0))
+        }
+        "merge" => {
+            let num = input.num_indices_to_merge.unwrap_or(1);
+            if num == 0 {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge must be > 0 for mode='merge'",
+                ));
+            }
+            (OptimizeOptions::merge(num), false, Some(num))
+        }
+        "retrain" => {
+            if input.num_indices_to_merge.is_some() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge is invalid for mode='retrain'",
+                ));
+            }
+            (OptimizeOptions::retrain(), true, None)
+        }
+        other => {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("unsupported optimize mode: {other}"),
+            ))
+        }
+    };
+
+    Ok((options, mode, retrain, num_indices_to_merge))
+}
+
+fn dataset_optimize_index_with_options_inner(
+    dataset: *mut c_void,
+    index_name: *const c_char,
+    options_json: *const c_char,
+    out_metrics_json: *mut *const c_char,
+    legacy_retrain: bool,
 ) -> FfiResult<()> {
     let handle = unsafe { dataset_handle(dataset)? };
     let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
@@ -365,33 +574,61 @@ fn dataset_optimize_index_inner(
             "index_name must be non-empty",
         ));
     }
+    let index_name_owned = index_name.to_string();
 
-    let mut options = if retrain != 0 {
-        OptimizeOptions::retrain()
-    } else {
-        OptimizeOptions::append()
-    };
-    options = options.index_names(vec![index_name.to_string()]);
+    let (mut options, mode, retrain, num_indices_to_merge) =
+        parse_optimize_index_options_json(options_json, legacy_retrain)?;
+    options = options.index_names(vec![index_name_owned.clone()]);
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
-    run_with_large_stack(move || {
+    let metrics = run_with_large_stack(move || {
         match runtime::block_on(async { ds.optimize_indices(&options).await }) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => Ok(OptimizeIndexMetricsOutput {
+                index_name: index_name_owned,
+                mode,
+                retrain,
+                num_indices_to_merge,
+            }),
             Ok(Err(err)) => Err(FfiError::new(
                 ErrorCode::DatasetOptimizeIndices,
                 format!("dataset optimize_indices: {err}"),
             )),
             Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
-    })?
+    })??;
+
+    if !out_metrics_json.is_null() {
+        let payload = serde_json::to_string(&metrics).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetOptimizeIndices,
+                format!("optimize_index metrics_json serialize: {err}"),
+            )
+        })?;
+        unsafe {
+            ptr::write_unaligned(
+                out_metrics_json,
+                to_c_string(payload).into_raw() as *const c_char,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn normalize_index_type(index_type: &str) -> String {
     index_type
         .trim()
         .to_ascii_uppercase()
-        .replace('-', "_")
-        .replace(' ', "_")
+        .replace(['-', ' '], "_")
+}
+
+fn canonicalize_index_columns(
+    schema: &lance_core::datatypes::Schema,
+    columns: &[String],
+) -> FfiResult<Vec<String>> {
+    columns
+        .iter()
+        .map(|column| canonicalize_lance_field_path(schema, column, "index column"))
+        .collect()
 }
 
 fn build_index_params(
@@ -649,4 +886,85 @@ fn index_list_schema() -> SchemaHandle {
         Field::new("details", DataType::Utf8, true),
     ]);
     Arc::new(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+
+    fn nested_schema() -> lance_core::datatypes::Schema {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "left_struct",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new(
+                "right_struct",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new(
+                "dotted",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "literal.dot",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+        ]);
+        let mut schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
+        schema.set_field_id(None);
+        schema
+    }
+
+    #[test]
+    fn canonicalizes_nested_index_columns() {
+        let schema = nested_schema();
+
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "left_struct.value", "index column").unwrap(),
+            "left_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "right_struct.value", "index column").unwrap(),
+            "right_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "dotted.`literal.dot`", "index column").unwrap(),
+            "dotted.`literal.dot`"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_case_insensitive_index_columns() {
+        let schema = nested_schema();
+
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "LEFT_STRUCT.VALUE", "index column").unwrap(),
+            "left_struct.value"
+        );
+        assert_eq!(
+            canonicalize_lance_field_path(&schema, "DOTTED.`LITERAL.DOT`", "index column").unwrap(),
+            "dotted.`literal.dot`"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_leaf_without_parent_path() {
+        let schema = nested_schema();
+        let err = canonicalize_lance_field_path(&schema, "value", "index column").unwrap_err();
+
+        assert!(err.message.contains("index column not found"));
+    }
 }

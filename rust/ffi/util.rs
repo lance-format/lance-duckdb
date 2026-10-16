@@ -1,13 +1,16 @@
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
+use lance::session::Session;
+use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
 
-use super::types::{DatasetHandle, SchemaHandle, StreamHandle};
+use super::types::{DatasetHandle, SchemaHandle, SessionHandle, StreamHandle};
 
 #[derive(Debug)]
 pub(crate) struct FfiError {
@@ -32,6 +35,34 @@ pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
         Err(_) => CString::new(s.as_ref().replace('\0', "\\0"))
             .unwrap_or_else(|_| CString::new("invalid string").unwrap()),
     }
+}
+
+pub(crate) fn canonicalize_lance_field_path(
+    schema: &LanceSchema,
+    column: &str,
+    what: &'static str,
+) -> FfiResult<String> {
+    let column = column.trim();
+    if column.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} cannot be empty"),
+        ));
+    }
+
+    let field = schema.field_case_insensitive(column).ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} not found: '{column}'"),
+        )
+    })?;
+
+    schema.field_path(field.id).map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("{what} path normalize: {err}"),
+        )
+    })
 }
 
 pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> FfiResult<&'a str> {
@@ -153,6 +184,16 @@ pub(crate) unsafe fn dataset_handle<'a>(dataset: *mut c_void) -> FfiResult<&'a D
     }
     // SAFETY: Caller guarantees dataset points to a valid DatasetHandle.
     Ok(unsafe { &*(dataset as *const DatasetHandle) })
+}
+
+pub(crate) unsafe fn optional_session_handle(
+    session: *mut c_void,
+) -> FfiResult<Option<Arc<Session>>> {
+    if session.is_null() {
+        return Ok(None);
+    }
+    let handle = unsafe { &*(session as *const SessionHandle) };
+    Ok(Some(handle.session.clone()))
 }
 
 pub(crate) unsafe fn stream_handle_mut<'a>(stream: *mut c_void) -> FfiResult<&'a mut StreamHandle> {

@@ -1,0 +1,195 @@
+# name: test/sql/scan_struct_list_semijoin.test
+# description: Semi/mark join over a Lance scan that carries a STRUCT[] filter column
+# group: [sql]
+
+# Regression test for the internal error raised when the OUTER (probe) side of a
+# semi/mark join references a nested STRUCT[] (list-of-struct) column via a
+# predicate that cannot be encoded as Lance Filter IR (e.g. prices[1].x < c or
+# list_filter(prices, ...)). DuckDB pushes such a predicate as an
+# ExpressionFilter table filter; the Lance scan must still prune the filter-only
+# STRUCT[] column from its projected output. Previously LanceSupportsPushdownType
+# reported the STRUCT[] type as unsupported, which made DuckDB retain that column
+# in the scan's projection_ids and feed an extra column into the join probe,
+# crashing with either
+#   "Attempted to access index 1 within vector of size 1"           (semi join)
+# or
+#   "Vector::Reference used on vector of different type
+#    (source BOOLEAN referenced STRUCT(...)[])"                      (mark join)
+
+require lance
+
+statement ok
+SET lambda_syntax='ENABLE_SINGLE_ARROW';
+
+# A tiny dataset with a STRUCT[] "prices" column: 20 products, 2 variants each,
+# current_cent_amount = row_index * 100 (0, 100, ..., 3900).
+statement ok
+COPY (
+  SELECT
+    'p' || (i // 2)        AS product_id,
+    (i % 2)::INTEGER       AS variant_id,
+    [{'currency': 'EUR', 'current_cent_amount': (i * 100)::BIGINT}]
+      ::STRUCT(currency VARCHAR, current_cent_amount BIGINT)[] AS prices
+  FROM range(0, 40) t(i)
+) TO 'test/.tmp/struct_list_semijoin.lance' (FORMAT lance, mode 'overwrite');
+
+# Identical data in a native table, used to cross-check results.
+statement ok
+CREATE TEMP TABLE baseline AS
+  SELECT
+    'p' || (i // 2)        AS product_id,
+    (i % 2)::INTEGER       AS variant_id,
+    [{'currency': 'EUR', 'current_cent_amount': (i * 100)::BIGINT}]
+      ::STRUCT(currency VARCHAR, current_cent_amount BIGINT)[] AS prices
+  FROM range(0, 40) t(i);
+
+# --------------------------------------------------------------------------
+# Semi join (IN subquery): STRUCT[] predicate on the probe (outer) side.
+# prices[1].current_cent_amount < 2000 -> 20 rows; every product has a
+# variant_id = 0 row, so all product_ids match the subquery.
+# --------------------------------------------------------------------------
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE prices[1].current_cent_amount < 2000
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 0);
+----
+20
+
+# Same predicate expressed with list_filter + a lambda (also non-encodable).
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE len(list_filter(prices, p -> p.current_cent_amount < 2000)) > 0
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 0);
+----
+20
+
+# Selective subquery so the semi join is non-trivial: subquery keeps products
+# p0..p4 (variant 0 with amount < 1000), outer keeps i < 20 -> 10 rows.
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE prices[1].current_cent_amount < 2000
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance'
+    WHERE variant_id = 0 AND prices[1].current_cent_amount < 1000);
+----
+10
+
+# --------------------------------------------------------------------------
+# Anti join (NOT IN): forces the MARK-join code path (the variant that hit the
+# "BOOLEAN referenced STRUCT[]" error). Complement of the selective semi join.
+# --------------------------------------------------------------------------
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE prices[1].current_cent_amount < 2000
+  AND product_id NOT IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance'
+    WHERE variant_id = 0 AND prices[1].current_cent_amount < 1000);
+----
+10
+
+# EXISTS is another semi-join spelling of the same shape.
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance' t
+WHERE t.prices[1].current_cent_amount < 2000
+  AND EXISTS (
+    SELECT 1 FROM 'test/.tmp/struct_list_semijoin.lance' s
+    WHERE s.product_id = t.product_id AND s.variant_id = 1);
+----
+20
+
+# --------------------------------------------------------------------------
+# Aggregate over the probe side: list() in the outer, STRUCT[] filter in the
+# outer, and product_id IN (subquery).
+# --------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+  SELECT product_id, list(variant_id ORDER BY variant_id) AS variant_ids
+  FROM 'test/.tmp/struct_list_semijoin.lance'
+  WHERE prices[1].current_cent_amount < 2000
+    AND product_id IN (
+      SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 0)
+  GROUP BY product_id);
+----
+10
+
+# Exact per-product aggregation (string_agg to avoid list literal spacing).
+# amount < 300 -> rows i = 0,1,2 -> p0 has variants 0 and 1, p1 only variant 0.
+query TT
+SELECT product_id, string_agg(variant_id::VARCHAR, ',' ORDER BY variant_id) AS vs
+FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE prices[1].current_cent_amount < 300
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 0)
+GROUP BY product_id ORDER BY product_id;
+----
+p0	0,1
+p1	0
+
+# --------------------------------------------------------------------------
+# Results must match the native table for the same queries.
+# --------------------------------------------------------------------------
+query I
+SELECT
+  (SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+     WHERE prices[1].current_cent_amount < 2000
+       AND product_id IN (SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 0))
+  =
+  (SELECT count(*) FROM baseline
+     WHERE prices[1].current_cent_amount < 2000
+       AND product_id IN (SELECT product_id FROM baseline WHERE variant_id = 0));
+----
+true
+
+# --------------------------------------------------------------------------
+# Same query shape with a scalar BTREE index on the join key present, which
+# selects the index-aware scanner path.
+# --------------------------------------------------------------------------
+statement ok
+COPY (
+  SELECT
+    'p' || (i // 2)        AS product_id,
+    (i % 2)::INTEGER       AS variant_id,
+    [{'currency': 'EUR', 'current_cent_amount': (i * 100)::BIGINT}]
+      ::STRUCT(currency VARCHAR, current_cent_amount BIGINT)[] AS prices
+  FROM range(0, 40) t(i)
+) TO 'test/.tmp/struct_list_semijoin_idx.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX pid_idx ON 'test/.tmp/struct_list_semijoin_idx.lance' (product_id) USING BTREE;
+
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin_idx.lance'
+WHERE prices[1].current_cent_amount < 2000
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin_idx.lance' WHERE variant_id = 0);
+----
+20
+
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin_idx.lance'
+WHERE prices[1].current_cent_amount < 2000
+  AND product_id NOT IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin_idx.lance'
+    WHERE variant_id = 0 AND prices[1].current_cent_amount < 1000);
+----
+10
+
+# --------------------------------------------------------------------------
+# Sanity: a plain STRUCT[] scan with the same filter but no join still works,
+# and a semi join whose probe references only a scalar column still works.
+# --------------------------------------------------------------------------
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE prices[1].current_cent_amount < 2000;
+----
+20
+
+query I
+SELECT count(*) FROM 'test/.tmp/struct_list_semijoin.lance'
+WHERE variant_id = 0
+  AND product_id IN (
+    SELECT product_id FROM 'test/.tmp/struct_list_semijoin.lance' WHERE variant_id = 1);
+----
+20

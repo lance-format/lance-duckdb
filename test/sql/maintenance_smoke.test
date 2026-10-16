@@ -1,0 +1,56 @@
+# name: test/sql/maintenance_smoke.test
+# description: Maintenance SQL surface supports both dataset paths and attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/test_data.lance')
+TO 'test/.tmp/maintenance_smoke.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM 'test/.tmp/maintenance_smoke.lance';
+----
+5
+
+query TTT
+OPTIMIZE 'test/.tmp/maintenance_smoke.lance';
+----
+compact	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+query TTT
+VACUUM LANCE 'test/.tmp/maintenance_smoke.lance' WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true
+);
+----
+cleanup	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+statement ok
+ATTACH 'test/.tmp' AS maintenance_ns (TYPE LANCE);
+
+query TTT
+OPTIMIZE maintenance_ns.main.maintenance_smoke;
+----
+compact	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+query TTT
+VACUUM LANCE maintenance_ns.main.maintenance_smoke WITH (
+  older_than_seconds = 0,
+  delete_unverified = false,
+  error_if_tagged_old_versions = true
+);
+----
+cleanup	test/.tmp/maintenance_smoke.lance	<REGEX>:\{.*\}
+
+statement error
+VACUUM LANCE maintenance_ns.main.maintenance_smoke WITH (
+  older_than_seconds = -1,
+  delete_unverified = false
+);
+----
+older_than_seconds must be >= 0
+
+statement ok
+DETACH maintenance_ns;

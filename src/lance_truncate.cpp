@@ -9,6 +9,7 @@
 #include "duckdb/parser/qualified_name.hpp"
 
 #include "lance_common.hpp"
+#include "lance_dataset_cache.hpp"
 #include "lance_table_entry.hpp"
 
 #include <cctype>
@@ -172,7 +173,8 @@ static void LanceTruncateFunc(ClientContext &context, TableFunctionInput &data,
   ResolveLanceStorageOptionsForTable(context, *lance_entry, open_path,
                                      option_keys, option_values, display_uri);
   auto row_count = LanceTruncateDatasetWithStorageOptions(
-      open_path, option_keys, option_values, display_uri);
+      context, open_path, option_keys, option_values, display_uri);
+  LanceInvalidateDatasetCacheForTable(context, *lance_entry);
 
   output.SetCardinality(1);
   output.SetValue(0, 0, Value::BIGINT(row_count));

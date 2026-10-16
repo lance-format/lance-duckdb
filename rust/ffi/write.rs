@@ -12,14 +12,15 @@ use arrow_array::{
     make_array, Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
     RecordBatch, RecordBatchReader, StructArray,
 };
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::session::record_commit;
+use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 #[repr(C)]
 struct RawArrowArray {
@@ -72,7 +73,7 @@ struct WriterHandle {
 
 enum WriterResult {
     Committed,
-    Uncommitted(lance::dataset::transaction::Transaction),
+    Uncommitted(Box<lance::dataset::transaction::Transaction>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +258,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -269,7 +270,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -304,7 +305,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float64Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -316,7 +317,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -351,7 +352,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float32Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -363,7 +364,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -398,7 +399,7 @@ fn convert_list_array_to_fixed_size(
                 FixedSizeListBuilder::with_capacity(Float64Builder::new(), dim_i32, list.len())
                     .with_field(field);
             let offsets = list.value_offsets();
-            for i in 0..list.len() {
+            for (i, start) in offsets.iter().take(list.len()).enumerate() {
                 if list.is_null(i) {
                     for _ in 0..dim {
                         builder.values().append_null();
@@ -410,7 +411,7 @@ fn convert_list_array_to_fixed_size(
                 if len != dim {
                     return Err(format!("vector dim mismatch: expected {dim} got {len}"));
                 }
-                let start = offsets[i] as usize;
+                let start = *start as usize;
                 for j in 0..dim {
                     let idx = start + j;
                     if idx >= values.len() {
@@ -427,6 +428,79 @@ fn convert_list_array_to_fixed_size(
             Ok(builder.finish())
         }
     }
+}
+
+/// Best-effort read of the destination dataset's schema; `None` when the
+/// dataset does not exist yet, in which case an append behaves like a create.
+fn existing_dataset_schema(path: &str, storage_options: &HashMap<String, String>) -> Option<Schema> {
+    let builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
+        .with_storage_options(storage_options.clone());
+    let dataset = runtime::block_on(builder.load()).ok()?.ok()?;
+    Some(Schema::from(dataset.schema()))
+}
+
+/// Rewrites list child field names in `schema` to match `reference`.
+///
+/// DuckDB's Arrow exporter names list children `l`; the C++ write paths rewrite
+/// them to Arrow's `item` so DataFusion leaves list columns uncoerced and Lance
+/// can answer `array_has_*` from a LABEL_LIST index. Datasets written before
+/// that change still carry `l`, and Lance rejects an append whose schema
+/// disagrees, so an append has to speak whatever the destination already uses.
+fn align_list_field_names(fields: &Fields, reference: &Fields) -> Option<Fields> {
+    let mut aligned = fields.as_ref().to_vec();
+    let mut changed = false;
+    for slot in &mut aligned {
+        let Some(reference_field) = reference.iter().find(|f| f.name() == slot.name()) else {
+            continue;
+        };
+        let Some(field) = align_list_field(slot, reference_field) else {
+            continue;
+        };
+        *slot = field;
+        changed = true;
+    }
+    changed.then(|| Fields::from(aligned))
+}
+
+fn align_list_field(field: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
+    let data_type = match (field.data_type(), reference.data_type()) {
+        (DataType::List(child), DataType::List(reference_child)) => {
+            let child = align_list_child(child, reference_child)?;
+            DataType::List(child)
+        }
+        (DataType::LargeList(child), DataType::LargeList(reference_child)) => {
+            let child = align_list_child(child, reference_child)?;
+            DataType::LargeList(child)
+        }
+        (DataType::Struct(children), DataType::Struct(reference_children)) => {
+            DataType::Struct(align_list_field_names(children, reference_children)?)
+        }
+        _ => return None,
+    };
+    Some(Arc::new(
+        Field::new(field.name(), data_type, field.is_nullable())
+            .with_metadata(field.metadata().clone()),
+    ))
+}
+
+fn align_list_child(child: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
+    let nested = match (child.data_type(), reference.data_type()) {
+        (DataType::Struct(children), DataType::Struct(reference_children)) => {
+            align_list_field_names(children, reference_children).map(DataType::Struct)
+        }
+        _ => None,
+    };
+    if child.name() == reference.name() && nested.is_none() {
+        return None;
+    }
+    Some(Arc::new(
+        Field::new(
+            reference.name(),
+            nested.unwrap_or_else(|| child.data_type().clone()),
+            child.is_nullable(),
+        )
+        .with_metadata(child.metadata().clone()),
+    ))
 }
 
 fn build_output_schema(
@@ -468,10 +542,8 @@ fn convert_record_batch(
     conversions: &[VectorConversion],
 ) -> Result<RecordBatch, String> {
     if conversions.is_empty() {
-        return Ok(
-            RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
-                .map_err(|e| e.to_string())?,
-        );
+        return RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
+            .map_err(|e| e.to_string());
     }
     let mut cols = input_batch.columns().to_vec();
     for conv in conversions {
@@ -510,7 +582,7 @@ fn spawn_writer_thread(
                 let builder = InsertBuilder::new(path.as_str()).with_params(&params);
                 let fut = builder.execute_uncommitted_stream(source);
                 match runtime::block_on(fut) {
-                    Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(txn)),
+                    Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(Box::new(txn))),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(err) => Err(format!("runtime: {err}")),
                 }
@@ -529,6 +601,8 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_writer_inner(
@@ -540,6 +614,8 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
+        session,
         schema,
     ) {
         Ok(handle) => {
@@ -563,6 +639,8 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> *mut c_void {
     match open_uncommitted_writer_inner(
@@ -574,6 +652,8 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
+        session,
         schema,
     ) {
         Ok(handle) => {
@@ -587,6 +667,33 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     }
 }
 
+fn parse_data_storage_version_arg(
+    data_storage_version: *const c_char,
+) -> FfiResult<Option<String>> {
+    if data_storage_version.is_null() {
+        return Ok(None);
+    }
+
+    let raw = unsafe { cstr_to_str(data_storage_version, "data_storage_version")? };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(FfiError::new(
+            ErrorCode::DatasetWriteOpen,
+            "data_storage_version cannot be empty",
+        ));
+    }
+
+    let lower = token.to_ascii_lowercase();
+    let normalized = match lower.as_str() {
+        "v2_0" | "v2.0" | "2_0" => "2.0".to_string(),
+        "v2_1" | "v2.1" | "2_1" => "2.1".to_string(),
+        "v2_2" | "v2.2" | "2_2" => "2.2".to_string(),
+        _ => lower,
+    };
+    Ok(Some(normalized))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn open_uncommitted_writer_inner(
     path: *const c_char,
     mode: *const c_char,
@@ -596,6 +703,8 @@ fn open_uncommitted_writer_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -650,7 +759,7 @@ fn open_uncommitted_writer_inner(
             "schema must be a struct",
         ));
     };
-    let schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
+    let mut schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
 
     let write_mode = WriteMode::try_from(mode).map_err(|err| {
         FfiError::new(
@@ -658,6 +767,18 @@ fn open_uncommitted_writer_inner(
             format!("invalid write mode '{mode}': {err}"),
         )
     })?;
+
+    // The incoming Arrow arrays are imported against `data_type`, so realigning
+    // the schema without it would fail RecordBatch validation.
+    let mut data_type = data_type.clone();
+    if matches!(write_mode, WriteMode::Append) {
+        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
+            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
+                data_type = DataType::Struct(fields.clone());
+                schema = Arc::new(Schema::new(fields));
+            }
+        }
+    }
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -677,6 +798,17 @@ fn open_uncommitted_writer_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let data_storage_version = parse_data_storage_version_arg(data_storage_version)?
+        .map(|value| {
+            value.parse().map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetWriteOpen,
+                    format!("invalid data_storage_version '{value}': {err}"),
+                )
+            })
+        })
+        .transpose()?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -690,6 +822,8 @@ fn open_uncommitted_writer_inner(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
+        session,
         store_params: Some(store_params),
         ..Default::default()
     };
@@ -722,6 +856,7 @@ fn open_uncommitted_writer_inner(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_writer_inner(
     path: *const c_char,
     mode: *const c_char,
@@ -731,6 +866,8 @@ fn open_writer_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    data_storage_version: *const c_char,
+    session: *mut c_void,
     schema: *const c_void,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -785,7 +922,7 @@ fn open_writer_inner(
             "schema must be a struct",
         ));
     };
-    let schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
+    let mut schema: SchemaRef = std::sync::Arc::new(Schema::new(fields.clone()));
 
     let write_mode = WriteMode::try_from(mode).map_err(|err| {
         FfiError::new(
@@ -793,6 +930,18 @@ fn open_writer_inner(
             format!("invalid write mode '{mode}': {err}"),
         )
     })?;
+
+    // The incoming Arrow arrays are imported against `data_type`, so realigning
+    // the schema without it would fail RecordBatch validation.
+    let mut data_type = data_type.clone();
+    if matches!(write_mode, WriteMode::Append) {
+        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
+            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
+                data_type = DataType::Struct(fields.clone());
+                schema = Arc::new(Schema::new(fields));
+            }
+        }
+    }
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -812,6 +961,17 @@ fn open_writer_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
+    let data_storage_version = parse_data_storage_version_arg(data_storage_version)?
+        .map(|value| {
+            value.parse().map_err(|err| {
+                FfiError::new(
+                    ErrorCode::DatasetWriteOpen,
+                    format!("invalid data_storage_version '{value}': {err}"),
+                )
+            })
+        })
+        .transpose()?;
+    let session = unsafe { optional_session_handle(session)? };
 
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
@@ -825,6 +985,8 @@ fn open_writer_inner(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        data_storage_version,
+        session,
         store_params: Some(store_params),
         ..Default::default()
     };
@@ -1235,9 +1397,8 @@ fn writer_finish_uncommitted_inner(
         }
     };
 
-    let boxed = Box::new(txn);
     unsafe {
-        *out_transaction = Box::into_raw(boxed) as *mut c_void;
+        *out_transaction = Box::into_raw(txn) as *mut c_void;
     }
 
     Ok(())
@@ -1259,9 +1420,17 @@ pub unsafe extern "C" fn lance_commit_transaction_with_storage_options(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
     transaction: *mut c_void,
 ) -> i32 {
-    match commit_transaction_inner(path, option_keys, option_values, options_len, transaction) {
+    match commit_transaction_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        session,
+        transaction,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -1278,6 +1447,7 @@ fn commit_transaction_inner(
     option_keys: *const *const c_char,
     option_values: *const *const c_char,
     options_len: usize,
+    session: *mut c_void,
     transaction: *mut c_void,
 ) -> FfiResult<()> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
@@ -1329,14 +1499,20 @@ fn commit_transaction_inner(
             StorageOptionsAccessor::with_static_options(storage_options),
         ));
     }
+    let session = unsafe { optional_session_handle(session)? };
 
     let txn =
         unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
-    let fut = CommitBuilder::new(path.as_str())
-        .with_store_params(store_params)
-        .execute(*txn);
+    let mut builder = CommitBuilder::new(path.as_str()).with_store_params(store_params);
+    if let Some(session) = session {
+        builder = builder.with_session(session);
+    }
+    let fut = builder.execute(*txn);
     match runtime::block_on(fut) {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => {
+            record_commit();
+            Ok(())
+        }
         Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetCommitTransaction,
             err.to_string(),
@@ -1355,5 +1531,56 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
     }
     unsafe {
         let _ = Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction);
+    }
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    fn list_of(child_name: &str) -> DataType {
+        DataType::List(Arc::new(Field::new(child_name, DataType::Utf8, true)))
+    }
+
+    #[test]
+    fn renames_list_child_to_match_the_destination() {
+        let incoming = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        let existing = Fields::from(vec![Field::new("tags", list_of("l"), true)]);
+
+        let aligned = align_list_field_names(&incoming, &existing).expect("expected a rename");
+        assert_eq!(aligned[0].data_type(), &list_of("l"));
+    }
+
+    #[test]
+    fn leaves_matching_schemas_alone() {
+        let fields = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        assert!(align_list_field_names(&fields, &fields.clone()).is_none());
+    }
+
+    #[test]
+    fn ignores_columns_the_destination_does_not_have() {
+        let incoming = Fields::from(vec![Field::new("tags", list_of("item"), true)]);
+        let existing = Fields::from(vec![Field::new("other", list_of("l"), true)]);
+        assert!(align_list_field_names(&incoming, &existing).is_none());
+    }
+
+    #[test]
+    fn descends_into_struct_columns() {
+        let incoming = Fields::from(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_of("item"), true)])),
+            true,
+        )]);
+        let existing = Fields::from(vec![Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![Field::new("tags", list_of("l"), true)])),
+            true,
+        )]);
+
+        let aligned = align_list_field_names(&incoming, &existing).expect("expected a rename");
+        let DataType::Struct(children) = aligned[0].data_type() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(children[0].data_type(), &list_of("l"));
     }
 }
