@@ -13,6 +13,7 @@
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
+#include "lance_insert.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
@@ -214,8 +215,9 @@ static void LanceMaintenanceFunc(ClientContext &context,
     op_name = "compact";
     break;
   case LanceMaintenanceOp::CLEANUP:
-    rc = lance_dataset_cleanup_old_versions_with_options(dataset, options_ptr,
-                                                         &metrics_ptr);
+    rc = lance_dataset_cleanup_old_versions_with_options(
+        dataset, options_ptr, LanceHasUncommittedWrites(context) ? 1 : 0,
+        &metrics_ptr);
     op_name = "cleanup";
     break;
   case LanceMaintenanceOp::OPTIMIZE_INDEX:

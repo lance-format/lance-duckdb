@@ -489,7 +489,11 @@ VACUUM LANCE 'path/to/dataset.lance' WITH (
 Returns:
 - `Operation` (`cleanup`)
 - `Target`
-- `MetricsJSON` (cleanup metrics such as removed bytes / versions)
+- `MetricsJSON` (`bytes_removed`, `old_versions`, `failed_deletes`)
+
+Notes:
+- Cleanup is best-effort: a file that cannot be deleted is counted in `failed_deletes` and left in place for a later run instead of failing the statement.
+- `delete_unverified = true` removes unreferenced data and index files regardless of age, including those of writes that have not committed, so use it only when nothing else is writing to the dataset. It is rejected while a transaction in this database holds Lance writes it has not committed, though a write or `COMMIT` that is still running is not detected. The rejection aborts the transaction it runs in, so a following `COMMIT` rolls that transaction back.
 
 ### `ALTER INDEX ... OPTIMIZE`
 

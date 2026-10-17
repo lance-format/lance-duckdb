@@ -150,7 +150,8 @@ int32_t lance_dataset_cleanup_old_versions(void *dataset,
                                            int64_t older_than_seconds,
                                            uint8_t delete_unverified);
 int32_t lance_dataset_cleanup_old_versions_with_options(
-    void *dataset, const char *options_json, const char **out_metrics_json);
+    void *dataset, const char *options_json, uint8_t has_uncommitted_writes,
+    const char **out_metrics_json);
 
 const char *lance_dataset_list_config(void *dataset);
 const char *lance_dataset_list_table_metadata(void *dataset);

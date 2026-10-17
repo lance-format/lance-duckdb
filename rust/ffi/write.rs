@@ -12,9 +12,13 @@ use arrow_array::{
     make_array, Array, FixedSizeListArray, Float32Array, Float64Array, LargeListArray, ListArray,
     RecordBatch, RecordBatchReader, StructArray,
 };
+use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_arrow::json::is_arrow_json_field;
+use lance_arrow::BLOB_V2_EXT_NAME;
+use lance_core::datatypes::Field as LanceField;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -106,6 +110,8 @@ struct WriterState {
     kind: WriterKind,
     path: String,
     params: WriteParams,
+    /// The destination's fields when appending to an existing dataset.
+    append_reference: Option<Fields>,
 
     vector_candidates: Vec<VectorConversion>,
     buffered_batches: Vec<RecordBatch>,
@@ -127,7 +133,8 @@ impl WriterState {
             .filter(|c| c.dim != 0)
             .cloned()
             .collect();
-        let output_schema = build_output_schema(input_schema, &conversions)?;
+        let output_schema =
+            build_output_schema(input_schema, &conversions, self.append_reference.as_ref())?;
         // Validate buffered input before starting a task that can publish a dataset.
         let mut batches = self
             .buffered_batches
@@ -584,9 +591,143 @@ fn align_list_child(child: &FieldRef, reference: &FieldRef) -> Option<FieldRef> 
     ))
 }
 
+/// Restates `fields` the way the destination dataset already records them:
+/// list child names, then Arrow extension types.
+fn align_append_fields(fields: &Fields, reference: &Fields) -> Option<Fields> {
+    let renamed = align_list_field_names(fields, reference);
+    align_extension_types(renamed.as_ref().unwrap_or(fields), reference).or(renamed)
+}
+
+/// Gives incoming fields the Arrow extension types the destination records.
+///
+/// Lance checks an append against the destination and writes it under the
+/// destination's fields; its check ignores most extensions, so Lance 12
+/// recorded the destination's extensions whatever a batch carried. Lance 13's
+/// dataset writer still leaves each batch its own extensions, but its file
+/// writers reject those that differ from the destination's
+/// (lance-format/lance#9478). DuckDB drops extensions it does not model, such
+/// as `arrow.fixed_shape_tensor`, adds its own under
+/// `arrow_lossless_conversion`, such as `arrow.opaque` on `BIT`, and spells
+/// extension metadata its own way, such as `{}` on a `geoarrow.wkb` without a
+/// CRS. So wherever Lance gives both sides the same type, a field takes the
+/// destination's extension (JSON text only its metadata, as
+/// `restated_extension_metadata` explains), which is what Lance 12 recorded;
+/// as with Lance 12, the values are not checked against it. Other fields, and
+/// those `align_extension_type` sets aside, are left to Lance.
+fn align_extension_types(fields: &Fields, reference: &Fields) -> Option<Fields> {
+    let mut aligned = fields.as_ref().to_vec();
+    let mut changed = false;
+    for slot in &mut aligned {
+        let Some(reference_field) = reference.iter().find(|f| f.name() == slot.name()) else {
+            continue;
+        };
+        let Some(field) = align_extension_type(slot, reference_field) else {
+            continue;
+        };
+        *slot = field;
+        changed = true;
+    }
+    changed.then(|| Fields::from(aligned))
+}
+
+/// Walks `field` against `reference` the way Lance's check pairs them: struct
+/// children by name, and list, map and fixed-size list items in place.
+fn align_extension_type(field: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
+    // Lance's blob handling reads Blob v2 input by its extension, so it is left
+    // as is.
+    let blob_v2 = |field: &Field| field.extension_type_name() == Some(BLOB_V2_EXT_NAME);
+    if blob_v2(field) || blob_v2(reference) || !same_lance_type(field, reference) {
+        return None;
+    }
+    let data_type = match (field.data_type(), reference.data_type()) {
+        (DataType::Struct(children), DataType::Struct(reference_children)) => {
+            align_extension_types(children, reference_children).map(DataType::Struct)
+        }
+        (DataType::List(item), DataType::List(reference_item)) => {
+            align_extension_type(item, reference_item).map(DataType::List)
+        }
+        (DataType::LargeList(item), DataType::LargeList(reference_item)) => {
+            align_extension_type(item, reference_item).map(DataType::LargeList)
+        }
+        // Lance's check compares the item of a fixed-size list of structs
+        // whole, extensions included, so that item is left as it is.
+        (DataType::FixedSizeList(item, size), DataType::FixedSizeList(reference_item, _))
+            if !matches!(item.data_type(), DataType::Struct(_)) =>
+        {
+            align_extension_type(item, reference_item)
+                .map(|item| DataType::FixedSizeList(item, *size))
+        }
+        (DataType::Map(entries, sorted), DataType::Map(reference_entries, _)) => {
+            align_extension_type(entries, reference_entries)
+                .map(|entries| DataType::Map(entries, *sorted))
+        }
+        _ => None,
+    };
+    let metadata = restated_extension_metadata(field, reference);
+    if data_type.is_none() && metadata.is_none() {
+        return None;
+    }
+    Some(Arc::new(
+        Field::new(
+            field.name(),
+            data_type.unwrap_or_else(|| field.data_type().clone()),
+            field.is_nullable(),
+        )
+        .with_metadata(metadata.unwrap_or_else(|| field.metadata().clone())),
+    ))
+}
+
+/// The metadata `field` needs to carry the destination's extension, or `None`
+/// when it already does.
+///
+/// JSON text keeps its `arrow.json` name, which is what makes Lance convert it
+/// to JSONB; the conversion keeps the text's extension metadata, so only that
+/// follows the destination.
+fn restated_extension_metadata(
+    field: &Field,
+    reference: &Field,
+) -> Option<HashMap<String, String>> {
+    let name = if is_arrow_json_field(field) {
+        field.extension_type_name()
+    } else {
+        reference.extension_type_name()
+    };
+    let metadata = reference.extension_type_metadata();
+    if (field.extension_type_name(), field.extension_type_metadata()) == (name, metadata) {
+        return None;
+    }
+    let mut restated = field.metadata().clone();
+    restated.remove(EXTENSION_TYPE_NAME_KEY);
+    restated.remove(EXTENSION_TYPE_METADATA_KEY);
+    if let Some(name) = name {
+        restated.insert(EXTENSION_TYPE_NAME_KEY.to_string(), name.to_string());
+    }
+    if let Some(metadata) = metadata {
+        restated.insert(
+            EXTENSION_TYPE_METADATA_KEY.to_string(),
+            metadata.to_string(),
+        );
+    }
+    Some(restated)
+}
+
+/// Whether Lance gives both fields the same logical type, which for JSON and
+/// bfloat16 vectors depends on their extensions. `align_extension_type` makes
+/// this check again at each child it descends into.
+fn same_lance_type(field: &Field, reference: &Field) -> bool {
+    matches!(
+        (LanceField::try_from(field), LanceField::try_from(reference)),
+        (Ok(incoming), Ok(stored)) if incoming.logical_type == stored.logical_type
+    )
+}
+
+/// `reference` holds the destination's fields when appending; a list column
+/// converted to a fixed-size vector takes the extension the destination
+/// records for it, which `align_append_fields` could not match on the list.
 fn build_output_schema(
     input_schema: &SchemaRef,
     conversions: &[VectorConversion],
+    reference: Option<&Fields>,
 ) -> Result<SchemaRef, String> {
     if conversions.is_empty() {
         return Ok(input_schema.clone());
@@ -608,11 +749,15 @@ fn build_output_schema(
             _ => return Err("vector column has unexpected data type".to_string()),
         };
         let dim_i32 = i32::try_from(conv.dim).map_err(|_| "vector dim is too large".to_string())?;
-        fields[idx] = Arc::new(Field::new(
+        let converted = Arc::new(Field::new(
             original.name(),
             DataType::FixedSizeList(child_field, dim_i32),
             original.is_nullable(),
         ));
+        fields[idx] = reference
+            .and_then(|reference| reference.iter().find(|f| f.name() == converted.name()))
+            .and_then(|stored| align_extension_type(&converted, stored))
+            .unwrap_or(converted);
     }
     Ok(Arc::new(Schema::new(fields)))
 }
@@ -855,12 +1000,14 @@ fn open_writer_inner(
     // The incoming Arrow arrays are imported against `data_type`, so realigning
     // the schema without it would fail RecordBatch validation.
     let mut data_type = data_type.clone();
+    let mut append_reference = None;
     if matches!(write_mode, WriteMode::Append) {
         if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
-            if let Some(fields) = align_list_field_names(schema.fields(), existing.fields()) {
+            if let Some(fields) = align_append_fields(schema.fields(), existing.fields()) {
                 data_type = DataType::Struct(fields.clone());
                 schema = Arc::new(Schema::new(fields));
             }
+            append_reference = Some(existing.fields().clone());
         }
     }
 
@@ -931,6 +1078,7 @@ fn open_writer_inner(
             kind,
             path,
             params,
+            append_reference,
             vector_candidates,
             buffered_batches: Vec::new(),
             output_schema: None,
@@ -1297,6 +1445,8 @@ pub unsafe extern "C" fn lance_free_transaction(transaction: *mut c_void) {
 #[cfg(test)]
 mod align_tests {
     use super::*;
+    use lance_arrow::bfloat16::BFLOAT16_EXT_NAME;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME};
 
     fn list_of(child_name: &str) -> DataType {
         DataType::List(Arc::new(Field::new(child_name, DataType::Utf8, true)))
@@ -1346,6 +1496,155 @@ mod align_tests {
             panic!("expected a struct");
         };
         assert_eq!(children[0].data_type(), &list_of("l"));
+    }
+
+    fn vector_of(child_name: &str) -> DataType {
+        DataType::FixedSizeList(Arc::new(Field::new(child_name, DataType::Float32, true)), 4)
+    }
+
+    fn with_extension(field: Field, name: &str, metadata: Option<&str>) -> Field {
+        let mut map = field.metadata().clone();
+        map.insert(EXTENSION_TYPE_NAME_KEY.to_string(), name.to_string());
+        if let Some(metadata) = metadata {
+            map.insert(
+                EXTENSION_TYPE_METADATA_KEY.to_string(),
+                metadata.to_string(),
+            );
+        }
+        field.with_metadata(map)
+    }
+
+    fn column(name: &str, data_type: DataType, extension: Option<(&str, Option<&str>)>) -> Fields {
+        let field = Field::new(name, data_type, true);
+        Fields::from(vec![match extension {
+            Some((extension, metadata)) => with_extension(field, extension, metadata),
+            None => field,
+        }])
+    }
+
+    const TENSOR: &str = "arrow.fixed_shape_tensor";
+    const TENSOR_META: &str = r#"{"shape":[4]}"#;
+    const OPAQUE: &str = "arrow.opaque";
+    const BIT_META: &str = r#"{"type_name":"bit","vendor_name":"DuckDB"}"#;
+    const WKB: &str = "geoarrow.wkb";
+
+    fn extension(field: &Field) -> (Option<&str>, Option<&str>) {
+        (field.extension_type_name(), field.extension_type_metadata())
+    }
+
+    #[test]
+    fn restates_the_destination_extension() {
+        // DuckDB drops an extension it does not model (and names the child "")...
+        let tensor = column("v", vector_of("item"), Some((TENSOR, Some(TENSOR_META))));
+        let aligned = align_append_fields(&column("v", vector_of(""), None), &tensor)
+            .expect("expected the tensor extension");
+        assert_eq!(extension(&aligned[0]), (Some(TENSOR), Some(TENSOR_META)));
+        assert_eq!(aligned[0].data_type(), &vector_of(""));
+
+        // ...adds its own under arrow_lossless_conversion, other metadata staying...
+        let comment = HashMap::from([("comment".to_string(), "kept".to_string())]);
+        let bit = Field::new("b", DataType::Binary, true).with_metadata(comment.clone());
+        let incoming = Fields::from(vec![with_extension(bit, OPAQUE, Some(BIT_META))]);
+        let aligned = align_append_fields(&incoming, &column("b", DataType::Binary, None));
+        assert_eq!(
+            aligned.expect("expected no extension")[0].metadata(),
+            &comment
+        );
+
+        // ...and spells extension metadata its own way.
+        let geometry = |metadata| column("g", DataType::Binary, Some((WKB, metadata)));
+        for stored in [None, Some(r#"{"crs":"OGC:CRS84"}"#)] {
+            let aligned = align_append_fields(&geometry(Some("{}")), &geometry(stored));
+            assert_eq!(aligned, Some(geometry(stored)));
+        }
+
+        // JSON text keeps its name, so Lance still converts it; the metadata follows.
+        let text = |metadata| column("j", DataType::Utf8, Some((ARROW_JSON_EXT_NAME, metadata)));
+        let json = |metadata| column("j", DataType::LargeBinary, Some((JSON_EXT_NAME, metadata)));
+        assert_eq!(
+            align_append_fields(&text(Some("")), &json(None)),
+            Some(text(None))
+        );
+        assert!(align_append_fields(&text(Some("")), &json(Some(""))).is_none());
+    }
+
+    #[test]
+    fn leaves_type_differences_to_lance() {
+        let leaves = |incoming: Fields, stored: Fields| {
+            assert!(align_append_fields(&incoming, &stored).is_none());
+        };
+        let tensor = column("v", vector_of("item"), Some((TENSOR, Some(TENSOR_META))));
+        leaves(tensor.clone(), tensor);
+        leaves(
+            column("g", DataType::Binary, None),
+            column("g", DataType::LargeBinary, Some((WKB, None))),
+        );
+
+        // Lance types JSON, Blob v2 and bfloat16 vectors by their extension.
+        let json = column("j", DataType::LargeBinary, Some((JSON_EXT_NAME, None)));
+        leaves(column("j", DataType::LargeBinary, None), json);
+        let blob = DataType::Struct(Fields::from(vec![
+            Field::new("data", DataType::LargeBinary, true),
+            Field::new("uri", DataType::Utf8, true),
+        ]));
+        leaves(
+            column("b", blob.clone(), None),
+            column("b", blob, Some((BLOB_V2_EXT_NAME, None))),
+        );
+        let raw = Field::new("item", DataType::FixedSizeBinary(2), true);
+        let bf16 = with_extension(raw.clone(), BFLOAT16_EXT_NAME, None);
+        let halves = |item| column("h", DataType::FixedSizeList(Arc::new(item), 4), None);
+        leaves(halves(raw), halves(bf16));
+
+        // Lance compares the item of a fixed-size list of structs whole.
+        let pairs = |child: Field| {
+            let item = Field::new("item", DataType::Struct(Fields::from(vec![child])), true);
+            column("p", DataType::FixedSizeList(Arc::new(item), 2), None)
+        };
+        let bit = Field::new("c", DataType::Binary, true);
+        let opaque = with_extension(bit.clone(), OPAQUE, Some(BIT_META));
+        leaves(pairs(bit), pairs(opaque));
+    }
+
+    #[test]
+    fn restates_nested_extensions_after_list_names() {
+        let bits = |item: Field| column("bits", DataType::List(Arc::new(item)), None);
+        let item = Field::new("l", DataType::Binary, true);
+        let stored = bits(with_extension(item, OPAQUE, Some(BIT_META)));
+        let incoming = bits(Field::new("item", DataType::Binary, true));
+        assert_eq!(align_append_fields(&incoming, &stored), Some(stored));
+    }
+
+    #[test]
+    fn converted_vectors_take_the_destination_extension() {
+        let floats = || Arc::new(Field::new("item", DataType::Float32, true));
+        let input = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::List(floats()),
+            true,
+        )]));
+        let conversions = vec![VectorConversion {
+            col_idx: 0,
+            dim: 4,
+            list_kind: VectorListKind::List,
+            element_type: VectorElementType::Float32,
+        }];
+        let tensor = column("v", vector_of("item"), Some((TENSOR, Some(TENSOR_META))));
+
+        let output = build_output_schema(&input, &conversions, Some(&tensor)).unwrap();
+        assert_eq!(output.field(0).extension_type_name(), Some(TENSOR));
+        let offsets = arrow::buffer::OffsetBuffer::from_lengths([4]);
+        let values = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]));
+        let list = ListArray::new(floats(), offsets, values, None);
+        let batch = RecordBatch::try_new(input.clone(), vec![Arc::new(list)]).unwrap();
+        let converted = convert_record_batch(&batch, &output, &conversions).unwrap();
+        assert_eq!(
+            converted.schema().field(0).extension_type_name(),
+            Some(TENSOR)
+        );
+
+        let plain = build_output_schema(&input, &conversions, None).unwrap();
+        assert_eq!(plain.field(0).extension_type_name(), None);
     }
 }
 

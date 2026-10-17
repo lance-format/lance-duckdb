@@ -24,7 +24,7 @@ FROM __lance_cleanup_old_versions(
   '{"older_than_seconds":0,"delete_unverified":false,"error_if_tagged_old_versions":true}'
 );
 ----
-cleanup	{TEST_DIR}/maintenance_internal_metrics.lance	<REGEX>:\{.*"bytes_removed".*"old_versions".*\}
+cleanup	{TEST_DIR}/maintenance_internal_metrics.lance	<REGEX>:\{.*"bytes_removed".*"old_versions".*"failed_deletes":0\}
 
 statement ok
 ATTACH '{TEST_DIR}' AS maintenance_internal_ns (TYPE LANCE);

@@ -68,6 +68,7 @@ struct CleanupOldVersionsOptionsInput {
 struct CleanupOldVersionsMetricsOutput {
     bytes_removed: u64,
     old_versions: u64,
+    failed_deletes: u64,
 }
 
 impl Default for CleanupOldVersionsOptionsInput {
@@ -823,6 +824,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
     options_json: *const c_char,
+    has_uncommitted_writes: u8,
     out_metrics_json: *mut *const c_char,
 ) -> i32 {
     if !out_metrics_json.is_null() {
@@ -830,9 +832,20 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
             ptr::write_unaligned(out_metrics_json, ptr::null());
         }
     }
-    match parse_cleanup_options_json(options_json).and_then(|options| {
+    let result = parse_cleanup_options_json(options_json).and_then(|options| {
+        // delete_unverified lists data files with no age cutoff
+        // (lance-format/lance#8944), so it would delete the files of writes still
+        // pending in an open transaction, whose commit then publishes a table
+        // that cannot be read.
+        if options.delete_unverified && has_uncommitted_writes != 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "delete_unverified cannot run while a transaction has uncommitted Lance writes",
+            ));
+        }
         dataset_cleanup_old_versions_with_options_struct(dataset, options, out_metrics_json)
-    }) {
+    });
+    match result {
         Ok(()) => {
             clear_last_error();
             0
@@ -894,6 +907,9 @@ fn dataset_cleanup_old_versions_with_options_struct(
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
                 old_versions: stats.old_versions,
+                // Lance keeps going past files it cannot delete; report them so
+                // a partial cleanup is not mistaken for a complete one.
+                failed_deletes: stats.failed_deletes,
             };
             write_metrics_json(
                 &metrics,

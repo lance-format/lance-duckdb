@@ -11,6 +11,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{DataFusionError, Result as DFResult};
 use futures::{StreamExt, TryStreamExt};
+use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
@@ -19,7 +20,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::ROW_ID;
 use lance_table::format::RowIdMeta;
 use lance_table::rowids::{
-    read_row_ids, rechunk_sequences, write_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence,
+    rechunk_sequences, write_row_ids, FragmentRowIdIndex, RowIdIndex, RowIdSequence,
 };
 use roaring::RoaringTreemap;
 
@@ -500,36 +501,14 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
         return Err("row id index requested for dataset without stable row ids".to_string());
     }
 
-    let base = dataset.branch_location().path;
-    let object_store = dataset
-        .object_store(None)
-        .await
-        .map_err(|e| e.to_string())?;
     let fragments = dataset.get_fragments();
 
     let mut indices = Vec::with_capacity(dataset.manifest.fragments.len());
     for fragment in dataset.manifest.fragments.iter() {
-        let row_id_meta = fragment
-            .row_id_meta
-            .as_ref()
-            .ok_or_else(|| "missing row id meta".to_string())?;
-        let row_id_bytes = match row_id_meta {
-            RowIdMeta::Inline(data) => data.to_vec(),
-            RowIdMeta::External(file) => {
-                let path = base.clone().join(file.path.as_str());
-                let range = file.offset as usize..(file.offset + file.size) as usize;
-                object_store
-                    .open(&path)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .get_range(range)
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .to_vec()
-            }
-        };
-
-        let sequence = read_row_ids(&row_id_bytes).map_err(|e| e.to_string())?;
+        // Lance owns the row id layout (inline bytes or a spilled column).
+        let sequence = load_row_id_sequence(dataset, fragment)
+            .await
+            .map_err(|e| e.to_string())?;
         let deletion_vector = fragments
             .iter()
             .find(|f| f.id() as u32 == fragment.id as u32)
@@ -541,7 +520,7 @@ pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowId
 
         indices.push(FragmentRowIdIndex {
             fragment_id: fragment.id as u32,
-            row_id_sequence: Arc::new(sequence),
+            row_id_sequence: sequence,
             deletion_vector,
         });
     }

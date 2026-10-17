@@ -18,6 +18,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -1883,6 +1884,11 @@ public:
         std::move(pending));
   }
 
+  bool HasPendingAppends() {
+    lock_guard<mutex> guard(pending_lock);
+    return !pending_appends.empty();
+  }
+
   ErrorData CommitTransaction(ClientContext &context,
                               Transaction &transaction_p) override {
     auto &transaction = transaction_p.Cast<DuckTransaction>();
@@ -1986,6 +1992,20 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
   tm->RegisterPendingAppend(txn, std::move(pending));
+}
+
+// Checks every attached Lance catalog, not only the one a caller targets: the
+// same dataset can be reached through a catalog name and through a path, so a
+// match on the dataset URI could miss it.
+bool LanceHasUncommittedWrites(ClientContext &context) {
+  for (auto &db : DatabaseManager::Get(context).GetDatabases(context)) {
+    auto *tm =
+        dynamic_cast<LanceTransactionManager *>(&db->GetTransactionManager());
+    if (tm && tm->HasPendingAppends()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace duckdb

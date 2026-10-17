@@ -22,7 +22,7 @@ VACUUM LANCE '{TEST_DIR}/maintenance_sql_surface.lance' WITH (
   error_if_tagged_old_versions = true
 );
 ----
-cleanup	{TEST_DIR}/maintenance_sql_surface.lance	<REGEX>:\{.*"bytes_removed".*\}
+cleanup	{TEST_DIR}/maintenance_sql_surface.lance	<REGEX>:\{.*"bytes_removed".*"failed_deletes":0\}
 
 statement ok
 CREATE INDEX id_btree_surface

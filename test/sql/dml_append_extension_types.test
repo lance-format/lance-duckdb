@@ -1,0 +1,89 @@
+# name: test/sql/dml_append_extension_types.test
+# description: Appends keep the Arrow extension types the destination records
+# group: [sql]
+
+require lance
+
+# Lance 13 rejects an appended batch whose Arrow extension types differ from
+# the ones the destination records. DuckDB attaches `arrow.opaque` to BIT only
+# under arrow_lossless_conversion, so toggling it between create and append
+# makes the appended data disagree with the stored column, both ways and when
+# nested.
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, '101'::BIT AS b, {'c': '11'::BIT} AS s, ['1'::BIT, '0'::BIT] AS l,
+    MAP {'k': '1'::BIT} AS m
+) TO '{TEST_DIR}/ext_ns/opaque.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+SET arrow_lossless_conversion = false;
+
+statement ok
+COPY (SELECT 2::BIGINT AS id, '01'::BIT AS b) TO '{TEST_DIR}/ext_ns/plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/ext_ns' AS ext_ns (TYPE LANCE);
+
+# Plain BIT into a column that records arrow.opaque.
+statement ok
+INSERT INTO ext_ns.main.opaque VALUES (2, '110'::BIT, {'c': '01'::BIT}, ['1'::BIT], MAP {'k': '0'::BIT});
+
+statement ok
+COPY (
+  SELECT 3::BIGINT AS id, '111'::BIT AS b, {'c': '10'::BIT} AS s, ['0'::BIT] AS l, MAP {'k': '11'::BIT} AS m
+) TO '{TEST_DIR}/ext_ns/opaque.lance' (FORMAT lance, mode 'append');
+
+query ITTTT
+SELECT id, b::VARCHAR, s.c::VARCHAR, l::VARCHAR, m::VARCHAR FROM ext_ns.main.opaque ORDER BY id;
+----
+1	101	11	[1, 0]	{k=1}
+2	110	01	[1]	{k=0}
+3	111	10	[0]	{k=11}
+
+# arrow.opaque BIT into a column that records plain bytes.
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+COPY (SELECT 3::BIGINT AS id, '110'::BIT AS b) TO '{TEST_DIR}/ext_ns/plain.lance' (FORMAT lance, mode 'append');
+
+query II
+SELECT id, octet_length(b) FROM ext_ns.main.plain ORDER BY id;
+----
+2	2
+3	2
+
+# DuckDB records a GEOMETRY's CRS in the metadata of `geoarrow.wkb` and writes
+# "{}" without one. COPY appends keep their source type, so a geometry without a
+# CRS meets a column with one, and the other way round.
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'POINT(1 2)'::GEOMETRY('OGC:CRS84') AS g)
+TO '{TEST_DIR}/geo_crs.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 2::BIGINT AS id, 'POINT(3 4)'::GEOMETRY AS g)
+TO '{TEST_DIR}/geo_crs.lance' (FORMAT lance, mode 'append');
+
+query ITT
+SELECT id, g::VARCHAR, typeof(g) FROM '{TEST_DIR}/geo_crs.lance' ORDER BY id;
+----
+1	POINT (1 2)	GEOMETRY('OGC:CRS84')
+2	POINT (3 4)	GEOMETRY('OGC:CRS84')
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'POINT(1 2)'::GEOMETRY AS g)
+TO '{TEST_DIR}/geo_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 2::BIGINT AS id, 'POINT(3 4)'::GEOMETRY('OGC:CRS84') AS g)
+TO '{TEST_DIR}/geo_plain.lance' (FORMAT lance, mode 'append');
+
+query ITT
+SELECT id, g::VARCHAR, typeof(g) FROM '{TEST_DIR}/geo_plain.lance' ORDER BY id;
+----
+1	POINT (1 2)	GEOMETRY
+2	POINT (3 4)	GEOMETRY
