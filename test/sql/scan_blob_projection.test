@@ -1,0 +1,46 @@
+# name: test/sql/scan_blob_projection.test
+# description: Projecting a Lance blob column (v1 lance-encoding:blob or v2 lance.blob.v2) fails closed instead of crashing (issue #212)
+# group: [sql]
+
+require lance
+
+# Non-blob columns scan fine even though the dataset has a blob-encoded column.
+query I
+SELECT id FROM 'test/data/issue212_blob.lance' ORDER BY id;
+----
+1
+2
+3
+
+# Projecting the blob-encoded column fails closed with a clear error instead of
+# crashing the process.
+statement error
+SELECT image_bytes FROM 'test/data/issue212_blob.lance';
+----
+blob-encoded column
+
+# SELECT * also projects the blob-encoded column and hits the same guard.
+statement error
+SELECT * FROM 'test/data/issue212_blob.lance';
+----
+blob-encoded column
+
+# The v2 blob encoding (lance.blob.v2 extension type) is covered by the same
+# guard. Non-blob columns still scan fine.
+query I
+SELECT id FROM 'test/data/blob_v2.lance' ORDER BY id;
+----
+1
+2
+3
+
+statement error
+SELECT image_bytes FROM 'test/data/blob_v2.lance';
+----
+blob-encoded column
+
+statement error
+SELECT * FROM 'test/data/blob_v2.lance';
+----
+blob-encoded column
+

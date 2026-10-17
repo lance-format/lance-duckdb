@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -1080,6 +1081,25 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
   return std::move(result);
 }
 
+// Lance blob columns come in two forms: the legacy v1 `lance-encoding:blob`
+// field metadata and the v2 `lance.blob.v2` Arrow extension type. Neither has
+// a read path yet; projecting one binds the dataset schema while the scan
+// returns a mismatched descriptor struct, crashing the process. Detect both
+// markers (mirroring Lance's own is_blob) and fail closed.
+static bool LanceColumnIsBlobEncoded(const ArrowSchema &schema_root,
+                                     column_t col_id) {
+  if (col_id >= static_cast<column_t>(schema_root.n_children)) {
+    return false;
+  }
+  const auto *child = schema_root.children[col_id];
+  if (!child || !child->metadata) {
+    return false;
+  }
+  ArrowSchemaMetadata metadata(child->metadata);
+  return metadata.GetOption("lance-encoding:blob") == "true" ||
+         metadata.GetOption("ARROW:extension:name") == "lance.blob.v2";
+}
+
 static unique_ptr<GlobalTableFunctionState>
 LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
@@ -1148,6 +1168,11 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 
     if (col_id >= bind_data.types.size() || col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
+    }
+    if (LanceColumnIsBlobEncoded(bind_data.schema_root.arrow_schema, col_id)) {
+      throw NotImplementedException(
+          "Projecting blob-encoded column \"" + bind_data.names[col_id] +
+          "\" is not supported yet; omit it from the column list");
     }
     auto scan_idx = add_scan_column(col_id, bind_data.names[col_id],
                                     bind_data.types[col_id]);
@@ -1230,7 +1255,22 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       }
     }
     if (!has_physical_column && !bind_data.names.empty()) {
-      add_scan_column(0, bind_data.names[0], bind_data.types[0]);
+      // Drive the count/rowid-only scan with the first non-blob column; a blob
+      // column here would re-enter the same unsupported Arrow conversion that
+      // LanceColumnIsBlobEncoded guards against in the projection loop above.
+      idx_t driver = bind_data.names.size();
+      for (idx_t i = 0; i < bind_data.names.size(); i++) {
+        if (!LanceColumnIsBlobEncoded(bind_data.schema_root.arrow_schema, i)) {
+          driver = i;
+          break;
+        }
+      }
+      if (driver == bind_data.names.size()) {
+        throw NotImplementedException(
+            "Projecting blob-encoded column \"" + bind_data.names[0] +
+            "\" is not supported yet; omit it from the column list");
+      }
+      add_scan_column(driver, bind_data.names[driver], bind_data.types[driver]);
     }
     return state;
   }
