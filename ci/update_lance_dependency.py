@@ -154,14 +154,6 @@ def update_cargo_lock(repo_root: Path, version: str) -> None:
         )
 
 
-def write_github_outputs(path: str | None, payload: dict[str, str]) -> None:
-    if not path:
-        return
-    with open(path, "a", encoding="utf-8") as output:
-        for key, value in payload.items():
-            output.write(f"{key}={value}\n")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -173,11 +165,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path(__file__).resolve().parents[1],
         help="Path to the lance-duckdb repository root",
-    )
-    parser.add_argument(
-        "--github-output",
-        default=None,
-        help="Optional GitHub Actions output file to receive metadata fields",
     )
     parser.add_argument(
         "--metadata-only",
@@ -194,7 +181,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         update_cargo_toml(repo_root, version)
         update_cargo_lock(repo_root, version)
 
-    write_github_outputs(args.github_output, payload)
     print(json.dumps(payload, sort_keys=True))
     return 0
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
-"""Determine whether a newer Lance tag exists and expose results for CI."""
+"""Check for a newer upstream Lance dependency tag and print JSON."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 from collections.abc import Iterable, Sequence
@@ -161,15 +160,6 @@ def determine_latest_tag(tags: Iterable[TagInfo]) -> TagInfo:
     return max(tags, key=lambda tag: tag.semver)
 
 
-def write_outputs(args: argparse.Namespace, payload: dict) -> None:
-    target = getattr(args, "github_output", None)
-    if not target:
-        return
-    with open(target, "a", encoding="utf-8") as handle:
-        for key, value in payload.items():
-            handle.write(f"{key}={value}\n")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -177,11 +167,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path(__file__).resolve().parents[1],
         type=Path,
         help="Path to the lance-duckdb repository root",
-    )
-    parser.add_argument(
-        "--github-output",
-        default=os.environ.get("GITHUB_OUTPUT"),
-        help="Optional file path for writing GitHub Action outputs",
     )
     args = parser.parse_args(argv)
 
@@ -205,7 +190,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
 
     print(json.dumps(payload))
-    write_outputs(args, payload)
     return 0
 
 

@@ -1,6 +1,8 @@
 [package]
 name = "lance_duckdb_ffi"
+# Internal Cargo metadata; lance-duckdb releases follow DuckDB.
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 [lib]

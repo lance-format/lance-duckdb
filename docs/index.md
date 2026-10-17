@@ -2,6 +2,10 @@
 
 The Lance extension provides support for managing Lance tables and querying them in SQL, via DuckDB.
 
+Lance is a DuckDB core extension with no independent lance-duckdb version
+number. Releases follow DuckDB, and binaries target the corresponding DuckDB
+build and platform. See the [version and release policy](duckdb-compatibility.md).
+
 ## Installation
 
 To install and load the extension, run these commands in your DuckDB CLI:
@@ -11,11 +15,15 @@ INSTALL lance;
 LOAD lance;
 ```
 
-> If you already have a version of the extension installed locally, run the following command to update it to the latest version:
+To refresh installed extensions from their repositories for your current DuckDB
+build, run:
 
 ```sql
 UPDATE EXTENSIONS;
 ```
+
+This does not upgrade DuckDB or select an independent lance-duckdb release.
+Availability depends on DuckDB publishing a compatible Lance artifact.
 
 ## Examples
 

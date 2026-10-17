@@ -158,7 +158,7 @@ These notes apply to all three search functions.
 - Containment predicates over list columns — `array_has_any` and `array_has_all` — push down. With `prefilter=true` and a `LABEL_LIST` index on the list column, Lance answers them from the index; without one, Lance evaluates them with a scan. The index is used for `VARCHAR[]` and `BIGINT[]` element types; narrower integer widths still push and prefilter, but scan.
 - `IS NULL` / `IS NOT NULL` on list columns push down. No scalar index answers them.
 - Containment forms that cannot push — empty or non-constant needles, needles containing `NULL`, `array_has` / `array_contains`, and the `&&` / `@>` / `<@` aliases — are evaluated by DuckDB after the search.
-- Datasets whose list columns have a child field named `l` (written by older versions of this extension) push and prefilter correctly, but the `LABEL_LIST` index is not used. A metadata-only rename fixes this without rewriting data: `ALTER TABLE ns.main.t RENAME COLUMN "tags.l" TO item;`
+- Datasets whose list columns have a child field named `l` (written by earlier builds of this extension) push and prefilter correctly, but the `LABEL_LIST` index is not used. A metadata-only rename fixes this without rewriting data: `ALTER TABLE ns.main.t RENAME COLUMN "tags.l" TO item;`
 - Known limitation: `IN` over a `VARCHAR` column with two or more values currently raises an error from the search functions when it must prefilter. Apply it after the search, or use a scan.
 
 ## Namespaces

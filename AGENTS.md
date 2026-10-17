@@ -4,6 +4,15 @@
 
 This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
+## Version and Release Policy
+
+- Lance is a DuckDB core extension. lance-duckdb has no independent product version or release cadence; delivery follows DuckDB releases and the target DuckDB commit.
+- Do not propose or create lance-duckdb version bumps, release tags, or GitHub releases. DuckDB owns official core-extension publication and selects this repository's latest `main` for the active target.
+- Identify compatibility by DuckDB release/commit and platform. Identify extension source by its lance-duckdb commit. Record both commits when reporting validation; repository CI success is distinct from official artifact availability.
+- The `duckdb` gitlink pins the tested upstream commit. DuckDB-named maintenance branches are compatibility lines, not independent extension versions. Keep gitlinks, branch annotations, and CI targets aligned when changing the DuckDB target.
+- Cargo package versions are internal metadata; Lance dependency versions and dataset/storage/IR versions are separate concepts. Preserve DuckDB's generated build metadata without treating it as an independent product version.
+- Follow [DuckDB compatibility and release policy](docs/duckdb-compatibility.md) for branch and publication details.
+
 ## Documentation Language
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
