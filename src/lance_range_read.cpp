@@ -203,8 +203,8 @@ LanceBlobRangeReadBind(ClientContext &context, TableFunctionBindInput &input,
     // was read from.
     throw BinderException(
         "lance_read_blob_ranges: selector 'row_address' requires an explicit "
-        "positive version; use 'row_id' with a NULL version for the latest "
-        "snapshot");
+        "positive version; a NULL version for the latest snapshot is only "
+        "available through 'row_id' on datasets with stable row ids");
   }
 
   result->request_id_idx =
@@ -256,6 +256,29 @@ LanceBlobRangeReadBind(ClientContext &context, TableFunctionBindInput &input,
                       result->dataset_path + "': " + error_message);
   }
   result->dataset_version = actual_version;
+
+  if (result->selector == LANCE_FFI_BLOB_SELECTOR_ROW_ID &&
+      !version.IsValid()) {
+    // `_rowid` is only a stable identity when the manifest enables stable row
+    // ids. Otherwise it is the physical address, which must stay bound to the
+    // snapshot it was read from.
+    uint8_t uses_stable_row_ids = 0;
+    if (lance_dataset_uses_stable_row_ids(result->dataset,
+                                          &uses_stable_row_ids) != 0) {
+      auto error_message = LanceConsumeLastError();
+      lance_close_dataset(result->dataset);
+      result->dataset = nullptr;
+      throw IOException("Failed to read Lance stable row-id flag for '" +
+                        result->dataset_path + "': " + error_message);
+    }
+    if (!uses_stable_row_ids) {
+      throw BinderException(
+          "lance_read_blob_ranges: selector 'row_id' with a NULL version "
+          "requires a dataset with stable row ids; this dataset exposes "
+          "physical row addresses as '_rowid', so pass an explicit positive "
+          "version (or use selector 'row_address')");
+    }
+  }
 
   auto &buffer_manager = BufferManager::GetBufferManager(context);
   auto memory_limit = buffer_manager.GetMaxMemory();

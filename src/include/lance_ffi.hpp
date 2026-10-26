@@ -41,6 +41,8 @@ void *lance_open_dataset_with_storage_options_and_version(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, uint8_t has_version, uint64_t version);
 int32_t lance_dataset_version(void *dataset, uint64_t *out_version);
+int32_t lance_dataset_uses_stable_row_ids(void *dataset,
+                                          uint8_t *out_uses_stable_row_ids);
 const char *lance_dir_namespace_list_tables(const char *root,
                                             const char **option_keys,
                                             const char **option_values,

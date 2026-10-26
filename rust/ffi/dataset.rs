@@ -298,6 +298,34 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void, out_version
     }
 }
 
+/// Report whether the dataset manifest enables stable row ids.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_uses_stable_row_ids(
+    dataset: *mut c_void,
+    out_uses_stable_row_ids: *mut u8,
+) -> i32 {
+    if out_uses_stable_row_ids.is_null() {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "out_uses_stable_row_ids must not be null",
+        );
+        return -1;
+    }
+    match unsafe { dataset_handle(dataset) } {
+        Ok(handle) => {
+            clear_last_error();
+            unsafe {
+                *out_uses_stable_row_ids = u8::from(handle.dataset.manifest.uses_stable_row_ids());
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
 /// Refresh a dataset handle to the latest committed version if it is stale.
 ///
 /// Compares the handle's checked-out manifest identity against the latest

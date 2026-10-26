@@ -103,26 +103,52 @@ empty_blob	1	false	0	none
 zero_len	2	false	0	none
 packed	3	false	3	424242
 
-# A NULL version reads the latest snapshot for `row_id` requests and reports
-# the version the handle was actually pinned to.
+# test/data/blob_range_stable_fixture.lance is a tiny dataset written with
+# stable row ids; `_rowid` carries the stable identity there.
+query II
+SELECT id, CAST(rowid AS BIGINT)
+FROM 'test/data/blob_range_stable_fixture.lance'
+ORDER BY id;
+----
+0	0
+1	1
+
+# A NULL version reads the latest snapshot for `row_id` requests on a dataset
+# with stable row ids and reports the version the handle was pinned to.
 query TTTT
 SELECT request_id,
        CAST(version AS VARCHAR),
        CAST(row_address AS VARCHAR),
        hex(data)
 FROM lance_read_blob_ranges(
+  'test/data/blob_range_stable_fixture.lance',
+  'payload',
+  NULL,
+  'row_id',
+  (
+    SELECT 'stable_latest' AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 12::BIGINT AS length
+  )
+);
+----
+stable_latest	1	0	737461626C6520616C706861
+
+# Without stable row ids `_rowid` is the physical address, so a NULL version
+# must be rejected instead of reinterpreting addresses on a later snapshot.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
   'test/data/blob_range_fixture.lance',
   'payload',
   NULL,
   'row_id',
   (
-    SELECT 'latest' AS request_id, CAST(rowid AS BIGINT) AS row_value,
-           0::BIGINT AS offset, 16::BIGINT AS length
-    FROM 'test/data/blob_range_fixture.lance' WHERE id = 5
+    SELECT 'latest' AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 5::BIGINT AS length
   )
 );
 ----
-latest	2	4294967296	617070656E646564207061796C6F6164
+requires a dataset with stable row ids
 
 # An explicit version binds `row_id` requests to that snapshot as well.
 query TT
@@ -274,7 +300,7 @@ SELECT COUNT(*)
 FROM lance_read_blob_ranges(
   'test/data/blob_range_fixture.lance',
   'payload',
-  NULL,
+  2,
   'row_id',
   (
     SELECT 1 AS request_id, 0 AS row_value, 0 AS offset, 1 AS length

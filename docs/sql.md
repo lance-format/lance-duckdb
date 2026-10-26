@@ -57,8 +57,9 @@ Positional arguments:
   credentials resolve through the same secrets and session as scans.
 - `column` (VARCHAR): A top-level blob column.
 - `version` (BIGINT): Dataset version to pin. `NULL` means the latest version
-  and is only allowed for the `row_id` selector, because a stored physical row
-  address must stay bound to the snapshot it was read from.
+  and is only allowed for `row_id` requests against a dataset whose manifest
+  enables stable row ids. Without stable row ids `_rowid` is the physical row
+  address, so both selectors require an explicit version there.
 - `selector` (VARCHAR): One selector kind for the whole call. `row_address`
   addresses the physical `row_address` value reported by a previous call at the
   same version. `row_id` addresses the dataset row id exposed as `_rowid`:

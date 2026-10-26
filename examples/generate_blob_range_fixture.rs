@@ -1,10 +1,12 @@
-//! Regenerate test/data/blob_range_fixture.lance with the pinned Lance
-//! dependency. The fixture is committed so SQL tests run without a writer that
-//! can produce Blob v2 columns yet; use this binary to refresh it after
+//! Regenerate the committed blob range-read fixtures with the pinned Lance
+//! dependency. The fixtures are committed so SQL tests run without a writer
+//! that can produce Blob v2 columns yet; use this binary to refresh them after
 //! dependency changes:
 //!
 //! ```sh
-//! cargo run --example generate_blob_range_fixture -- test/data/blob_range_fixture.lance
+//! cargo run --example generate_blob_range_fixture -- \
+//!   test/data/blob_range_fixture.lance \
+//!   test/data/blob_range_stable_fixture.lance
 //! ```
 
 use std::sync::Arc;
@@ -92,19 +94,45 @@ fn v2_batch() -> RecordBatch {
     .unwrap()
 }
 
-#[tokio::main]
-async fn main() -> lance::Result<()> {
-    let output = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "test/data/blob_range_fixture.lance".to_string());
-    if output.starts_with("file://") {
+fn stable_batch() -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        blob_field_with_options("payload", true, BlobFieldOptions::default()),
+        ArrowField::new("id", DataType::UInt64, false),
+    ]));
+    let mut builder = BlobArrayBuilder::new(2);
+    builder.push_bytes(b"stable alpha").unwrap();
+    builder.push_bytes(b"stable beta").unwrap();
+    let blob_array: ArrayRef = builder.finish().unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![blob_array, Arc::new(UInt64Array::from(vec![0, 1]))],
+    )
+    .unwrap()
+}
+
+fn reset_output(path: &str) -> lance::Result<()> {
+    if path.starts_with("file://") {
         return Err(lance::Error::invalid_input(
             "pass a plain local path; file:// URIs are not supported here".to_string(),
         ));
     }
-    if std::path::Path::new(&output).exists() {
-        std::fs::remove_dir_all(&output).ok();
+    if std::path::Path::new(path).exists() {
+        std::fs::remove_dir_all(path).ok();
     }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> lance::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let output = args
+        .next()
+        .unwrap_or_else(|| "test/data/blob_range_fixture.lance".to_string());
+    let stable_output = args
+        .next()
+        .unwrap_or_else(|| "test/data/blob_range_stable_fixture.lance".to_string());
+    reset_output(&output)?;
+    reset_output(&stable_output)?;
 
     let v1 = v1_batch();
     let v1_schema = v1.schema();
@@ -124,5 +152,23 @@ async fn main() -> lance::Result<()> {
         .await?;
     assert_eq!(dataset.manifest.version, 2);
     println!("wrote {} at version {}", output, dataset.manifest.version);
+
+    let stable = stable_batch();
+    let stable_schema = stable.schema();
+    let stable_dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(stable)], stable_schema),
+        &stable_output,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert!(stable_dataset.manifest.uses_stable_row_ids());
+    println!(
+        "wrote {} at version {}",
+        stable_output, stable_dataset.manifest.version
+    );
     Ok(())
 }
