@@ -1,0 +1,51 @@
+# name: test/sql/s3_blob_v2_external_source_access_minio.test
+# description: Blob v2 absolute source URIs honor disabled external access
+# group: [sql]
+
+require-env LANCE_TEST_S3 1
+
+test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
+
+test-env LANCE_S3_REGION us-east-1
+
+test-env LANCE_S3_BUCKET lance-test
+
+test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+
+test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+
+require lance
+
+statement ok
+CREATE SECRET blob_source_a (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
+  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok
+CREATE SECRET blob_source_b (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/b/',
+  ACCESS_KEY_ID 'blob-reader-b',
+  SECRET_ACCESS_KEY 'blob-reader-b-secret',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok
+SET enable_external_access=false;
+
+statement error
+SELECT payload FROM 'test/data/blob_v2_external_source.lance';
+----
+Cannot access source URI
