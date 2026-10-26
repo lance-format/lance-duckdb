@@ -32,23 +32,40 @@ pub(crate) fn nullable_output_schema(schema: SchemaRef) -> SchemaRef {
 ///
 /// Missing columns are null placeholders only: they preserve column indexes
 /// for the caller's bound schema and must never be exposed as SQL values.
+/// Present columns take the batch's field types so nested runtime metadata
+/// matches the arrays before constructing the padded batch.
 pub(crate) fn fill_missing_columns(
     batch: RecordBatch,
     full_schema: &SchemaRef,
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
     let row_count = batch.num_rows();
     let batch_schema = batch.schema();
+    let mut fields = Vec::with_capacity(full_schema.fields().len());
     let mut arrays = Vec::with_capacity(full_schema.fields().len());
     for field in full_schema.fields() {
-        let array = batch_schema
+        let batch_index = batch_schema
             .fields()
             .iter()
-            .position(|candidate| candidate.name() == field.name())
-            .map(|index| batch.column(index).clone())
-            .unwrap_or_else(|| new_null_array(field.data_type(), row_count));
+            .position(|candidate| candidate.name() == field.name());
+        let (field, array) = if let Some(index) = batch_index {
+            (
+                batch_schema.field(index).clone().with_nullable(true),
+                batch.column(index).clone(),
+            )
+        } else {
+            (
+                field.as_ref().clone().with_nullable(true),
+                new_null_array(field.data_type(), row_count),
+            )
+        };
+        fields.push(field);
         arrays.push(array);
     }
-    RecordBatch::try_new(full_schema.clone(), arrays)
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        full_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(schema, arrays)
 }
 
 /// A stream wrapper that holds the Lance RecordBatchStream

@@ -331,3 +331,36 @@ FROM lance_fts('test/data/blob_v2_reads.lance', 'text', 'beta', k = 1)
 ORDER BY id;
 ----
 1	96
+
+# Nested Blob leaves remain bytes in every native search projection.
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_fts('test/data/blob_v2_reads.lance', 'text', 'alpha', k = 1);
+----
+6E6573746564	6669727374
+
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_vector_search(
+  'test/data/blob_v2_reads.lance',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false
+);
+----
+6E6573746564	6669727374
+
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_hybrid_search(
+  'test/data/blob_v2_reads.lance',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  'text',
+  'alpha',
+  k = 1,
+  use_index = false
+);
+----
+6E6573746564	6669727374
