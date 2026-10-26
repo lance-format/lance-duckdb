@@ -16,8 +16,9 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, optional_cstr_to_str, parse_filter_sql,
-    parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult,
+    cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, optional_cstr_array,
+    optional_cstr_to_str, parse_filter_sql, parse_optional_filter_ir, slice_from_ptr, FfiError,
+    FfiResult,
 };
 
 #[no_mangle]
@@ -81,6 +82,8 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
     text_column: *const c_char,
     query: *const c_char,
     k: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     filter_sql: *const c_char,
@@ -91,6 +94,8 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
         text_column,
         query,
         k,
+        columns,
+        columns_len,
         filter_ir,
         filter_ir_len,
         filter_sql,
@@ -113,6 +118,8 @@ fn create_fts_stream_ir_inner(
     text_column: *const c_char,
     query: *const c_char,
     k: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     filter_sql: *const c_char,
@@ -120,6 +127,7 @@ fn create_fts_stream_ir_inner(
 ) -> FfiResult<StreamHandle> {
     let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
+    let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let mut filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
@@ -144,7 +152,13 @@ fn create_fts_stream_ir_inner(
             None => sql_filter,
         });
     }
-    let projection = handle.fts_projection.clone();
+    projection_columns.push(text_column.to_string());
+    projection_columns.push(SCORE_COLUMN.to_string());
+    if let Some(filter) = &filter {
+        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
+    }
+    projection_columns.sort();
+    projection_columns.dedup();
 
     let fts_query = FullTextSearchQuery::new(query.to_string())
         .with_column(text_column.to_string())
@@ -164,7 +178,7 @@ fn create_fts_stream_ir_inner(
         )
     })?;
     scan.disable_scoring_autoprojection();
-    scan.project(projection.as_ref()).map_err(|err| {
+    scan.project(&projection_columns).map_err(|err| {
         FfiError::new(
             ErrorCode::FtsStreamCreate,
             format!("fts scan project: {err}"),
@@ -172,7 +186,8 @@ fn create_fts_stream_ir_inner(
     })?;
     scan.scan_in_order(false);
 
-    let stream = LanceStream::from_scanner(scan).map_err(|err| {
+    let full_schema = projection::build_fts_schema(&handle.read_schema);
+    let stream = LanceStream::from_scanner_with_schema(scan, full_schema).map_err(|err| {
         FfiError::new(
             ErrorCode::FtsStreamCreate,
             format!("fts stream create: {err}"),
@@ -211,6 +226,8 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -228,6 +245,8 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         k,
         nprobes,
         refine_factor,
+        columns,
+        columns_len,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -257,6 +276,8 @@ fn create_hybrid_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -274,6 +295,7 @@ fn create_hybrid_stream_ir_inner(
     let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
     let text_query = unsafe { cstr_to_str(text_query, "text_query")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let requested_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
@@ -299,6 +321,7 @@ fn create_hybrid_stream_ir_inner(
         use_index,
         alpha,
         oversample_factor,
+        &requested_columns,
     )?;
 
     Ok(StreamHandle::Batches(vec![rows].into_iter()))
@@ -319,6 +342,7 @@ fn create_hybrid_batch(
     use_index: u8,
     alpha: f32,
     oversample_factor: u32,
+    requested_columns: &[String],
 ) -> FfiResult<RecordBatch> {
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     let oversample = k.saturating_mul(oversample_factor.max(1) as usize).max(k);
@@ -467,11 +491,20 @@ fn create_hybrid_batch(
     ranked.truncate(k);
 
     let row_ids: Vec<u64> = ranked.iter().map(|(rowid, _, _, _)| *rowid).collect();
-    let base_columns = handle
-        .base_projection
+    let base_columns = requested_columns
         .iter()
-        .map(|column| column.to_string())
+        .filter(|column| {
+            column.as_str() != DISTANCE_COLUMN
+                && column.as_str() != SCORE_COLUMN
+                && column.as_str() != HYBRID_SCORE_COLUMN
+        })
+        .cloned()
         .collect::<Vec<_>>();
+    let base_columns = if base_columns.is_empty() {
+        vec![ROW_ID_COLUMN.to_string()]
+    } else {
+        base_columns
+    };
     let uses_blob_v2_scanner =
         projection::projection_contains_blob_v2(&handle.dataset, &base_columns)
             .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?;
@@ -522,6 +555,13 @@ fn create_hybrid_batch(
             Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
     };
+    let rows =
+        projection::fill_missing_columns(rows, handle.read_schema.clone()).map_err(|err| {
+            FfiError::new(
+                ErrorCode::HybridStreamCreate,
+                format!("hybrid fill projected columns: {err}"),
+            )
+        })?;
 
     let mut dist_builder = Float32Builder::with_capacity(rows.num_rows());
     let mut score_builder = Float32Builder::with_capacity(rows.num_rows());

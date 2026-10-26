@@ -87,6 +87,40 @@ def main() -> None:
         )
         assert survivors == "0,6\n4,0", survivors
 
+        search_calls = {
+            "fts": f"lance_fts('{escaped_dataset}', 'text', 'external', k = 1)",
+            "vector": (
+                f"lance_vector_search('{escaped_dataset}', 'vec', "
+                f"[1.0, 0.0, 5.0]::FLOAT[3], k = 1, use_index = false)"
+            ),
+            "hybrid": (
+                f"lance_hybrid_search('{escaped_dataset}', 'vec', "
+                f"[1.0, 0.0, 5.0]::FLOAT[3], 'text', 'external', "
+                f"k = 1, use_index = false)"
+            ),
+        }
+        for name, search_call in search_calls.items():
+            rows = run_sql(
+                args.duckdb,
+                args.extension,
+                prefix + f" SELECT id FROM {search_call};",
+            )
+            assert rows == "5", f"{name} unexpectedly read the removed blob: {rows}"
+            projected = subprocess.run(
+                [
+                    str(args.duckdb),
+                    "-unsigned",
+                    "-csv",
+                    "-noheader",
+                    "-c",
+                    prefix + f" SELECT id, hex(payload) FROM {search_call};",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            assert projected.returncode != 0, f"{name} projected the removed external blob without an error"
+
         result = subprocess.run(
             [
                 str(args.duckdb),

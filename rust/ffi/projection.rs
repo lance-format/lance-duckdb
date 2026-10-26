@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use arrow_array::{new_null_array, RecordBatch};
 use lance::dataset::rowids::get_row_id_index;
 use lance::Dataset;
 use lance_core::datatypes::{BlobHandling, Schema};
@@ -28,6 +29,47 @@ pub(crate) fn build_knn_projection(base_projection: &Arc<[String]>) -> Arc<[Stri
     cols.extend(base_projection.iter().cloned());
     cols.push(DISTANCE_COLUMN.to_string());
     cols.into()
+}
+
+fn append_search_metric(schema: &ArrowSchema, metric: &str) -> Arc<ArrowSchema> {
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(metric, DataType::Float32, true)));
+    Arc::new(ArrowSchema::new(fields))
+}
+
+pub(crate) fn build_knn_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
+    append_search_metric(schema, DISTANCE_COLUMN)
+}
+
+pub(crate) fn build_fts_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
+    append_search_metric(schema, SCORE_COLUMN)
+}
+
+pub(crate) fn fill_missing_columns(
+    batch: RecordBatch,
+    full_schema: Arc<ArrowSchema>,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    let row_count = batch.num_rows();
+    let batch_schema = batch.schema();
+    let mut arrays = Vec::with_capacity(full_schema.fields().len());
+    for field in full_schema.fields() {
+        let array = batch_schema
+            .fields()
+            .iter()
+            .position(|candidate| candidate.name() == field.name())
+            .map(|index| batch.column(index).clone())
+            .unwrap_or_else(|| new_null_array(field.data_type(), row_count));
+        arrays.push(array);
+    }
+    let nullable_schema = Arc::new(ArrowSchema::new_with_metadata(
+        full_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        full_schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(nullable_schema, arrays)
 }
 
 pub(crate) fn build_hybrid_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {

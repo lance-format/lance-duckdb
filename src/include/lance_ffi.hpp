@@ -272,10 +272,10 @@ void *lance_get_knn_schema(void *dataset, const char *vector_column,
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  const float *query_values, size_t query_len,
                                  uint64_t k, uint64_t nprobes,
-                                 uint64_t refine_factor,
-                                 const uint8_t *filter_ir, size_t filter_ir_len,
-                                 const char *filter_sql, uint8_t prefilter,
-                                 uint8_t use_index);
+                                 uint64_t refine_factor, const char **columns,
+                                 size_t columns_len, const uint8_t *filter_ir,
+                                 size_t filter_ir_len, const char *filter_sql,
+                                 uint8_t prefilter, uint8_t use_index);
 
 const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       const float *query_values,
@@ -289,6 +289,7 @@ void *lance_get_fts_schema(void *dataset, const char *text_column,
                            const char *query, uint64_t k, uint8_t prefilter);
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
+                                 const char **columns, size_t columns_len,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
                                  const char *filter_sql, uint8_t prefilter);
 
@@ -341,9 +342,10 @@ void *lance_get_hybrid_schema(void *dataset);
 void *lance_create_hybrid_stream_ir(
     void *dataset, const char *vector_column, const float *query_values,
     size_t query_len, const char *text_column, const char *text_query,
-    uint64_t k, uint64_t nprobes, uint64_t refine_factor,
-    const uint8_t *filter_ir, size_t filter_ir_len, uint8_t prefilter,
-    uint8_t use_index, float alpha, uint32_t oversample_factor);
+    uint64_t k, uint64_t nprobes, uint64_t refine_factor, const char **columns,
+    size_t columns_len, const uint8_t *filter_ir, size_t filter_ir_len,
+    uint8_t prefilter, uint8_t use_index, float alpha,
+    uint32_t oversample_factor);
 
 // Index DDL / metadata
 int32_t lance_dataset_create_index(void *dataset, const char *index_name,

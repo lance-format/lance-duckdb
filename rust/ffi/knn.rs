@@ -10,7 +10,7 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, optional_cstr_to_str, parse_filter_sql,
+    cstr_to_str, nonzero_u64_to_usize, optional_cstr_array, optional_cstr_to_str, parse_filter_sql,
     parse_optional_filter_ir, slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
 
@@ -110,6 +110,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     filter_sql: *const c_char,
@@ -124,6 +126,8 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         k,
         nprobes,
         refine_factor,
+        columns,
+        columns_len,
         filter_ir,
         filter_ir_len,
         filter_sql,
@@ -150,6 +154,8 @@ fn create_knn_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
     filter_sql: *const c_char,
@@ -164,6 +170,7 @@ fn create_knn_stream_ir_inner(
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let mut filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
@@ -188,7 +195,13 @@ fn create_knn_stream_ir_inner(
             None => sql_filter,
         });
     }
-    let projection = projection::build_knn_projection(&handle.base_projection);
+    projection_columns.push(vector_column.to_string());
+    projection_columns.push(crate::constants::DISTANCE_COLUMN.to_string());
+    if let Some(filter) = &filter {
+        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
+    }
+    projection_columns.sort();
+    projection_columns.dedup();
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -216,7 +229,7 @@ fn create_knn_stream_ir_inner(
     }
     scan.use_index(use_index != 0);
     scan.disable_scoring_autoprojection();
-    scan.project(projection.as_ref()).map_err(|err| {
+    scan.project(&projection_columns).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
             format!("knn scan project: {err}"),
@@ -224,7 +237,8 @@ fn create_knn_stream_ir_inner(
     })?;
     scan.scan_in_order(false);
 
-    let stream = LanceStream::from_scanner(scan).map_err(|err| {
+    let full_schema = projection::build_knn_schema(&handle.read_schema);
+    let stream = LanceStream::from_scanner_with_schema(scan, full_schema).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
             format!("knn stream create: {err}"),

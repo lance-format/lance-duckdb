@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, RecordBatch, UInt64Array};
+use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::compute::take as arrow_take;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::datatypes::SchemaRef;
@@ -22,6 +22,7 @@ use tokio::runtime::Handle;
 pub struct LanceStream {
     handle: Handle,
     stream: Pin<Box<DatasetRecordBatchStream>>,
+    fill_schema: Option<SchemaRef>,
 }
 
 impl LanceStream {
@@ -33,6 +34,20 @@ impl LanceStream {
         Ok(Self {
             handle,
             stream: Box::pin(stream),
+            fill_schema: None,
+        })
+    }
+
+    pub fn from_scanner_with_schema(
+        scanner: Scanner,
+        fill_schema: SchemaRef,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let handle = crate::runtime::handle()?;
+        let stream = handle.block_on(async { scanner.try_into_stream().await })?;
+        Ok(Self {
+            handle,
+            stream: Box::pin(stream),
+            fill_schema: Some(fill_schema),
         })
     }
 
@@ -46,7 +61,17 @@ impl LanceStream {
 
         self.handle.block_on(async {
             match self.stream.next().await {
-                Some(Ok(batch)) => Ok(Some(batch)),
+                Some(Ok(batch)) => {
+                    let batch = if let Some(full_schema) = &self.fill_schema {
+                        crate::ffi::projection::fill_missing_columns(batch, full_schema.clone())
+                            .map_err(|err| {
+                                lance::Error::internal(format!("fill projected columns: {err}"))
+                            })?
+                    } else {
+                        batch
+                    };
+                    Ok(Some(batch))
+                }
                 Some(Err(err)) => Err(err),
                 None => Ok(None),
             }
@@ -122,6 +147,15 @@ pub async fn take_rows_by_row_ids(
         })
         .collect();
     let indices = UInt64Array::from(indices);
+
+    if columns.is_empty() {
+        return RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            Vec::new(),
+            &RecordBatchOptions::new().with_row_count(Some(indices.len())),
+        )
+        .map_err(|err| lance::Error::internal(format!("empty take projection: {err}")));
+    }
 
     let schema = scanned.schema();
     let mut out_fields: Vec<Field> = Vec::with_capacity(columns.len());
