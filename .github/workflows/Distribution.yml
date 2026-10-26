@@ -1,24 +1,9 @@
-# Validate source commits; DuckDB owns official core-extension publication.
+# Validate main commits and manually selected refs; DuckDB owns official publication.
 name: Main Extension Distribution Pipeline
 on:
   push:
     branches:
       - main
-  pull_request:
-    paths:
-      - "src/**"
-      - "rust/**"
-      - "test/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "duckdb"
-      - "extension-ci-tools"
-      - ".gitmodules"
-      - "CMakeLists.txt"
-      - "Makefile"
-      - "extension_config.cmake"
-      - "vcpkg.json"
-      - ".github/workflows/Distribution.yml"
   workflow_dispatch:
 
 concurrency:

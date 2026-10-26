@@ -73,13 +73,17 @@ maintenance fix needs a dependency update.
 3. Preserve pushdown and residual-filter correctness, prepared-statement schema
    refresh, defaults, parser statement boundaries, and Arrow ownership. Check
    existing EXPLAIN assertions as well as query results.
-4. Run the matching extension-ci-tools distribution workflow on source and
-   gitlink changes. It uses the checked-out DuckDB gitlink, a Rust toolchain,
-   and the selected platforms. Our Actions artifacts are build evidence;
-   DuckDB owns official deployment.
-5. Merge only after the required behavior and platform checks pass. Give the
-   DuckDB maintainers the accepted main SHA, both dependency pins, and remaining
-   coverage limitations. Confirm Lance is included in the official build.
+4. Pull requests run the Extension Build and Extension Code Quality workflows,
+   including Linux builds, SQL/MinIO tests, and Rust checks. The distribution
+   workflow runs after pushes to `main` and on manual dispatch, using the
+   checked-out DuckDB gitlink, a Rust toolchain, and the selected platforms.
+   Manually dispatch it on the PR branch when cross-platform validation is
+   needed before merging, especially for toolchain or platform-specific changes.
+5. Merge after the required PR checks pass. Before handing a main SHA to DuckDB
+   maintainers, verify that its distribution checks passed and provide both
+   dependency pins and remaining coverage limitations. Our Actions artifacts
+   are build evidence; DuckDB owns official deployment. Confirm Lance is included
+   in the official build.
 6. Validate installation, loading, and representative SQL against the official
    staging or release artifact. Source compatibility alone does not establish
    official availability.
