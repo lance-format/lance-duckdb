@@ -449,10 +449,19 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     const char *headers_ptr =
         headers_tsv.empty() ? nullptr : headers_tsv.c_str();
     const char *uri_ptr = nullptr;
-    auto rc = lance_dataset_namespace_checkout_latest_if_stale(
-        dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-        delimiter_ptr, headers_ptr, LanceGetSessionHandle(context),
-        out_new_dataset, &uri_ptr);
+    int32_t rc = 0;
+    // A moved namespace table needs a fresh source registry. Reusing the
+    // cached dataset's registry would mutate state retained by old handles.
+    auto source_resolver = LanceCreateSourceResolver(context);
+    auto *reopened = LanceOpenDatasetWithSourceSession(
+        context, source_resolver, [&](void *session) {
+          rc = lance_dataset_namespace_checkout_latest_if_stale(
+              dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr,
+              api_key_ptr, delimiter_ptr, headers_ptr, session, out_new_dataset,
+              &uri_ptr);
+          return rc == 0 ? *out_new_dataset : nullptr;
+        });
+    *out_new_dataset = reopened;
     if (uri_ptr) {
       out_new_display_uri = uri_ptr;
       lance_free_string(uri_ptr);
