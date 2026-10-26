@@ -33,13 +33,13 @@ lance-namespace-impls = { version = "13.0.0", features = ["rest"] }
 lance-table = "13.0.0"
 object_store = "0.14.2"
 
-arrow = { version = "58.0.0", features = ["ffi"] }
+arrow = { version = "60.0.0", features = ["ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 
 datafusion = "54.0.0"
-datafusion-common = "54.0.0"
-datafusion-expr = "54.0.0"
+datafusion-common = "55.2.0"
+datafusion-expr = "55.2.0"
 datafusion-functions = "54.0.0"
 datafusion-functions-nested = "54.0.0"
 datafusion-sql = "54.0.0"
