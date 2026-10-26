@@ -5,8 +5,8 @@ use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
+use lance::dataset::scanner::Scanner;
 use lance::session::Session;
-use lance::Dataset;
 use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
@@ -161,20 +161,34 @@ pub(crate) unsafe fn parse_optional_filter_ir(
         .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))
 }
 
-pub(crate) fn parse_filter_sql(
-    dataset: &Dataset,
-    filter_sql: &str,
+/// Apply named SQL and pushed IR filters after configuring the search so Lance can
+/// resolve system fields such as `_rowid`, `_distance`, and `_score`.
+pub(crate) fn apply_scanner_filter(
+    scanner: &mut Scanner,
+    filter_ir: Option<Expr>,
+    filter_sql: Option<&str>,
     code: ErrorCode,
     what: &'static str,
-) -> FfiResult<Expr> {
-    let schema = Arc::new(arrow::datatypes::Schema::from(dataset.schema()));
-    let planner = lance::io::exec::Planner::new(schema);
-    let expr = planner
-        .parse_expr(filter_sql)
-        .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))?;
-    planner
-        .optimize_expr(expr)
-        .map_err(|err| FfiError::new(code, format!("{what} optimize: {err}")))
+) -> FfiResult<Option<Expr>> {
+    let filter = if let Some(filter_sql) = filter_sql {
+        scanner
+            .filter(filter_sql)
+            .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))?;
+        let sql_filter = scanner
+            .get_expr_filter()
+            .map_err(|err| FfiError::new(code, format!("{what} optimize: {err}")))?
+            .ok_or_else(|| FfiError::new(code, format!("{what} produced no expression")))?;
+        Some(match filter_ir {
+            Some(filter_ir) => filter_ir.and(sql_filter),
+            None => sql_filter,
+        })
+    } else {
+        filter_ir
+    };
+    if let Some(filter) = &filter {
+        scanner.filter_expr(filter.clone());
+    }
+    Ok(filter)
 }
 
 pub(crate) fn u64_to_usize(v: u64, what: &'static str) -> FfiResult<usize> {

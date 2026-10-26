@@ -249,6 +249,65 @@ FROM lance_vector_search(
 ----
 1
 
+# Named SQL filters resolve Lance system columns after search configuration.
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 5,
+  use_index = false,
+  prefilter = true,
+  filter := '_rowid = 1'
+);
+----
+1
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 5,
+  use_index = false,
+  prefilter = false,
+  filter := '_distance < 1'
+);
+----
+0
+
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 5,
+  prefilter = false,
+  filter := '_score > 0'
+);
+----
+1
+
+# The named filter and pushed DuckDB predicate both constrain the search
+# before top-k; either one alone would select a different row.
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  prefilter = true,
+  filter := '_rowid <= 1'
+)
+WHERE id >= 1;
+----
+1
+
 statement ok
 DETACH blob_ns;
 

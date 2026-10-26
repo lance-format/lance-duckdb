@@ -16,8 +16,8 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize, optional_cstr_array,
-    optional_cstr_to_str, parse_filter_sql, parse_optional_filter_ir, slice_from_ptr, FfiError,
+    apply_scanner_filter, cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize,
+    optional_cstr_array, optional_cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError,
     FfiResult,
 };
 
@@ -128,7 +128,7 @@ fn create_fts_stream_ir_inner(
     let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
     let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
-    let mut filter = unsafe {
+    let filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
             filter_ir_len,
@@ -140,25 +140,8 @@ fn create_fts_stream_ir_inner(
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
-    if let Some(filter_sql) = filter_sql {
-        let sql_filter = parse_filter_sql(
-            &handle.dataset,
-            filter_sql,
-            ErrorCode::FtsStreamCreate,
-            "fts filter_sql",
-        )?;
-        filter = Some(match filter {
-            Some(filter) => filter.and(sql_filter),
-            None => sql_filter,
-        });
-    }
     projection_columns.push(text_column.to_string());
     projection_columns.push(SCORE_COLUMN.to_string());
-    if let Some(filter) = &filter {
-        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
-    }
-    projection_columns.sort();
-    projection_columns.dedup();
 
     let fts_query = FullTextSearchQuery::new(query.to_string())
         .with_column(text_column.to_string())
@@ -168,15 +151,24 @@ fn create_fts_stream_ir_inner(
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
     scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
-    if let Some(filter) = filter {
-        scan.filter_expr(filter);
-    }
     scan.full_text_search(fts_query).map_err(|err| {
         FfiError::new(
             ErrorCode::FtsStreamCreate,
             format!("fts scan search: {err}"),
         )
     })?;
+    let filter = apply_scanner_filter(
+        &mut scan,
+        filter,
+        filter_sql,
+        ErrorCode::FtsStreamCreate,
+        "fts filter_sql",
+    )?;
+    if let Some(filter) = &filter {
+        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
+    }
+    projection_columns.sort();
+    projection_columns.dedup();
     scan.disable_scoring_autoprojection();
     scan.project(&projection_columns).map_err(|err| {
         FfiError::new(
