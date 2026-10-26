@@ -10,9 +10,9 @@ test-env LANCE_S3_REGION us-east-1
 
 test-env LANCE_S3_BUCKET lance-test
 
-test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+test-env LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID blob-reader-a
 
-test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+test-env LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY blob-reader-a-secret
 
 test-env LANCE_S3_BLOB_READER_ACCESS_KEY_ID blob-reader-b
 
@@ -21,12 +21,12 @@ test-env LANCE_S3_BLOB_READER_SECRET_ACCESS_KEY blob-reader-b-secret
 require lance
 
 statement ok
-CREATE SECRET blob_source_a (
+CREATE SECRET blob_source_a IN connection (
   TYPE LANCE,
   PROVIDER config,
   SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
-  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
-  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY}',
   REGION '{LANCE_S3_REGION}',
   ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
@@ -34,7 +34,7 @@ CREATE SECRET blob_source_a (
 );
 
 statement ok
-CREATE SECRET blob_source_b (
+CREATE SECRET blob_source_b IN connection (
   TYPE LANCE,
   PROVIDER config,
   SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/b/',
@@ -46,12 +46,24 @@ CREATE SECRET blob_source_b (
   ALLOW_HTTP true
 );
 
-# Row 1 resolves the limited-scope reader first. Row 2 must not reuse that
-# object store for the same bucket; it needs the root secret from its own scope.
+# The two source paths share a bucket but use disjoint credentials. Reusing one
+# resolved store for the other path fails with either request order.
 query II
-SELECT id, hex(payload)
-FROM 'test/data/blob_v2_external_source.lance'
-ORDER BY id;
+SELECT request_id, hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT id AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+  )
+)
+ORDER BY request_id;
 ----
 1	736F757263652D622D7061796C6F61640A
 2	736F757263652D612D7061796C6F61640A
@@ -69,9 +81,87 @@ statement ok
 SET enable_external_access=false;
 
 query II
-SELECT id, hex(payload)
-FROM 'test/data/blob_v2_external_source.lance'
-ORDER BY id;
+SELECT request_id, hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT id AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+  )
+)
+ORDER BY request_id;
 ----
 1	736F757263652D622D7061796C6F61640A
 2	736F757263652D612D7061796C6F61640A
+
+# Connection-scoped secrets must not share resolved source stores across active
+# connections. Both connections resolve the same URI, but their secrets differ.
+statement ok con1
+CREATE SECRET source_shared IN connection (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok con2
+CREATE SECRET source_shared IN connection (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+query T con1
+SELECT hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'a' AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+    WHERE id = 2
+  )
+);
+----
+736F757263652D612D7061796C6F61640A
+
+statement error con2
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'a' AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+    WHERE id = 2
+  )
+);
+----
+403

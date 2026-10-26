@@ -157,8 +157,11 @@ jobs:
           chmod +x mc
           ./mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
           ./mc mb -p local/lance-test || true
+          ./mc admin user add local blob-reader-a blob-reader-a-secret
           ./mc admin user add local blob-reader-b blob-reader-b-secret
+          ./mc admin policy create local blob-reader-a test/scripts/blob_v2_external_reader_a_policy.json
           ./mc admin policy create local blob-reader-b test/scripts/blob_v2_external_reader_policy.json
+          ./mc admin policy attach local blob-reader-a --user blob-reader-a
           ./mc admin policy attach local blob-reader-b --user blob-reader-b
           ./mc mirror --overwrite test/data/test_data.lance local/lance-test/test_data.lance
           ./mc mirror --overwrite test/data/search_test_data.lance local/lance-test/search_test_data.lance

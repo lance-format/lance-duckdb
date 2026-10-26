@@ -17,8 +17,8 @@ def main() -> None:
             blob_field("payload"),
         ]
     )
-    # Row order is intentional: the limited reader is used first. Reusing its
-    # same-bucket object store for row 2 would make the root-only source fail.
+    # Each row uses a different path-scoped reader. Reusing one reader's
+    # same-bucket object store for the other row fails regardless of row order.
     table = pa.Table.from_arrays(
         [
             pa.array([1, 2], pa.int64()),

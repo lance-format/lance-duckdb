@@ -10,19 +10,23 @@ test-env LANCE_S3_REGION us-east-1
 
 test-env LANCE_S3_BUCKET lance-test
 
-test-env LANCE_S3_ACCESS_KEY_ID minioadmin
+test-env LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID blob-reader-a
 
-test-env LANCE_S3_SECRET_ACCESS_KEY minioadmin
+test-env LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY blob-reader-a-secret
+
+test-env LANCE_S3_BLOB_READER_B_ACCESS_KEY_ID blob-reader-b
+
+test-env LANCE_S3_BLOB_READER_B_SECRET_ACCESS_KEY blob-reader-b-secret
 
 require lance
 
 statement ok
-CREATE SECRET blob_source_a (
+CREATE SECRET blob_source_a IN connection (
   TYPE LANCE,
   PROVIDER config,
   SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
-  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
-  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY}',
   REGION '{LANCE_S3_REGION}',
   ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
@@ -30,12 +34,12 @@ CREATE SECRET blob_source_a (
 );
 
 statement ok
-CREATE SECRET blob_source_b (
+CREATE SECRET blob_source_b IN connection (
   TYPE LANCE,
   PROVIDER config,
   SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/b/',
-  ACCESS_KEY_ID 'blob-reader-b',
-  SECRET_ACCESS_KEY 'blob-reader-b-secret',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_B_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_B_SECRET_ACCESS_KEY}',
   REGION '{LANCE_S3_REGION}',
   ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
@@ -46,6 +50,19 @@ statement ok
 SET enable_external_access=false;
 
 statement error
-SELECT payload FROM 'test/data/blob_v2_external_source.lance';
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT id AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+  )
+);
 ----
 Cannot access source URI
