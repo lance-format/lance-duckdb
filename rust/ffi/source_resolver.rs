@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use async_trait::async_trait;
 use lance::dataset::Dataset;
@@ -172,7 +172,8 @@ impl SourceOptionScopeIds {
     }
 }
 
-static NEXT_SOURCE_STATE_ID: AtomicU64 = AtomicU64::new(1);
+static SOURCE_OPTION_SCOPE_IDS: LazyLock<SourceOptionScopeIds> =
+    LazyLock::new(SourceOptionScopeIds::default);
 
 #[derive(Debug)]
 struct SourceStorageOptionsProvider {
@@ -233,8 +234,6 @@ fn is_dataset_fallback(
 #[derive(Debug)]
 pub(crate) struct SourceResolutionState {
     resolver: SourceResolver,
-    state_id: u64,
-    source_option_ids: SourceOptionScopeIds,
     target_uri: RwLock<Option<String>>,
     target_storage_options: RwLock<HashMap<String, String>>,
 }
@@ -243,8 +242,6 @@ impl SourceResolutionState {
     fn new(resolver: SourceResolver) -> Self {
         Self {
             resolver,
-            state_id: NEXT_SOURCE_STATE_ID.fetch_add(1, Ordering::Relaxed),
-            source_option_ids: SourceOptionScopeIds::default(),
             target_uri: RwLock::new(None),
             target_storage_options: RwLock::new(HashMap::new()),
         }
@@ -296,8 +293,8 @@ impl SourceResolutionState {
     }
 
     fn source_scope_id(&self, options: &HashMap<String, String>) -> String {
-        let option_id = self.source_option_ids.id_for(options);
-        format!("duckdb-source-{:016x}-{option_id:016x}", self.state_id)
+        let option_id = SOURCE_OPTION_SCOPE_IDS.id_for(options);
+        format!("duckdb-source-{option_id:016x}")
     }
 }
 
@@ -494,7 +491,7 @@ mod tests {
         let params = apply_source_options(
             &ObjectStoreParams::default(),
             options,
-            format!("duckdb-source-0000000000000007-{first_id:016x}"),
+            format!("duckdb-source-{first_id:016x}"),
         );
         assert_eq!(
             params.storage_options(),
@@ -508,10 +505,7 @@ mod tests {
             .as_ref()
             .expect("source accessor")
             .accessor_id();
-        assert_eq!(
-            accessor_id,
-            "duckdb-source-0000000000000007-0000000000000000"
-        );
+        assert_eq!(accessor_id, "duckdb-source-0000000000000000");
         assert!(!accessor_id.contains("reader"));
         assert!(!accessor_id.contains("super-secret"));
     }
