@@ -521,18 +521,22 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                                     "lance_vector_search");
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    result->namespace_backed = true;
-    result->namespace_config = table->NamespaceConfig();
-    result->file_path = table->DatasetUri();
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    PopulateNamespaceSearchSchema(
-        context, *table, "_distance", result->schema_root, result->arrow_table,
-        result->names, result->types, names, return_types);
-    return std::move(result);
+    if (!table->HasBlobColumns()) {
+      result->namespace_backed = true;
+      result->namespace_config = table->NamespaceConfig();
+      result->file_path = table->DatasetUri();
+      PopulateNamespaceSearchSchema(context, *table, "_distance",
+                                    result->schema_root, result->arrow_table,
+                                    result->names, result->types, names,
+                                    return_types);
+      return std::move(result);
+    }
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      !(table && table->IsNamespaceBacked())) {
     throw InvalidInputException(
         "lance_vector_search filter parameter is only supported for "
         "namespace-backed tables");
@@ -1151,18 +1155,21 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
                           LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    result->namespace_backed = true;
-    result->namespace_config = table->NamespaceConfig();
-    result->file_path = table->DatasetUri();
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
-    PopulateNamespaceSearchSchema(
-        context, *table, "_score", result->schema_root, result->arrow_table,
-        result->names, result->types, names, return_types);
-    return std::move(result);
+    if (!table->HasBlobColumns()) {
+      result->namespace_backed = true;
+      result->namespace_config = table->NamespaceConfig();
+      result->file_path = table->DatasetUri();
+      PopulateNamespaceSearchSchema(
+          context, *table, "_score", result->schema_root, result->arrow_table,
+          result->names, result->types, names, return_types);
+      return std::move(result);
+    }
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      !(table && table->IsNamespaceBacked())) {
     throw InvalidInputException(
         "lance_fts filter parameter is only supported for namespace-backed "
         "tables");

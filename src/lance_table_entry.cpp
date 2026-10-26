@@ -56,6 +56,7 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
     ColumnDefinition column(Identifier(names[i]), types[i]);
     RestoreColumnDefault(context, field, column);
     result.columns.AddColumn(std::move(column));
+    result.blob_columns.push_back(LanceArrowFieldContainsBlob(field));
     if ((field.flags & ARROW_FLAG_NULLABLE) == 0) {
       result.constraints.push_back(
           make_uniq<NotNullConstraint>(LogicalIndex(i)));
@@ -169,11 +170,13 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
   vector<string> coerced;
+  vector<bool> blob_columns;
   try {
     auto live = LanceTableSchema::FromDataset(context, dataset);
     create_info.columns = std::move(live.columns);
     create_info.constraints = std::move(live.constraints);
     coerced = std::move(live.coerced_columns);
+    blob_columns = std::move(live.blob_columns);
     LoadLanceColumnComments(dataset, create_info.columns);
   } catch (...) {
     lance_close_dataset(dataset);
@@ -189,6 +192,7 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
                                        base.DatasetUri());
   }
   entry->SetCoercedColumnNames(std::move(coerced));
+  entry->SetBlobColumns(std::move(blob_columns));
 
   auto *table_md = lance_dataset_list_table_metadata(dataset);
   if (!table_md) {
@@ -515,6 +519,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
         make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
+  copy->SetBlobColumns(blob_column_flags);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 

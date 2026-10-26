@@ -25,6 +25,7 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema scan_arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<bool> blob_columns;
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;

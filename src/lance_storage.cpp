@@ -270,11 +270,13 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
+    vector<bool> blob_columns;
     try {
       auto live = LanceTableSchema::FromDataset(context, dataset);
       info.columns = std::move(live.columns);
       info.constraints = std::move(live.constraints);
       coerced = std::move(live.coerced_columns);
+      blob_columns = std::move(live.blob_columns);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -294,6 +296,7 @@ public:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
+    entry->SetBlobColumns(std::move(blob_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
@@ -427,16 +430,18 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<bool> blob_columns;
       try {
         auto live = LanceTableSchemaFromJson(context, schema_json);
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
+        blob_columns = std::move(live.blob_columns);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(blob_columns));
     }
 
     // Slow fallback: open dataset from S3.
@@ -461,18 +466,20 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<bool> blob_columns;
       try {
         auto live = LanceTableSchema::FromDataset(context, dataset);
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
+        blob_columns = std::move(live.blob_columns);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(blob_columns));
     }
 
     // All paths failed — return an empty entry to prevent DuckDB crash.
@@ -480,7 +487,7 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {});
+                              {}, {});
   }
 
   vector<Identifier> GetDefaultEntries() override {
@@ -503,7 +510,8 @@ private:
   unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
                                               const string &table_id,
                                               CreateTableInfo info,
-                                              vector<string> coerced_columns) {
+                                              vector<string> coerced_columns,
+                                              vector<bool> blob_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -515,6 +523,7 @@ private:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
+    entry->SetBlobColumns(std::move(blob_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 

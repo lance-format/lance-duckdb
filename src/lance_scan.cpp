@@ -352,40 +352,18 @@ static constexpr const char *LANCE_NAMESPACE_QUERY_TABLE_SETTING =
     "lance_namespace_query_table";
 static constexpr uint64_t DEFERRED_AVG_BYTES_THRESHOLD = 1024;
 
-// Blob columns in the materialized read schema carry either the legacy v1
-// `lance-encoding:blob` marker or the v2 `lance.blob.v2` Arrow extension name.
-// Nested blobs keep the marker on their leaf field, so detection must recurse.
-static bool LanceArrowFieldContainsBlob(const ArrowSchema &field) {
-  if (field.metadata) {
-    ArrowSchemaMetadata metadata(field.metadata);
-    if (metadata.GetOption("lance-encoding:blob") == "true" ||
-        metadata.GetOption("ARROW:extension:name") == "lance.blob.v2") {
-      return true;
-    }
-  }
-  if (field.dictionary) {
-    return LanceArrowFieldContainsBlob(*field.dictionary);
-  }
-  for (int64_t child_idx = 0; child_idx < field.n_children; child_idx++) {
-    if (field.children && field.children[child_idx] &&
-        LanceArrowFieldContainsBlob(*field.children[child_idx])) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static bool LanceScanColumnContainsBlob(const ArrowSchema &schema_root,
-                                        column_t col_id) {
-  if (col_id >= static_cast<column_t>(schema_root.n_children)) {
-    return false;
-  }
-  auto *child = schema_root.children[col_id];
-  return child && LanceArrowFieldContainsBlob(*child);
-}
-
 static bool IsLanceVirtualRowIdColumnId(column_t col_id) {
   return col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID;
+}
+
+static vector<bool> LanceBlobColumnsFromSchema(const ArrowSchema &schema_root) {
+  vector<bool> result;
+  result.reserve(schema_root.n_children);
+  for (int64_t i = 0; i < schema_root.n_children; i++) {
+    result.push_back(schema_root.children && schema_root.children[i] &&
+                     LanceArrowFieldContainsBlob(*schema_root.children[i]));
+  }
+  return result;
 }
 
 static bool IsLikelyHeavyColumnType(const LogicalType &type) {
@@ -421,29 +399,6 @@ static bool IsLikelyHeavyColumnType(const LogicalType &type) {
     }
     return false;
   }
-  default:
-    return false;
-  }
-}
-
-static bool LanceLogicalTypeContainsBlob(const LogicalType &type) {
-  switch (type.id()) {
-  case LogicalTypeId::BLOB:
-    return true;
-  case LogicalTypeId::LIST:
-    return LanceLogicalTypeContainsBlob(ListType::GetChildType(type));
-  case LogicalTypeId::ARRAY:
-    return LanceLogicalTypeContainsBlob(ArrayType::GetChildType(type));
-  case LogicalTypeId::STRUCT:
-    for (auto &entry : StructType::GetChildTypes(type)) {
-      if (LanceLogicalTypeContainsBlob(entry.second)) {
-        return true;
-      }
-    }
-    return false;
-  case LogicalTypeId::MAP:
-    return LanceLogicalTypeContainsBlob(MapType::KeyType(type)) ||
-           LanceLogicalTypeContainsBlob(MapType::ValueType(type));
   default:
     return false;
   }
@@ -1093,6 +1048,8 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->blob_columns =
+      LanceBlobColumnsFromSchema(result->schema_root.arrow_schema);
 
   auto *scan_schema_handle = lance_get_schema_for_scan(result->dataset);
   if (!scan_schema_handle) {
@@ -1192,6 +1149,8 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->blob_columns =
+      LanceBlobColumnsFromSchema(result->schema_root.arrow_schema);
 
   auto *scan_schema_handle = lance_get_schema_for_scan(result->dataset);
   if (!scan_schema_handle) {
@@ -1293,11 +1252,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
     auto scan_idx = add_scan_column(col_id, bind_data.names[col_id],
                                     bind_data.types[col_id]);
-    if (LanceScanColumnContainsBlob(bind_data.schema_root.arrow_schema,
-                                    col_id)) {
-      has_projected_blob = true;
-    }
-    if (LanceLogicalTypeContainsBlob(bind_data.types[col_id])) {
+    if (col_id < bind_data.blob_columns.size() &&
+        bind_data.blob_columns[col_id]) {
       has_projected_blob = true;
     }
     scan_state.scanned_types.push_back(bind_data.types[col_id]);
@@ -1358,14 +1314,10 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
 
     if (has_projected_blob) {
-      // The namespace `query_table` API has no blob handling option and would
-      // return descriptors. Open the pinned dataset directly for the same SQL
-      // contract: the extension already has an authenticated local handle.
-      scan_state.use_namespace_query = false;
-      scan_state.use_dataset_scanner = true;
-      scan_state.max_threads = 1;
-      // Continue into the ordinary scan planning (including count-only paths)
-      // instead of returning here.
+      // REST query_table bindings are only created for tables without blob
+      // columns. A blob projection here would receive descriptor structs.
+      throw InternalException(
+          "Namespace query_table scan cannot materialize Lance blob columns");
     } else {
       scan_state.use_namespace_query = true;
       scan_state.use_dataset_scanner = true;
@@ -1392,8 +1344,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       if (!has_physical_column && !bind_data.names.empty()) {
         idx_t driver = bind_data.names.size();
         for (idx_t col_idx = 0; col_idx < bind_data.names.size(); col_idx++) {
-          if (!LanceScanColumnContainsBlob(bind_data.schema_root.arrow_schema,
-                                           col_idx)) {
+          if (col_idx >= bind_data.blob_columns.size() ||
+              !bind_data.blob_columns[col_idx]) {
             driver = col_idx;
             break;
           }
@@ -3637,6 +3589,7 @@ static void PopulateNamespaceQueryScanSchema(ClientContext &context,
                                                result.schema_root.arrow_schema);
   result.names = result.arrow_table.GetNames();
   result.types = result.arrow_table.GetTypes();
+  result.blob_columns = table.GetBlobColumns();
 
   field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
   field_types.push_back(LogicalType::UBIGINT);
@@ -3657,7 +3610,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->file_path = dataset_uri;
 
   if (IsNamespaceBacked() && NamespaceConfig().IsRest() &&
-      LanceNamespaceQueryTableEnabled(context)) {
+      LanceNamespaceQueryTableEnabled(context) && !HasBlobColumns()) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
     PopulateNamespaceQueryScanSchema(context, *this, *result);
@@ -3698,6 +3651,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       context, result->schema_root.arrow_schema, result->arrow_table);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->blob_columns = live.blob_columns;
 
   ValidateLiveSchemaOrReplace(context, live, result->file_path);
 

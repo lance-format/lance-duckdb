@@ -26,6 +26,8 @@ struct LanceTableSchema {
   ColumnList columns;
   vector<unique_ptr<Constraint>> constraints;
   vector<string> coerced_columns;
+  // Top-level columns whose source Arrow field contains an actual Lance blob.
+  vector<bool> blob_columns;
 };
 
 enum class LanceNamespaceKind { Directory, Rest };
@@ -116,6 +118,19 @@ public:
     coerced_column_names = std::move(names);
   }
 
+  const vector<bool> &GetBlobColumns() const { return blob_column_flags; }
+  bool HasBlobColumns() const {
+    for (auto is_blob : blob_column_flags) {
+      if (is_blob) {
+        return true;
+      }
+    }
+    return false;
+  }
+  void SetBlobColumns(vector<bool> columns) {
+    blob_column_flags = std::move(columns);
+  }
+
 private:
   bool MatchesLiveSchemaState(const LanceTableSchema &live) const;
 
@@ -134,6 +149,7 @@ private:
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;
+  vector<bool> blob_column_flags;
 };
 
 // Rebuild a stale cache entry without changing storage. Executing queries pin

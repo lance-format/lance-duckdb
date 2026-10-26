@@ -170,6 +170,27 @@ ORDER BY id;
 3	NULL
 4	0
 
+# Attached search functions use the same byte materialization contract.
+query II
+SELECT id, octet_length(payload)
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+0	6
+
+query II
+SELECT id, octet_length(payload)
+FROM lance_fts('blob_ns.main.blob_v2_reads', 'text', 'beta', k = 1)
+ORDER BY id;
+----
+1	96
+
 statement ok
 DETACH blob_ns;
 
