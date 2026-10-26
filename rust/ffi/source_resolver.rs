@@ -206,16 +206,20 @@ fn apply_source_options(
     effective
 }
 
-fn is_under_target(uri: &str, target_uri: &str) -> bool {
-    let uri = uri.trim_end_matches('/');
-    uri == target_uri
-        || uri
-            .strip_prefix(target_uri)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+fn is_target_root(uri: &str, target_uri: &str) -> bool {
+    uri.trim_end_matches('/') == target_uri
 }
 
 fn normalize_target_uri(uri: &str) -> String {
     uri.trim_end_matches('/').to_string()
+}
+
+fn resolved_fallback_options(params: &ObjectStoreParams) -> HashMap<String, String> {
+    params
+        .scoped_to_base(None)
+        .storage_options()
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn is_dataset_fallback(
@@ -224,7 +228,7 @@ fn is_dataset_fallback(
     uri: &str,
     storage_options: Option<&HashMap<String, String>>,
 ) -> bool {
-    !is_under_target(uri, target_uri)
+    !is_target_root(uri, target_uri)
         && storage_options
             .map(|options| options == target_storage_options)
             .unwrap_or_else(|| target_storage_options.is_empty())
@@ -256,8 +260,7 @@ impl SourceResolutionState {
         *self.target_uri.write().unwrap() = Some(normalize_target_uri(dataset.uri()));
         *self.target_storage_options.write().unwrap() = dataset
             .store_params()
-            .and_then(ObjectStoreParams::storage_options)
-            .cloned()
+            .map(resolved_fallback_options)
             .unwrap_or_default();
     }
 
@@ -425,17 +428,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_roots_use_path_boundaries() {
-        assert!(is_under_target(
+    fn only_the_exact_target_root_is_primary() {
+        assert!(is_target_root(
+            "s3://bucket/table.lance/",
+            "s3://bucket/table.lance"
+        ));
+        assert!(!is_target_root(
             "s3://bucket/table.lance/data/file",
             "s3://bucket/table.lance"
         ));
-        assert!(!is_under_target(
+        assert!(!is_target_root(
             "s3://bucket/table.lance-other/file",
-            "s3://bucket/table.lance"
-        ));
-        assert!(!is_under_target(
-            "s3://bucket/other/file",
             "s3://bucket/table.lance"
         ));
     }
@@ -468,8 +471,32 @@ mod tests {
         assert!(!is_dataset_fallback(
             "s3://bucket/table.lance",
             &target_options,
-            "s3://bucket/table.lance/data/file",
+            "s3://bucket/table.lance/",
             Some(&target_options),
+        ));
+        assert!(is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &target_options,
+            "s3://bucket/table.lance/assets/payload.bin",
+            Some(&target_options),
+        ));
+    }
+
+    #[test]
+    fn unrelated_base_scope_does_not_disable_absolute_source_resolution() {
+        let raw = HashMap::from([("base_1.download_retry_count".to_string(), "3".to_string())]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                raw,
+            ))),
+            ..Default::default()
+        };
+        let resolved = params.scoped_to_base(None);
+        assert!(is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &resolved_fallback_options(&params),
+            "s3://other/source.bin",
+            resolved.storage_options(),
         ));
     }
 
