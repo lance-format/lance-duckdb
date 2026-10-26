@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::{CacheSpec, Session};
-use lance_core::cache::{CacheBackend, MokaCacheBackend};
+use lance_core::cache::{CacheBackend, MokaCacheBackend, QuickCacheBackend, QuickCacheShardPolicy};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
@@ -88,8 +88,10 @@ fn create_session_inner(
         };
     let index_cache: Arc<dyn CacheBackend> =
         Arc::new(MokaCacheBackend::with_capacity(index_cache_size_bytes));
-    let metadata_cache: Arc<dyn CacheBackend> =
-        Arc::new(MokaCacheBackend::with_capacity(metadata_cache_size_bytes));
+    let metadata_cache: Arc<dyn CacheBackend> = Arc::new(QuickCacheBackend::with_shard_policy(
+        metadata_cache_size_bytes,
+        QuickCacheShardPolicy::Recommended,
+    ));
     let session = Arc::new(Session::with_cache_backends(
         CacheSpec::Backend(index_cache.clone()),
         CacheSpec::Backend(metadata_cache.clone()),

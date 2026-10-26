@@ -37,6 +37,8 @@ bool LanceSourceResolver::ResolveSource(const string &uri,
                 "\" - file system operations are disabled by configuration";
     return false;
   }
+  // This is the same context transaction and SecretManager path used by
+  // DuckDB's KeyValueSecretReader(FileOpener &) on file-I/O worker threads.
   LanceFillStorageOptionsFromSecrets(*locked_context, uri, out_keys, out_values);
   return true;
 }
