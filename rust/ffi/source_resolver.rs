@@ -38,6 +38,7 @@ pub(crate) struct SourceResolverCallbacks {
             out_error: *mut *const c_char,
         ) -> i32,
     >,
+    pub release_source: Option<unsafe extern "C" fn(resolver: *mut c_void)>,
     pub destroy: Option<unsafe extern "C" fn(resolver: *mut c_void)>,
 }
 
@@ -50,6 +51,7 @@ impl SourceResolver {
     fn new(callbacks: SourceResolverCallbacks) -> Result<Self, String> {
         if callbacks.resolver.is_null()
             || callbacks.resolve_source.is_none()
+            || callbacks.release_source.is_none()
             || callbacks.destroy.is_none()
         {
             return Err("DuckDB source resolver callback is null".to_string());
@@ -78,42 +80,50 @@ impl SourceResolver {
                 &mut error,
             )
         };
-        if status != 0 {
-            let message = if error.is_null() {
-                "DuckDB source resolution failed".to_string()
-            } else {
-                unsafe { CStr::from_ptr(error) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            return Err(Error::io(message));
-        }
-        if count == 0 {
-            return Ok(HashMap::new());
-        }
-        if keys.is_null() || values.is_null() {
-            return Err(Error::io(
-                "DuckDB source resolver returned null option arrays",
-            ));
-        }
-        let keys = unsafe { std::slice::from_raw_parts(keys, count) };
-        let values = unsafe { std::slice::from_raw_parts(values, count) };
-        let mut options = HashMap::with_capacity(count);
-        for idx in 0..count {
-            if keys[idx].is_null() || values[idx].is_null() {
-                return Err(Error::io(format!(
-                    "DuckDB source resolver returned null option at index {idx}"
-                )));
+        let result = (|| {
+            if status != 0 {
+                let message = if error.is_null() {
+                    "DuckDB source resolution failed".to_string()
+                } else {
+                    unsafe { CStr::from_ptr(error) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                return Err(Error::io(message));
             }
-            let key = unsafe { CStr::from_ptr(keys[idx]) }
-                .to_string_lossy()
-                .into_owned();
-            let value = unsafe { CStr::from_ptr(values[idx]) }
-                .to_string_lossy()
-                .into_owned();
-            options.insert(key, value);
-        }
-        Ok(options)
+            if count == 0 {
+                return Ok(HashMap::new());
+            }
+            if keys.is_null() || values.is_null() {
+                return Err(Error::io(
+                    "DuckDB source resolver returned null option arrays",
+                ));
+            }
+            let keys = unsafe { std::slice::from_raw_parts(keys, count) };
+            let values = unsafe { std::slice::from_raw_parts(values, count) };
+            let mut options = HashMap::with_capacity(count);
+            for idx in 0..count {
+                if keys[idx].is_null() || values[idx].is_null() {
+                    return Err(Error::io(format!(
+                        "DuckDB source resolver returned null option at index {idx}"
+                    )));
+                }
+                let key = unsafe { CStr::from_ptr(keys[idx]) }
+                    .to_string_lossy()
+                    .into_owned();
+                let value = unsafe { CStr::from_ptr(values[idx]) }
+                    .to_string_lossy()
+                    .into_owned();
+                options.insert(key, value);
+            }
+            Ok(options)
+        })();
+        unsafe {
+            self.callbacks
+                .release_source
+                .expect("callback checked during construction")(self.callbacks.resolver)
+        };
+        result
     }
 }
 

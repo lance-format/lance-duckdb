@@ -27,6 +27,7 @@ typedef struct LanceSourceResolverCallbacks {
                             const char ***out_keys,
                             const char ***out_values, size_t *out_count,
                             const char **out_error);
+  void (*release_source)(void *resolver);
   void (*destroy)(void *resolver);
 } LanceSourceResolverCallbacks;
 

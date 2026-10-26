@@ -138,11 +138,16 @@ static void DestroySourceResolverCallback(void *opaque) {
   delete static_cast<LanceSourceResolver *>(opaque);
 }
 
+static void ReleaseSourceCallback(void *) {
+  SOURCE_CALLBACK_RESULT = LanceSourceCallbackResult();
+}
+
 LanceSourceResolverCallbacks
 LanceBuildSourceResolverCallbacks(LanceSourceResolver *resolver) {
   return LanceSourceResolverCallbacks{
       resolver,
       ResolveSourceCallback,
+      ReleaseSourceCallback,
       DestroySourceResolverCallback,
   };
 }
