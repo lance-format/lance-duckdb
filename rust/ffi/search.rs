@@ -555,13 +555,13 @@ fn create_hybrid_batch(
             Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
     };
-    let rows =
-        projection::fill_missing_columns(rows, handle.read_schema.clone()).map_err(|err| {
-            FfiError::new(
-                ErrorCode::HybridStreamCreate,
-                format!("hybrid fill projected columns: {err}"),
-            )
-        })?;
+    let full_schema = crate::scanner::nullable_output_schema(handle.read_schema.clone());
+    let rows = crate::scanner::fill_missing_columns(rows, &full_schema).map_err(|err| {
+        FfiError::new(
+            ErrorCode::HybridStreamCreate,
+            format!("hybrid fill projected columns: {err}"),
+        )
+    })?;
 
     let mut dist_builder = Float32Builder::with_capacity(rows.num_rows());
     let mut score_builder = Float32Builder::with_capacity(rows.num_rows());

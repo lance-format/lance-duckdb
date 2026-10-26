@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions, UInt64Array};
+use arrow::array::{new_null_array, Array, AsArray, RecordBatch, RecordBatchOptions, UInt64Array};
 use arrow::compute::take as arrow_take;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::datatypes::SchemaRef;
@@ -18,11 +18,46 @@ use lance_core::ROW_ID;
 use lance_datafusion::projection::ProjectionPlan;
 use tokio::runtime::Handle;
 
+pub(crate) fn nullable_output_schema(schema: SchemaRef) -> SchemaRef {
+    Arc::new(ArrowSchema::new_with_metadata(
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+        schema.metadata().clone(),
+    ))
+}
+
+/// Pad a projected batch back to the bound Arrow column layout.
+///
+/// Missing columns are null placeholders only: they preserve column indexes
+/// for the caller's bound schema and must never be exposed as SQL values.
+pub(crate) fn fill_missing_columns(
+    batch: RecordBatch,
+    full_schema: &SchemaRef,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    let row_count = batch.num_rows();
+    let batch_schema = batch.schema();
+    let mut arrays = Vec::with_capacity(full_schema.fields().len());
+    for field in full_schema.fields() {
+        let array = batch_schema
+            .fields()
+            .iter()
+            .position(|candidate| candidate.name() == field.name())
+            .map(|index| batch.column(index).clone())
+            .unwrap_or_else(|| new_null_array(field.data_type(), row_count));
+        arrays.push(array);
+    }
+    RecordBatch::try_new(full_schema.clone(), arrays)
+}
+
 /// A stream wrapper that holds the Lance RecordBatchStream
 pub struct LanceStream {
     handle: Handle,
     stream: Pin<Box<DatasetRecordBatchStream>>,
-    fill_schema: Option<SchemaRef>,
+    schema: SchemaRef,
+    pad_schema: Option<SchemaRef>,
 }
 
 impl LanceStream {
@@ -30,11 +65,13 @@ impl LanceStream {
     pub fn from_scanner(scanner: Scanner) -> Result<Self, Box<dyn std::error::Error>> {
         let handle = crate::runtime::handle()?;
         let stream = handle.block_on(async { scanner.try_into_stream().await })?;
+        let schema = stream.schema();
 
         Ok(Self {
             handle,
             stream: Box::pin(stream),
-            fill_schema: None,
+            schema,
+            pad_schema: None,
         })
     }
 
@@ -44,15 +81,17 @@ impl LanceStream {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let handle = crate::runtime::handle()?;
         let stream = handle.block_on(async { scanner.try_into_stream().await })?;
+        let schema = nullable_output_schema(fill_schema);
         Ok(Self {
             handle,
             stream: Box::pin(stream),
-            fill_schema: Some(fill_schema),
+            schema: schema.clone(),
+            pad_schema: Some(schema),
         })
     }
 
     pub fn schema(&self) -> SchemaRef {
-        self.stream.schema()
+        self.schema.clone()
     }
 
     /// Get the next batch from the stream
@@ -62,11 +101,10 @@ impl LanceStream {
         self.handle.block_on(async {
             match self.stream.next().await {
                 Some(Ok(batch)) => {
-                    let batch = if let Some(full_schema) = &self.fill_schema {
-                        crate::ffi::projection::fill_missing_columns(batch, full_schema.clone())
-                            .map_err(|err| {
-                                lance::Error::internal(format!("fill projected columns: {err}"))
-                            })?
+                    let batch = if let Some(full_schema) = &self.pad_schema {
+                        fill_missing_columns(batch, full_schema).map_err(|err| {
+                            lance::Error::internal(format!("fill projected columns: {err}"))
+                        })?
                     } else {
                         batch
                     };
