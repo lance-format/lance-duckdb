@@ -78,6 +78,16 @@ ORDER BY id;
 3	NULL
 4	0
 
+# Legacy Blob v1 stays on the native take path.
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v1_reads.lance'
+WHERE _rowid IN (0, 2)
+ORDER BY id;
+----
+0	13
+2	NULL
+
 query II
 SELECT id, octet_length(payload)
 FROM 'test/data/blob_v2_reads.lance'
