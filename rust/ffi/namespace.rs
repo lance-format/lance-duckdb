@@ -17,6 +17,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
+use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
@@ -582,6 +583,7 @@ fn open_dataset_in_namespace_inner(
     headers_tsv: *const c_char,
     session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
+    let session_ptr = session;
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
@@ -635,6 +637,9 @@ fn open_dataset_in_namespace_inner(
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok((DatasetHandle::new(dataset), table_uri))
 }
@@ -801,6 +806,7 @@ fn namespace_checkout_latest_if_stale_inner(
     out_new_dataset: *mut *mut c_void,
     out_table_uri: *mut *const c_char,
 ) -> FfiResult<()> {
+    let session_ptr = session;
     if out_new_dataset.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -895,6 +901,9 @@ fn namespace_checkout_latest_if_stale_inner(
                     format!("namespace dataset open: {err}"),
                 )
             })?;
+            unsafe {
+                activate_source_resolution_for_session(session_ptr, &reopened);
+            }
             record_dataset_open();
             let uri = reopened.uri().to_string();
             return Ok::<_, FfiError>((Some(reopened), Some(uri)));

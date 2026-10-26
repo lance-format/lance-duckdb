@@ -21,6 +21,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_dataset_open;
+use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, lookup_row_address, CapturedRowIds};
 use super::util::{
@@ -93,12 +94,13 @@ pub unsafe extern "C" fn lance_open_dataset_with_session(
 }
 
 fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<DatasetHandle> {
+    let session_ptr = session;
     let path_str = unsafe { cstr_to_str(path, "path")? };
     let session = unsafe { optional_session_handle(session)? };
     let dataset = match runtime::block_on(async {
         let mut builder = DatasetBuilder::from_uri(path_str);
         if let Some(session) = session {
-            builder = builder.with_session(session);
+            builder = builder.with_session(session.clone());
         }
         builder.load().await
     }) {
@@ -111,6 +113,9 @@ fn open_dataset_inner(path: *const c_char, session: *mut c_void) -> FfiResult<Da
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok(DatasetHandle::new(dataset))
 }
@@ -214,6 +219,7 @@ fn open_dataset_with_storage_options_inner(
     session: *mut c_void,
     version: Option<u64>,
 ) -> FfiResult<DatasetHandle> {
+    let session_ptr = session;
     let path_str = unsafe { cstr_to_str(path, "path")? };
     let session = unsafe { optional_session_handle(session)? };
 
@@ -272,6 +278,9 @@ fn open_dataset_with_storage_options_inner(
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
 
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok(DatasetHandle::new(dataset))
 }

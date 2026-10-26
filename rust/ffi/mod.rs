@@ -13,6 +13,7 @@ mod scan;
 mod schema_evolution;
 mod search;
 mod session;
+mod source_resolver;
 mod stream;
 mod take;
 mod types;
