@@ -381,12 +381,11 @@ FROM lance_read_blob_ranges(
   1,
   'row_address',
   (
+    -- Constant request relation: no scan bind data participates, so this
+    -- prepared statement only rebinds if the range function itself opts out
+    -- of statement caching. Address 4 is fixture row id 4 in version 1.
     SELECT 1 AS request_id,
-           (
-             SELECT CAST(rowid AS BIGINT)
-             FROM 'test/data/blob_range_fixture.lance' fixture
-             WHERE fixture.id = 4
-           ) AS row_value,
+           4::BIGINT AS row_value,
            0::BIGINT AS offset,
            1048576::BIGINT AS length
   )
