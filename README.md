@@ -50,6 +50,7 @@ match the DuckDB build and platform used to compile the extension; local builds 
 ## Usage
 
 - Full SQL reference: [`docs/sql.md`](./docs/sql.md)
+- Blob columns and write inputs: [`docs/sql.md#blob-columns-and-write-inputs`](./docs/sql.md#blob-columns-and-write-inputs)
 - Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
 
 ### Query a Lance dataset

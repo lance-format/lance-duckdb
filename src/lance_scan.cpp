@@ -533,6 +533,7 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   vector<idx_t> output_to_scan_converted_idx;
   vector<bool> output_is_duckdb_rowid;
   vector<bool> output_is_empty;
+  vector<bool> output_is_forced_null;
 
   vector<column_t> scan_column_ids;
   vector<string> scan_column_names;
@@ -1211,6 +1212,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   scan_state.output_to_scan_converted_idx.reserve(input.column_ids.size());
   scan_state.output_is_duckdb_rowid.reserve(input.column_ids.size());
   scan_state.output_is_empty.reserve(input.column_ids.size());
+  scan_state.output_is_forced_null.reserve(input.column_ids.size());
 
   unordered_map<column_t, idx_t> scan_idx_by_col_id;
   scan_idx_by_col_id.reserve(input.column_ids.size());
@@ -1237,6 +1239,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
           DConstants::INVALID_INDEX);
       scan_state.output_is_duckdb_rowid.push_back(false);
       scan_state.output_is_empty.push_back(true);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
@@ -1248,6 +1251,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.output_to_scan_converted_idx.push_back(scan_idx);
       scan_state.output_is_duckdb_rowid.push_back(true);
       scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
@@ -1259,11 +1263,21 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.output_to_scan_converted_idx.push_back(scan_idx);
       scan_state.output_is_duckdb_rowid.push_back(false);
       scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
     if (col_id >= bind_data.types.size() || col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
+    }
+    if (bind_data.forced_null_columns.count(col_id)) {
+      scan_state.scanned_types.push_back(bind_data.types[col_id]);
+      scan_state.output_to_scan_converted_idx.push_back(
+          DConstants::INVALID_INDEX);
+      scan_state.output_is_duckdb_rowid.push_back(false);
+      scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(true);
+      continue;
     }
     auto scan_idx = add_scan_column(col_id, bind_data.names[col_id],
                                     bind_data.types[col_id]);
@@ -1275,6 +1289,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.output_to_scan_converted_idx.push_back(scan_idx);
     scan_state.output_is_duckdb_rowid.push_back(false);
     scan_state.output_is_empty.push_back(false);
+    scan_state.output_is_forced_null.push_back(false);
   }
 
   // Blob projection forces native access, but the bind schema stays unchanged.
@@ -2193,6 +2208,11 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       for (idx_t i = 0; i < target.ColumnCount(); i++) {
         if (global_state.output_is_empty[i]) {
           target.data[i].Reference(Value::BOOLEAN(true), count_t(output_size));
+          continue;
+        }
+        if (global_state.output_is_forced_null[i]) {
+          target.data[i].Reference(Value(target.data[i].GetType()),
+                                   count_t(output_size));
           continue;
         }
         auto scan_idx = global_state.output_to_scan_converted_idx[i];

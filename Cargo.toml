@@ -35,6 +35,7 @@ object_store = "0.14.2"
 
 arrow = { version = "58.0.0", features = ["ffi"] }
 arrow-array = "58.0.0"
+arrow-buffer = "58.0.0"
 arrow-schema = "58.0.0"
 
 datafusion = "54.0.0"

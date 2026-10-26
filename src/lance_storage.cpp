@@ -37,6 +37,7 @@
 #include "duckdb/transaction/transaction.hpp"
 
 #include "lance_common.hpp"
+#include "lance_blob.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
@@ -271,12 +272,14 @@ public:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
     vector<bool> blob_columns;
+    vector<string> writable_blob_v2_columns;
     try {
       auto live = LanceTableSchema::FromDataset(context, dataset);
       info.columns = std::move(live.columns);
       info.constraints = std::move(live.constraints);
       coerced = std::move(live.coerced_columns);
       blob_columns = std::move(live.blob_columns);
+      writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
@@ -297,6 +300,7 @@ public:
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
     entry->SetBlobColumns(std::move(blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
@@ -431,17 +435,20 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       vector<bool> blob_columns;
+      vector<string> writable_blob_v2_columns;
       try {
         auto live = LanceTableSchemaFromJson(context, schema_json);
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
         blob_columns = std::move(live.blob_columns);
+        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(blob_columns));
+                                std::move(coerced), std::move(blob_columns),
+                                std::move(writable_blob_v2_columns));
     }
 
     // Slow fallback: open dataset from S3.
@@ -467,19 +474,22 @@ public:
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
       vector<bool> blob_columns;
+      vector<string> writable_blob_v2_columns;
       try {
         auto live = LanceTableSchema::FromDataset(context, dataset);
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
         blob_columns = std::move(live.blob_columns);
+        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
         lance_close_dataset(dataset);
         continue;
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(blob_columns));
+                                std::move(coerced), std::move(blob_columns),
+                                std::move(writable_blob_v2_columns));
     }
 
     // All paths failed — return an empty entry to prevent DuckDB crash.
@@ -487,7 +497,7 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {}, {});
+                              {}, {}, {});
   }
 
   vector<Identifier> GetDefaultEntries() override {
@@ -507,11 +517,11 @@ public:
   }
 
 private:
-  unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
-                                              const string &table_id,
-                                              CreateTableInfo info,
-                                              vector<string> coerced_columns,
-                                              vector<bool> blob_columns) {
+  unique_ptr<CatalogEntry>
+  MakeNamespaceEntry(const string &entry_name, const string &table_id,
+                     CreateTableInfo info, vector<string> coerced_columns,
+                     vector<bool> blob_columns,
+                     vector<string> writable_blob_v2_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -524,6 +534,7 @@ private:
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
     entry->SetBlobColumns(std::move(blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
@@ -1097,6 +1108,7 @@ public:
                                     value_ptrs);
     const char *data_storage_version_ptr =
         data_storage_version.empty() ? nullptr : data_storage_version.c_str();
+    auto blob_flags = LanceBlobFlagsForTypes(types);
 
     auto *writer = lance_open_writer_with_storage_options(
         dataset_path.c_str(), mode.c_str(),
@@ -1104,7 +1116,9 @@ public:
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
         LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-        LanceGetSessionHandle(context), &schema_root.arrow_schema);
+        LanceGetSessionHandle(context), &schema_root.arrow_schema,
+        blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
+        LanceBlobIngestBatchBudget(context));
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
                         LanceFormatErrorSuffix());
@@ -1245,11 +1259,12 @@ public:
 
   PhysicalOperator &PlanUpdate(ClientContext &context,
                                PhysicalPlanGenerator &planner,
-                               LogicalUpdate &op) override {
+                               LogicalUpdate &op,
+                               PhysicalOperator &plan) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
-      return PlanLanceUpdateOverwrite(context, planner, op);
+      return PlanLanceUpdateOverwrite(context, planner, op, plan);
     }
-    return Catalog::PlanUpdate(context, planner, op);
+    return DuckCatalog::PlanUpdate(context, planner, op, plan);
   }
 
   PhysicalOperator &PlanInsert(ClientContext &context,
@@ -1430,7 +1445,12 @@ public:
             }
           }
 
-          // If overwriting, drop any existing table first.
+          // REST namespace metadata changes (DROP + CREATE empty table) happen
+          // before the writer starts and are not part of the Lance data
+          // transaction. A failed write therefore publishes no Lance data
+          // version, but an overwrite cannot roll the namespace catalog entry
+          // back; this is the existing REST service boundary, not a
+          // distributed namespace transaction.
           if (state->writer_mode == "overwrite") {
             string drop_error;
             if (!TryLanceNamespaceDropTable(context, state->endpoint,
@@ -1485,6 +1505,7 @@ public:
               state->data_storage_version.empty()
                   ? nullptr
                   : state->data_storage_version.c_str();
+          auto blob_flags = LanceBlobFlagsForTypes(state->column_types);
           state->writer = lance_open_writer_with_storage_options(
               state->open_path.c_str(), state->writer_mode.c_str(),
               key_ptrs.empty() ? nullptr : key_ptrs.data(),
@@ -1492,7 +1513,9 @@ public:
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
               LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-              LanceGetSessionHandle(context), &state->schema_root.arrow_schema);
+              LanceGetSessionHandle(context), &state->schema_root.arrow_schema,
+              blob_flags.empty() ? nullptr : blob_flags.data(),
+              blob_flags.size(), LanceBlobIngestBatchBudget(context));
           if (!state->writer) {
             throw IOException("Failed to open Lance writer: " +
                               state->open_path + LanceFormatErrorSuffix());
@@ -1520,12 +1543,18 @@ public:
               extension_type_cast;
           auto props = context.client.GetClientProperties();
 
+          // Resolve and validate source access before exporting the Arrow
+          // array so a policy/secret failure cannot leak it.
+          LanceBatchSourceOptions source_options;
+          LanceCollectIngestSourceOptions(context.client, chunk,
+                                          source_options);
+
           ArrowArray array;
           memset(&array, 0, sizeof(array));
           ArrowConverter::ToArrowArray(chunk, &array, props,
                                        extension_type_cast);
 
-          auto rc = lance_writer_write_batch(gstate.writer, &array);
+          auto rc = LanceWriteBlobBatch(gstate.writer, &array, source_options);
           if (array.release) {
             array.release(&array);
           }

@@ -32,6 +32,130 @@ to avoid silently changing their on-disk types. For a scalar float16 column,
 `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
 and makes it writable.
 
+## Blob columns and write inputs
+
+SQL `BLOB` columns read and write real bytes. In addition, a write can carry
+an explicit external-reference or managed-ingest description through the
+`LANCE_BLOB_INPUT` value type:
+
+```sql
+SELECT typeof(lance_blob_ref('file:///data/a.jpg'));
+-- LANCE_BLOB_INPUT
+```
+
+For partial reads without materializing whole values, see
+[Blob range reads](#blob-range-reads).
+
+### Encoding defaults
+
+- New top-level `BLOB` fields in datasets written with an effective file
+  version `>= 2.2` are stored as Lance Blob v2. Lance chooses inline, packed,
+  or dedicated storage; the SQL surface does not expose layout knobs.
+  `ALTER TABLE ... ADD COLUMN` applies the same default: a new top-level BLOB
+  column becomes Blob v2 at file version `>= 2.2` and stays plain binary
+  below it. Non-BLOB binary-typed columns such as `BIT` are never re-encoded.
+- `ALTER TABLE ... ADD COLUMN ... DEFAULT` back-fills every existing row. BLOB
+  defaults accept constant-foldable bytes and `NULL`; URI inputs are a
+  DML value contract and are rejected as stored defaults, and non-foldable
+  expressions such as column references or volatile functions fail with an
+  explicit error. The stored `duckdb_default_expr` metadata is persisted by a
+  separate best-effort commit after the schema evolution; this does not create
+  a new atomic DDL guarantee.
+- Datasets written with an older file version keep their existing binary
+  encoding.
+- Existing plain binary and legacy Blob columns keep their encoding. They
+  still accept ordinary bytes, but a URI input is rejected instead of
+  silently migrating the column.
+- URI inputs are only supported for top-level `BLOB` columns. Nested
+  `LANCE_BLOB_INPUT` values (inside `STRUCT`, `LIST`, or `MAP`) are rejected;
+  ordinary nested `BLOB` values keep their existing behavior.
+
+### Constructors
+
+```sql
+lance_blob_ref(uri)
+lance_blob_ref(uri, offset, length)
+
+lance_blob_ingest(uri)
+lance_blob_ingest(uri, offset, length)
+```
+
+- `uri` is `VARCHAR` and must be absolute with a scheme, for example
+  `file:///path/object.bin` or `s3://bucket/key`. Relative paths are
+  rejected; they are never resolved against the process working directory.
+- Without `offset`/`length`, the whole object is referenced. With a range,
+  `offset` is a zero-based `BIGINT >= 0` and `length` is a `BIGINT > 0`.
+  Both range arguments must be non-NULL and the range must not overflow.
+- A NULL URI produces a NULL blob. NULL is distinct from an empty BLOB; an
+  empty object can be ingested or referenced as a whole object.
+- Constructors only build and validate the value. They perform no HEAD, GET,
+  or ingest I/O; I/O happens only when a row reaches the writer.
+
+### Reference vs. ingest
+
+| Variant | Source I/O at write time | Ownership after commit |
+| --- | --- | --- |
+| `lance_blob_ref` | None | The external owner keeps the object. Later reads follow the URI; deleting or changing the source affects those reads. |
+| `lance_blob_ingest` | Reads the selected object or range | Lance manages the stored bytes. The source object can be deleted after a successful commit. |
+
+Source storage is resolved per source URI through DuckDB secrets, separately
+from the target dataset. Creating a reference does not validate that the
+external object exists; reference reads and ingest writes report missing
+objects or invalid ranges as errors.
+
+### INSERT, COPY, and CTAS
+
+Ordinary `BLOB` values and both URI constructors share one value contract.
+Each top-level value keeps its own mode, including values selected by `CASE`.
+
+```sql
+ATTACH 'path/to/namespace' AS ns (TYPE LANCE);
+
+INSERT INTO ns.main.media (id, payload)
+VALUES (1, 'plain bytes'::BLOB),
+       (2, lance_blob_ref('s3://source/a.jpg')),
+       (3, lance_blob_ingest('s3://source/b.jpg', 1024, 4096)),
+       (4, NULL);
+
+COPY (
+  SELECT id, lance_blob_ingest(uri) AS payload
+  FROM incoming_media
+) TO 'path/to/media.lance' (FORMAT lance);
+
+CREATE TABLE ns.main.media_copy AS
+SELECT id,
+       CASE WHEN keep_reference THEN lance_blob_ref(uri)
+            ELSE lance_blob_ingest(uri) END AS payload
+FROM incoming_media;
+```
+
+`UPDATE` and `MERGE` accept the same values:
+
+```sql
+UPDATE ns.main.media
+SET payload = lance_blob_ingest('s3://source/replacement.jpg')
+WHERE id = 1;
+
+MERGE INTO ns.main.media AS target
+USING incoming_media AS source ON target.id = source.id
+WHEN MATCHED THEN
+  UPDATE SET payload = lance_blob_ingest(source.uri)
+WHEN NOT MATCHED THEN
+  INSERT (id, payload) VALUES (source.id, lance_blob_ref(source.uri));
+```
+
+Ingest is materialized with a per-batch budget derived from DuckDB's
+`memory_limit` (`memory_limit / 8`, shared by all blob columns and all ingest
+rows of one batch). An object or range larger than that budget fails with an
+explicit error; use `lance_blob_ref` for large external objects or raise
+`memory_limit`. The budget bounds one batch conversion, not the total query
+or process RSS: buffered batches and downstream operators can hold additional
+memory.
+
+Existing SQL capability boundaries apply. `MERGE ... RETURNING` is supported
+and returns the action row's bytes; `INSERT ... RETURNING` and
+`UPDATE ... RETURNING` remain rejected by the extension.
+
 ## Blob range reads
 
 `lance_read_blob_ranges` reads byte ranges inside top-level blob values without

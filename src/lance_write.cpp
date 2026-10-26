@@ -14,6 +14,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "lance_arrow_compat.hpp"
+#include "lance_blob.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -163,6 +164,7 @@ LanceWriteInitGlobal(ClientContext &context,
       bind_data.data_storage_version.empty()
           ? nullptr
           : bind_data.data_storage_version.c_str();
+  auto blob_flags = LanceBlobFlagsForTypes(bind_data.types);
   auto *session = LanceGetSessionHandle(context);
   state->writer = lance_open_uncommitted_writer_with_storage_options(
       open_path.c_str(), bind_data.mode.c_str(),
@@ -170,7 +172,9 @@ LanceWriteInitGlobal(ClientContext &context,
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       bind_data.max_rows_per_file, bind_data.max_rows_per_group,
       bind_data.max_bytes_per_file, data_storage_version_ptr, session,
-      &state->schema_root.arrow_schema);
+      &state->schema_root.arrow_schema,
+      blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
+      LanceBlobIngestBatchBudget(context));
   if (!state->writer) {
     throw IOException("Failed to open Lance writer: " + open_path +
                       LanceFormatErrorSuffix());
@@ -189,11 +193,16 @@ static void LanceWriteSink(ExecutionContext &context,
   unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
       extension_type_cast;
 
+  // Resolve and validate source access before exporting the Arrow array so a
+  // policy/secret failure cannot leak it.
+  LanceBatchSourceOptions source_options;
+  LanceCollectIngestSourceOptions(context.client, input, source_options);
+
   ArrowArray array;
   memset(&array, 0, sizeof(array));
   ArrowConverter::ToArrowArray(input, &array, props, extension_type_cast);
 
-  auto rc = lance_writer_write_batch(gstate.writer, &array);
+  auto rc = LanceWriteBlobBatch(gstate.writer, &array, source_options);
   if (array.release) {
     array.release(&array);
   }

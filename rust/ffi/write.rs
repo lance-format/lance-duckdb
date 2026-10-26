@@ -14,7 +14,8 @@ use arrow_array::{
 };
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef};
-use lance::dataset::{CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::write::ExternalBlobMode;
+use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_arrow::json::is_arrow_json_field;
 use lance_arrow::BLOB_V2_EXT_NAME;
@@ -23,6 +24,10 @@ use lance_core::datatypes::Field as LanceField;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::blob::{
+    apply_blob_output_fields, convert_blob_column, plan_blob_conversions, BlobColumnConversion,
+    BlobWriteContext, SourceOptionsMap,
+};
 use super::session::record_commit;
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
@@ -73,12 +78,12 @@ struct WriterHandle {
     data_type: DataType,
     state: Mutex<WriterState>,
     batches_sent: AtomicU64,
+    /// The background writer's failure, recorded so a failed channel send can
+    /// report the real cause instead of only "writer background task exited".
+    writer_error: Arc<Mutex<Option<String>>>,
 }
 
-enum WriterResult {
-    Committed,
-    Uncommitted(Box<lance::dataset::transaction::Transaction>),
-}
+struct WriterResult(Box<lance::dataset::transaction::Transaction>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterKind {
@@ -107,6 +112,7 @@ struct VectorConversion {
 }
 
 struct WriterState {
+    #[allow(dead_code)]
     kind: WriterKind,
     path: String,
     params: WriteParams,
@@ -114,7 +120,10 @@ struct WriterState {
     append_reference: Option<Fields>,
 
     vector_candidates: Vec<VectorConversion>,
-    buffered_batches: Vec<RecordBatch>,
+    blob_conversions: Vec<BlobColumnConversion>,
+    blob_context: BlobWriteContext,
+    buffered_batches: Vec<(RecordBatch, SourceOptionsMap)>,
+    writer_error: Arc<Mutex<Option<String>>>,
 
     output_schema: Option<SchemaRef>,
     output_sender: Option<SyncSender<RecordBatch>>,
@@ -133,24 +142,37 @@ impl WriterState {
             .filter(|c| c.dim != 0)
             .cloned()
             .collect();
-        let output_schema =
-            build_output_schema(input_schema, &conversions, self.append_reference.as_ref())?;
+        let output_schema = build_output_schema(
+            input_schema,
+            &conversions,
+            self.append_reference.as_ref(),
+            &self.blob_conversions,
+        )?;
         // Validate buffered input before starting a task that can publish a dataset.
         let mut batches = self
             .buffered_batches
             .iter()
-            .map(|batch| convert_record_batch(batch, &output_schema, &conversions))
+            .map(|(batch, source_options)| {
+                convert_record_batch(
+                    batch,
+                    &output_schema,
+                    &conversions,
+                    &self.blob_conversions,
+                    &self.blob_context,
+                    source_options,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if write_empty {
             batches.push(RecordBatch::new_empty(output_schema.clone()));
         }
         let (sender, receiver) = sync_channel::<RecordBatch>(2);
         let join = spawn_writer_thread(
-            self.kind,
             self.path.clone(),
             self.params.clone(),
             output_schema.clone(),
             receiver,
+            self.writer_error.clone(),
         );
         self.buffered_batches.clear();
         self.output_schema = Some(output_schema);
@@ -186,9 +208,17 @@ impl WriterHandle {
             (sender, join, batches)
         };
         let sent = batches.into_iter().try_for_each(|batch| {
-            sender
-                .send(batch)
-                .map_err(|_| "writer background task exited".to_string())
+            sender.send(batch).map_err(|_| {
+                let detail = self
+                    .writer_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                match detail {
+                    Some(detail) => format!("writer background task failed: {detail}"),
+                    None => "writer background task exited".to_string(),
+                }
+            })
         });
         drop(sender);
         // Always join, including when the worker stopped accepting buffered input.
@@ -515,16 +545,23 @@ fn convert_list_array_to_fixed_size(
     }
 }
 
-/// Best-effort read of the destination dataset's schema; `None` when the
-/// dataset does not exist yet, in which case an append behaves like a create.
-fn existing_dataset_schema(
+/// Best-effort read of the destination dataset's schema and file version;
+/// `None` when the dataset does not exist yet, in which case an append behaves
+/// like a create.
+fn existing_dataset_context(
     path: &str,
     storage_options: &HashMap<String, String>,
-) -> Option<Schema> {
+) -> Option<(Schema, String)> {
     let builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
         .with_storage_options(storage_options.clone());
     let dataset = runtime::block_on(builder.load()).ok()?.ok()?;
-    Some(Schema::from(dataset.schema()))
+    let version = dataset
+        .manifest
+        .data_storage_format
+        .lance_file_format()
+        .to_manifest_string()
+        .to_string();
+    Some((Schema::from(dataset.schema()), version))
 }
 
 /// Rewrites list child field names in `schema` to match `reference`.
@@ -728,11 +765,13 @@ fn build_output_schema(
     input_schema: &SchemaRef,
     conversions: &[VectorConversion],
     reference: Option<&Fields>,
+    blob_conversions: &[BlobColumnConversion],
 ) -> Result<SchemaRef, String> {
+    let blob_schema = apply_blob_output_fields(input_schema, blob_conversions);
+    let mut fields = blob_schema.fields().as_ref().to_vec();
     if conversions.is_empty() {
-        return Ok(input_schema.clone());
+        return Ok(Arc::new(Schema::new(fields)));
     }
-    let mut fields = input_schema.fields().as_ref().to_vec();
     for conv in conversions {
         let idx = conv.col_idx;
         if idx >= fields.len() {
@@ -766,12 +805,37 @@ fn convert_record_batch(
     input_batch: &RecordBatch,
     output_schema: &SchemaRef,
     conversions: &[VectorConversion],
+    blob_conversions: &[BlobColumnConversion],
+    blob_context: &BlobWriteContext,
+    source_options: &SourceOptionsMap,
 ) -> Result<RecordBatch, String> {
-    if conversions.is_empty() {
+    if conversions.is_empty() && blob_conversions.is_empty() {
         return RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
             .map_err(|e| e.to_string());
     }
     let mut cols = input_batch.columns().to_vec();
+    // One shared ingest budget for the whole batch conversion, so N ingest
+    // columns of one batch cannot accumulate N times the configured budget.
+    let mut remaining_budget = blob_context.ingest_batch_budget;
+    for conversion in blob_conversions {
+        let arr = cols
+            .get(conversion.col_idx)
+            .ok_or_else(|| "blob column index is out of bounds".to_string())?
+            .as_ref();
+        let input_schema = input_batch.schema();
+        let field = input_schema.field(conversion.col_idx);
+        let converted = convert_blob_column(
+            field.name(),
+            arr,
+            conversion.target,
+            field.is_nullable(),
+            blob_context,
+            source_options,
+            &mut remaining_budget,
+            conversion.output_field.as_ref(),
+        )?;
+        cols[conversion.col_idx] = converted;
+    }
     for conv in conversions {
         let arr = cols
             .get(conv.col_idx)
@@ -786,34 +850,32 @@ fn convert_record_batch(
 }
 
 fn spawn_writer_thread(
-    kind: WriterKind,
     path: String,
     params: WriteParams,
     schema: SchemaRef,
     receiver: Receiver<RecordBatch>,
+    writer_error: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<Result<WriterResult, String>> {
     std::thread::spawn(move || -> Result<WriterResult, String> {
         let reader = ReceiverRecordBatchReader::new(schema, receiver);
-        match kind {
-            WriterKind::Committed => {
-                let fut = Dataset::write(reader, &path, Some(params));
-                match runtime::block_on(fut) {
-                    Ok(Ok(_)) => Ok(WriterResult::Committed),
-                    Ok(Err(err)) => Err(err.to_string()),
-                    Err(err) => Err(format!("runtime: {err}")),
-                }
-            }
-            WriterKind::Uncommitted => {
-                let source: Box<dyn RecordBatchReader + Send> = Box::new(reader);
-                let builder = InsertBuilder::new(path.as_str()).with_params(&params);
-                let fut = builder.execute_uncommitted_stream(source);
-                match runtime::block_on(fut) {
-                    Ok(Ok(txn)) => Ok(WriterResult::Uncommitted(Box::new(txn))),
-                    Ok(Err(err)) => Err(err.to_string()),
-                    Err(err) => Err(format!("runtime: {err}")),
-                }
-            }
+        // Every writer produces an uncommitted transaction. A dropped pipeline
+        // simply drops that transaction, so a later batch failure can never
+        // publish an earlier batch's data. Committed callers commit explicitly
+        // in `writer_finish_inner`.
+        let source: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+        let builder = InsertBuilder::new(path.as_str()).with_params(&params);
+        let fut = builder.execute_uncommitted_stream(source);
+        let result = match runtime::block_on(fut) {
+            Ok(Ok(txn)) => Ok(WriterResult(Box::new(txn))),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(err) => Err(format!("runtime: {err}")),
+        };
+        if let Err(err) = &result {
+            *writer_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(err.clone());
         }
+        result
     })
 }
 
@@ -830,6 +892,9 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     data_storage_version: *const c_char,
     session: *mut c_void,
     schema: *const c_void,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
+    ingest_batch_budget: u64,
 ) -> *mut c_void {
     match open_writer_inner(
         WriterKind::Committed,
@@ -844,6 +909,9 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
         data_storage_version,
         session,
         schema,
+        blob_columns,
+        blob_columns_len,
+        ingest_batch_budget,
     ) {
         Ok(handle) => {
             clear_last_error();
@@ -869,6 +937,9 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     data_storage_version: *const c_char,
     session: *mut c_void,
     schema: *const c_void,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
+    ingest_batch_budget: u64,
 ) -> *mut c_void {
     match open_writer_inner(
         WriterKind::Uncommitted,
@@ -883,6 +954,9 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         data_storage_version,
         session,
         schema,
+        blob_columns,
+        blob_columns_len,
+        ingest_batch_budget,
     ) {
         Ok(handle) => {
             clear_last_error();
@@ -935,6 +1009,9 @@ fn open_writer_inner(
     data_storage_version: *const c_char,
     session: *mut c_void,
     schema: *const c_void,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
+    ingest_batch_budget: u64,
 ) -> FfiResult<WriterHandle> {
     let path = unsafe { cstr_to_str(path, "path")? }.to_string();
     let mode = unsafe { cstr_to_str(mode, "mode")? };
@@ -1001,13 +1078,17 @@ fn open_writer_inner(
     // the schema without it would fail RecordBatch validation.
     let mut data_type = data_type.clone();
     let mut append_reference = None;
+    let mut existing_schema = None;
+    let mut existing_version = None;
     if matches!(write_mode, WriteMode::Append) {
-        if let Some(existing) = existing_dataset_schema(&path, &storage_options) {
+        if let Some((existing, version)) = existing_dataset_context(&path, &storage_options) {
             if let Some(fields) = align_append_fields(schema.fields(), existing.fields()) {
                 data_type = DataType::Struct(fields.clone());
                 schema = Arc::new(Schema::new(fields));
             }
             append_reference = Some(existing.fields().clone());
+            existing_version = Some(version);
+            existing_schema = Some(existing);
         }
     }
 
@@ -1041,6 +1122,28 @@ fn open_writer_inner(
         .transpose()?;
     let session = unsafe { optional_session_handle(session)? };
 
+    let blob_flags = if blob_columns_len == 0 {
+        Vec::new()
+    } else if blob_columns.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "blob_columns is null with non-zero length",
+        ));
+    } else {
+        let flags = unsafe { std::slice::from_raw_parts(blob_columns, blob_columns_len) };
+        if flags.len() != schema.fields().len() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "blob_columns length {} does not match the {}-column schema",
+                    flags.len(),
+                    schema.fields().len()
+                ),
+            ));
+        }
+        flags.to_vec()
+    };
+
     let mut store_params = ObjectStoreParams::default();
     if !storage_options.is_empty() {
         store_params.storage_options_accessor = Some(Arc::new(
@@ -1054,9 +1157,45 @@ fn open_writer_inner(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
-        session,
+        session: session.clone(),
         store_params: Some(store_params),
+        // Absolute external URIs are part of the SQL reference contract:
+        // references that match a registered base reuse it, others are stored
+        // as absolute URIs through Lance's native outside-bases capability.
+        allow_external_blob_outside_bases: true,
+        external_blob_mode: ExternalBlobMode::Reference,
         ..Default::default()
+    };
+
+    // Blob v2 requires file version >= 2.2. Append writes follow the
+    // destination's recorded version; create/overwrite use the resolved request
+    // (an unspecified request resolves through Lance's stable selector).
+    let new_fields_use_blob_v2 = match existing_version.as_deref() {
+        Some(version) => super::blob::version_supports_blob_v2(version),
+        None => super::blob::version_supports_blob_v2(
+            params.storage_version_or_default().to_manifest_string(),
+        ),
+    };
+    let blob_conversions = plan_blob_conversions(
+        schema.as_ref(),
+        existing_schema.as_ref(),
+        new_fields_use_blob_v2,
+        &blob_flags,
+    )
+    .map_err(|err| FfiError::new(ErrorCode::DatasetWriteOpen, err))?;
+    let ingest_batch_budget = if ingest_batch_budget == 0 {
+        super::blob::DEFAULT_INGEST_BATCH_BUDGET
+    } else {
+        usize::try_from(ingest_batch_budget).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetWriteOpen,
+                format!("invalid ingest memory budget: {err}"),
+            )
+        })?
+    };
+    let blob_context = BlobWriteContext {
+        registry: params.store_registry(),
+        ingest_batch_budget,
     };
 
     let mut vector_candidates = Vec::<VectorConversion>::new();
@@ -1071,6 +1210,7 @@ fn open_writer_inner(
         }
     }
 
+    let writer_error = Arc::new(Mutex::new(None));
     Ok(WriterHandle {
         input_schema: schema.clone(),
         data_type,
@@ -1080,18 +1220,22 @@ fn open_writer_inner(
             params,
             append_reference,
             vector_candidates,
+            blob_conversions,
+            blob_context,
             buffered_batches: Vec::new(),
+            writer_error: writer_error.clone(),
             output_schema: None,
             output_sender: None,
             output_join: None,
         }),
         batches_sent: AtomicU64::new(0),
+        writer_error,
     })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_writer_write_batch(writer: *mut c_void, array: *mut c_void) -> i32 {
-    match writer_write_batch_inner(writer, array) {
+    match writer_write_batch_inner(writer, array, &HashMap::new()) {
         Ok(()) => {
             clear_last_error();
             0
@@ -1103,7 +1247,128 @@ pub unsafe extern "C" fn lance_writer_write_batch(writer: *mut c_void, array: *m
     }
 }
 
-fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResult<()> {
+pub(super) fn parse_batch_source_options(
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
+) -> FfiResult<SourceOptionsMap> {
+    let mut map = HashMap::new();
+    if source_uri_count == 0 {
+        return Ok(map);
+    }
+    if source_uris.is_null()
+        || source_uri_keys.is_null()
+        || source_uri_values.is_null()
+        || source_uri_counts.is_null()
+    {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "source URI option arrays are null with non-zero count",
+        ));
+    }
+    let uris = unsafe { slice_from_ptr(source_uris, source_uri_count, "source_uris")? };
+    let all_keys = unsafe { slice_from_ptr(source_uri_keys, source_uri_count, "source_uri_keys")? };
+    let all_values =
+        unsafe { slice_from_ptr(source_uri_values, source_uri_count, "source_uri_values")? };
+    let counts =
+        unsafe { slice_from_ptr(source_uri_counts, source_uri_count, "source_uri_counts")? };
+    for idx in 0..source_uri_count {
+        if uris[idx].is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("source_uris[{idx}] is null"),
+            ));
+        }
+        let uri = unsafe { CStr::from_ptr(uris[idx]) }
+            .to_str()
+            .map_err(|err| {
+                FfiError::new(ErrorCode::Utf8, format!("source_uris[{idx}] utf8: {err}"))
+            })?
+            .to_string();
+        let count = counts[idx];
+        let mut options = HashMap::new();
+        if count > 0 {
+            if all_keys[idx].is_null() || all_values[idx].is_null() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("source_uri_options[{idx}] arrays are null with non-zero count"),
+                ));
+            }
+            let keys = unsafe { slice_from_ptr(all_keys[idx], count, "source_uri_keys")? };
+            let values = unsafe { slice_from_ptr(all_values[idx], count, "source_uri_values")? };
+            for kv_idx in 0..count {
+                if keys[kv_idx].is_null() || values[kv_idx].is_null() {
+                    return Err(FfiError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("source_uri_options[{idx}] option at index {kv_idx} is null"),
+                    ));
+                }
+                let key = unsafe { CStr::from_ptr(keys[kv_idx]) }
+                    .to_str()
+                    .map_err(|err| {
+                        FfiError::new(
+                            ErrorCode::Utf8,
+                            format!("source_uri_options[{idx}] key[{kv_idx}] utf8: {err}"),
+                        )
+                    })?
+                    .to_string();
+                let value = unsafe { CStr::from_ptr(values[kv_idx]) }
+                    .to_str()
+                    .map_err(|err| {
+                        FfiError::new(
+                            ErrorCode::Utf8,
+                            format!("source_uri_options[{idx}] value[{kv_idx}] utf8: {err}"),
+                        )
+                    })?
+                    .to_string();
+                options.insert(key, value);
+            }
+        }
+        map.insert(uri, options);
+    }
+    Ok(map)
+}
+
+/// Write one batch and the source-storage options resolved by DuckDB's secret
+/// lookup for each ingest URI it carries.
+#[no_mangle]
+pub unsafe extern "C" fn lance_writer_write_batch_with_source_options(
+    writer: *mut c_void,
+    array: *mut c_void,
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
+) -> i32 {
+    let source_options = parse_batch_source_options(
+        source_uris,
+        source_uri_keys,
+        source_uri_values,
+        source_uri_counts,
+        source_uri_count,
+    );
+    let result =
+        source_options.and_then(|options| writer_write_batch_inner(writer, array, &options));
+    match result {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn writer_write_batch_inner(
+    writer: *mut c_void,
+    array: *mut c_void,
+    source_options: &SourceOptionsMap,
+) -> FfiResult<()> {
     if writer.is_null() {
         return Err(FfiError::new(ErrorCode::InvalidArgument, "writer is null"));
     }
@@ -1144,10 +1409,16 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if guard.output_sender.is_none() {
-            guard.buffered_batches.push(input_batch);
+            guard
+                .buffered_batches
+                .push((input_batch, source_options.clone()));
 
             if !guard.vector_candidates.is_empty() {
-                let batches = guard.buffered_batches.clone();
+                let batches = guard
+                    .buffered_batches
+                    .iter()
+                    .map(|(batch, _)| batch.clone())
+                    .collect::<Vec<_>>();
                 for cand in guard.vector_candidates.iter_mut() {
                     if cand.dim != 0 {
                         continue;
@@ -1167,7 +1438,11 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
                     }
                 }
 
-                let batches = guard.buffered_batches.clone();
+                let batches = guard
+                    .buffered_batches
+                    .iter()
+                    .map(|(batch, _)| batch.clone())
+                    .collect::<Vec<_>>();
                 for cand in guard.vector_candidates.iter() {
                     if cand.dim == 0 {
                         continue;
@@ -1206,8 +1481,15 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
                 .filter(|c| c.dim != 0)
                 .cloned()
                 .collect();
-            let out = convert_record_batch(&input_batch, &schema, &conversions)
-                .map_err(|e| FfiError::new(ErrorCode::DatasetWriteBatch, e))?;
+            let out = convert_record_batch(
+                &input_batch,
+                &schema,
+                &conversions,
+                &guard.blob_conversions,
+                &guard.blob_context,
+                source_options,
+            )
+            .map_err(|e| FfiError::new(ErrorCode::DatasetWriteBatch, e))?;
             (sender, vec![out])
         }
     };
@@ -1215,9 +1497,16 @@ fn writer_write_batch_inner(writer: *mut c_void, array: *mut c_void) -> FfiResul
     if let Some(sender) = sender {
         for batch in to_send {
             sender.send(batch).map_err(|_| {
+                let detail = handle
+                    .writer_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 FfiError::new(
                     ErrorCode::DatasetWriteBatch,
-                    "writer background task exited",
+                    detail
+                        .map(|detail| format!("writer background task failed: {detail}"))
+                        .unwrap_or_else(|| "writer background task exited".to_string()),
                 )
             })?;
         }
@@ -1248,14 +1537,37 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
-    match handle
+    let txn = handle
         .finish()
         .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?
-    {
-        WriterResult::Committed => Ok(()),
-        WriterResult::Uncommitted(_) => Err(FfiError::new(
+        .0;
+    let (path, store_params, session) = {
+        let guard = handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            guard.path.clone(),
+            guard.params.store_params.clone().unwrap_or_default(),
+            guard.params.session.clone(),
+        )
+    };
+    let mut builder = CommitBuilder::new(path.as_str()).with_store_params(store_params);
+    if let Some(session) = session {
+        builder = builder.with_session(session);
+    }
+    match runtime::block_on(builder.execute(*txn)) {
+        Ok(Ok(_)) => {
+            record_commit();
+            Ok(())
+        }
+        Ok(Err(err)) => Err(FfiError::new(
             ErrorCode::DatasetWriteFinish,
-            "writer returned an uncommitted transaction",
+            err.to_string(),
+        )),
+        Err(err) => Err(FfiError::new(
+            ErrorCode::DatasetWriteFinish,
+            format!("runtime: {err}"),
         )),
     }
 }
@@ -1292,18 +1604,10 @@ fn writer_finish_uncommitted_inner(
     }
 
     let handle = unsafe { &*(writer as *const WriterHandle) };
-    let txn = match handle
+    let txn = handle
         .finish()
         .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?
-    {
-        WriterResult::Uncommitted(txn) => txn,
-        WriterResult::Committed => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetWriteFinishUncommitted,
-                "writer did not return an uncommitted transaction",
-            ))
-        }
-    };
+        .0;
 
     unsafe {
         *out_transaction = Box::into_raw(txn) as *mut c_void;
@@ -1631,19 +1935,30 @@ mod align_tests {
         }];
         let tensor = column("v", vector_of("item"), Some((TENSOR, Some(TENSOR_META))));
 
-        let output = build_output_schema(&input, &conversions, Some(&tensor)).unwrap();
+        let output = build_output_schema(&input, &conversions, Some(&tensor), &[]).unwrap();
         assert_eq!(output.field(0).extension_type_name(), Some(TENSOR));
         let offsets = arrow::buffer::OffsetBuffer::from_lengths([4]);
         let values = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]));
         let list = ListArray::new(floats(), offsets, values, None);
         let batch = RecordBatch::try_new(input.clone(), vec![Arc::new(list)]).unwrap();
-        let converted = convert_record_batch(&batch, &output, &conversions).unwrap();
+        let converted = convert_record_batch(
+            &batch,
+            &output,
+            &conversions,
+            &[],
+            &BlobWriteContext {
+                registry: Arc::new(lance::io::ObjectStoreRegistry::default()),
+                ingest_batch_budget: 0,
+            },
+            &HashMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             converted.schema().field(0).extension_type_name(),
             Some(TENSOR)
         );
 
-        let plain = build_output_schema(&input, &conversions, None).unwrap();
+        let plain = build_output_schema(&input, &conversions, None, &[]).unwrap();
         assert_eq!(plain.field(0).extension_type_name(), None);
     }
 }
@@ -1652,7 +1967,117 @@ mod align_tests {
 mod lifecycle_tests {
     use super::*;
     use arrow_array::types::Float32Type;
+    use arrow_array::{
+        BinaryArray, Int64Array, LargeBinaryArray, RecordBatchIterator, StringArray, UnionArray,
+    };
+    use arrow_schema::UnionFields;
+    use futures::StreamExt as _;
+    use lance::Dataset;
+    use lance_core::datatypes::BlobHandling;
     use std::ffi::CString;
+
+    fn blob_union_fields() -> UnionFields {
+        let descriptor = |name: &str| {
+            Field::new(
+                name,
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("uri", DataType::Utf8, true)),
+                    Arc::new(Field::new("position", DataType::UInt64, true)),
+                    Arc::new(Field::new("size", DataType::UInt64, true)),
+                ])),
+                true,
+            )
+        };
+        UnionFields::try_new(
+            vec![0, 1, 2],
+            vec![
+                Arc::new(Field::new("bytes", DataType::Binary, true)),
+                Arc::new(descriptor("reference")),
+                Arc::new(descriptor("ingest")),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn blob_union_batch(source_uri: &str) -> RecordBatch {
+        let fields = blob_union_fields();
+        let uri_children = || {
+            Fields::from(vec![
+                Arc::new(Field::new("uri", DataType::Utf8, true)),
+                Arc::new(Field::new("position", DataType::UInt64, true)),
+                Arc::new(Field::new("size", DataType::UInt64, true)),
+            ])
+        };
+        let descriptor = |uri_val: Option<&str>, len: usize, at: usize| {
+            let mut uri_rows = vec![None; len];
+            if let Some(uri) = uri_val {
+                uri_rows[at] = Some(uri.to_string());
+            }
+            let position = arrow_array::UInt64Array::from(vec![None; len]);
+            let size = arrow_array::UInt64Array::from(vec![None; len]);
+            StructArray::try_new(
+                uri_children(),
+                vec![
+                    Arc::new(StringArray::from(uri_rows)),
+                    Arc::new(position),
+                    Arc::new(size),
+                ],
+                None,
+            )
+            .unwrap()
+        };
+        let bytes = BinaryArray::from(vec![Some(b"abc".as_slice()), None, None]);
+        let reference = descriptor(Some(source_uri), 3, 1);
+        let ingest = descriptor(Some(source_uri), 3, 2);
+        let payload = UnionArray::try_new(
+            fields,
+            vec![0_i8, 1, 2].into(),
+            None,
+            vec![Arc::new(bytes), Arc::new(reference), Arc::new(ingest)],
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", payload.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(payload)],
+        )
+        .unwrap()
+    }
+
+    fn scan_blob_payloads(dataset: &Dataset) -> Result<Vec<(i64, Vec<u8>)>, String> {
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let mut stream = runtime::block_on(scanner.try_into_stream())
+            .map_err(|err| err.to_string())?
+            .map_err(|err| err.to_string())?;
+        let mut out = Vec::new();
+        loop {
+            let Some(batch) = runtime::block_on(stream.next()).map_err(|err| err.to_string())?
+            else {
+                break;
+            };
+            let batch = batch.map_err(|err| err.to_string())?;
+            let ids = batch
+                .column_by_name("id")
+                .ok_or_else(|| "missing id".to_string())?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "id not int64".to_string())?;
+            let payloads = batch
+                .column_by_name("payload")
+                .ok_or_else(|| "missing payload".to_string())?
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "payload not large binary".to_string())?;
+            for i in 0..batch.num_rows() {
+                out.push((ids.value(i), payloads.value(i).to_vec()));
+            }
+        }
+        Ok(out)
+    }
 
     struct TestDirectory(std::path::PathBuf);
 
@@ -1684,14 +2109,21 @@ mod lifecycle_tests {
                 ptr::null(),
                 ptr::null_mut(),
                 &schema as *const _ as *const c_void,
+                ptr::null(),
+                0,
+                0,
             )
             .unwrap();
             let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
             if write_batch {
                 let array = StructArray::from(batch.clone());
                 let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
-                writer_write_batch_inner(writer_ptr, &mut exported as *mut _ as *mut c_void)
-                    .unwrap();
+                writer_write_batch_inner(
+                    writer_ptr,
+                    &mut exported as *mut _ as *mut c_void,
+                    &HashMap::new(),
+                )
+                .unwrap();
             }
             match kind {
                 WriterKind::Committed => writer_finish_inner(writer_ptr).unwrap(),
@@ -1739,6 +2171,228 @@ mod lifecycle_tests {
     #[test]
     fn empty_finish_preserves_publication_mode() {
         check_publication(vector_batch(vec![]), false);
+    }
+
+    #[test]
+    fn dropped_writer_never_publishes_committed_data() {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("ffi-writer-drop-{}", rand::random::<u64>())),
+        );
+        let path = CString::new(directory.0.to_str().unwrap()).unwrap();
+        let batch = vector_batch(vec![Some(vec![Some(1.0), Some(2.0)])]);
+        let schema =
+            super::super::util::schema_to_ffi_arrow_schema(batch.schema().as_ref()).unwrap();
+        let mut writer = open_writer_inner(
+            WriterKind::Committed,
+            path.as_ptr(),
+            c"create".as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            1024,
+            1024,
+            1024 * 1024,
+            ptr::null(),
+            ptr::null_mut(),
+            &schema as *const _ as *const c_void,
+            ptr::null(),
+            0,
+            0,
+        )
+        .unwrap();
+        let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
+        let array = StructArray::from(batch.clone());
+        let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
+        writer_write_batch_inner(
+            writer_ptr,
+            &mut exported as *mut _ as *mut c_void,
+            &HashMap::new(),
+        )
+        .unwrap();
+        // Dropping without finish (the failure path of a later batch) must
+        // publish nothing.
+        drop(writer);
+        assert!(runtime::block_on(Dataset::open(path.to_str().unwrap()))
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn blob_v2_ffi_roundtrip_preserves_modes_and_bytes() {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("ffi-blob-v2-{}", rand::random::<u64>())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let source = directory.0.join("blob_src.bin");
+        std::fs::write(&source, b"source-bytes").unwrap();
+        let source_uri = format!("file://{}", source.display());
+        let batch = blob_union_batch(&source_uri);
+        let dataset_path = directory.0.join("ds.lance");
+        let path = CString::new(dataset_path.to_str().unwrap()).unwrap();
+        let schema =
+            super::super::util::schema_to_ffi_arrow_schema(batch.schema().as_ref()).unwrap();
+        let mut writer = open_writer_inner(
+            WriterKind::Uncommitted,
+            path.as_ptr(),
+            c"create".as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            1024,
+            1024,
+            1024 * 1024,
+            ptr::null(),
+            ptr::null_mut(),
+            &schema as *const _ as *const c_void,
+            [0u8, 1u8].as_ptr(),
+            2,
+            0,
+        )
+        .unwrap();
+        let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
+        let array = StructArray::from(batch);
+        let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
+        writer_write_batch_inner(
+            writer_ptr,
+            &mut exported as *mut _ as *mut c_void,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut transaction = ptr::null_mut();
+        writer_finish_uncommitted_inner(writer_ptr, &mut transaction).unwrap();
+        commit_transaction_inner(
+            path.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            transaction,
+        )
+        .unwrap();
+
+        let dataset = runtime::block_on(Dataset::open(dataset_path.to_str().unwrap()))
+            .unwrap()
+            .unwrap();
+        let schema: Schema = dataset.schema().into();
+        assert!(
+            super::super::blob::is_blob_v2_field(
+                schema.field_with_name("payload").expect("payload field"),
+            ),
+            "payload field must be Blob v2"
+        );
+        let rows = scan_blob_payloads(&dataset).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, b"abc".to_vec()),
+                (2, b"source-bytes".to_vec()),
+                (3, b"source-bytes".to_vec()),
+            ]
+        );
+
+        // References follow the external object; deleting it must make those
+        // reads fail while managed rows stay in the dataset.
+        std::fs::remove_file(&source).unwrap();
+        assert!(scan_blob_payloads(&dataset).is_err());
+    }
+
+    #[test]
+    fn blob_v2_append_accepts_minimal_two_field_datasets() {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("ffi-blob-v2-min-{}", rand::random::<u64>())),
+        );
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let dataset_path = directory.0.join("ds.lance");
+
+        // Lance's public blob_field/BlobArrayBuilder path creates the minimal
+        // two-field (data, uri) logical shape; our writer emits the complete
+        // four-field shape. The append must accept the existing dataset as is.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            lance::blob::blob_field("payload", true),
+        ]));
+        let data = LargeBinaryArray::from(vec![Some(b"initial".as_slice())]);
+        let uri = StringArray::from(vec![None::<String>]);
+        let payload = StructArray::try_new(
+            Fields::from(vec![
+                Arc::new(Field::new("data", DataType::LargeBinary, true)),
+                Arc::new(Field::new("uri", DataType::Utf8, true)),
+            ]),
+            vec![Arc::new(data), Arc::new(uri)],
+            None,
+        )
+        .unwrap();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1])), Arc::new(payload)],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(initial)], schema);
+        runtime::block_on(Dataset::write(
+            reader,
+            dataset_path.to_str().unwrap(),
+            Some(WriteParams::default()),
+        ))
+        .unwrap()
+        .unwrap();
+
+        let append_source = blob_union_batch("file:///unused");
+        let payload = append_source.column(1).slice(0, 1);
+        let append_batch = RecordBatch::try_new(
+            append_source.schema(),
+            vec![Arc::new(Int64Array::from(vec![2])), payload],
+        )
+        .unwrap();
+        let path = CString::new(dataset_path.to_str().unwrap()).unwrap();
+        let schema =
+            super::super::util::schema_to_ffi_arrow_schema(append_batch.schema().as_ref()).unwrap();
+        let mut writer = open_writer_inner(
+            WriterKind::Uncommitted,
+            path.as_ptr(),
+            c"append".as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            1024,
+            1024,
+            1024 * 1024,
+            ptr::null(),
+            ptr::null_mut(),
+            &schema as *const _ as *const c_void,
+            [0u8, 1u8].as_ptr(),
+            2,
+            0,
+        )
+        .unwrap();
+        let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
+        let array = StructArray::from(append_batch);
+        let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
+        writer_write_batch_inner(
+            writer_ptr,
+            &mut exported as *mut _ as *mut c_void,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut transaction = ptr::null_mut();
+        writer_finish_uncommitted_inner(writer_ptr, &mut transaction).unwrap();
+        commit_transaction_inner(
+            path.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null_mut(),
+            transaction,
+        )
+        .unwrap();
+
+        let dataset = runtime::block_on(Dataset::open(dataset_path.to_str().unwrap()))
+            .unwrap()
+            .unwrap();
+        let rows = scan_blob_payloads(&dataset).unwrap();
+        assert_eq!(rows, vec![(1, b"initial".to_vec()), (2, b"abc".to_vec())]);
     }
 
     #[test]

@@ -13,4 +13,8 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
                                      LogicalMergeInto &op,
                                      PhysicalOperator &plan);
 
+// Wrap a RETURNING projection above a MERGE with a pass-through extension
+// operator that records which table columns the projection references.
+void LanceWrapMergeReturningOperator(LogicalOperator &plan);
+
 } // namespace duckdb

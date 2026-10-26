@@ -3928,6 +3928,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "async-trait",
  "blake3",

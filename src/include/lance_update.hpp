@@ -6,10 +6,12 @@
 namespace duckdb {
 
 class LogicalUpdate;
+class PhysicalOperator;
 class PhysicalPlanGenerator;
 
 PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
                                            PhysicalPlanGenerator &planner,
-                                           LogicalUpdate &op);
+                                           LogicalUpdate &op,
+                                           PhysicalOperator &plan);
 
 } // namespace duckdb
