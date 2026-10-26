@@ -338,6 +338,79 @@ materialization budget
 statement ok
 SET memory_limit='80%';
 
+# Prepared explicit-version reads stay pinned across executions even though the
+# dataset has a newer version.
+statement ok
+PREPARE range_pinned AS
+SELECT CAST(version AS VARCHAR) AS pinned_version, hex(data) AS payload
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_id',
+  (
+    SELECT 7 AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 5::BIGINT AS length
+  )
+);
+
+query TT
+EXECUTE range_pinned;
+----
+1	68656C6C6F
+
+query TT
+EXECUTE range_pinned;
+----
+1	68656C6C6F
+
+statement ok
+DEALLOCATE range_pinned;
+
+# Prepared executions must pick up a new memory_limit instead of reusing the
+# budget captured when the statement was prepared.
+statement ok
+SET memory_limit='80MB';
+
+statement ok
+PREPARE range_budget AS
+SELECT request_id, CAST(octet_length(data) AS BIGINT) AS payload_bytes
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 1 AS request_id,
+           (
+             SELECT CAST(rowid AS BIGINT)
+             FROM 'test/data/blob_range_fixture.lance' fixture
+             WHERE fixture.id = 4
+           ) AS row_value,
+           0::BIGINT AS offset,
+           1048576::BIGINT AS length
+  )
+);
+
+query TI
+EXECUTE range_budget;
+----
+1	1048576
+
+statement ok
+SET memory_limit='4MB';
+
+statement error
+EXECUTE range_budget;
+----
+materialization budget
+
+statement ok
+DEALLOCATE range_budget;
+
+statement ok
+SET memory_limit='80%';
+
 # More requests than one DuckDB chunk: every chunk keeps its own request ids
 # and indexes contiguous, and payloads still match their own request row.
 query IIII

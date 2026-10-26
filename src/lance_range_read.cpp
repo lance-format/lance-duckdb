@@ -56,6 +56,11 @@ struct LanceBlobRangeReadBindData : public TableFunctionData {
       dataset = nullptr;
     }
   }
+
+  // The bind data pins a dataset handle and the memory_limit-derived window
+  // budget. Both must be refreshed per execution so prepared statements with
+  // version = NULL observe external commits and pick up SET memory_limit.
+  bool SupportStatementCache() const override { return false; }
 };
 
 struct LanceBlobRangeReadGlobalState : public GlobalTableFunctionState {
