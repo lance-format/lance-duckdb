@@ -88,6 +88,24 @@ CREATE SECRET nested_target IN connection (
   STORAGE_OPTIONS MAP {'base_1.download_retry_count': '3'}
 );
 
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  's3://{LANCE_S3_BUCKET}/nested_target.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT id AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           14::BIGINT AS length
+    FROM 's3://{LANCE_S3_BUCKET}/nested_target.lance'
+  )
+);
+----
+403
+
 statement ok
 CREATE SECRET nested_source IN connection (
   TYPE LANCE,
