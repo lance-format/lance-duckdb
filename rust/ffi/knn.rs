@@ -10,8 +10,8 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr, to_c_string,
-    FfiError, FfiResult,
+    cstr_to_str, nonzero_u64_to_usize, optional_cstr_to_str, parse_filter_sql,
+    parse_optional_filter_ir, slice_from_ptr, to_c_string, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -112,6 +112,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -125,6 +126,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         refine_factor,
         filter_ir,
         filter_ir_len,
+        filter_sql,
         prefilter,
         use_index,
     ) {
@@ -150,6 +152,7 @@ fn create_knn_stream_ir_inner(
     refine_factor: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<StreamHandle> {
@@ -161,7 +164,7 @@ fn create_knn_stream_ir_inner(
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
-    let filter = unsafe {
+    let mut filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
             filter_ir_len,
@@ -172,6 +175,19 @@ fn create_knn_stream_ir_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
+    if let Some(filter_sql) = filter_sql {
+        let sql_filter = parse_filter_sql(
+            &handle.dataset,
+            filter_sql,
+            ErrorCode::KnnStreamCreate,
+            "knn filter_sql",
+        )?;
+        filter = Some(match filter {
+            Some(filter) => filter.and(sql_filter),
+            None => sql_filter,
+        });
+    }
     let projection = projection::build_knn_projection(&handle.base_projection);
 
     let mut scan = handle.dataset.scan();

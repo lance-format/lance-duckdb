@@ -692,6 +692,9 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
             bind_data.dataset, bind_data.vector_column.c_str(),
             bind_data.query.data(), bind_data.query.size(), bind_data.k,
             bind_data.nprobes, bind_data.refine_factor, ir, ir_len,
+            bind_data.namespace_filter.empty()
+                ? nullptr
+                : bind_data.namespace_filter.c_str(),
             bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
       });
   if (!result->stream) {
@@ -1065,6 +1068,9 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
               return lance_create_fts_stream_ir(
                   bind_data.dataset, bind_data.text_column.c_str(),
                   bind_data.query.c_str(), bind_data.k, ir, ir_len,
+                  bind_data.namespace_filter.empty()
+                      ? nullptr
+                      : bind_data.namespace_filter.c_str(),
                   bind_data.prefilter ? 1 : 0);
             }
             return lance_create_hybrid_stream_ir(

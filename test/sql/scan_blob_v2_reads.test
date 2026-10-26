@@ -191,6 +191,55 @@ ORDER BY id;
 ----
 1	96
 
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 1,
+  filter := 'id = -1'
+);
+----
+
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 1,
+  filter := 'id = 1'
+);
+----
+1
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  filter := 'id = -1'
+);
+----
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  prefilter = true,
+  filter := 'id = 1'
+);
+----
+1
+
 statement ok
 DETACH blob_ns;
 

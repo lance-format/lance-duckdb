@@ -6,6 +6,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 use lance::session::Session;
+use lance::Dataset;
 use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
@@ -79,6 +80,17 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> 
     Ok(s)
 }
 
+pub(crate) unsafe fn optional_cstr_to_str<'a>(
+    ptr: *const c_char,
+    what: &'static str,
+) -> FfiResult<Option<&'a str>> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        unsafe { cstr_to_str(ptr, what) }.map(Some)
+    }
+}
+
 pub(crate) unsafe fn slice_from_ptr<'a, T>(
     ptr: *const T,
     len: usize,
@@ -147,6 +159,22 @@ pub(crate) unsafe fn parse_optional_filter_ir(
     crate::filter_ir::parse_filter_ir(bytes)
         .map(Some)
         .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))
+}
+
+pub(crate) fn parse_filter_sql(
+    dataset: &Dataset,
+    filter_sql: &str,
+    code: ErrorCode,
+    what: &'static str,
+) -> FfiResult<Expr> {
+    let schema = Arc::new(arrow::datatypes::Schema::from(dataset.schema()));
+    let planner = lance::io::exec::Planner::new(schema);
+    let expr = planner
+        .parse_expr(filter_sql)
+        .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))?;
+    planner
+        .optimize_expr(expr)
+        .map_err(|err| FfiError::new(code, format!("{what} optimize: {err}")))
 }
 
 pub(crate) fn u64_to_usize(v: u64, what: &'static str) -> FfiResult<usize> {

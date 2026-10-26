@@ -274,7 +274,8 @@ void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  uint64_t k, uint64_t nprobes,
                                  uint64_t refine_factor,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter, uint8_t use_index);
+                                 const char *filter_sql, uint8_t prefilter,
+                                 uint8_t use_index);
 
 const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       const float *query_values,
@@ -289,7 +290,7 @@ void *lance_get_fts_schema(void *dataset, const char *text_column,
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char *query, uint64_t k,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
-                                 uint8_t prefilter);
+                                 const char *filter_sql, uint8_t prefilter);
 
 typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;
