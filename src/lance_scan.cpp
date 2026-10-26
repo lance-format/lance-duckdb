@@ -1508,8 +1508,13 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       }
       for (idx_t ci = 0; ci < scan_state.scan_column_names.size(); ci++) {
         auto &name = scan_state.scan_column_names[ci];
-        if (stats_covered.count(name) == 0 &&
-            IsLikelyHeavyColumnType(scan_state.scan_converted_types[ci])) {
+        bool source_blob_column =
+            ci < scan_state.scan_column_ids.size() &&
+            scan_state.scan_column_ids[ci] < bind_data.blob_columns.size() &&
+            bind_data.blob_columns[scan_state.scan_column_ids[ci]];
+        if (source_blob_column ||
+            (stats_covered.count(name) == 0 &&
+             IsLikelyHeavyColumnType(scan_state.scan_converted_types[ci]))) {
           heavy_columns.insert(name);
         }
       }
