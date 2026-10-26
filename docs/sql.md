@@ -93,9 +93,12 @@ NULL or truncated bytes.
 Lance serves the requested ranges directly and may combine nearby requests
 into fewer physical reads; the extension never reads a whole blob and slices
 it afterwards. Requests are processed in windows sized by DuckDB's current
-`memory_limit`; a single range larger than the derived per-window budget fails
-with an explicit error, so raise `memory_limit` or split the range. The
-function does not accept nested blob columns.
+`memory_limit` (window budget = `memory_limit / 8`), bounding each native read
+call: a single range larger than the budget fails with an explicit error, so
+raise `memory_limit` or split the range. The budget bounds a single call, not
+the whole query - concurrent request pipelines and downstream SQL operators
+can still hold more materialized bytes in total. The function does not accept
+nested blob columns.
 
 ## Search
 
