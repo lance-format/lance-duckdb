@@ -921,8 +921,10 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
         }
         uint64_t row_id = 0;
         Value value;
-        if (!TryGetRowIdConstant(rhs, value) ||
-            !TryParseRowIdValue(value, row_id)) {
+        if (!TryGetRowIdConstant(rhs, value)) {
+          return false;
+        }
+        if (!TryParseRowIdValue(value, row_id)) {
           throw InvalidInputException(
               "Lance point lookup requires non-negative integer rowid/_rowid "
               "values");

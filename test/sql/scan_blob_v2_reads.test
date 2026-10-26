@@ -78,6 +78,25 @@ ORDER BY id;
 3	NULL
 4	0
 
+# Comparing rowid with a data column stays a local predicate.
+query I
+SELECT id FROM 'test/data/blob_v2_reads.lance' WHERE rowid = id ORDER BY id;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT id FROM 'test/data/blob_v2_reads.lance' WHERE id = rowid ORDER BY id;
+----
+0
+1
+2
+3
+4
+
 # Legacy Blob v1 stays on the native take path.
 query II
 SELECT id, octet_length(payload)

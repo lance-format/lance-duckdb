@@ -265,7 +265,7 @@ async fn row_offsets_to_addresses(
         .collect();
     sorted.sort_by_key(|&(offset, _)| offset);
 
-    let mut out = vec![u64::from(RowAddress::TOMBSTONE_ROW); row_indices.len()];
+    let mut out = vec![RowAddress::TOMBSTONE_ROW; row_indices.len()];
     let mut fragment_iter = fragments.iter();
     let mut fragment = fragment_iter.next();
     let mut fragment_logical_rows: u64 = match fragment {
@@ -484,7 +484,7 @@ mod tests {
     async fn offset_mapping_flags_out_of_range_offsets() {
         let (_dir, dataset) = write_fixture(false).await;
         let addresses = row_offsets_to_addresses(&dataset, &[99]).await.unwrap();
-        assert_eq!(addresses[0], u64::from(RowAddress::TOMBSTONE_ROW));
+        assert_eq!(addresses[0], RowAddress::TOMBSTONE_ROW);
     }
 
     #[tokio::test]
