@@ -6,7 +6,6 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
-use lance::dataset::ProjectionRequest;
 use lance_index::scalar::FullTextSearchQuery;
 
 use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, ROW_ID_COLUMN, SCORE_COLUMN};
@@ -62,6 +61,7 @@ fn get_fts_schema_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     scan.full_text_search(fts_query)
         .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema search: {err}")))?;
     scan.disable_scoring_autoprojection();
@@ -136,6 +136,7 @@ fn create_fts_stream_ir_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(filter) = filter {
         scan.filter_expr(filter);
     }
@@ -179,7 +180,7 @@ pub unsafe extern "C" fn lance_get_hybrid_schema(dataset: *mut c_void) -> *mut c
 
 fn get_hybrid_schema_inner(dataset: *mut c_void) -> FfiResult<SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    Ok(projection::build_hybrid_schema(&handle.arrow_schema))
+    Ok(projection::build_hybrid_schema(&handle.read_schema))
 }
 
 #[no_mangle]
@@ -307,6 +308,7 @@ fn create_hybrid_batch(
 
     let mut vector_scan = handle.dataset.scan();
     vector_scan.prefilter(prefilter != 0);
+    vector_scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(expr) = filter.clone() {
         vector_scan.filter_expr(expr);
     }
@@ -370,6 +372,7 @@ fn create_hybrid_batch(
 
     let mut fts_scan = handle.dataset.scan();
     fts_scan.prefilter(prefilter != 0);
+    fts_scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(expr) = filter {
         fts_scan.filter_expr(expr);
     }
@@ -447,9 +450,30 @@ fn create_hybrid_batch(
     ranked.truncate(k);
 
     let row_ids: Vec<u64> = ranked.iter().map(|(rowid, _, _, _)| *rowid).collect();
-    let projection =
-        ProjectionRequest::from_columns(handle.base_projection.as_ref(), handle.dataset.schema());
-    let rows = match runtime::block_on(handle.dataset.take_rows(&row_ids, projection)) {
+    let base_columns = handle
+        .base_projection
+        .iter()
+        .map(|column| column.to_string())
+        .collect::<Vec<_>>();
+    let plan = Arc::new(
+        projection::binary_projection_plan(handle.dataset.clone(), &base_columns)
+            .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?,
+    );
+    let row_addrs =
+        match runtime::block_on(projection::row_ids_to_addresses(&handle.dataset, &row_ids)) {
+            Ok(Ok(addresses)) => addresses,
+            Ok(Err(err)) => return Err(FfiError::new(ErrorCode::HybridStreamCreate, err)),
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        };
+    let rows = match runtime::block_on(async {
+        lance::dataset::TakeBuilder::try_new_from_addresses(
+            handle.dataset.clone(),
+            row_addrs,
+            plan.clone(),
+        )?
+        .execute()
+        .await
+    }) {
         Ok(Ok(batch)) => batch,
         Ok(Err(err)) => {
             return Err(FfiError::new(

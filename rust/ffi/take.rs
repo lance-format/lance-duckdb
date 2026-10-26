@@ -2,12 +2,15 @@ use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
 use futures::{stream, StreamExt, TryStreamExt};
-use lance::dataset::{fragment::FileFragment, Dataset, ProjectionRequest};
+use lance::dataset::TakeBuilder;
+use lance::dataset::{fragment::FileFragment, Dataset};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::projection;
 use super::types::StreamHandle;
 use super::util::{optional_cstr_array, slice_from_ptr, FfiError, FfiResult};
 
@@ -174,21 +177,47 @@ fn create_dataset_take_stream_inner(
     };
 
     let projection_cols = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
-    let projection = if projection_cols.is_empty() {
-        ProjectionRequest::from_schema(handle.dataset.schema().clone())
+    let projection_cols = if projection_cols.is_empty() {
+        handle
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
     } else {
-        ProjectionRequest::from_columns(
-            projection_cols.iter().map(|s| s.as_str()),
-            handle.dataset.schema(),
-        )
+        projection_cols
     };
+    let plan = Arc::new(
+        projection::binary_projection_plan(handle.dataset.clone(), &projection_cols)
+            .map_err(|err| FfiError::new(ErrorCode::DatasetTake, err))?,
+    );
 
-    let batch = match runtime::block_on(handle.dataset.take_rows(row_ids, projection)) {
+    if row_ids.is_empty() {
+        let schema = plan
+            .output_schema()
+            .map_err(|err| FfiError::new(ErrorCode::DatasetTake, format!("take schema: {err}")))?;
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        return Ok(StreamHandle::Batches(vec![batch].into_iter()));
+    }
+
+    let row_addrs =
+        match runtime::block_on(projection::row_ids_to_addresses(&handle.dataset, row_ids)) {
+            Ok(Ok(addrs)) => addrs,
+            Ok(Err(err)) => return Err(FfiError::new(ErrorCode::DatasetTake, err)),
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        };
+
+    let batch = match runtime::block_on(async {
+        TakeBuilder::try_new_from_addresses(handle.dataset.clone(), row_addrs, plan.clone())?
+            .execute()
+            .await
+    }) {
         Ok(Ok(batch)) => batch,
         Ok(Err(err)) => {
             return Err(FfiError::new(
                 ErrorCode::DatasetTake,
-                format!("dataset take_rows: {err}"),
+                format!("dataset take: {err}"),
             ))
         }
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),

@@ -75,6 +75,7 @@ fn get_knn_schema_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     scan.nearest(vector_column, &query, k_usize)
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema nearest: {err}")))?;
@@ -175,6 +176,7 @@ fn create_knn_stream_ir_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(filter) = filter {
         scan.filter_expr(filter);
     }
@@ -293,6 +295,7 @@ fn explain_knn_scan_ir_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(filter) = filter {
         scan.filter_expr(filter);
     }

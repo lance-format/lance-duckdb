@@ -499,7 +499,7 @@ pub unsafe extern "C" fn lance_get_schema(dataset: *mut c_void) -> *mut c_void {
 
 fn get_schema_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    Ok(handle.arrow_schema.clone())
+    Ok(handle.read_schema.clone())
 }
 
 #[no_mangle]
@@ -519,7 +519,7 @@ pub unsafe extern "C" fn lance_get_schema_for_scan(dataset: *mut c_void) -> *mut
 fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::SchemaHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
-    let mut schema: Schema = (*handle.arrow_schema).clone();
+    let mut schema: Schema = (*handle.read_schema).clone();
     let has_row_id = schema.fields.iter().any(|f| f.name() == ROW_ID_COLUMN);
     if !has_row_id {
         let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();

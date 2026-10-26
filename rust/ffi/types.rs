@@ -21,20 +21,20 @@ pub(crate) struct SessionHandle {
 
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,
-    pub(crate) arrow_schema: SchemaHandle,
+    pub(crate) read_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
 }
 
 impl DatasetHandle {
     pub(crate) fn new(dataset: Arc<Dataset>) -> Self {
-        let arrow_schema: Schema = dataset.schema().into();
-        let arrow_schema = Arc::new(arrow_schema);
-        let base_projection = projection::build_base_projection(&arrow_schema);
+        let read_schema: Schema = (&projection::materialized_schema(dataset.schema())).into();
+        let read_schema = Arc::new(read_schema);
+        let base_projection = projection::build_base_projection(&read_schema);
         let fts_projection = projection::build_fts_projection(&base_projection);
         Self {
             dataset,
-            arrow_schema,
+            read_schema,
             base_projection,
             fts_projection,
         }
