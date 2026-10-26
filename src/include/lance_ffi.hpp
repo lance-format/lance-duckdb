@@ -37,6 +37,10 @@ void *lance_open_dataset_with_storage_options(const char *path,
 void *lance_open_dataset_with_storage_options_and_session(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session);
+void *lance_open_dataset_with_storage_options_and_version(
+    const char *path, const char **option_keys, const char **option_values,
+    size_t options_len, void *session, uint8_t has_version, uint64_t version);
+int32_t lance_dataset_version(void *dataset, uint64_t *out_version);
 const char *lance_dir_namespace_list_tables(const char *root,
                                             const char **option_keys,
                                             const char **option_values,
@@ -360,4 +364,27 @@ void lance_free_scalar_indexed_columns(char **ptr, size_t len);
 void lance_free_batch(void *batch);
 int32_t lance_batch_to_arrow(void *batch, ArrowArray *out_array,
                              ArrowSchema *out_schema);
+
+typedef struct LanceBlobRangeRequest {
+  uint64_t row;
+  uint64_t offset;
+  uint64_t length;
+} LanceBlobRangeRequest;
+
+typedef struct LanceBlobRangeResult {
+  uint64_t request_index;
+  uint64_t row_address;
+  uint8_t is_null;
+  size_t data_len;
+  const uint8_t *data_ptr;
+} LanceBlobRangeResult;
+
+int32_t lance_read_blob_ranges(void *dataset, const char *column,
+                               uint8_t selector,
+                               const LanceBlobRangeRequest *requests,
+                               size_t requests_len,
+                               LanceBlobRangeResult **out_results,
+                               size_t *out_results_len);
+void lance_free_blob_range_results(LanceBlobRangeResult *results,
+                                   size_t results_len);
 }

@@ -24,8 +24,8 @@ use super::session::record_dataset_open;
 use super::types::DatasetHandle;
 use super::update::{apply_deletions, build_row_id_index, lookup_row_address, CapturedRowIds};
 use super::util::{
-    cstr_to_str, optional_session_handle, parse_optional_filter_ir, slice_from_ptr, FfiError,
-    FfiResult,
+    cstr_to_str, dataset_handle, optional_session_handle, parse_optional_filter_ir, slice_from_ptr,
+    FfiError, FfiResult,
 };
 
 // Quote identifiers with the backticks required by Lance filter SQL. The default
@@ -128,6 +128,7 @@ pub unsafe extern "C" fn lance_open_dataset_with_storage_options(
         option_values,
         options_len,
         ptr::null_mut(),
+        None,
     ) {
         Ok(handle) => {
             clear_last_error();
@@ -154,6 +155,45 @@ pub unsafe extern "C" fn lance_open_dataset_with_storage_options_and_session(
         option_values,
         options_len,
         session,
+        None,
+    ) {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Open a dataset checked out at an explicit version.
+///
+/// `has_version` distinguishes "latest" from a real version number so callers
+/// never need to reserve a sentinel version value.
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_dataset_with_storage_options_and_version(
+    path: *const c_char,
+    option_keys: *const *const c_char,
+    option_values: *const *const c_char,
+    options_len: usize,
+    session: *mut c_void,
+    has_version: u8,
+    version: u64,
+) -> *mut c_void {
+    let requested_version = if has_version != 0 {
+        Some(version)
+    } else {
+        None
+    };
+    match open_dataset_with_storage_options_inner(
+        path,
+        option_keys,
+        option_values,
+        options_len,
+        session,
+        requested_version,
     ) {
         Ok(handle) => {
             clear_last_error();
@@ -172,6 +212,7 @@ fn open_dataset_with_storage_options_inner(
     option_values: *const *const c_char,
     options_len: usize,
     session: *mut c_void,
+    version: Option<u64>,
 ) -> FfiResult<DatasetHandle> {
     let path_str = unsafe { cstr_to_str(path, "path")? };
     let session = unsafe { optional_session_handle(session)? };
@@ -213,6 +254,9 @@ fn open_dataset_with_storage_options_inner(
 
     let dataset = match runtime::block_on(async {
         let mut builder = DatasetBuilder::from_uri(path_str).with_storage_options(storage_options);
+        if let Some(version) = version {
+            builder = builder.with_version(version);
+        }
         if let Some(session) = session {
             builder = builder.with_session(session);
         }
@@ -230,6 +274,28 @@ fn open_dataset_with_storage_options_inner(
 
     record_dataset_open();
     Ok(DatasetHandle::new(dataset))
+}
+
+/// Report the version the dataset handle is pinned to.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void, out_version: *mut u64) -> i32 {
+    if out_version.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_version must not be null");
+        return -1;
+    }
+    match unsafe { dataset_handle(dataset) } {
+        Ok(handle) => {
+            clear_last_error();
+            unsafe {
+                *out_version = handle.dataset.manifest.version;
+            }
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
 }
 
 /// Refresh a dataset handle to the latest committed version if it is stale.

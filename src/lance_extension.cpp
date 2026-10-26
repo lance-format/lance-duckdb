@@ -16,6 +16,7 @@ void RegisterLanceMaintenance(ExtensionLoader &loader);
 void RegisterLanceMaintenanceParser(DBConfig &config);
 void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
+void RegisterLanceRangeRead(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
@@ -26,6 +27,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register internal scan table functions.
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
+  RegisterLanceRangeRead(loader);
   RegisterLanceWrite(loader);
   RegisterLanceMaintenance(loader);
 }

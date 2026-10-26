@@ -32,6 +32,71 @@ to avoid silently changing their on-disk types. For a scalar float16 column,
 `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
 and makes it writable.
 
+## Blob range reads
+
+`lance_read_blob_ranges` reads byte ranges inside top-level blob values without
+materializing whole blobs in SQL:
+
+```sql
+SELECT request_id, version, row_address, data
+FROM lance_read_blob_ranges(
+  'path/to/dataset.lance',
+  'payload',
+  7,               -- dataset version, NULL selects the latest version
+  'row_address',   -- or 'row_id'
+  (
+    SELECT request_id, row_value, offset, length
+    FROM requests
+  )
+);
+```
+
+Positional arguments:
+
+- `dataset` (VARCHAR): Dataset root path or object store URI. Storage
+  credentials resolve through the same secrets and session as scans.
+- `column` (VARCHAR): A top-level blob column.
+- `version` (BIGINT): Dataset version to pin. `NULL` means the latest version
+  and is only allowed for the `row_id` selector, because a stored physical row
+  address must stay bound to the snapshot it was read from.
+- `selector` (VARCHAR): One selector kind for the whole call. `row_address`
+  addresses the physical `row_address` value reported by a previous call at the
+  same version. `row_id` addresses the dataset row id exposed as `_rowid`:
+  stable row ids when the dataset has them enabled, the physical row address
+  otherwise.
+- `requests` (TABLE): A relation with one row per request. It must provide
+  `request_id` (any type; echoed back), `row_value`, `offset`, and `length`
+  (integer types). Extra columns are ignored.
+
+The function returns one row per request:
+
+- `request_index` (UBIGINT): A processing ordinal unique within one call, in
+  no guaranteed relation order. The request relation has no intrinsic order
+  and independent pipelines (for example `UNION ALL` branches) may process
+  requests in any order, so use `request_id` to correlate results and `ORDER
+  BY` to choose display order. Repeated executions are not promised to
+  assign the same ordinals.
+- `request_id`: The caller's `request_id`, unchanged. Duplicate ids stay
+  duplicated.
+- `row_address` (UBIGINT): Physical row address of the selected blob at the
+  pinned version.
+- `data` (BLOB): The requested bytes.
+- `version` (UBIGINT): The dataset version the handle was actually pinned to.
+
+`offset` and `length` are relative to the logical blob value, and ranges of
+blobs that reference an external source are translated by Lance. A NULL blob
+returns NULL `data`; a zero-length range on a non-NULL blob returns an empty
+BLOB. Out-of-bounds ranges, offset/length overflow, missing rows, missing
+physical fragments and source I/O failures raise errors instead of returning
+NULL or truncated bytes.
+
+Lance serves the requested ranges directly and may combine nearby requests
+into fewer physical reads; the extension never reads a whole blob and slices
+it afterwards. Requests are processed in windows sized by DuckDB's current
+`memory_limit`; a single range larger than the derived per-window budget fails
+with an explicit error, so raise `memory_limit` or split the range. The
+function does not accept nested blob columns.
+
 ## Search
 
 ### Vector search: `lance_vector_search`

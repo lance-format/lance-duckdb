@@ -15,6 +15,8 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
                         DataChunk &chunk, SelectionVector &sel);
 
 void *LanceOpenDataset(ClientContext &context, const string &path);
+void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
+                                const optional_idx &version);
 
 string LanceNormalizeS3Scheme(const string &path);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,

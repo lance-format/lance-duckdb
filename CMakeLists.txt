@@ -31,6 +31,7 @@ set(EXTENSION_SOURCES
     src/lance_expr_ir.cpp
     src/lance_write.cpp
     src/lance_index.cpp
+    src/lance_range_read.cpp
     src/lance_arrow_compat.cpp
     src/lance_resolver.cpp)
 

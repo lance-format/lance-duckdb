@@ -538,6 +538,28 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
       session);
 }
 
+void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
+                                const optional_idx &version) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
+  auto *session = LanceGetSessionHandle(context);
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+  const uint8_t has_version = version.IsValid() ? 1 : 0;
+  const uint64_t version_value =
+      version.IsValid() ? NumericCast<uint64_t>(version.GetIndex()) : 0;
+  return lance_open_dataset_with_storage_options_and_version(
+      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      session, has_version, version_value);
+}
+
 static unordered_map<string, Value>
 BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
                                   const string &api_key_override) {
