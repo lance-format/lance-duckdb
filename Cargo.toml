@@ -25,7 +25,6 @@ lance = { version = "13.0.0", default-features = false, features = ["aws", "azur
 lance-arrow = "13.0.0"
 lance-core = "13.0.0"
 lance-datafusion = "13.0.0"
-lance-file = "13.0.0"
 lance-index = "13.0.0"
 lance-linalg = "13.0.0"
 lance-namespace = "13.0.0"
