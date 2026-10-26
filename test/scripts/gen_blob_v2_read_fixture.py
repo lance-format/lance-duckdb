@@ -168,7 +168,12 @@ def main() -> None:
 
     if output.exists():
         shutil.rmtree(output)
-    dataset = lance.write_dataset(table, str(output), data_storage_version="2.2")
+    dataset = lance.write_dataset(
+        table,
+        str(output),
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=args.external,
+    )
     dataset.create_scalar_index("text", index_type="INVERTED")
     print(f"Wrote {output}")
 

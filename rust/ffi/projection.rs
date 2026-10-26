@@ -66,6 +66,25 @@ pub(crate) fn materialized_schema(schema: &Schema) -> Schema {
     }
 }
 
+fn field_contains_blob_v2(field: &lance_core::datatypes::Field) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
+
+/// Whether the requested top-level columns contain a Blob v2 leaf.
+///
+/// Blob v1 on legacy storage remains on the native TakeBuilder path because
+/// Lance 13 does not support row-address prefilter scans for legacy storage.
+pub(crate) fn projection_contains_blob_v2(
+    dataset: &Dataset,
+    columns: &[String],
+) -> Result<bool, String> {
+    let projected = dataset
+        .schema()
+        .project_preserve_system_columns(columns)
+        .map_err(|err| format!("take projection: {err}"))?;
+    Ok(projected.fields.iter().any(field_contains_blob_v2))
+}
+
 /// Build a projection plan whose blob fields are materialized as binary.
 pub(crate) fn binary_projection_plan(
     dataset: Arc<Dataset>,

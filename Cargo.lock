@@ -3944,6 +3944,7 @@ dependencies = [
  "lance-core",
  "lance-file",
  "lance-datafusion",
+ "lance-file",
  "lance-index",
  "lance-io",
  "lance-linalg",

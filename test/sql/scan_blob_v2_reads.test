@@ -60,7 +60,7 @@ SELECT count(*) FROM 'test/data/blob_v2_reads.lance';
 ----
 5
 
-# Blob projections bypass the take fast path and still materialize bytes.
+# Point lookup uses the take path and still materializes the blob bytes.
 query II
 SELECT id, octet_length(payload)
 FROM 'test/data/blob_v2_reads.lance'

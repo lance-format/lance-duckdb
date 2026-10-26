@@ -19,7 +19,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 def run_sql(duckdb: pathlib.Path, extension: pathlib.Path, sql: str) -> str:
-    command = [str(duckdb), "-unsigned", "-csv", "-c", sql]
+    command = [str(duckdb), "-unsigned", "-csv", "-noheader", "-c", sql]
     result = subprocess.run(command, check=False, text=True, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(result.stderr or result.stdout)
@@ -79,13 +79,22 @@ def main() -> None:
         assert changed == "true", changed
 
         source.unlink()
+        survivors = run_sql(
+            args.duckdb,
+            args.extension,
+            prefix + f" SELECT id, octet_length(payload) FROM '{escaped_dataset}' "
+            f"WHERE _rowid IN (0, 4) ORDER BY id;",
+        )
+        assert survivors == "0,6\n4,0", survivors
+
         result = subprocess.run(
             [
                 str(args.duckdb),
                 "-unsigned",
                 "-csv",
+                "-noheader",
                 "-c",
-                prefix + f" SELECT payload FROM '{escaped_dataset}' WHERE id = 5;",
+                prefix + f" SELECT payload FROM '{escaped_dataset}' WHERE _rowid = 5;",
             ],
             check=False,
             text=True,

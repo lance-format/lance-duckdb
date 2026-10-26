@@ -449,22 +449,6 @@ static bool LanceLogicalTypeContainsBlob(const LogicalType &type) {
   }
 }
 
-static bool LanceProjectionContainsBlob(const LanceScanBindData &scan_bind,
-                                        const LogicalGet &get) {
-  for (auto col_id : get.GetColumnIds()) {
-    auto primary_id = col_id.GetPrimaryIndex();
-    if (primary_id >= scan_bind.names.size()) {
-      continue;
-    }
-    if (LanceScanColumnContainsBlob(scan_bind.schema_root.arrow_schema,
-                                    primary_id) ||
-        LanceLogicalTypeContainsBlob(scan_bind.types[primary_id])) {
-      return true;
-    }
-  }
-  return false;
-}
-
 static bool LanceDeferredMaterializationEnabled(ClientContext &context) {
   Value val;
   if (context.TryGetCurrentSetting(LANCE_DEFERRED_SETTING, val)) {
@@ -978,13 +962,11 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
     return false;
   };
 
-  const bool projects_blob = LanceProjectionContainsBlob(scan_bind, get);
   for (auto &expr : filters) {
     if (!expr || expr->HasParameter() || expr->IsVolatile()) {
       continue;
     }
-    if (!scan_bind.UsesNamespaceQuery() && !projects_blob &&
-        scan_bind.take_row_ids.empty()) {
+    if (!scan_bind.UsesNamespaceQuery() && scan_bind.take_row_ids.empty()) {
       vector<uint64_t> take_row_ids;
       if (try_extract_rowids(*expr, take_row_ids) && !take_row_ids.empty()) {
         scan_bind.take_row_ids = std::move(take_row_ids);
@@ -1464,10 +1446,6 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     if (scan_state.sampling_pushed_down) {
       // Sampling is applied before filtering, so do not combine it with point
       // lookup pushdown (which would filter first).
-      scan_state.take_row_ids.clear();
-    } else if (has_projected_blob) {
-      // Same TakeBuilder limitation as the optimizer rewrite: keep the
-      // predicate as a local filter when blob bytes are part of the scan.
       scan_state.take_row_ids.clear();
     } else {
       if (bind_data.limit_offset_pushed_down) {
@@ -2595,19 +2573,13 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
       return op;
     }
 
-    // TakeBuilder cannot materialize blob columns in Lance 13 (the low-level
-    // reader expects descriptor structs). Keep the rowid predicate as a local
-    // filter when the scan would return blob bytes, and let the ordinary
-    // scanner (which uses `blob_handling(AllBinary)`) produce them.
-    const bool projects_blob = LanceProjectionContainsBlob(scan_bind, get);
-
     auto col_type = filter_col_id == COLUMN_IDENTIFIER_ROW_ID
                         ? LogicalType::ROW_TYPE
                         : LogicalType::UBIGINT;
     auto colref = make_uniq<BoundColumnRefExpression>(
         col_type, ColumnBinding(get.table_index, filter_index));
     vector<uint64_t> row_ids;
-    bool can_take = !projects_blob && scan_bind.take_row_ids.empty();
+    bool can_take = scan_bind.take_row_ids.empty();
     if (can_take) {
       auto filter_expr = rowid_filter->ToExpression(*colref);
       can_take = TryExtractTakeRowIdsFromExpression(*filter_expr, row_ids) &&

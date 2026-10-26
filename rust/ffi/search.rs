@@ -455,33 +455,55 @@ fn create_hybrid_batch(
         .iter()
         .map(|column| column.to_string())
         .collect::<Vec<_>>();
-    let plan = Arc::new(
-        projection::binary_projection_plan(handle.dataset.clone(), &base_columns)
-            .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?,
-    );
-    let row_addrs =
-        match runtime::block_on(projection::row_ids_to_addresses(&handle.dataset, &row_ids)) {
-            Ok(Ok(addresses)) => addresses,
-            Ok(Err(err)) => return Err(FfiError::new(ErrorCode::HybridStreamCreate, err)),
-            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-        };
-    let rows = match runtime::block_on(async {
-        lance::dataset::TakeBuilder::try_new_from_addresses(
+    let uses_blob_v2_scanner =
+        projection::projection_contains_blob_v2(&handle.dataset, &base_columns)
+            .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?;
+    let rows = if uses_blob_v2_scanner {
+        match runtime::block_on(crate::scanner::take_rows_by_row_ids(
             handle.dataset.clone(),
-            row_addrs,
-            plan.clone(),
-        )?
-        .execute()
-        .await
-    }) {
-        Ok(Ok(batch)) => batch,
-        Ok(Err(err)) => {
-            return Err(FfiError::new(
-                ErrorCode::HybridStreamCreate,
-                format!("hybrid take_rows: {err}"),
-            ))
+            &row_ids,
+            &base_columns,
+        )) {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::HybridStreamCreate,
+                    format!("hybrid take_rows: {err}"),
+                ))
+            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
-        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    } else {
+        let plan = Arc::new(
+            projection::binary_projection_plan(handle.dataset.clone(), &base_columns)
+                .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?,
+        );
+        let row_addrs =
+            match runtime::block_on(projection::row_ids_to_addresses(&handle.dataset, &row_ids)) {
+                Ok(Ok(addresses)) => addresses,
+                Ok(Err(err)) => return Err(FfiError::new(ErrorCode::HybridStreamCreate, err)),
+                Err(err) => {
+                    return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
+                }
+            };
+        match runtime::block_on(async {
+            lance::dataset::TakeBuilder::try_new_from_addresses(
+                handle.dataset.clone(),
+                row_addrs,
+                plan.clone(),
+            )?
+            .execute()
+            .await
+        }) {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::HybridStreamCreate,
+                    format!("hybrid take_rows: {err}"),
+                ))
+            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        }
     };
 
     let mut dist_builder = Float32Builder::with_capacity(rows.num_rows());
