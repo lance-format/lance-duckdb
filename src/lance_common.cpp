@@ -5,6 +5,7 @@
 
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
+#include "lance_source_resolver.hpp"
 #include "lance_table_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -499,7 +500,6 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &api_key, const string &delimiter,
                             const string &headers_tsv, string &out_table_uri) {
   out_table_uri.clear();
-  auto *session = LanceGetSessionHandle(context);
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
@@ -507,9 +507,13 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *uri_ptr = nullptr;
-  auto *dataset = lance_open_dataset_in_namespace_with_session(
-      endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr, session, &uri_ptr);
+  auto source_resolver = LanceCreateSourceResolver(context);
+  auto *dataset = LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        return lance_open_dataset_in_namespace_with_session(
+            endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+            delimiter_ptr, headers_ptr, session, &uri_ptr);
+      });
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -523,19 +527,21 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
-  auto *session = LanceGetSessionHandle(context);
+  auto source_resolver = LanceCreateSourceResolver(context);
+  return LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        if (option_keys.empty()) {
+          return lance_open_dataset_with_session(open_path.c_str(), session);
+        }
 
-  if (option_keys.empty()) {
-    return lance_open_dataset_with_session(open_path.c_str(), session);
-  }
-
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-  return lance_open_dataset_with_storage_options_and_session(
-      open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
-      session);
+        vector<const char *> key_ptrs;
+        vector<const char *> value_ptrs;
+        BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                        value_ptrs);
+        return lance_open_dataset_with_storage_options_and_session(
+            open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+            option_keys.size(), session);
+      });
 }
 
 void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
@@ -545,19 +551,21 @@ void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
-  auto *session = LanceGetSessionHandle(context);
-
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
   const uint8_t has_version = version.IsValid() ? 1 : 0;
   const uint64_t version_value =
       version.IsValid() ? NumericCast<uint64_t>(version.GetIndex()) : 0;
-  return lance_open_dataset_with_storage_options_and_version(
-      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      session, has_version, version_value);
+  auto source_resolver = LanceCreateSourceResolver(context);
+  return LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        vector<const char *> key_ptrs;
+        vector<const char *> value_ptrs;
+        BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                        value_ptrs);
+        return lance_open_dataset_with_storage_options_and_version(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), session, has_version, version_value);
+      });
 }
 
 static unordered_map<string, Value>
@@ -589,11 +597,15 @@ void *LanceOpenDatasetForTable(ClientContext &context,
                                     key_ptrs, value_ptrs);
 
     const char *uri_ptr = nullptr;
-    auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
-        cfg.root.c_str(), cfg.table_id.c_str(),
-        key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(),
-        cfg.option_keys.size(), LanceGetSessionHandle(context), &uri_ptr);
+    auto source_resolver = LanceCreateSourceResolver(context);
+    auto *dataset = LanceOpenDatasetWithSourceSession(
+        context, source_resolver, [&](void *session) {
+          return lance_open_dataset_in_dir_namespace_with_session(
+              cfg.root.c_str(), cfg.table_id.c_str(),
+              key_ptrs.empty() ? nullptr : key_ptrs.data(),
+              value_ptrs.empty() ? nullptr : value_ptrs.data(),
+              cfg.option_keys.size(), session, &uri_ptr);
+        });
     if (uri_ptr) {
       out_display_uri = uri_ptr;
       lance_free_string(uri_ptr);

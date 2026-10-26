@@ -13,6 +13,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_dataset_open;
+use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, optional_session_handle, slice_from_ptr, to_c_string, FfiError, FfiResult,
@@ -124,6 +125,7 @@ fn open_dataset_in_dir_namespace_inner(
     options_len: usize,
     session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
+    let session_ptr = session;
     let root = unsafe { cstr_to_str(root, "root")? }
         .trim_end_matches('/')
         .to_string();
@@ -182,6 +184,9 @@ fn open_dataset_in_dir_namespace_inner(
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
     let table_uri = dataset.uri().to_string();
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok((DatasetHandle::new(Arc::new(dataset)), table_uri))
 }

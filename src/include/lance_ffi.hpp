@@ -21,8 +21,20 @@ typedef struct LanceExecContext {
   uint32_t threads;
 } LanceExecContext;
 
+typedef struct LanceSourceResolverCallbacks {
+  void *resolver;
+  int32_t (*resolve_source)(void *resolver, const char *uri,
+                            const char ***out_keys, const char ***out_values,
+                            size_t *out_count, const char **out_error);
+  void (*release_source)(void *resolver);
+  void (*destroy)(void *resolver);
+} LanceSourceResolverCallbacks;
+
 void *lance_create_session(uint64_t index_cache_size_bytes,
                            uint64_t metadata_cache_size_bytes);
+void *
+lance_create_source_session(void *parent_session,
+                            const LanceSourceResolverCallbacks *callbacks);
 void lance_close_session(void *session);
 int32_t lance_session_get_stats(void *session, LanceSessionStats *out_stats);
 int32_t lance_debug_get_counters(LanceDebugCounters *out_counters);

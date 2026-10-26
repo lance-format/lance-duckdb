@@ -3930,6 +3930,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "blake3",
  "bzip2-sys",
  "chrono",
  "datafusion",
@@ -3950,12 +3951,14 @@ dependencies = [
  "lance-namespace",
  "lance-namespace-impls",
  "lance-table",
+ "object_store 0.14.2",
  "rand 0.8.5",
  "roaring",
  "serde",
  "serde_json",
  "snafu",
  "tokio",
+ "url",
 ]
 
 [[package]]

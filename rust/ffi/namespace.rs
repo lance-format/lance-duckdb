@@ -17,6 +17,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
+use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
@@ -582,6 +583,7 @@ fn open_dataset_in_namespace_inner(
     headers_tsv: *const c_char,
     session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
+    let session_ptr = session;
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
@@ -635,6 +637,9 @@ fn open_dataset_in_namespace_inner(
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok((DatasetHandle::new(dataset), table_uri))
 }
@@ -745,7 +750,9 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
 /// On success writes the refreshed handle (or null when the cached handle is
 /// current) to `out_new_dataset`. `out_table_uri` receives the newly resolved
 /// table URI only when the table moved; the caller frees it with
-/// `lance_free_string`. Returns `0` on success and `-1` on error.
+/// `lance_free_string`. A caller that installs source resolution must pass a
+/// fresh derived session for the replacement dataset. Returns `0` on success
+/// and `-1` on error.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn lance_dataset_namespace_checkout_latest_if_stale(
@@ -801,6 +808,7 @@ fn namespace_checkout_latest_if_stale_inner(
     out_new_dataset: *mut *mut c_void,
     out_table_uri: *mut *const c_char,
 ) -> FfiResult<()> {
+    let session_ptr = session;
     if out_new_dataset.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -895,6 +903,9 @@ fn namespace_checkout_latest_if_stale_inner(
                     format!("namespace dataset open: {err}"),
                 )
             })?;
+            unsafe {
+                activate_source_resolution_for_session(session_ptr, &reopened);
+            }
             record_dataset_open();
             let uri = reopened.uri().to_string();
             return Ok::<_, FfiError>((Some(reopened), Some(uri)));
@@ -992,6 +1003,8 @@ mod tests {
 
     use super::super::dataset::{lance_close_dataset, lance_dataset_count_rows};
     use super::*;
+    use crate::ffi::source_resolver::{create_source_session, SourceResolverCallbacks};
+    use crate::ffi::types::SessionHandle;
     use crate::runtime;
 
     /// Commit a batch to `uri` through the Lance Rust API, bypassing any FFI
@@ -1419,6 +1432,98 @@ mod tests {
             lance_close_dataset(moved);
             lance_close_dataset(refreshed_same_location);
             lance_close_dataset(handle);
+        }
+
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn namespace_repoint_uses_the_replacement_source_session() {
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        let base =
+            std::env::temp_dir().join(format!("ffi-ns-source-session-{}", rand::random::<u64>()));
+        let table_a = base.join("a.lance");
+        let table_b = base.join("b.lance");
+        let uri_a = table_a.to_string_lossy().to_string();
+        let uri_b = table_b.to_string_lossy().to_string();
+        external_write(&uri_a, vec![1], WriteMode::Create);
+        external_write(&uri_b, vec![2], WriteMode::Create);
+
+        let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
+        let (endpoint, stop, _requests) = spawn_describe_server(body.clone(), None);
+
+        unsafe extern "C" fn deny(
+            _: *mut c_void,
+            _: *const c_char,
+            _: *mut *const *const c_char,
+            _: *mut *const *const c_char,
+            _: *mut usize,
+            _: *mut *const c_char,
+        ) -> i32 {
+            -1
+        }
+        unsafe extern "C" fn noop(_: *mut c_void) {}
+
+        unsafe {
+            let endpoint_c = CString::new(endpoint).unwrap();
+            let table_id_c = CString::new("t").unwrap();
+            let parent = Box::from_raw(
+                crate::ffi::session::lance_create_session(0, 0) as *mut SessionHandle
+            );
+            let callbacks = || SourceResolverCallbacks {
+                resolver: std::ptr::dangling_mut::<c_void>(),
+                resolve_source: Some(deny),
+                release_source: Some(noop),
+                destroy: Some(noop),
+            };
+            let original_session = create_source_session(&parent, callbacks()).unwrap();
+            let replacement_session = create_source_session(&parent, callbacks()).unwrap();
+
+            let original = lance_open_dataset_in_namespace_with_session(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &original_session as *const _ as *mut c_void,
+                ptr::null_mut(),
+            );
+            assert!(!original.is_null());
+
+            *body.lock().unwrap() = format!("{{\"location\": \"{uri_b}\"}}");
+            let mut replacement: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    original,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    &replacement_session as *const _ as *mut c_void,
+                    &mut replacement,
+                    ptr::null_mut(),
+                ),
+                0
+            );
+            assert!(!replacement.is_null());
+
+            let replacement_handle = &*(replacement as *const crate::ffi::types::DatasetHandle);
+            assert!(Arc::ptr_eq(
+                &replacement_handle.dataset.session().store_registry(),
+                &replacement_session.session.store_registry(),
+            ));
+            assert!(!Arc::ptr_eq(
+                &replacement_handle.dataset.session().store_registry(),
+                &parent.session.store_registry(),
+            ));
+
+            lance_close_dataset(replacement);
+            lance_close_dataset(original);
         }
 
         *stop.lock().unwrap() = true;

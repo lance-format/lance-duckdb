@@ -26,10 +26,12 @@ lance-arrow = "13.0.0"
 lance-core = "13.0.0"
 lance-datafusion = "13.0.0"
 lance-index = "13.0.0"
+lance-io = "13.0.0"
 lance-linalg = "13.0.0"
 lance-namespace = "13.0.0"
 lance-namespace-impls = { version = "13.0.0", features = ["rest"] }
 lance-table = "13.0.0"
+object_store = "0.14.2"
 
 arrow = { version = "58.0.0", features = ["ffi"] }
 arrow-array = "58.0.0"
@@ -44,6 +46,7 @@ datafusion-sql = "54.0.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
+blake3 = "1"
 bzip2-sys = { version = "0.1.13", features = ["static"] }
 chrono = "0.4"
 futures = "0.3"
@@ -53,6 +56,7 @@ serde = { version = "1.0", features = ["derive"] }
 snafu = "0.9.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
+url = "2"
 
 [dev-dependencies]
 lance-file = "13.0.0"

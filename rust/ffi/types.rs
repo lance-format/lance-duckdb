@@ -10,6 +10,7 @@ use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::projection;
+use super::source_resolver::SourceResolutionState;
 
 pub(crate) type SchemaHandle = Arc<Schema>;
 
@@ -17,6 +18,10 @@ pub(crate) struct SessionHandle {
     pub(crate) session: Arc<Session>,
     // Lance does not expose clearing its index cache through Session.
     pub(crate) index_cache: Arc<dyn CacheBackend>,
+    // Derived source sessions share these backends but clear neither on close.
+    pub(crate) metadata_cache: Arc<dyn CacheBackend>,
+    pub(crate) source_resolution: Option<Arc<SourceResolutionState>>,
+    pub(crate) clear_caches_on_close: bool,
 }
 
 pub(crate) struct DatasetHandle {
