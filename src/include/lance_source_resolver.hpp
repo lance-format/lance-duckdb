@@ -35,8 +35,7 @@ void *LanceCreateSourceSession(ClientContext &context,
 // Run one dataset open on a derived source session. The Dataset returned by
 // `open` retains the session, so the temporary FFI handle is closed here.
 void *LanceOpenDatasetWithSourceSession(
-    ClientContext &context,
-    const shared_ptr<LanceSourceResolver> &resolver,
+    ClientContext &context, const shared_ptr<LanceSourceResolver> &resolver,
     const std::function<void *(void *session)> &open);
 
 LanceSourceResolverCallbacks

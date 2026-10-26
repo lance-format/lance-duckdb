@@ -39,7 +39,8 @@ bool LanceSourceResolver::ResolveSource(const string &uri,
   }
   // This is the same context transaction and SecretManager path used by
   // DuckDB's KeyValueSecretReader(FileOpener &) on file-I/O worker threads.
-  LanceFillStorageOptionsFromSecrets(*locked_context, uri, out_keys, out_values);
+  LanceFillStorageOptionsFromSecrets(*locked_context, uri, out_keys,
+                                     out_values);
   return true;
 }
 
@@ -48,8 +49,9 @@ LanceCreateSourceResolver(ClientContext &context) {
   return make_shared_ptr<LanceSourceResolver>(context);
 }
 
-void *LanceCreateSourceSession(ClientContext &context,
-                               const shared_ptr<LanceSourceResolver> &resolver) {
+void *
+LanceCreateSourceSession(ClientContext &context,
+                         const shared_ptr<LanceSourceResolver> &resolver) {
   if (!resolver) {
     return nullptr;
   }
@@ -65,8 +67,7 @@ void *LanceCreateSourceSession(ClientContext &context,
 }
 
 void *LanceOpenDatasetWithSourceSession(
-    ClientContext &context,
-    const shared_ptr<LanceSourceResolver> &resolver,
+    ClientContext &context, const shared_ptr<LanceSourceResolver> &resolver,
     const std::function<void *(void *session)> &open) {
   auto *session = LanceCreateSourceSession(context, resolver);
   try {

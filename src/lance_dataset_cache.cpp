@@ -512,9 +512,9 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
           string table_uri;
           auto *dataset = LanceOpenDatasetWithSourceSession(
               context, source_resolver, [&](void *session) {
-                return OpenDirNamespaceDataset(
-                    session, cfg.root, cfg.table_id, cfg.option_keys,
-                    cfg.option_values, table_uri);
+                return OpenDirNamespaceDataset(session, cfg.root, cfg.table_id,
+                                               cfg.option_keys,
+                                               cfg.option_values, table_uri);
               });
           if (!dataset) {
             return shared_ptr<LanceDatasetCacheEntry>();
@@ -563,9 +563,9 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
   string api_key;
   ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
                             api_key);
-  return LanceBuildNamespaceDatasetCacheKey(
-      cfg.endpoint, cfg.table_id, bearer_token, api_key, cfg.delimiter,
-      cfg.headers_tsv);
+  return LanceBuildNamespaceDatasetCacheKey(cfg.endpoint, cfg.table_id,
+                                            bearer_token, api_key,
+                                            cfg.delimiter, cfg.headers_tsv);
 }
 
 void LanceInvalidateDatasetCache(ClientContext &context,

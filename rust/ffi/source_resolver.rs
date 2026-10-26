@@ -8,18 +8,19 @@
 //! object-store registry. The registry wraps Lance's public providers so a Blob
 //! external URI can resolve its own DuckDB secret only after the dataset's
 //! primary store has opened. This covers absolute references stored with
-//! `base_id=0` as well as registered external bases.
+//! `base_id=0`. Registered bases with explicit runtime options keep their own
+//! store configuration.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use lance::dataset::Dataset;
 use lance::io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use lance_core::Error;
-use lance_io::object_store::ObjectStoreProvider;
+use lance_io::object_store::{ObjectStoreProvider, StorageOptionsProvider};
 use url::Url;
 
 use super::types::SessionHandle;
@@ -140,20 +141,100 @@ impl Drop for SourceResolver {
 unsafe impl Send for SourceResolver {}
 unsafe impl Sync for SourceResolver {}
 
-fn options_fingerprint(options: &HashMap<String, String>) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut entries = options.iter().collect::<Vec<_>>();
-    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    for (key, value) in entries {
-        key.hash(&mut hasher);
-        value.hash(&mut hasher);
+#[derive(Debug, Default)]
+struct SourceOptionScopeIds {
+    ids: RwLock<HashMap<[u8; 32], u64>>,
+    next_id: AtomicU64,
+}
+
+impl SourceOptionScopeIds {
+    fn id_for(&self, options: &HashMap<String, String>) -> u64 {
+        let mut hasher = blake3::Hasher::new();
+        let mut entries = options.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (key, value) in entries {
+            hasher.update(&(key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        let digest = *hasher.finalize().as_bytes();
+        if let Some(id) = self.ids.read().unwrap().get(&digest) {
+            return *id;
+        }
+        let mut ids = self.ids.write().unwrap();
+        if let Some(id) = ids.get(&digest) {
+            return *id;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        ids.insert(digest, id);
+        id
     }
-    hasher.finish()
+}
+
+static NEXT_SOURCE_STATE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct SourceStorageOptionsProvider {
+    id: String,
+    options: HashMap<String, String>,
+}
+
+#[async_trait]
+impl StorageOptionsProvider for SourceStorageOptionsProvider {
+    async fn fetch_storage_options(&self) -> lance_core::Result<Option<HashMap<String, String>>> {
+        Ok(Some(self.options.clone()))
+    }
+
+    fn provider_id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn apply_source_options(
+    params: &ObjectStoreParams,
+    options: HashMap<String, String>,
+    source_scope_id: String,
+) -> ObjectStoreParams {
+    let provider = Arc::new(SourceStorageOptionsProvider {
+        id: source_scope_id,
+        options: options.clone(),
+    });
+    let accessor = StorageOptionsAccessor::with_initial_and_provider(options, provider);
+    let mut effective = params.clone();
+    effective.storage_options_accessor = Some(Arc::new(accessor));
+    effective
+}
+
+fn is_under_target(uri: &str, target_uri: &str) -> bool {
+    let uri = uri.trim_end_matches('/');
+    uri == target_uri
+        || uri
+            .strip_prefix(target_uri)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn normalize_target_uri(uri: &str) -> String {
+    uri.trim_end_matches('/').to_string()
+}
+
+fn is_dataset_fallback(
+    target_uri: &str,
+    target_storage_options: &HashMap<String, String>,
+    uri: &str,
+    storage_options: Option<&HashMap<String, String>>,
+) -> bool {
+    !is_under_target(uri, target_uri)
+        && storage_options
+            .map(|options| options == target_storage_options)
+            .unwrap_or_else(|| target_storage_options.is_empty())
 }
 
 #[derive(Debug)]
 pub(crate) struct SourceResolutionState {
     resolver: SourceResolver,
+    state_id: u64,
+    source_option_ids: SourceOptionScopeIds,
     target_uri: RwLock<Option<String>>,
     target_storage_options: RwLock<HashMap<String, String>>,
 }
@@ -162,6 +243,8 @@ impl SourceResolutionState {
     fn new(resolver: SourceResolver) -> Self {
         Self {
             resolver,
+            state_id: NEXT_SOURCE_STATE_ID.fetch_add(1, Ordering::Relaxed),
+            source_option_ids: SourceOptionScopeIds::default(),
             target_uri: RwLock::new(None),
             target_storage_options: RwLock::new(HashMap::new()),
         }
@@ -185,16 +268,11 @@ impl SourceResolutionState {
         let Some(target_uri) = target_uri.as_deref() else {
             return false;
         };
-        if is_under_target(uri, target_uri) {
-            return false;
-        }
         // Exact target options identify the dataset-level fallback used for
         // absolute `base_id=0` references. Registered bases with explicit
         // runtime params keep their own store configuration.
         let target_storage_options = self.target_storage_options.read().unwrap();
-        storage_options
-            .map(|options| options == &*target_storage_options)
-            .unwrap_or_else(|| target_storage_options.is_empty())
+        is_dataset_fallback(target_uri, &target_storage_options, uri, storage_options)
     }
 
     fn source_options(
@@ -207,35 +285,26 @@ impl SourceResolutionState {
         }
         self.resolver.resolve(uri).map(Some)
     }
-}
 
-fn normalize_target_uri(uri: &str) -> String {
-    uri.trim_end_matches('/').to_string()
-}
+    fn source_params(
+        &self,
+        params: &ObjectStoreParams,
+        options: HashMap<String, String>,
+    ) -> ObjectStoreParams {
+        let source_scope_id = self.source_scope_id(&options);
+        apply_source_options(params, options, source_scope_id)
+    }
 
-fn is_under_target(uri: &str, target_uri: &str) -> bool {
-    let uri = uri.trim_end_matches('/');
-    uri == target_uri
-        || uri
-            .strip_prefix(target_uri)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+    fn source_scope_id(&self, options: &HashMap<String, String>) -> String {
+        let option_id = self.source_option_ids.id_for(options);
+        format!("duckdb-source-{:016x}-{option_id:016x}", self.state_id)
+    }
 }
 
 #[derive(Debug)]
 struct SourceResolvingProvider {
     inner: Arc<dyn ObjectStoreProvider>,
     state: Arc<SourceResolutionState>,
-}
-
-fn apply_source_options(
-    params: &ObjectStoreParams,
-    options: HashMap<String, String>,
-) -> ObjectStoreParams {
-    let mut effective = params.clone();
-    effective.storage_options_accessor = Some(Arc::new(
-        StorageOptionsAccessor::with_static_options(options),
-    ));
-    effective
 }
 
 #[async_trait]
@@ -249,7 +318,7 @@ impl ObjectStoreProvider for SourceResolvingProvider {
         let Some(source_options) = self.state.source_options(uri, params.storage_options())? else {
             return self.inner.new_store(base_path, params).await;
         };
-        let effective = apply_source_options(params, source_options);
+        let effective = self.state.source_params(params, source_options);
         self.inner.new_store(base_path, &effective).await
     }
 
@@ -272,8 +341,8 @@ impl ObjectStoreProvider for SourceResolvingProvider {
             .inner
             .calculate_object_store_prefix(url, Some(&source_options))?;
         Ok(format!(
-            "{prefix}$duckdb-source-{:016x}",
-            options_fingerprint(&source_options)
+            "{prefix}${}",
+            self.state.source_scope_id(&source_options)
         ))
     }
 }
@@ -367,5 +436,83 @@ mod tests {
             "s3://bucket/other/file",
             "s3://bucket/table.lance"
         ));
+    }
+
+    #[test]
+    fn only_dataset_fallback_options_resolve_source_secrets() {
+        let target_options =
+            HashMap::from([("endpoint".to_string(), "http://target.example".to_string())]);
+        assert!(is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &target_options,
+            "s3://other/source.bin",
+            Some(&target_options),
+        ));
+        assert!(is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &HashMap::new(),
+            "s3://other/source.bin",
+            None,
+        ));
+        assert!(!is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &target_options,
+            "s3://other/source.bin",
+            Some(&HashMap::from([(
+                "base_1.endpoint".to_string(),
+                "http://source.example".to_string(),
+            )])),
+        ));
+        assert!(!is_dataset_fallback(
+            "s3://bucket/table.lance",
+            &target_options,
+            "s3://bucket/table.lance/data/file",
+            Some(&target_options),
+        ));
+    }
+
+    #[test]
+    fn source_option_ids_are_stable_across_states_and_never_expose_values() {
+        let options = HashMap::from([
+            ("access_key_id".to_string(), "reader".to_string()),
+            ("secret_access_key".to_string(), "super-secret".to_string()),
+        ]);
+        let first = SourceOptionScopeIds::default();
+        let second = SourceOptionScopeIds::default();
+
+        let first_id = first.id_for(&options);
+        assert_eq!(first_id, first.id_for(&options));
+        assert_eq!(first_id, second.id_for(&options));
+        assert_ne!(
+            first_id,
+            first.id_for(&HashMap::from([(
+                "secret_access_key".to_string(),
+                "rotated-secret".to_string(),
+            )]))
+        );
+
+        let params = apply_source_options(
+            &ObjectStoreParams::default(),
+            options,
+            format!("duckdb-source-0000000000000007-{first_id:016x}"),
+        );
+        assert_eq!(
+            params.storage_options(),
+            Some(&HashMap::from([
+                ("access_key_id".to_string(), "reader".to_string()),
+                ("secret_access_key".to_string(), "super-secret".to_string()),
+            ]))
+        );
+        let accessor_id = params
+            .storage_options_accessor
+            .as_ref()
+            .expect("source accessor")
+            .accessor_id();
+        assert_eq!(
+            accessor_id,
+            "duckdb-source-0000000000000007-0000000000000000"
+        );
+        assert!(!accessor_id.contains("reader"));
+        assert!(!accessor_id.contains("super-secret"));
     }
 }
