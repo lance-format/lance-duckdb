@@ -10,7 +10,6 @@ use arrow::datatypes::{Field, UInt64Type};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 use lance::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use lance::dataset::{Dataset, ProjectionRequest, TakeBuilder};
-use lance::io::RecordBatchStream;
 use lance_core::datatypes::BlobHandling;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
@@ -56,7 +55,6 @@ pub(crate) fn fill_missing_columns(
 pub struct LanceStream {
     handle: Handle,
     stream: Pin<Box<DatasetRecordBatchStream>>,
-    schema: SchemaRef,
     pad_schema: Option<SchemaRef>,
 }
 
@@ -65,12 +63,10 @@ impl LanceStream {
     pub fn from_scanner(scanner: Scanner) -> Result<Self, Box<dyn std::error::Error>> {
         let handle = crate::runtime::handle()?;
         let stream = handle.block_on(async { scanner.try_into_stream().await })?;
-        let schema = stream.schema();
 
         Ok(Self {
             handle,
             stream: Box::pin(stream),
-            schema,
             pad_schema: None,
         })
     }
@@ -85,13 +81,8 @@ impl LanceStream {
         Ok(Self {
             handle,
             stream: Box::pin(stream),
-            schema: schema.clone(),
             pad_schema: Some(schema),
         })
-    }
-
-    pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()
     }
 
     /// Get the next batch from the stream

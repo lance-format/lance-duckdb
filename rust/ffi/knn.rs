@@ -96,9 +96,9 @@ fn get_knn_schema_inner(
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema project: {err}")))?;
     scan.scan_in_order(false);
 
-    let schema = LanceStream::from_scanner(scan)
-        .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema: {err}")))?
-        .schema();
+    let schema = runtime::block_on(scan.schema())
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("knn schema runtime: {err}")))?
+        .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema: {err}")))?;
     Ok(schema)
 }
 

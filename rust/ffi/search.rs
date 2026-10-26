@@ -70,9 +70,9 @@ fn get_fts_schema_inner(
         .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema project: {err}")))?;
     scan.scan_in_order(false);
 
-    let schema = LanceStream::from_scanner(scan)
-        .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema: {err}")))?
-        .schema();
+    let schema = runtime::block_on(scan.schema())
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("fts schema runtime: {err}")))?
+        .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts schema: {err}")))?;
     Ok(schema)
 }
 
