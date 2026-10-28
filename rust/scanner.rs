@@ -140,7 +140,7 @@ pub struct LanceTakeStream {
 /// through Lance's materialization path instead of a bare fragment take.
 ///
 /// `row_ids` are in the dataset's `_rowid` space (stable row IDs when enabled,
-/// physical row addresses otherwise), matching `with_row_addr_prefilter`.
+/// physical row addresses otherwise), matching `with_row_id_prefilter`.
 /// Output rows follow the input `columns` order and repeat/omit rows to match
 /// the input `row_ids` exactly.
 pub async fn take_rows_by_row_ids(
@@ -164,7 +164,7 @@ pub async fn take_rows_by_row_ids(
     } else {
         RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(row_ids.iter().copied()))
     };
-    scanner.with_row_addr_prefilter(mask);
+    scanner.with_row_id_prefilter(mask);
 
     let scanned = scanner.try_into_batch().await?;
     let rowid_pos = scanned
