@@ -6,5 +6,8 @@ duckdb_extension_load(lance
     LOAD_TESTS
 )
 
+# Keep the local CLI and test runner self-contained.
+duckdb_extension_statically_link(lance)
+
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)

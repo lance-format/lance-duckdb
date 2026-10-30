@@ -24,21 +24,19 @@ test-env LANCE_S3_NS_PREFIX ns_attach_test
 
 require lance
 
+# Binding a path must not capture credentials before they exist.
 statement ok
-INSTALL httpfs;
-
-statement ok
-LOAD httpfs;
+PREPARE resolved_s3_path AS SELECT * FROM __lance_show_auto_cleanup('s3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance');
 
 statement ok
 CREATE SECRET (
   TYPE LANCE,
   PROVIDER config,
-  SCOPE 's3://${LANCE_S3_BUCKET}/',
-  ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
-  SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}',
-  REGION '${LANCE_S3_REGION}',
-  ENDPOINT '${LANCE_S3_ENDPOINT}',
+  SCOPE 's3://{LANCE_S3_BUCKET}/',
+  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
   ALLOW_HTTP true
 );
@@ -46,18 +44,23 @@ CREATE SECRET (
 # Seed two datasets directly under the namespace prefix.
 statement ok
 COPY (SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s UNION ALL SELECT 2::BIGINT, 'b')
-TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}/alpha.lance' (FORMAT lance, mode 'overwrite');
+TO 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 COPY (SELECT 10::BIGINT AS id UNION ALL SELECT 20::BIGINT UNION ALL SELECT 30::BIGINT)
-TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}/beta.lance' (FORMAT lance, mode 'overwrite');
+TO 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/beta.lance' (FORMAT lance, mode 'overwrite');
+
+query TT
+EXECUTE resolved_s3_path;
+----
+enabled	false
 
 # ATTACH the prefix as a directory namespace and verify that the tables are
 # visible through the catalog. Before the fix, this catalog was always empty
 # on non-AWS S3-compatible endpoints because dataset open returned NULL for
 # every entry.
 statement ok
-ATTACH 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}' AS ns (TYPE LANCE, READ_ONLY false);
+ATTACH 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}' AS ns (TYPE LANCE, READ_ONLY false);
 
 query TT
 SELECT table_name, database_name FROM duckdb_tables()
@@ -65,6 +68,29 @@ WHERE database_name = 'ns' ORDER BY table_name;
 ----
 alpha	ns
 beta	ns
+
+# URI paths also bypass discovery in the active Lance catalog.
+statement ok
+USE ns;
+
+query TT
+SELECT * FROM __lance_show_auto_cleanup('s3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance');
+----
+enabled	false
+
+statement ok
+USE memory;
+
+# Catalog targets use the namespace-aware open path for config and maintenance.
+query TT
+SHOW MAINTENANCE ON ns.main.alpha;
+----
+enabled	false
+
+query T
+SELECT Operation FROM __lance_compact_files('ns.main.alpha', '{}');
+----
+compact
 
 query I
 SELECT count(*) FROM ns.main.alpha;
@@ -91,7 +117,7 @@ DETACH ns;
 
 # Re-ATTACH and confirm the catalog still discovers the tables.
 statement ok
-ATTACH 's3://${LANCE_S3_BUCKET}/${LANCE_S3_NS_PREFIX}' AS ns2 (TYPE LANCE, READ_ONLY false);
+ATTACH 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}' AS ns2 (TYPE LANCE, READ_ONLY false);
 
 query I
 SELECT count(*) FROM ns2.main.alpha;

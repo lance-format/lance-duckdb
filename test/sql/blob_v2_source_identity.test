@@ -1,0 +1,60 @@
+# name: test/sql/blob_v2_source_identity.test
+# description: Blob source admission uses Lance's normalized resource identity
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=1;
+
+# Create an allowed directory whose name contains a space. Lance creates the
+# parent directories for the nested dataset path.
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2 source identity allowed/seed.lance'
+(FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT 'permitted bytes'::VARCHAR AS s)
+TO '{TEST_DIR}/blob_v2 source identity allowed/plain.bin'
+(FORMAT csv);
+
+statement ok
+COPY (SELECT 'private bytes'::VARCHAR AS s)
+TO '{TEST_DIR}/blob_v2 source identity secret.bin'
+(FORMAT csv);
+
+statement ok
+SET allowed_directories = ['{TEST_DIR}/blob_v2 source identity allowed'];
+
+statement ok
+SET enable_external_access=false;
+
+# The escaped file URI must normalize to the allowed local path before DuckDB's
+# admission check, even though the allowed path itself contains a space.
+statement ok
+COPY (
+  SELECT lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2%20source%20identity%20allowed/plain.bin') AS payload
+) TO '{TEST_DIR}/blob_v2 source identity allowed/ingest.lance'
+(FORMAT lance, mode 'overwrite');
+
+query I
+SELECT octet_length(payload) > 0 FROM '{TEST_DIR}/blob_v2 source identity allowed/ingest.lance'
+----
+true
+
+statement error
+COPY (
+  SELECT lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2%20source%20identity%20secret.bin') AS payload
+) TO '{TEST_DIR}/blob_v2 source identity allowed/direct.lance'
+(FORMAT lance, mode 'overwrite')
+----
+Cannot access source URI
+
+statement error
+COPY (
+  SELECT lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2%20source%20identity%20allowed/%2e%2e/blob_v2%20source%20identity%20secret.bin') AS payload
+) TO '{TEST_DIR}/blob_v2 source identity allowed/encoded.lance'
+(FORMAT lance, mode 'overwrite')
+----
+Cannot access source URI

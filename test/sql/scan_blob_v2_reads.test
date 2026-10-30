@@ -1,0 +1,366 @@
+# name: test/sql/scan_blob_v2_reads.test
+# description: Lance Blob v2 columns read as real BLOB bytes on all SQL scan paths
+# group: [sql]
+
+require lance
+
+# Inline, packed, dedicated, NULL, and empty values all return bytes, not
+# Lance's physical descriptor struct.
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v2_reads.lance'
+ORDER BY id;
+----
+0	6
+1	96
+2	256
+3	NULL
+4	0
+
+# Byte predicates are evaluated on bytes even though Lance filter IR cannot
+# represent BLOB comparisons.
+query I
+SELECT id
+FROM 'test/data/blob_v2_reads.lance'
+WHERE payload = repeat('d', 256)::BLOB;
+----
+2
+
+query I
+SELECT id
+FROM 'test/data/blob_v2_reads.lance'
+WHERE payload IS NULL;
+----
+3
+
+# ORDER BY uses byte values rather than descriptor fields.
+query I
+SELECT id
+FROM 'test/data/blob_v2_reads.lance'
+ORDER BY payload;
+----
+4
+2
+0
+1
+3
+
+# Unprojected blobs, count, and row-id-only queries remain valid.
+query I
+SELECT id FROM 'test/data/blob_v2_reads.lance' ORDER BY id;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT count(*) FROM 'test/data/blob_v2_reads.lance';
+----
+5
+
+# Point lookup uses the take path and still materializes the blob bytes.
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v2_reads.lance'
+WHERE _rowid = 1;
+----
+1	96
+
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v2_reads.lance'
+WHERE _rowid > 1
+ORDER BY id;
+----
+2	256
+3	NULL
+4	0
+
+# Comparing rowid with a data column stays a local predicate.
+query I
+SELECT id FROM 'test/data/blob_v2_reads.lance' WHERE rowid = id ORDER BY id;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT id FROM 'test/data/blob_v2_reads.lance' WHERE id = rowid ORDER BY id;
+----
+0
+1
+2
+3
+4
+
+# Legacy Blob v1 stays on the native take path.
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v1_reads.lance'
+WHERE _rowid IN (0, 2)
+ORDER BY id;
+----
+0	13
+2	NULL
+
+# Blob payloads remain deferred when DuckDB must evaluate the filter locally.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id, octet_length(payload), nested, items
+FROM 'test/data/blob_v2_reads.lance'
+WHERE id::VARCHAR LIKE '%2%';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*"Lance Deferred Columns": "payload"[\s\S]*
+
+query II
+SELECT id, octet_length(payload)
+FROM 'test/data/blob_v2_reads.lance'
+WHERE id::VARCHAR LIKE '%2%';
+----
+2	256
+
+# Ordinary nested values survive alongside a materialized BLOB column.
+query II
+SELECT nested.a, items[1]
+FROM 'test/data/blob_v2_reads.lance'
+WHERE id = 2;
+----
+2	2
+
+# Nested Blob leaves inside STRUCT and LIST preserve bytes, NULL, and empty.
+query II
+SELECT id,
+       CASE
+           WHEN nested_blob.payload IS NULL THEN 'NULL'
+           WHEN octet_length(nested_blob.payload) = 0 THEN 'EMPTY'
+           ELSE hex(nested_blob.payload)
+       END
+FROM 'test/data/blob_v2_reads.lance'
+ORDER BY id;
+----
+0	6E6573746564
+1	NULL
+2	EMPTY
+3	6E65737465642D33
+4	6E65737465642D34
+
+query II
+SELECT id,
+       CASE
+           WHEN blob_items[1] IS NULL THEN 'NULL'
+           WHEN octet_length(blob_items[1]) = 0 THEN 'EMPTY'
+           ELSE hex(blob_items[1])
+       END
+FROM 'test/data/blob_v2_reads.lance'
+ORDER BY id;
+----
+0	6669727374
+1	EMPTY
+2	NULL
+3	6C6973742D61
+4	6C6973742D63
+
+# Attached directory catalogs share the same binding and read contract.
+statement ok
+ATTACH 'test/data' AS blob_ns (TYPE LANCE);
+
+query II
+SELECT id, octet_length(payload)
+FROM blob_ns.main.blob_v2_reads
+ORDER BY id;
+----
+0	6
+1	96
+2	256
+3	NULL
+4	0
+
+# Attached search functions use the same byte materialization contract.
+query II
+SELECT id, octet_length(payload)
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+0	6
+
+query II
+SELECT id, octet_length(payload)
+FROM lance_fts('blob_ns.main.blob_v2_reads', 'text', 'beta', k = 1)
+ORDER BY id;
+----
+1	96
+
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 1,
+  filter := 'id = -1'
+);
+----
+
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 1,
+  filter := 'id = 1'
+);
+----
+1
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  filter := 'id = -1'
+);
+----
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  prefilter = true,
+  filter := 'id = 1'
+);
+----
+1
+
+# Named SQL filters resolve Lance system columns after search configuration.
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 5,
+  use_index = false,
+  prefilter = true,
+  filter := '_rowid = 1'
+);
+----
+1
+
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 5,
+  use_index = false,
+  prefilter = false,
+  filter := '_distance < 1'
+);
+----
+0
+
+query I
+SELECT id
+FROM lance_fts(
+  'blob_ns.main.blob_v2_reads',
+  'text',
+  'beta',
+  k = 5,
+  prefilter = false,
+  filter := '_score > 0'
+);
+----
+1
+
+# The named filter and pushed DuckDB predicate both constrain the search
+# before top-k; either one alone would select a different row.
+query I
+SELECT id
+FROM lance_vector_search(
+  'blob_ns.main.blob_v2_reads',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false,
+  prefilter = true,
+  filter := '_rowid <= 1'
+)
+WHERE id >= 1;
+----
+1
+
+statement ok
+DETACH blob_ns;
+
+# KNN and FTS return the projected blob bytes.
+query II
+SELECT id, octet_length(payload)
+FROM lance_vector_search(
+  'test/data/blob_v2_reads.lance',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false
+)
+ORDER BY _distance;
+----
+0	6
+
+query II
+SELECT id, octet_length(payload)
+FROM lance_fts('test/data/blob_v2_reads.lance', 'text', 'beta', k = 1)
+ORDER BY id;
+----
+1	96
+
+# Nested Blob leaves remain bytes in every native search projection.
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_fts('test/data/blob_v2_reads.lance', 'text', 'alpha', k = 1);
+----
+6E6573746564	6669727374
+
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_vector_search(
+  'test/data/blob_v2_reads.lance',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  k = 1,
+  use_index = false
+);
+----
+6E6573746564	6669727374
+
+query II
+SELECT hex(nested_blob.payload), hex(blob_items[1])
+FROM lance_hybrid_search(
+  'test/data/blob_v2_reads.lance',
+  'vec',
+  [1.0, 0.0, 0.0]::FLOAT[3],
+  'text',
+  'alpha',
+  k = 1,
+  use_index = false
+);
+----
+6E6573746564	6669727374

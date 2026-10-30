@@ -1,13 +1,67 @@
 use std::ffi::{c_char, c_void};
 use std::ptr;
+use std::sync::Arc;
 
-use lance::dataset::ProjectionRequest;
+use arrow::array::RecordBatch;
+use futures::{stream, StreamExt, TryStreamExt};
+use lance::dataset::TakeBuilder;
+use lance::dataset::{fragment::FileFragment, Dataset};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::projection;
 use super::types::StreamHandle;
 use super::util::{optional_cstr_array, slice_from_ptr, FfiError, FfiResult};
+
+async fn fragment_physical_row_counts(
+    dataset: &Arc<Dataset>,
+    row_ids: &[u64],
+) -> lance::Result<Vec<(u64, usize)>> {
+    let mut fragment_ids = row_ids
+        .iter()
+        .map(|row_id| row_id >> 32)
+        .collect::<Vec<_>>();
+    fragment_ids.sort_unstable();
+    fragment_ids.dedup();
+
+    let fragments = fragment_ids
+        .into_iter()
+        .filter_map(|fragment_id| {
+            let fragment_idx = dataset
+                .manifest
+                .fragments
+                .binary_search_by_key(&fragment_id, |fragment| fragment.id)
+                .ok()?;
+            Some((
+                fragment_id,
+                FileFragment::new(
+                    dataset.clone(),
+                    dataset.manifest.fragments[fragment_idx].clone(),
+                ),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let io_parallelism = dataset.object_store(None).await?.io_parallelism();
+    stream::iter(fragments)
+        .map(|(fragment_id, fragment)| async move {
+            fragment
+                .physical_rows()
+                .await
+                .map(|row_count| (fragment_id, row_count))
+        })
+        .buffered(io_parallelism)
+        .try_collect()
+        .await
+}
+
+fn row_address_is_in_range(fragment_row_counts: &[(u64, usize)], row_id: u64) -> bool {
+    let fragment_id = row_id >> 32;
+    let row_offset = row_id as u32 as usize;
+    fragment_row_counts
+        .binary_search_by_key(&fragment_id, |(fragment_id, _)| *fragment_id)
+        .is_ok_and(|idx| row_offset < fragment_row_counts[idx].1)
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_dataset_take_stream(
@@ -81,18 +135,8 @@ fn create_dataset_take_stream_inner(
     let row_ids_filtered;
     let row_ids = if !filter_out_of_range || row_ids.is_empty() {
         row_ids
-    } else {
-        let max_row_id = if handle.dataset.manifest.uses_stable_row_ids() {
-            handle.dataset.manifest.next_row_id
-        } else {
-            handle
-                .dataset
-                .manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.num_rows().unwrap_or_default() as u64)
-                .sum::<u64>()
-        };
+    } else if handle.dataset.manifest.uses_stable_row_ids() {
+        let max_row_id = handle.dataset.manifest.next_row_id;
         if row_ids.iter().all(|id| *id < max_row_id) {
             row_ids
         } else {
@@ -103,28 +147,158 @@ fn create_dataset_take_stream_inner(
                 .collect::<Vec<_>>();
             row_ids_filtered.as_slice()
         }
+    } else {
+        let fragment_row_counts =
+            match runtime::block_on(fragment_physical_row_counts(&handle.dataset, row_ids)) {
+                Ok(Ok(row_counts)) => row_counts,
+                Ok(Err(err)) => {
+                    return Err(FfiError::new(
+                        ErrorCode::DatasetTake,
+                        format!("dataset fragment physical rows: {err}"),
+                    ))
+                }
+                Err(err) => {
+                    return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
+                }
+            };
+        if row_ids
+            .iter()
+            .all(|id| row_address_is_in_range(&fragment_row_counts, *id))
+        {
+            row_ids
+        } else {
+            row_ids_filtered = row_ids
+                .iter()
+                .copied()
+                .filter(|id| row_address_is_in_range(&fragment_row_counts, *id))
+                .collect::<Vec<_>>();
+            row_ids_filtered.as_slice()
+        }
     };
 
     let projection_cols = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
-    let projection = if projection_cols.is_empty() {
-        ProjectionRequest::from_schema(handle.dataset.schema().clone())
+    let projection_cols = if projection_cols.is_empty() {
+        handle
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
     } else {
-        ProjectionRequest::from_columns(
-            projection_cols.iter().map(|s| s.as_str()),
-            handle.dataset.schema(),
-        )
+        projection_cols
     };
+    let plan = Arc::new(
+        projection::binary_projection_plan(handle.dataset.clone(), &projection_cols)
+            .map_err(|err| FfiError::new(ErrorCode::DatasetTake, err))?,
+    );
+    let uses_blob_v2_scanner =
+        projection::projection_contains_blob_v2(&handle.dataset, &projection_cols)
+            .map_err(|err| FfiError::new(ErrorCode::DatasetTake, err))?;
 
-    let batch = match runtime::block_on(handle.dataset.take_rows(row_ids, projection)) {
-        Ok(Ok(batch)) => batch,
-        Ok(Err(err)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetTake,
-                format!("dataset take_rows: {err}"),
-            ))
+    if row_ids.is_empty() {
+        let schema = plan
+            .output_schema()
+            .map_err(|err| FfiError::new(ErrorCode::DatasetTake, format!("take schema: {err}")))?;
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        return Ok(StreamHandle::Batches(vec![batch].into_iter()));
+    }
+
+    let batch = if uses_blob_v2_scanner {
+        match runtime::block_on(crate::scanner::take_rows_by_row_ids(
+            handle.dataset.clone(),
+            row_ids,
+            &projection_cols,
+        )) {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetTake,
+                    format!("dataset take: {err}"),
+                ))
+            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
         }
-        Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    } else {
+        let row_addrs =
+            match runtime::block_on(projection::row_ids_to_addresses(&handle.dataset, row_ids)) {
+                Ok(Ok(addrs)) => addrs,
+                Ok(Err(err)) => return Err(FfiError::new(ErrorCode::DatasetTake, err)),
+                Err(err) => {
+                    return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))
+                }
+            };
+        match runtime::block_on(async {
+            TakeBuilder::try_new_from_addresses(handle.dataset.clone(), row_addrs, plan.clone())?
+                .execute()
+                .await
+        }) {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(err)) => {
+                return Err(FfiError::new(
+                    ErrorCode::DatasetTake,
+                    format!("dataset take: {err}"),
+                ))
+            }
+            Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+        }
     };
 
     Ok(StreamHandle::Batches(vec![batch].into_iter()))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use lance::dataset::WriteParams;
+
+    use super::*;
+    use crate::ffi::types::DatasetHandle;
+
+    #[test]
+    fn legacy_unknown_physical_rows_remain_addressable() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 20]))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        let mut dataset = runtime::block_on(Dataset::write(
+            batches,
+            "memory://take-legacy-unknown-rows",
+            Some(params),
+        ))
+        .unwrap()
+        .unwrap();
+
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.writer_version = None;
+        for fragment in Arc::make_mut(&mut manifest.fragments) {
+            fragment.physical_rows = None;
+        }
+
+        let mut handle = Box::new(DatasetHandle::new(Arc::new(dataset)));
+        let handle_ptr = handle.as_mut() as *mut DatasetHandle as *mut c_void;
+        let row_ids = [1_u64 << 32];
+        let stream = create_dataset_take_stream_inner(
+            handle_ptr,
+            row_ids.as_ptr(),
+            row_ids.len(),
+            ptr::null(),
+            0,
+            true,
+        )
+        .unwrap();
+        let StreamHandle::Batches(mut batches) = stream else {
+            panic!("expected batches stream");
+        };
+        let result = batches.next().unwrap();
+        assert_eq!(result.num_rows(), 1, "valid legacy row address was dropped");
+    }
 }

@@ -54,56 +54,56 @@ COPY (
     1::INTEGER AS b,
     '-inf'::DOUBLE AS f1,
     'inf'::DOUBLE AS f2
-) TO 'test/.tmp/distinct_from_pushdown.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/distinct_from_pushdown.lance' (FORMAT lance, mode 'overwrite');
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b;
 ----
 4
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b;
 ----
 3
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance'
 WHERE f1 IS NOT DISTINCT FROM f2;
 ----
 4
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance'
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance'
 WHERE f1 IS DISTINCT FROM f2;
 ----
 3
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM NULL;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM NULL;
 ----
 1
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM NULL;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM NULL;
 ----
 6
 
 # Verify we emit a non-empty Filter IR for these operators.
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT a FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b LIMIT 1;
+SELECT a FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE a IS NOT DISTINCT FROM b LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT a FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b LIMIT 1;
+SELECT a FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE a IS DISTINCT FROM b LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT f1 FROM 'test/.tmp/distinct_from_pushdown.lance'
+SELECT f1 FROM '{TEST_DIR}/distinct_from_pushdown.lance'
 WHERE f1 IS NOT DISTINCT FROM f2
 LIMIT 1;
 ----
@@ -111,43 +111,43 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 # Non-finite float literals are encoded and pushed down (no DuckDB-side re-filtering).
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
 ----
 2
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM 'nan'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 IS DISTINCT FROM 'nan'::DOUBLE;
 ----
 5
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'nan'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 = 'nan'::DOUBLE;
 ----
 2
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 <> 'nan'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 <> 'nan'::DOUBLE;
 ----
 4
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
 ----
 1
 
 query I
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = '-inf'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 = '-inf'::DOUBLE;
 ----
 1
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 IS NOT DISTINCT FROM 'nan'::DOUBLE;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
+SELECT count(*) FROM '{TEST_DIR}/distinct_from_pushdown.lance' WHERE f1 = 'inf'::DOUBLE;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*"Lance Rows Out"[\s\S]*

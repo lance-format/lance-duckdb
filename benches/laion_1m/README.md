@@ -23,7 +23,7 @@ The runner covers the full local lifecycle:
 5. run the benchmark and print a summary table
 
 All generated files live under `benches/laion_1m/data/` and are reused across
-runs. The initial download is the only networked step.
+runs. Dataset downloads and DuckDB extension installation require network access.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ runs. The initial download is the only networked step.
 - Python 3
 - internet access for the first run
 - a stable DuckDB `lance` extension release that includes indexed hybrid search
-  parameters such as `use_index`, `nprobes`, and `refine_factor`
+  parameters such as `use_index`, `nprobs`, and `refine_factor`
 
 The benchmark uses the stable DuckDB `lance` extension via `INSTALL lance; LOAD lance;`.
 It does not require a repository-local Lance build.

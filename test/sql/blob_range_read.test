@@ -1,0 +1,534 @@
+# name: test/sql/blob_range_read.test
+# description: Batched blob range reads over explicit snapshots and row selectors
+# group: [sql]
+
+require lance
+
+# test/data/blob_range_fixture.lance holds two versions written with Blob v2
+# columns: version 1 (ids 0-4, touching inline, packed, NULL, empty and
+# dedicated layouts) and version 2 (id 5 in a second fragment).
+
+query II
+SELECT id, CAST(rowid AS BIGINT)
+FROM 'test/data/blob_range_fixture.lance'
+ORDER BY id;
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+5	4294967296
+
+# Duplicate requests keep their own request id, request index and payload.
+query TITT
+SELECT request_id,
+       CAST(request_index AS BIGINT),
+       CAST(octet_length(data) AS BIGINT),
+       hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'req_a' AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           CASE i WHEN 0 THEN 0 WHEN 1 THEN 6 ELSE 0 END AS offset,
+           5::BIGINT AS length
+    FROM 'test/data/blob_range_fixture.lance', range(3) t(i)
+    WHERE id = 0
+  )
+)
+ORDER BY request_index;
+----
+req_a	0	5	68656C6C6F
+req_a	1	5	776F726C64
+req_a	2	5	68656C6C6F
+
+# `data` is a BLOB column.
+query T
+SELECT DISTINCT typeof(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'typeof' AS request_id, CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset, 1::BIGINT AS length
+    FROM 'test/data/blob_range_fixture.lance' WHERE id = 0
+  )
+);
+----
+BLOB
+
+# NULL blobs and zero-length ranges stay distinct from each other.
+query TTTTT
+SELECT request_id,
+       CAST(request_index AS BIGINT)::VARCHAR,
+       CAST(data IS NULL AS VARCHAR),
+       CAST(CASE WHEN data IS NULL THEN -1 ELSE octet_length(data) END AS VARCHAR),
+       CASE
+         WHEN data IS NOT NULL AND octet_length(data) > 0 THEN hex(data)
+         ELSE 'none'
+       END
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT CASE i
+             WHEN 0 THEN 'null_blob'
+             WHEN 1 THEN 'empty_blob'
+             WHEN 2 THEN 'zero_len'
+             ELSE 'packed'
+           END AS request_id,
+           (
+             SELECT CAST(rowid AS BIGINT)
+             FROM 'test/data/blob_range_fixture.lance' fixture
+             WHERE fixture.id = CASE i WHEN 0 THEN 2 WHEN 1 THEN 3
+                                      WHEN 2 THEN 0 ELSE 1 END
+           ) AS row_value,
+           CASE i WHEN 1 THEN 0 WHEN 2 THEN 0 ELSE 0 END AS offset,
+           CASE i WHEN 0 THEN 4 WHEN 1 THEN 0 WHEN 2 THEN 0 ELSE 3 END AS length
+    FROM range(4) t(i)
+  )
+)
+ORDER BY request_index;
+----
+null_blob	0	true	-1	none
+empty_blob	1	false	0	none
+zero_len	2	false	0	none
+packed	3	false	3	424242
+
+# test/data/blob_range_stable_fixture.lance is a tiny dataset written with
+# stable row ids; `_rowid` carries the stable identity there.
+query II
+SELECT id, CAST(rowid AS BIGINT)
+FROM 'test/data/blob_range_stable_fixture.lance'
+ORDER BY id;
+----
+0	0
+1	1
+
+# A NULL version reads the latest snapshot for `row_id` requests on a dataset
+# with stable row ids and reports the version the handle was pinned to.
+query TTTT
+SELECT request_id,
+       CAST(version AS VARCHAR),
+       CAST(row_address AS VARCHAR),
+       hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_stable_fixture.lance',
+  'payload',
+  NULL,
+  'row_id',
+  (
+    SELECT 'stable_latest' AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 12::BIGINT AS length
+  )
+);
+----
+stable_latest	1	0	737461626C6520616C706861
+
+# Without stable row ids `_rowid` is the physical address, so a NULL version
+# must be rejected instead of reinterpreting addresses on a later snapshot.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  NULL,
+  'row_id',
+  (
+    SELECT 'latest' AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 5::BIGINT AS length
+  )
+);
+----
+requires a dataset with stable row ids
+
+# An explicit version binds `row_id` requests to that snapshot as well.
+query TT
+SELECT CAST(version AS VARCHAR), hex(data)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_id',
+  (
+    SELECT 'v1' AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 5::BIGINT AS length
+  )
+);
+----
+1	68656C6C6F
+
+# A physical row address from a later version must not be reinterpreted
+# against an older snapshot.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'v2_row' AS request_id, CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset, 4::BIGINT AS length
+    FROM 'test/data/blob_range_fixture.lance' WHERE id = 5
+  )
+);
+----
+missing fragment
+
+# row_address selectors require an explicit version.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  NULL,
+  'row_address',
+  (SELECT 1 AS request_id, 0 AS row_value, 0 AS offset, 1 AS length)
+);
+----
+requires an explicit positive version
+
+# Unknown selector kinds are rejected.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'offset_range',
+  (SELECT 1 AS request_id, 0 AS row_value, 0 AS offset, 1 AS length)
+);
+----
+selector must be 'row_address' or 'row_id'
+
+# The request relation must provide every required column.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (SELECT 1 AS request_id, 0 AS row_value, 0 AS offset)
+);
+----
+missing required column 'length'
+
+# Row selectors and ranges must be integer columns.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (SELECT 1 AS request_id, 'zero' AS row_value, 0 AS offset, 1 AS length)
+);
+----
+must be an integer type
+
+# NULL range fields are request errors, not NULL results.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (SELECT 1 AS request_id, 0 AS row_value, NULL::BIGINT AS offset,
+          1 AS length)
+);
+----
+has NULL 'offset'
+
+# Negative lengths are rejected.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (SELECT 1 AS request_id, 0 AS row_value, 0 AS offset, -1::BIGINT AS length)
+);
+----
+non-integer or negative 'length'
+
+# Ranges past the end of the selected blob fail instead of being truncated.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 1 AS request_id, CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset, 1048577::BIGINT AS length
+    FROM 'test/data/blob_range_fixture.lance' WHERE id = 4
+  )
+);
+----
+exceeds blob size
+
+# Missing physical row addresses fail instead of producing NULL or empty data.
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (SELECT 1 AS request_id, 8589934592::BIGINT AS row_value, 0 AS offset,
+          4 AS length)
+);
+----
+missing fragment
+
+# An empty request relation produces an empty result.
+query I
+SELECT COUNT(*)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  2,
+  'row_id',
+  (
+    SELECT 1 AS request_id, 0 AS row_value, 0 AS offset, 1 AS length
+    WHERE false
+  )
+);
+----
+0
+
+# A single request larger than the per-window materialization budget derived
+# from DuckDB's memory_limit fails explicitly.
+statement ok
+SET memory_limit='4MB';
+
+# Requests are split into multiple byte-bounded windows inside one input
+# chunk; request ids and indexes stay aligned with their own payload.
+query TTTT
+SELECT request_id,
+       CAST(request_index AS VARCHAR),
+       CAST(octet_length(data) AS VARCHAR),
+       CASE WHEN octet_length(data) <= 8 THEN hex(data) ELSE 'long' END
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT CASE i WHEN 0 THEN 'req_a' WHEN 1 THEN 'req_b' ELSE 'req_a' END AS request_id,
+           (
+             SELECT CAST(rowid AS BIGINT)
+             FROM 'test/data/blob_range_fixture.lance' fixture
+             WHERE fixture.id = CASE i WHEN 0 THEN 4 WHEN 1 THEN 4 ELSE 0 END
+           ) AS row_value,
+           CASE i WHEN 0 THEN 0 WHEN 1 THEN 300000 ELSE 0 END AS offset,
+           CASE i WHEN 0 THEN 300000 WHEN 1 THEN 300000 ELSE 5 END AS length
+    FROM range(3) t(i)
+  )
+)
+ORDER BY request_index;
+----
+req_a	0	300000	long
+req_b	1	300000	long
+req_a	2	5	68656C6C6F
+
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 1 AS request_id, CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset, 1048576::BIGINT AS length
+    FROM 'test/data/blob_range_fixture.lance' WHERE id = 4
+  )
+);
+----
+materialization budget
+
+statement ok
+SET memory_limit='80%';
+
+# Prepared explicit-version reads stay pinned across executions even though the
+# dataset has a newer version.
+statement ok
+PREPARE range_pinned AS
+SELECT CAST(version AS VARCHAR) AS pinned_version, hex(data) AS payload
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_id',
+  (
+    SELECT 7 AS request_id, 0::BIGINT AS row_value,
+           0::BIGINT AS offset, 5::BIGINT AS length
+  )
+);
+
+query TT
+EXECUTE range_pinned;
+----
+1	68656C6C6F
+
+query TT
+EXECUTE range_pinned;
+----
+1	68656C6C6F
+
+statement ok
+DEALLOCATE range_pinned;
+
+# Prepared executions must pick up a new memory_limit instead of reusing the
+# budget captured when the statement was prepared.
+statement ok
+SET memory_limit='80MB';
+
+statement ok
+PREPARE range_budget AS
+SELECT request_id, CAST(octet_length(data) AS BIGINT) AS payload_bytes
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    -- Constant request relation: no scan bind data participates, so this
+    -- prepared statement only rebinds if the range function itself opts out
+    -- of statement caching. Address 4 is fixture row id 4 in version 1.
+    SELECT 1 AS request_id,
+           4::BIGINT AS row_value,
+           0::BIGINT AS offset,
+           1048576::BIGINT AS length
+  )
+);
+
+query TI
+EXECUTE range_budget;
+----
+1	1048576
+
+statement ok
+SET memory_limit='4MB';
+
+statement error
+EXECUTE range_budget;
+----
+materialization budget
+
+statement ok
+DEALLOCATE range_budget;
+
+statement ok
+SET memory_limit='80%';
+
+# More requests than one DuckDB chunk: every chunk keeps its own request ids
+# and indexes contiguous, and payloads still match their own request row.
+query IIII
+SELECT COUNT(*),
+       COUNT(*) FILTER (WHERE request_index <> request_id),
+       COUNT(*) FILTER (
+         WHERE (request_id % 3 = 0 AND hex(data) = '68')
+            OR (request_id % 3 = 1 AND hex(data) = '42')
+            OR (request_id % 3 = 2 AND data IS NULL)
+       ),
+       COUNT(*) FILTER (WHERE version <> 1)
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT i::BIGINT AS request_id,
+           (i % 3)::BIGINT AS row_value,
+           0::BIGINT AS offset,
+           1::BIGINT AS length
+    FROM range(5000) t(i)
+  )
+);
+----
+5000	0	5000	0
+
+# Independent request sources (UNION ALL branches) may deliver rows in any
+# order, but every request still gets a distinct request_index and its own
+# payload.
+query III
+SELECT COUNT(*) AS rows,
+       COUNT(DISTINCT request_index) AS distinct_indexes,
+       COUNT(*) FILTER (WHERE request_index IS NULL) AS null_indexes
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'branch_a_' || i AS request_id,
+           (SELECT CAST(rowid AS BIGINT)
+            FROM 'test/data/blob_range_fixture.lance' fixture
+            WHERE fixture.id = 0) AS row_value,
+           0::BIGINT AS offset,
+           1::BIGINT AS length
+    FROM range(3) t(i)
+    UNION ALL
+    SELECT 'branch_b_' || i,
+           (SELECT CAST(rowid AS BIGINT)
+            FROM 'test/data/blob_range_fixture.lance' fixture
+            WHERE fixture.id = 1),
+           0,
+           1
+    FROM range(4) t(i)
+  )
+);
+----
+7	7	0
+
+query III
+SELECT COUNT(*) FILTER (
+         WHERE request_id LIKE 'branch_a%' AND hex(data) = '68'
+       ) AS branch_a_rows,
+       COUNT(*) FILTER (
+         WHERE request_id LIKE 'branch_b%' AND hex(data) = '42'
+       ) AS branch_b_rows,
+       COUNT(*) FILTER (
+         WHERE (request_id LIKE 'branch_a%' AND hex(data) <> '68')
+            OR (request_id LIKE 'branch_b%' AND hex(data) <> '42')
+       ) AS mismatched_payloads
+FROM lance_read_blob_ranges(
+  'test/data/blob_range_fixture.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT 'branch_a_' || i AS request_id,
+           (SELECT CAST(rowid AS BIGINT)
+            FROM 'test/data/blob_range_fixture.lance' fixture
+            WHERE fixture.id = 0) AS row_value,
+           0::BIGINT AS offset,
+           1::BIGINT AS length
+    FROM range(3) t(i)
+    UNION ALL
+    SELECT 'branch_b_' || i,
+           (SELECT CAST(rowid AS BIGINT)
+            FROM 'test/data/blob_range_fixture.lance' fixture
+            WHERE fixture.id = 1),
+           0,
+           1
+    FROM range(4) t(i)
+  )
+);
+----
+3	4	0

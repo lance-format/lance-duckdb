@@ -1,0 +1,213 @@
+# name: test/sql/dml_blob_v2_values.test
+# description: UPDATE and MERGE accept Blob v2 bytes, ingest and reference values
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 'ingest-value'::BLOB) TO '{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_ingest.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT 'reference-value'::BLOB) TO '{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_reference.bin' (FORMAT BLOB);
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 'old-1'::BLOB AS payload
+  UNION ALL SELECT 2, 'b', repeat('b', 5000)::BLOB
+  UNION ALL SELECT 3, 'c', NULL::BLOB
+  UNION ALL SELECT 4, 'd', 'old-4'::BLOB
+) TO '{TEST_DIR}/lance_blob_v2_values.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+# Bytes, NULL, and ingest replacements on a table whose payload column is
+# Blob v2 by default. The sibling columns keep their values.
+statement ok
+UPDATE ns.main.lance_blob_v2_values
+SET payload = 'new-1'::BLOB WHERE id = 1;
+
+statement ok
+UPDATE ns.main.lance_blob_v2_values
+SET payload = NULL::BLOB WHERE id = 2;
+
+statement ok
+UPDATE ns.main.lance_blob_v2_values
+SET payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_ingest.bin')
+WHERE id = 3;
+
+query III
+SELECT payload = 'new-1'::BLOB,
+       payload IS NULL,
+       payload = 'ingest-value'::BLOB
+FROM ns.main.lance_blob_v2_values
+ORDER BY id
+LIMIT 3;
+----
+true	false	false
+NULL	true	NULL
+false	false	true
+
+query III
+SELECT id, s, payload = 'old-4'::BLOB
+FROM ns.main.lance_blob_v2_values WHERE id = 4;
+----
+4	d	true
+
+# An absolute reference outside every registered base is accepted by UPDATE.
+statement ok
+UPDATE ns.main.lance_blob_v2_values
+SET payload = lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_reference.bin')
+WHERE id = 4;
+
+query I
+SELECT payload = 'reference-value'::BLOB FROM ns.main.lance_blob_v2_values WHERE id = 4;
+----
+true
+
+# Ingest materializes raw binary buffers. Backslash-x escapes, NUL,
+# non-UTF8 bytes and empty payloads must reach storage byte-for-byte.
+statement ok
+COPY (SELECT from_hex('7261775C783431656E64')) TO
+  '{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_backslash.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT from_hex('00FF5C783431')) TO
+  '{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_nul_nonutf8.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT ''::BLOB) TO
+  '{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_empty.bin' (FORMAT BLOB);
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'old-1'::BLOB AS payload
+  UNION ALL SELECT 2, 'old-2'::BLOB
+  UNION ALL SELECT 3, 'old-3'::BLOB
+  UNION ALL SELECT 4, 'old-4'::BLOB
+) TO '{TEST_DIR}/lance_blob_v2_binary_ingest.lance'
+  (FORMAT lance, mode 'overwrite');
+
+statement ok
+INSERT INTO ns.main.lance_blob_v2_binary_ingest VALUES
+  (5, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_backslash.bin')),
+  (6, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_nul_nonutf8.bin')),
+  (7, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_empty.bin'));
+
+query TI
+SELECT id, hex(payload) FROM ns.main.lance_blob_v2_binary_ingest
+WHERE id >= 5 ORDER BY id;
+----
+5	7261775C783431656E64
+6	00FF5C783431
+7	(empty)
+
+statement ok
+CREATE TEMP TABLE binary_ingest_sources(id BIGINT, uri VARCHAR);
+
+statement ok
+INSERT INTO binary_ingest_sources VALUES
+  (1, 'file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_backslash.bin'),
+  (2, 'file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_nul_nonutf8.bin'),
+  (3, 'file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_empty.bin');
+
+statement ok
+UPDATE ns.main.lance_blob_v2_binary_ingest AS t
+SET payload = lance_blob_ingest(s.uri)
+FROM binary_ingest_sources AS s
+WHERE t.id = s.id;
+
+query TI
+SELECT id, hex(payload) FROM ns.main.lance_blob_v2_binary_ingest
+WHERE id <= 3 ORDER BY id;
+----
+1	7261775C783431656E64
+2	00FF5C783431
+3	(empty)
+
+# MERGE RETURNING exposes the materialized bytes before commit.
+query TI
+MERGE INTO ns.main.lance_blob_v2_binary_ingest AS t
+USING (SELECT 4::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET
+  payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_backslash.bin')
+RETURNING id, hex(payload);
+----
+4	7261775C783431656E64
+
+query TI
+MERGE INTO ns.main.lance_blob_v2_binary_ingest AS t
+USING (SELECT 4::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET
+  payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_nul_nonutf8.bin')
+RETURNING id, hex(payload);
+----
+4	00FF5C783431
+
+# MERGE replacement through ingest, plus RETURNING of the real bytes.
+statement ok
+CREATE TEMP TABLE merge_blob_source(id BIGINT, payload BLOB);
+
+statement ok
+INSERT INTO merge_blob_source VALUES (1, 'ignored'::BLOB);
+
+query TI
+MERGE INTO ns.main.lance_blob_v2_values AS t
+USING (SELECT 1::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_reference.bin')
+RETURNING id, payload = 'reference-value'::BLOB;
+----
+1	true
+
+# MERGE INSERT with a reference value returns the referenced bytes.
+query TI
+MERGE INTO ns.main.lance_blob_v2_values AS t
+USING (SELECT 9::BIGINT AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, s, payload)
+VALUES (s.id, 'inserted', lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_reference.bin'))
+RETURNING id, payload = 'reference-value'::BLOB;
+----
+9	true
+
+query II
+SELECT id = 9, payload = 'reference-value'::BLOB
+FROM ns.main.lance_blob_v2_values WHERE id = 9;
+----
+true	true
+
+# A late ingest failure publishes nothing: row 2 keeps its NULL payload and
+# row 1 keeps the bytes from the successful statement above.
+statement error
+UPDATE ns.main.lance_blob_v2_values
+SET payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_missing.bin')
+WHERE id = 2;
+----
+Failed to materialize Lance Blob ingest value
+
+query II
+SELECT payload IS NULL, payload = 'reference-value'::BLOB
+FROM ns.main.lance_blob_v2_values WHERE id = 2;
+----
+true	NULL
+
+query I
+SELECT payload = 'reference-value'::BLOB FROM ns.main.lance_blob_v2_values WHERE id = 1;
+----
+true
+
+# Rolled-back UPDATE leaves the reference untouched.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_blob_v2_values
+SET payload = lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_dml_blob_v2_ingest.bin')
+WHERE id = 4;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT payload = 'reference-value'::BLOB FROM ns.main.lance_blob_v2_values WHERE id = 4;
+----
+true

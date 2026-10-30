@@ -12,15 +12,15 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 'test/.tmp/lance_merge_txn.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_merge_txn.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 CREATE OR REPLACE TEMP TABLE merge_txn_versions AS
   SELECT count(*)::BIGINT AS c
-  FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*');
+  FROM glob('{TEST_DIR}/lance_merge_txn.lance/_versions/*');
 
 statement ok
-ATTACH 'test/.tmp' AS merge_txn_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS merge_txn_ns (TYPE LANCE);
 
 statement ok
 BEGIN TRANSACTION;
@@ -49,7 +49,7 @@ SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
 
 query T
 SELECT (SELECT c FROM merge_txn_versions) =
-       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+       (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_merge_txn.lance/_versions/*'));
 ----
 true
 
@@ -81,7 +81,7 @@ SELECT id, s FROM merge_txn_ns.main.lance_merge_txn ORDER BY id;
 
 query T
 SELECT ((SELECT c FROM merge_txn_versions) + 1) =
-       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+       (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_merge_txn.lance/_versions/*'));
 ----
 true
 
@@ -101,7 +101,7 @@ COMMIT;
 
 query T
 SELECT ((SELECT c FROM merge_txn_versions) + 1) =
-       (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_merge_txn.lance/_versions/*'));
+       (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_merge_txn.lance/_versions/*'));
 ----
 true
 

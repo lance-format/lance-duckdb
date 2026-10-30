@@ -1,0 +1,96 @@
+# name: test/sql/maintenance_vacuum_pending_writes.test
+# description: VACUUM LANCE refuses delete_unverified while Lance writes are uncommitted
+# group: [sql]
+
+require lance
+
+# delete_unverified removes unreferenced data files regardless of age, which
+# includes the files of writes a still-open transaction has not committed.
+
+statement ok
+COPY (SELECT range::BIGINT AS id FROM range(2)) TO '{TEST_DIR}/vac_ns/t.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/vac_ns' AS vac_ns (TYPE LANCE);
+
+# Another connection's pending write keeps its files and commits intact.
+statement ok con1
+BEGIN;
+
+statement ok con1
+INSERT INTO vac_ns.main.t VALUES (10);
+
+statement error con2
+VACUUM LANCE vac_ns.main.t WITH (older_than_seconds = 0, delete_unverified = true);
+----
+delete_unverified cannot run while a transaction has uncommitted Lance writes
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT id FROM vac_ns.main.t ORDER BY id;
+----
+0
+1
+10
+
+# In the writing transaction itself the rejection aborts that transaction, so
+# its COMMIT rolls back.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO vac_ns.main.t VALUES (20);
+
+statement error
+VACUUM LANCE vac_ns.main.t WITH (older_than_seconds = 0, delete_unverified = true);
+----
+delete_unverified cannot run while a transaction has uncommitted Lance writes
+
+statement ok
+COMMIT;
+
+query I
+SELECT id FROM vac_ns.main.t ORDER BY id;
+----
+0
+1
+10
+
+# Without delete_unverified the pending files are kept and the commit stays readable.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO vac_ns.main.t VALUES (30);
+
+query TTT
+VACUUM LANCE vac_ns.main.t WITH (older_than_seconds = 0);
+----
+cleanup	<REGEX>:.*	<REGEX>:\{.*\}
+
+statement ok
+COMMIT;
+
+query I
+SELECT id FROM vac_ns.main.t ORDER BY id;
+----
+0
+1
+10
+30
+
+# With no transaction open, delete_unverified is allowed again.
+query TTT
+VACUUM LANCE vac_ns.main.t WITH (older_than_seconds = 0, delete_unverified = true);
+----
+cleanup	<REGEX>:.*	<REGEX>:\{.*\}
+
+query I
+SELECT id FROM vac_ns.main.t ORDER BY id;
+----
+0
+1
+10
+30

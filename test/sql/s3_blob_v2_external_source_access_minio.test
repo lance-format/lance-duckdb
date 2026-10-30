@@ -1,0 +1,68 @@
+# name: test/sql/s3_blob_v2_external_source_access_minio.test
+# description: Blob v2 absolute source URIs honor disabled external access
+# group: [sql]
+
+require-env LANCE_TEST_S3 1
+
+test-env LANCE_S3_ENDPOINT http://127.0.0.1:9000
+
+test-env LANCE_S3_REGION us-east-1
+
+test-env LANCE_S3_BUCKET lance-test
+
+test-env LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID blob-reader-a
+
+test-env LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY blob-reader-a-secret
+
+test-env LANCE_S3_BLOB_READER_B_ACCESS_KEY_ID blob-reader-b
+
+test-env LANCE_S3_BLOB_READER_B_SECRET_ACCESS_KEY blob-reader-b-secret
+
+require lance
+
+statement ok
+CREATE SECRET blob_source_a IN connection (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/a/',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_A_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_A_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok
+CREATE SECRET blob_source_b IN connection (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/blob_v2_external/b/',
+  ACCESS_KEY_ID '{LANCE_S3_BLOB_READER_B_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_BLOB_READER_B_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok
+SET enable_external_access=false;
+
+statement error
+SELECT *
+FROM lance_read_blob_ranges(
+  'test/data/blob_v2_external_source.lance',
+  'payload',
+  1,
+  'row_address',
+  (
+    SELECT id AS request_id,
+           CAST(rowid AS BIGINT) AS row_value,
+           0::BIGINT AS offset,
+           17::BIGINT AS length
+    FROM 'test/data/blob_v2_external_source.lance'
+  )
+);
+----
+Cannot access source URI

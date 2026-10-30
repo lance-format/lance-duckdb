@@ -4,17 +4,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use lance::session::Session;
-use lance_core::cache::{CacheBackend, MokaCacheBackend};
+use lance::session::{CacheSpec, Session};
+use lance_core::cache::{CacheBackend, MokaCacheBackend, QuickCacheBackend, QuickCacheShardPolicy};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
+use super::source_resolver::{create_source_session, SourceResolverCallbacks};
 use super::types::SessionHandle;
 use super::util::{optional_session_handle, u64_to_usize, FfiError, FfiResult};
 
 static DATASET_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_DESCRIBE_COUNT: AtomicU64 = AtomicU64::new(0);
 static COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The debug counters above are process-global, so unit tests that either
+/// assert on them or mutate them (e.g. by opening datasets through the FFI)
+/// must be serialized against each other to stay deterministic under the
+/// parallel test runner.
+#[cfg(test)]
+pub(crate) fn debug_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another test failed while holding it; the
+    // guarded state is just the counters, so continuing is safe.
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,22 +88,77 @@ fn create_session_inner(
         };
     let index_cache: Arc<dyn CacheBackend> =
         Arc::new(MokaCacheBackend::with_capacity(index_cache_size_bytes));
-    let session = Arc::new(Session::with_index_cache_backend(
-        index_cache.clone(),
+    let metadata_cache: Arc<dyn CacheBackend> = Arc::new(QuickCacheBackend::with_shard_policy(
         metadata_cache_size_bytes,
+        QuickCacheShardPolicy::Recommended,
+    ));
+    let session = Arc::new(Session::with_cache_backends(
+        CacheSpec::Backend(index_cache.clone()),
+        CacheSpec::Backend(metadata_cache.clone()),
         Default::default(),
     ));
     Ok(SessionHandle {
         session,
         index_cache,
+        metadata_cache,
+        source_resolution: None,
+        clear_caches_on_close: true,
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_source_session(
+    parent_session: *mut c_void,
+    callbacks: *const SourceResolverCallbacks,
+) -> *mut c_void {
+    if callbacks.is_null() {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "source resolver callbacks is null",
+        );
+        return ptr::null_mut();
+    }
+    let callbacks = unsafe { *callbacks };
+    let result = (|| {
+        if parent_session.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "parent session is null",
+            ));
+        }
+        let parent = unsafe { &*(parent_session as *const SessionHandle) };
+        create_source_session(parent, callbacks)
+            .map_err(|message| FfiError::new(ErrorCode::Runtime, message))
+    })();
+    match result {
+        Ok(handle) => {
+            clear_last_error();
+            Box::into_raw(Box::new(handle)) as *mut c_void
+        }
+        Err(err) => {
+            // The C++ callback table transfers resolver ownership to Rust.
+            if let Some(destroy) = callbacks.destroy {
+                unsafe { destroy(callbacks.resolver) };
+            }
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
 fn clear_session_caches(handle: &SessionHandle) {
+    // Skip during process teardown: a C++ static destructor can close a session after
+    // this thread's TLS is destroyed, and `block_on` would then panic inside tokio's
+    // context thread-local and wedge shutdown. The caches die with the process anyway.
+    if let Err(err) = tokio::runtime::Handle::try_current() {
+        if err.is_thread_local_destroyed() {
+            return;
+        }
+    }
     if let Some(runtime) = crate::runtime::initialized_runtime() {
         runtime.block_on(async {
             handle.index_cache.clear().await;
-            handle.session.file_metadata_cache().clear().await;
+            handle.metadata_cache.clear().await;
         });
     }
 }
@@ -99,7 +167,9 @@ fn clear_session_caches(handle: &SessionHandle) {
 pub unsafe extern "C" fn lance_close_session(session: *mut c_void) {
     if !session.is_null() {
         let handle = unsafe { Box::from_raw(session as *mut SessionHandle) };
-        clear_session_caches(&handle);
+        if handle.clear_caches_on_close {
+            clear_session_caches(&handle);
+        }
     }
 }
 
@@ -200,6 +270,7 @@ mod tests {
 
     #[test]
     fn test_open_dataset_with_session_records_debug_counters() {
+        let _counter_guard = debug_counter_test_lock();
         let dataset_dir =
             std::env::temp_dir().join(format!("ffi-session-{}", rand::random::<u64>()));
         let uri = dataset_dir.to_string_lossy().to_string();

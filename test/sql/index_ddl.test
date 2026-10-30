@@ -6,23 +6,51 @@ require lance
 
 statement ok
 COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
-TO 'test/.tmp/index_ddl_base.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/index_ddl_base.lance' (FORMAT lance, mode 'overwrite');
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_base.lance';
 ----
 
 statement ok
-CREATE INDEX vec_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
+CREATE INDEX vec_idx ON '{TEST_DIR}/index_ddl_base.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_base.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_base.lance';
 ----
 vec_idx	<REGEX>:.*	vec	2048	<REGEX>:.*
 
+# Invalid boolean values in WITH are rejected, not silently coerced to a default
+statement error
+CREATE INDEX bad_train_idx ON '{TEST_DIR}/index_ddl_base.lance' (label)
+USING BTREE WITH (train=ture);
+----
+WITH train must be a boolean
+
+statement error
+CREATE INDEX bad_replace_idx ON '{TEST_DIR}/index_ddl_base.lance' (label)
+USING BTREE WITH (replace=maybe);
+----
+WITH replace must be a boolean
+
+# A raw params JSON is the complete parameter set, so combining it with sibling
+# options would silently drop those siblings and build a different index.
+statement error
+CREATE INDEX bad_params_combo_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
+USING IVF_FLAT WITH (params='{"num_partitions":1}', metric_type='cosine');
+----
+WITH params cannot be combined with other index options
+
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+# Same rule when the target is an attached-namespace table name, not a path.
+statement error
+CREATE INDEX bad_params_combo_native_idx ON ns.main.index_ddl_base (label)
+USING BTREE WITH (params='{"foo":1}', metric_type='cosine');
+----
+WITH params cannot be combined with other index options
 
 statement ok
 CREATE INDEX attached_label_idx ON ns.main.index_ddl_base (label) USING BTREE;
@@ -66,7 +94,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/index_ddl_base.lance',
+  '{TEST_DIR}/index_ddl_base.lance',
   'vec',
   [
     0.32245764,
@@ -99,7 +127,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/index_ddl_base.lance',
+  '{TEST_DIR}/index_ddl_base.lance',
   'vec',
   [
     0.32245764,
@@ -130,7 +158,7 @@ query I
 WITH got AS (
   SELECT id
   FROM lance_vector_search(
-    'test/.tmp/index_ddl_base.lance',
+    '{TEST_DIR}/index_ddl_base.lance',
     'vec',
     [
       0.32245764,
@@ -162,7 +190,7 @@ query I
 WITH got AS (
   SELECT r.id AS id
   FROM lance_vector_search(
-    'test/.tmp/index_ddl_base.lance',
+    '{TEST_DIR}/index_ddl_base.lance',
     'vec',
     [
       0.32245764,
@@ -198,23 +226,23 @@ SELECT count(*) FROM got WHERE id IN (SELECT id FROM exp);
 1
 
 statement ok
-CREATE INDEX label_idx ON 'test/.tmp/index_ddl_base.lance' (label)
+CREATE INDEX label_idx ON '{TEST_DIR}/index_ddl_base.lance' (label)
 USING BTREE;
 
 query I
-SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label = 1;
+SELECT count(*) FROM '{TEST_DIR}/index_ddl_base.lance' WHERE label = 1;
 ----
 256
 
 query II
 EXPLAIN (FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label = 1;
+SELECT count(*) FROM '{TEST_DIR}/index_ddl_base.lance' WHERE label = 1;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
 query II
 EXPLAIN (FORMAT JSON)
-SELECT count(*) FROM 'test/.tmp/index_ddl_base.lance' WHERE label % 2 = 1;
+SELECT count(*) FROM '{TEST_DIR}/index_ddl_base.lance' WHERE label % 2 = 1;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Pushed Filter Parts": "0"[\s\S]*
 
@@ -228,30 +256,30 @@ COPY (
     {'literal.dot': i + 100} AS dotted,
     {'a,b': i + 200, 'a)b': i + 300, 'a`b': i + 400} AS escaped
   FROM range(8) tbl(i)
-) TO 'test/.tmp/index_ddl_nested.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/index_ddl_nested.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-CREATE INDEX left_value_idx ON 'test/.tmp/index_ddl_nested.lance' (left_struct.value)
+CREATE INDEX left_value_idx ON '{TEST_DIR}/index_ddl_nested.lance' (left_struct.value)
 USING BTREE;
 
 statement ok
-CREATE INDEX dotted_literal_idx ON 'test/.tmp/index_ddl_nested.lance' (dotted.`literal.dot`)
+CREATE INDEX dotted_literal_idx ON '{TEST_DIR}/index_ddl_nested.lance' (dotted.`literal.dot`)
 USING BTREE;
 
 statement ok
-CREATE INDEX path_comma_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a,b`)
+CREATE INDEX path_comma_idx ON '{TEST_DIR}/index_ddl_nested.lance' (escaped.`a,b`)
 USING BTREE;
 
 statement ok
-CREATE INDEX path_paren_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a)b`)
+CREATE INDEX path_paren_idx ON '{TEST_DIR}/index_ddl_nested.lance' (escaped.`a)b`)
 USING BTREE;
 
 statement ok
-CREATE INDEX path_backtick_idx ON 'test/.tmp/index_ddl_nested.lance' (escaped.`a``b`)
+CREATE INDEX path_backtick_idx ON '{TEST_DIR}/index_ddl_nested.lance' (escaped.`a``b`)
 USING BTREE;
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_nested.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_nested.lance';
 ----
 dotted_literal_idx	<REGEX>:.*	dotted.`literal.dot`	8	<REGEX>:.*|NULL
 left_value_idx	<REGEX>:.*	left_struct.value	8	<REGEX>:.*|NULL
@@ -260,13 +288,16 @@ path_comma_idx	<REGEX>:.*	escaped.`a,b`	8	<REGEX>:.*|NULL
 path_paren_idx	<REGEX>:.*	escaped.`a)b`	8	<REGEX>:.*|NULL
 
 statement ok
-ATTACH 'test/.tmp' AS nested_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS nested_ns (TYPE LANCE);
 
+# Catalog entry resolution validates schema freshness against the (cached)
+# dataset before the scan binds, so the first catalog access already warms
+# the dataset cache and the scan bind reports a hit.
 query II
 EXPLAIN (FORMAT JSON)
 SELECT count(*) FROM nested_ns.main.index_ddl_nested WHERE right_struct.value = 4;
 ----
-physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*
 
 statement ok
 CREATE INDEX right_value_idx ON nested_ns.main.index_ddl_nested (index_ddl_nested.right_struct.value)
@@ -282,14 +313,17 @@ path_comma_idx	<REGEX>:.*	escaped.`a,b`	8	<REGEX>:.*|NULL
 path_paren_idx	<REGEX>:.*	escaped.`a)b`	8	<REGEX>:.*|NULL
 right_value_idx	<REGEX>:.*	right_struct.value	8	<REGEX>:.*|NULL
 
+# CREATE INDEX invalidated the cached dataset; the catalog freshness probe
+# reopens it during entry resolution (taking the miss), so the scan bind
+# itself reports a hit again.
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM nested_ns.main.index_ddl_nested WHERE right_struct.value = 4;
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "false"[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Dataset Cache Hit": "true"[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*
 
 statement error
-CREATE INDEX ambiguous_leaf_idx ON 'test/.tmp/index_ddl_nested.lance' (value)
+CREATE INDEX ambiguous_leaf_idx ON '{TEST_DIR}/index_ddl_nested.lance' (value)
 USING BTREE;
 ----
 IO Error: Failed to create Lance index
@@ -299,22 +333,22 @@ DETACH nested_ns;
 
 statement ok
 COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
-TO 'test/.tmp/index_ddl_untrained.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/index_ddl_untrained.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-CREATE INDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance' (label)
+CREATE INDEX label_idx_untrained ON '{TEST_DIR}/index_ddl_untrained.lance' (label)
 USING BTREE WITH (train=false);
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_untrained.lance';
 ----
 label_idx_untrained	<REGEX>:.*	label	0	<REGEX>:.*
 
 statement ok
-DROP INDEX label_idx_untrained ON 'test/.tmp/index_ddl_untrained.lance';
+DROP INDEX label_idx_untrained ON '{TEST_DIR}/index_ddl_untrained.lance';
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_untrained.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_untrained.lance';
 ----
 
 statement ok
@@ -324,32 +358,32 @@ COPY (
   SELECT 2::BIGINT AS id, 'document two'::VARCHAR AS text
   UNION ALL
   SELECT 3::BIGINT AS id, 'other text'::VARCHAR AS text
-) TO 'test/.tmp/index_ddl_text.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/index_ddl_text.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-CREATE INDEX text_idx ON 'test/.tmp/index_ddl_text.lance' (text)
+CREATE INDEX text_idx ON '{TEST_DIR}/index_ddl_text.lance' (text)
 USING INVERTED;
 
 query I
 SELECT count(*)
-FROM lance_fts('test/.tmp/index_ddl_text.lance', 'text', 'document', k = 10);
+FROM lance_fts('{TEST_DIR}/index_ddl_text.lance', 'text', 'document', k = 10);
 ----
 2
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_text.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_text.lance';
 ----
 text_idx	<REGEX>:.*	text	3	<REGEX>:.*
 
 statement ok
-DROP INDEX text_idx ON 'test/.tmp/index_ddl_text.lance';
+DROP INDEX text_idx ON '{TEST_DIR}/index_ddl_text.lance';
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/index_ddl_text.lance';
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_text.lance';
 ----
 
 query I
 SELECT count(*)
-FROM lance_fts('test/.tmp/index_ddl_text.lance', 'text', 'document', k = 10);
+FROM lance_fts('{TEST_DIR}/index_ddl_text.lance', 'text', 'document', k = 10);
 ----
 2

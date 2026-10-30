@@ -1,0 +1,73 @@
+# name: test/sql/copy_access_policy.test
+# description: Lance COPY and directory CTAS enforce DuckDB destination access policy
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 42 AS id) TO '{TEST_DIR}/copy_policy_denied.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/copy_policy_ns' AS policy_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE policy_ns.items AS SELECT 42 AS id;
+
+statement ok
+PREPARE policy_copy AS COPY (SELECT 99 AS id) TO '{TEST_DIR}/copy_policy_denied.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+SET allowed_paths = ['{TEST_DIR}/copy_policy_allowed.lance'];
+
+statement ok
+SET allowed_directories = ['{TEST_DIR}/copy_policy_directory.lance'];
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+EXECUTE policy_copy;
+----
+file system operations are disabled by configuration
+
+statement error
+COPY (SELECT 99 AS id) TO '{TEST_DIR}/copy_policy_denied.lance' (FORMAT lance, mode 'overwrite');
+----
+file system operations are disabled by configuration
+
+query I
+SELECT id FROM '{TEST_DIR}/copy_policy_denied.lance';
+----
+42
+
+statement error
+COPY (SELECT 7 AS id) TO '{TEST_DIR}/copy_policy_new.lance' (FORMAT lance);
+----
+file system operations are disabled by configuration
+
+statement error
+CREATE OR REPLACE TABLE policy_ns.items AS SELECT 99 AS id;
+----
+file system operations are disabled by configuration
+
+query I
+SELECT id FROM policy_ns.items;
+----
+42
+
+# The native policy's exact-path and directory exceptions remain supported.
+statement ok
+COPY (SELECT 7 AS id) TO '{TEST_DIR}/copy_policy_allowed.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT id FROM '{TEST_DIR}/copy_policy_allowed.lance';
+----
+7
+
+statement ok
+COPY (SELECT 11 AS id) TO '{TEST_DIR}/copy_policy_directory.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT id FROM '{TEST_DIR}/copy_policy_directory.lance';
+----
+11

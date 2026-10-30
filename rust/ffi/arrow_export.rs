@@ -6,6 +6,7 @@ use arrow::datatypes::DataType;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::Float32Array;
+use lance_arrow::json::convert_lance_json_to_arrow;
 
 use crate::constants::DISTANCE_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -94,6 +95,9 @@ fn batch_to_arrow_inner(
     }
     let batch = unsafe { batch_handle(batch)? };
     let batch = normalize_distance_column(batch)?;
+    let batch = convert_lance_json_to_arrow(&batch).map_err(|err| {
+        FfiError::new(ErrorCode::BatchExport, format!("batch json export: {err}"))
+    })?;
 
     let struct_array: Arc<dyn Array> = Arc::new(StructArray::from(batch));
     let data = struct_array.to_data();

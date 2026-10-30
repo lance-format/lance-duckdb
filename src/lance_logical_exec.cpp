@@ -5,7 +5,8 @@
 
 namespace duckdb {
 
-LogicalLanceExec::LogicalLanceExec(idx_t group_index, idx_t aggregate_index,
+LogicalLanceExec::LogicalLanceExec(TableIndex group_index,
+                                   TableIndex aggregate_index,
                                    idx_t group_count,
                                    vector<LogicalType> output_types,
                                    unique_ptr<LogicalOperator> child_get)
@@ -28,19 +29,20 @@ vector<ColumnBinding> LogicalLanceExec::GetColumnBindings() {
   bindings.reserve(output_types_.size());
   for (idx_t i = 0; i < output_types_.size(); i++) {
     if (i < group_count_) {
-      bindings.emplace_back(group_index_, i);
+      bindings.emplace_back(group_index_, ProjectionIndex(i));
     } else {
-      bindings.emplace_back(aggregate_index_, i - group_count_);
+      bindings.emplace_back(aggregate_index_,
+                            ProjectionIndex(i - group_count_));
     }
   }
   return bindings;
 }
 
-vector<idx_t> LogicalLanceExec::GetTableIndex() const {
+vector<TableIndex> LogicalLanceExec::GetTableIndex() const {
   if (group_count_ == 0) {
-    return vector<idx_t>{aggregate_index_};
+    return vector<TableIndex>{aggregate_index_};
   }
-  return vector<idx_t>{group_index_, aggregate_index_};
+  return vector<TableIndex>{group_index_, aggregate_index_};
 }
 
 string LogicalLanceExec::GetName() const { return "__LANCE_EXEC"; }

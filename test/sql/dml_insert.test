@@ -12,10 +12,10 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 'test/.tmp/lance_insert_append.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_insert_append.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 query I
 SELECT count(*) FROM ns.main.lance_insert_append;

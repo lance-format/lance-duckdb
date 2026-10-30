@@ -1,0 +1,114 @@
+# name: test/sql/json_extension_scan.test
+# description: JSON Arrow extension columns are readable as text
+# group: [sql]
+
+require lance
+
+require json
+
+# Committed updates must use a temporary dataset rather than a tracked fixture.
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, '{"a":1}'::JSON AS payload
+      UNION ALL SELECT 2::BIGINT, '{"a":2}'::JSON)
+TO '__TEST_DIR__/json_extension_scan/json_data.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+RESET arrow_lossless_conversion;
+
+query TTTTTT
+DESCRIBE SELECT * FROM '__TEST_DIR__/json_extension_scan/json_data.lance';
+----
+id	BIGINT	YES	NULL	NULL	NULL
+payload	VARCHAR	YES	NULL	NULL	NULL
+
+query TI
+SELECT payload, id FROM '__TEST_DIR__/json_extension_scan/json_data.lance' ORDER BY id;
+----
+{"a":1}	1
+{"a":2}	2
+
+statement ok
+ATTACH '__TEST_DIR__/json_extension_scan' AS json_ns (TYPE LANCE);
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 1::BIGINT AS id) AS source
+ON target.id = source.id
+WHEN MATCHED THEN DELETE;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM json_ns.main.json_data ORDER BY id;
+----
+1
+2
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE json_ns.main.json_data SET id = id + 10 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query TI
+SELECT payload, id FROM json_ns.main.json_data ORDER BY id;
+----
+{"a":2}	2
+{"a":1}	11
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE json_ns.main.json_data SET id = id - 10 WHERE id = 11;
+
+statement ok
+COMMIT;
+
+query TI
+SELECT payload, id FROM json_ns.main.json_data ORDER BY id;
+----
+{"a":1}	1
+{"a":2}	2
+
+statement error
+UPDATE json_ns.main.json_data SET payload = '{"a":3}' WHERE id = 1;
+----
+writes JSON column(s) [payload]
+
+statement error
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 1::BIGINT AS id, '{"a":3}'::VARCHAR AS payload) AS source
+ON target.id = source.id
+WHEN MATCHED THEN UPDATE SET payload = source.payload;
+----
+writes JSON column(s) [payload]
+
+statement error
+MERGE INTO json_ns.main.json_data AS target
+USING (SELECT 3::BIGINT AS id, '{"a":3}'::VARCHAR AS payload) AS source
+ON target.id = source.id
+WHEN NOT MATCHED THEN INSERT (id, payload)
+VALUES (source.id, source.payload);
+----
+writes JSON column(s) [payload]
+
+statement error
+INSERT INTO json_ns.main.json_data VALUES (3, '{"a":3}');
+----
+writes JSON column(s) [payload]
+
+statement ok
+DETACH json_ns;
