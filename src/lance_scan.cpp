@@ -2288,6 +2288,9 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     }
 
     if (output.size() == 0) {
+      // Filtering can leave dictionary vectors; restore the output cache
+      // before materializing the next batch.
+      output.Reset();
       continue;
     }
     output.Verify();
