@@ -1,0 +1,35 @@
+# name: test/sql/namespace_rest_ctas_catalog_visibility.test
+# description: REST CTAS refreshes the shared schema catalog after commit
+# group: [sql]
+
+require-env LANCE_TEST_NAMESPACE 1
+
+test-env LANCE_NAMESPACE_ENDPOINT http://127.0.0.1:2333
+
+test-env LANCE_NAMESPACE_ID default
+
+test-env LANCE_TEST_CTAS_TABLE rest_ctas_visibility_356ebea
+
+require lance
+
+statement ok con1
+ATTACH '${LANCE_NAMESPACE_ID}' AS ns (TYPE LANCE, ENDPOINT '${LANCE_NAMESPACE_ENDPOINT}');
+
+statement ok con1
+SHOW TABLES FROM ns.main;
+
+statement ok con2
+CREATE TABLE ns.main."${LANCE_TEST_CTAS_TABLE}" AS SELECT 4242::BIGINT AS id;
+
+query I con1
+SELECT count(*)
+FROM (SHOW TABLES FROM ns.main)
+WHERE name = '${LANCE_TEST_CTAS_TABLE}'
+----
+1
+
+statement ok con1
+DROP TABLE ns.main."${LANCE_TEST_CTAS_TABLE}";
+
+statement ok con1
+DETACH ns;

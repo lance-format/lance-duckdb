@@ -1,0 +1,33 @@
+# name: test/sql/namespace_ctas_catalog_visibility.test
+# description: CTAS refreshes the shared directory schema catalog after commit
+# group: [sql]
+
+require lance
+
+statement ok con1
+ATTACH '__TEST_DIR__/nsroot_ctas_visibility' AS ns (TYPE LANCE);
+
+statement ok con1
+CREATE TABLE ns.main.seed AS SELECT 1::BIGINT AS id;
+
+query T con1
+SHOW TABLES FROM ns.main
+----
+seed
+
+statement ok con2
+CREATE TABLE ns.main.ctas_new AS SELECT 42::BIGINT AS id;
+
+query T con1
+SHOW TABLES FROM ns.main
+----
+ctas_new
+seed
+
+query I con1
+SELECT sum(id) FROM ns.main.ctas_new
+----
+42
+
+statement ok con1
+DETACH ns;

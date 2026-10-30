@@ -8,13 +8,16 @@ use lance::dataset::builder::DatasetBuilder;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
-    DeclareTableRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
+    CreateNamespaceRequest, DeclareTableRequest, DescribeTableRequest, DropNamespaceRequest,
+    DropTableRequest, ListNamespacesRequest, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
-use lance_namespace::LanceNamespace;
+use lance_namespace::{LanceNamespace, NamespaceError};
 use lance_namespace_impls::RestNamespaceBuilder;
 
-use crate::error::{clear_last_error, namespace_error_code, set_last_error, ErrorCode};
+use crate::error::{
+    clear_last_error, downcast_namespace_error, namespace_error_code, set_last_error, ErrorCode,
+};
 use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
@@ -94,6 +97,61 @@ fn split_id(id: &str, delimiter: &str) -> Vec<String> {
     } else {
         id.split(delimiter).map(ToString::to_string).collect()
     }
+}
+
+struct NamespaceConnection {
+    endpoint: String,
+    bearer_token: Option<String>,
+    api_key: Option<String>,
+    delimiter: String,
+    headers_tsv: Option<String>,
+    namespace_parts: Vec<String>,
+}
+
+/// # Safety
+/// Each pointer must be null or point to a valid NUL-terminated string.
+unsafe fn parse_namespace_connection(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> FfiResult<NamespaceConnection> {
+    // SAFETY: the outer FFI contract keeps all input C strings valid for this call.
+    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")?.to_string() };
+    // SAFETY: this input follows the same live C-string contract.
+    let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")? };
+    // SAFETY: this input follows the same live C-string contract.
+    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
+    // SAFETY: this input follows the same live C-string contract.
+    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
+    // SAFETY: this input follows the same live C-string contract.
+    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
+    // SAFETY: this input follows the same live C-string contract.
+    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+
+    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace_parts = split_id(namespace_id, &delimiter);
+    Ok(NamespaceConnection {
+        endpoint,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+        namespace_parts,
+    })
+}
+
+fn build_namespace(connection: &NamespaceConnection) -> impl LanceNamespace {
+    build_config(
+        &connection.endpoint,
+        connection.bearer_token.as_deref(),
+        connection.api_key.as_deref(),
+        connection.headers_tsv.as_deref(),
+    )
+    .delimiter(connection.delimiter.clone())
+    .build()
 }
 
 fn normalize_listed_tables(
@@ -205,6 +263,272 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
             ),
             out,
         )
+    }
+}
+
+fn list_namespaces_inner(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+) -> FfiResult<Vec<String>> {
+    // SAFETY: the exported caller requires valid C strings for the duration of this call.
+    let connection = unsafe {
+        parse_namespace_connection(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )
+    }?;
+    let namespace = build_namespace(&connection);
+
+    let values = runtime::block_on(async move {
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = HashSet::new();
+        loop {
+            let mut req = ListNamespacesRequest::new();
+            req.id = Some(connection.namespace_parts.clone());
+            req.page_token = page_token.clone();
+            req.limit = Some(1000);
+            let resp = namespace.list_namespaces(req).await.map_err(|err| {
+                FfiError::new(
+                    namespace_error_code(&err, ErrorCode::NamespaceListNamespaces),
+                    format!("namespace list_namespaces: {err}"),
+                )
+            })?;
+            out.extend(resp.namespaces);
+            match resp.page_token {
+                Some(token) if !token.is_empty() => {
+                    if !seen_page_tokens.insert(token.clone()) {
+                        return Err(FfiError::new(
+                            ErrorCode::NamespaceListNamespaces,
+                            "namespace list_namespaces: repeated page token",
+                        ));
+                    }
+                    page_token = Some(token);
+                }
+                _ => break,
+            }
+        }
+        Ok::<_, FfiError>(out)
+    })
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
+
+    let mut seen = HashSet::with_capacity(values.len());
+    Ok(values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect())
+}
+
+/// List direct child namespaces for a REST namespace.
+///
+/// # Safety
+/// Each input pointer must be null or point to a valid NUL-terminated string.
+/// `out` must be null or point to writable storage for a `LanceStringList`.
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_list_namespaces(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    out: *mut LanceStringList,
+) -> i32 {
+    // SAFETY: out is the writable list storage promised by this function's contract.
+    unsafe {
+        export_string_list(
+            list_namespaces_inner(
+                endpoint,
+                namespace_id,
+                bearer_token,
+                api_key,
+                delimiter,
+                headers_tsv,
+            ),
+            out,
+        )
+    }
+}
+
+fn create_namespace_inner(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    if_not_exists: bool,
+) -> FfiResult<()> {
+    // SAFETY: the exported caller requires valid C strings for the duration of this call.
+    let connection = unsafe {
+        parse_namespace_connection(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )
+    }?;
+    let namespace = build_namespace(&connection);
+    let mut req = CreateNamespaceRequest::new();
+    req.id = Some(connection.namespace_parts.clone());
+    req.mode = Some(if if_not_exists {
+        "ExistOk".to_string()
+    } else {
+        "Create".to_string()
+    });
+
+    runtime::block_on(async move { namespace.create_namespace(req).await })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        .map(|_| ())
+        .or_else(|err| {
+            if if_not_exists
+                && matches!(
+                    downcast_namespace_error(&err),
+                    Some(NamespaceError::NamespaceAlreadyExists { .. })
+                )
+            {
+                Ok(())
+            } else {
+                Err(FfiError::new(
+                    namespace_error_code(&err, ErrorCode::NamespaceCreateNamespace),
+                    format!("namespace create_namespace: {err}"),
+                ))
+            }
+        })
+}
+
+/// Create a namespace through the REST namespace API.
+///
+/// # Safety
+/// Each input pointer must be null or point to a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_create_namespace(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    if_not_exists: bool,
+) -> i32 {
+    match create_namespace_inner(
+        endpoint,
+        namespace_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+        if_not_exists,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn drop_namespace_inner(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    if_exists: bool,
+    cascade: bool,
+) -> FfiResult<()> {
+    // SAFETY: the exported caller requires valid C strings for the duration of this call.
+    let connection = unsafe {
+        parse_namespace_connection(
+            endpoint,
+            namespace_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers_tsv,
+        )
+    }?;
+    let namespace = build_namespace(&connection);
+    let mut req = DropNamespaceRequest::new();
+    req.id = Some(connection.namespace_parts.clone());
+    req.mode = Some(if if_exists {
+        "Skip".to_string()
+    } else {
+        "Fail".to_string()
+    });
+    req.behavior = Some(if cascade {
+        "Cascade".to_string()
+    } else {
+        "Restrict".to_string()
+    });
+
+    runtime::block_on(async move { namespace.drop_namespace(req).await })
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        .map(|_| ())
+        .or_else(|err| {
+            if if_exists
+                && matches!(
+                    downcast_namespace_error(&err),
+                    Some(NamespaceError::NamespaceNotFound { .. })
+                )
+            {
+                Ok(())
+            } else {
+                Err(FfiError::new(
+                    namespace_error_code(&err, ErrorCode::NamespaceDropNamespace),
+                    format!("namespace drop_namespace: {err}"),
+                ))
+            }
+        })
+}
+
+/// Drop a namespace through the REST namespace API.
+///
+/// # Safety
+/// Each input pointer must be null or point to a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_drop_namespace(
+    endpoint: *const c_char,
+    namespace_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers_tsv: *const c_char,
+    if_exists: bool,
+    cascade: bool,
+) -> i32 {
+    match drop_namespace_inner(
+        endpoint,
+        namespace_id,
+        bearer_token,
+        api_key,
+        delimiter,
+        headers_tsv,
+        if_exists,
+        cascade,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
     }
 }
 

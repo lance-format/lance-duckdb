@@ -73,21 +73,44 @@ pub enum ErrorCode {
 
     BlobRangeRead = 56,
     NamespaceTableNotFound = 57,
+    NamespaceListNamespaces = 58,
+    NamespaceCreateNamespace = 59,
+    NamespaceDropNamespace = 60,
+    NamespaceNotFound = 61,
+    NamespaceAlreadyExists = 62,
+    NamespaceNotEmpty = 63,
+    NamespaceUnsupported = 64,
+}
+
+pub(crate) fn downcast_namespace_error(
+    err: &LanceError,
+) -> Option<&lance_namespace::NamespaceError> {
+    match err {
+        LanceError::Namespace { source, .. } => {
+            source.downcast_ref::<lance_namespace::NamespaceError>()
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn namespace_error_code(err: &LanceError, fallback: ErrorCode) -> ErrorCode {
-    let is_table_not_found = match err {
-        LanceError::Namespace { source, .. } => source
-            .downcast_ref::<lance_namespace::NamespaceError>()
-            .is_some_and(|err| {
-                matches!(err, lance_namespace::NamespaceError::TableNotFound { .. })
-            }),
-        _ => false,
-    };
-    if is_table_not_found {
-        ErrorCode::NamespaceTableNotFound
-    } else {
-        fallback
+    match downcast_namespace_error(err) {
+        Some(lance_namespace::NamespaceError::Unsupported { .. }) => {
+            ErrorCode::NamespaceUnsupported
+        }
+        Some(lance_namespace::NamespaceError::NamespaceNotFound { .. }) => {
+            ErrorCode::NamespaceNotFound
+        }
+        Some(lance_namespace::NamespaceError::NamespaceAlreadyExists { .. }) => {
+            ErrorCode::NamespaceAlreadyExists
+        }
+        Some(lance_namespace::NamespaceError::NamespaceNotEmpty { .. }) => {
+            ErrorCode::NamespaceNotEmpty
+        }
+        Some(lance_namespace::NamespaceError::TableNotFound { .. }) => {
+            ErrorCode::NamespaceTableNotFound
+        }
+        _ => fallback,
     }
 }
 

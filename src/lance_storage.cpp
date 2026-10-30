@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -68,6 +70,19 @@ struct LanceRestNamespaceConfig {
   string bearer_token_override;
   string api_key_override;
   string headers_tsv; // Tab-separated key\tvalue pairs for custom headers
+
+  void ResolveAuth(ClientContext &context, string &bearer_token,
+                   string &api_key) const {
+    unordered_map<string, Value> overrides;
+    if (!bearer_token_override.empty()) {
+      overrides["bearer_token"] = Value(bearer_token_override);
+    }
+    if (!api_key_override.empty()) {
+      overrides["api_key"] = Value(api_key_override);
+    }
+    ResolveLanceNamespaceAuth(context, endpoint, overrides, bearer_token,
+                              api_key);
+  }
 };
 
 static string GetLanceNamespaceEndpoint(const AttachInfo &info) {
@@ -202,15 +217,18 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return LanceConsumeStringList(tables);
 }
 
-static string GetRestNamespaceTableId(const string &namespace_id,
-                                      const string &table_name,
-                                      const string &delimiter) {
+static string AppendRestNamespaceId(const string &namespace_id,
+                                    const string &table_name,
+                                    const string &delimiter) {
   auto separator = delimiter.empty() ? "$" : delimiter;
-  if (table_name.empty() || table_name.find(separator) != string::npos) {
+  if (table_name.empty()) {
     throw InvalidInputException(
-        "Lance namespace table names must be non-empty and cannot contain "
-        "the namespace delimiter '%s'",
-        separator);
+        "Lance REST identifier segments must be non-empty");
+  }
+  if (table_name.find(separator) != string::npos) {
+    throw InvalidInputException("Lance REST identifier segment '%s' contains "
+                                "the configured delimiter '%s'",
+                                table_name, separator);
   }
   if (namespace_id.empty() || namespace_id == separator) {
     return table_name;
@@ -223,7 +241,7 @@ static bool FindRestNamespaceTableId(const string &namespace_id,
                                      const string &delimiter,
                                      const vector<string> &listed_names,
                                      string &out_table_id) {
-  out_table_id = GetRestNamespaceTableId(namespace_id, table_name, delimiter);
+  out_table_id = AppendRestNamespaceId(namespace_id, table_name, delimiter);
   const string *matched = nullptr;
   for (const auto &name : listed_names) {
     if (!StringUtil::CIEquals(name, table_name)) {
@@ -239,7 +257,7 @@ static bool FindRestNamespaceTableId(const string &namespace_id,
   if (!matched) {
     return false;
   }
-  out_table_id = GetRestNamespaceTableId(namespace_id, *matched, delimiter);
+  out_table_id = AppendRestNamespaceId(namespace_id, *matched, delimiter);
   return true;
 }
 
@@ -434,8 +452,7 @@ public:
   CreateDefaultEntry(ClientContext &context,
                      const Identifier &entry_name_p) override {
     const auto &entry_name = entry_name_p.GetIdentifierName();
-    auto table_id =
-        GetRestNamespaceTableId(namespace_id, entry_name, delimiter);
+    auto table_id = AppendRestNamespaceId(namespace_id, entry_name, delimiter);
     string bearer_token;
     string api_key;
     ResolveAuth(context, bearer_token, api_key);
@@ -632,10 +649,26 @@ public:
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
                    shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
-        rest_ns(std::move(rest_ns)) {}
+        rest_ns(std::move(rest_ns)) {
+    if (this->rest_ns) {
+      const auto &ns = *this->rest_ns;
+      table_default_generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
+          catalog, *this, ns.endpoint, ns.namespace_id, ns.delimiter,
+          ns.bearer_token_override, ns.api_key_override, ns.headers_tsv);
+    } else {
+      table_default_generator = make_uniq<LanceDirectoryDefaultGenerator>(
+          catalog, *this, this->directory_ns);
+    }
+  }
 
-  void SetTableDefaultGenerator(unique_ptr<LanceTableGenerator> generator) {
-    table_default_generator = std::move(generator);
+  vector<string> CachedDatasetKeys(ClientContext &context) {
+    lock_guard<mutex> guard(table_lock);
+    vector<string> keys;
+    for (const auto &entry : tables) {
+      keys.push_back(LanceBuildDatasetCacheKeyForTable(
+          context, entry.second->Cast<LanceTableEntry>()));
+    }
+    return keys;
   }
 
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
@@ -748,6 +781,31 @@ public:
       }
       throw CatalogException("Cannot replace a Lance table with a view");
     }
+    if (transaction.context &&
+        Settings::Get<EnableViewDependenciesSetting>(*transaction.context)) {
+      vector<SchemaCatalogEntry *> source_schemas;
+      for (const auto &dependency : info.dependencies.Set()) {
+        if (dependency.catalog != catalog.GetName() ||
+            dependency.entry.type != CatalogType::TABLE_ENTRY) {
+          continue;
+        }
+        auto qualified = QualifiedName::FromCatalogSchema(
+            dependency.catalog, dependency.entry.schema_path,
+            dependency.entry.name);
+        auto source = Catalog::GetEntry(
+            *transaction.context,
+            EntryLookupInfo(CatalogType::TABLE_ENTRY, std::move(qualified)),
+            OnEntryNotFound::RETURN_NULL);
+        if (source && dynamic_cast<LanceTableEntry *>(source.get())) {
+          source_schemas.push_back(&source->ParentSchema());
+        }
+      }
+      // The custom table map has no native table-to-schema containment edge.
+      // Add source schema dependencies after iterating the dependency set.
+      for (auto *source_schema : source_schemas) {
+        info.dependencies.AddDependency(*source_schema);
+      }
+    }
     return DuckSchemaEntry::CreateView(transaction, info);
   }
 
@@ -772,6 +830,10 @@ public:
     if (!lance_entry) {
       DuckSchemaEntry::DropEntry(context, info);
       return;
+    }
+    if (rest_ns && !context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance table DDL does not support explicit transactions");
     }
     auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
     lock_guard<mutex> guard(table_lock);
@@ -855,6 +917,10 @@ public:
           "Lance CREATE TABLE does not support constraints");
     }
     auto &context = transaction.GetContext();
+    if (rest_ns && !context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance table DDL does not support explicit transactions");
+    }
     auto data_storage_version =
         GetCreateTableDataStorageVersionOption(create_info);
     string dataset_path;
@@ -1113,6 +1179,137 @@ private:
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
 };
 
+// Native CatalogSet owns schema entries and calls GetDefaultEntries without a
+// context. ScanSchemas preloads the snapshot; point creation loads it itself.
+class LanceSchemaDefaultGenerator final : public DefaultGenerator {
+public:
+  LanceSchemaDefaultGenerator(Catalog &catalog,
+                              shared_ptr<LanceRestNamespaceConfig> ns)
+      : DefaultGenerator(catalog), ns(std::move(ns)) {}
+
+  void EnsureLoaded(ClientContext &context) {
+    if (!TryEnsureLoaded(context)) {
+      throw NotImplementedException(
+          "Child namespace discovery is not supported" + unsupported_error);
+    }
+  }
+
+  bool TryEnsureLoaded(ClientContext &context) {
+    lock_guard<mutex> guard(snapshot_lock);
+    if (state == DiscoveryState::Loaded) {
+      return true;
+    }
+    if (state == DiscoveryState::Unsupported) {
+      return false;
+    }
+    string bearer_token;
+    string api_key;
+    ns->ResolveAuth(context, bearer_token, api_key);
+    LanceStringList result = {};
+    auto rc = lance_namespace_list_namespaces(
+        ns->endpoint.c_str(), ns->namespace_id.c_str(), bearer_token.c_str(),
+        api_key.c_str(), ns->delimiter.c_str(), ns->headers_tsv.c_str(),
+        &result);
+    if (rc != 0) {
+      auto code = lance_last_error_code();
+      auto error = LanceFormatErrorSuffix();
+      if (code == NAMESPACE_UNSUPPORTED) {
+        state = DiscoveryState::Unsupported;
+        unsupported_error = std::move(error);
+        return false;
+      }
+      throw IOException(
+          "Failed to list Lance child namespaces: " + ns->namespace_id + error);
+    }
+    auto listed = LanceConsumeStringList(result);
+    identifier_map_t<string> validated;
+    for (const auto &name : listed) {
+      auto identifier = Identifier(name);
+      if (DefaultSchemaGenerator::IsDefaultSchema(identifier)) {
+        throw CatalogException(
+            "Lance child namespace '%s' conflicts with a reserved schema",
+            name);
+      }
+      (void)AppendRestNamespaceId(ns->namespace_id, name, ns->delimiter);
+      auto inserted = validated.emplace(identifier, name);
+      if (!inserted.second) {
+        throw CatalogException(
+            "Ambiguous Lance child namespace names '%s' and '%s'",
+            inserted.first->second, name);
+      }
+    }
+    names = std::move(validated);
+    state = DiscoveryState::Loaded;
+    return true;
+  }
+
+  shared_ptr<LanceRestNamespaceConfig> ChildConfig(const string &name) const {
+    auto child = make_shared_ptr<LanceRestNamespaceConfig>(*ns);
+    child->namespace_id =
+        AppendRestNamespaceId(ns->namespace_id, name, ns->delimiter);
+    return child;
+  }
+
+  unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &context,
+                                              const Identifier &name) override {
+    if (DefaultSchemaGenerator::IsDefaultSchema(name)) {
+      return nullptr;
+    }
+    EnsureLoaded(context);
+    string physical_name;
+    {
+      lock_guard<mutex> guard(snapshot_lock);
+      auto found = names.find(name);
+      if (found == names.end()) {
+        return nullptr;
+      }
+      physical_name = found->second;
+    }
+    CreateSchemaInfo info;
+    info.SetSchema(Identifier(physical_name));
+    auto entry = make_uniq<LanceSchemaEntry>(catalog, info, nullptr,
+                                             ChildConfig(physical_name));
+    return unique_ptr_cast<LanceSchemaEntry, CatalogEntry>(std::move(entry));
+  }
+
+  vector<Identifier> GetDefaultEntries() override {
+    lock_guard<mutex> guard(snapshot_lock);
+    if (state == DiscoveryState::Unsupported) {
+      throw NotImplementedException(
+          "Child namespace discovery is not supported" + unsupported_error);
+    }
+    if (state != DiscoveryState::Loaded) {
+      throw InternalException(
+          "Lance schema enumeration requires a query context");
+    }
+    vector<Identifier> result;
+    for (const auto &name : names) {
+      result.push_back(name.first);
+    }
+    return result;
+  }
+
+  void Remember(const Identifier &name) {
+    lock_guard<mutex> guard(snapshot_lock);
+    names[name] = name.GetIdentifierName();
+  }
+
+  void Forget(const Identifier &name) {
+    lock_guard<mutex> guard(snapshot_lock);
+    names.erase(name);
+  }
+
+private:
+  shared_ptr<LanceRestNamespaceConfig> ns;
+  mutex snapshot_lock;
+  enum class DiscoveryState : uint8_t { Uninitialized, Loaded, Unsupported };
+  DiscoveryState state = DiscoveryState::Uninitialized;
+  string unsupported_error;
+  // Mirrored by ErrorCode::NamespaceUnsupported in rust/error.rs.
+  static constexpr int32_t NAMESPACE_UNSUPPORTED = 64;
+  identifier_map_t<string> names;
+};
+
 bool LanceTryReplaceStaleTableEntry(ClientContext &context,
                                     LanceTableEntry &table) {
   auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&table.schema);
@@ -1132,7 +1329,158 @@ public:
                    shared_ptr<LanceDirectoryNamespaceConfig> directory_ns,
                    shared_ptr<LanceRestNamespaceConfig> rest_ns)
       : DuckCatalog(db), directory_ns(std::move(directory_ns)),
-        rest_ns(std::move(rest_ns)) {}
+        rest_ns(std::move(rest_ns)) {
+    if (this->rest_ns) {
+      auto generator =
+          make_uniq<LanceSchemaDefaultGenerator>(*this, this->rest_ns);
+      schema_generator = generator.get();
+      GetSchemaCatalogSet().SetDefaultGenerator(std::move(generator));
+    }
+  }
+
+  bool SupportsNestedSchemas() const override { return false; }
+
+  ErrorData SupportsCreateSchema(CreateSchemaInfo &info) override {
+    if (info.IsNested()) {
+      return ErrorData(ExceptionType::NOT_IMPLEMENTED,
+                       "Nested schemas are not supported by Lance attachments");
+    }
+    if (info.internal ||
+        DefaultSchemaGenerator::IsDefaultSchema(info.SchemaName())) {
+      return ErrorData();
+    }
+    if (!rest_ns) {
+      return ErrorData(
+          ExceptionType::NOT_IMPLEMENTED,
+          "CREATE SCHEMA is not supported for legacy Lance directory "
+          "namespaces because manifest mode is disabled");
+    }
+    if (!info.options.empty()) {
+      return ErrorData(ExceptionType::NOT_IMPLEMENTED,
+                       "Lance schema options are not supported");
+    }
+    return ErrorData();
+  }
+
+  optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction,
+                                          CreateSchemaInfo &info) override {
+    if (info.internal) {
+      return DuckCatalog::CreateSchema(transaction, info);
+    }
+    auto supported = SupportsCreateSchema(info);
+    if (supported.HasError()) {
+      supported.Throw();
+    }
+    auto &context = transaction.GetContext();
+    if (!context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance schema DDL does not support explicit transactions");
+    }
+    if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+      throw NotImplementedException(
+          "CREATE OR REPLACE SCHEMA is not supported for Lance namespaces");
+    }
+    if (DefaultSchemaGenerator::IsDefaultSchema(info.SchemaName())) {
+      return DuckCatalog::CreateSchema(transaction, info);
+    }
+    schema_generator->EnsureLoaded(context);
+    auto child =
+        schema_generator->ChildConfig(info.SchemaName().GetIdentifierName());
+    auto entry = make_uniq<LanceSchemaEntry>(*this, info, nullptr, child);
+    auto *created = entry.get();
+    LogicalDependencyList dependencies;
+    if (!GetSchemaCatalogSet().CreateEntry(transaction, info.SchemaName(),
+                                           std::move(entry), dependencies)) {
+      (void)info.ShouldReplaceOnConflict();
+      return nullptr;
+    }
+    string bearer_token;
+    string api_key;
+    child->ResolveAuth(context, bearer_token, api_key);
+    auto rc = lance_namespace_create_namespace(
+        child->endpoint.c_str(), child->namespace_id.c_str(),
+        bearer_token.c_str(), api_key.c_str(), child->delimiter.c_str(),
+        child->headers_tsv.c_str(),
+        info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT);
+    if (rc != 0) {
+      throw IOException("Failed to create Lance namespace: " +
+                        child->namespace_id + LanceFormatErrorSuffix());
+    }
+    schema_generator->Remember(info.SchemaName());
+    return created;
+  }
+
+  using DuckCatalog::ScanSchemas;
+
+  void
+  ScanSchemas(ClientContext &context,
+              std::function<void(SchemaCatalogEntry &)> callback) override {
+    if (schema_generator && !schema_generator->TryEnsureLoaded(context)) {
+      // DuckDB's system tables scan every schema before applying SQL filters.
+      // An unsupported discovery operation can still expose known native
+      // entries without marking the default generator complete. Named child
+      // lookup continues to report the capability error.
+      DuckCatalog::ScanSchemas(std::move(callback));
+      return;
+    }
+    DuckCatalog::ScanSchemas(context, std::move(callback));
+  }
+
+  void DropSchema(ClientContext &context, DropInfo &info) override {
+    if (info.GetQualifiedName().Path().size() > 2) {
+      throw NotImplementedException(
+          "Nested schemas are not supported by Lance attachments");
+    }
+    if (!context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance schema DDL does not support explicit transactions");
+    }
+    auto transaction = GetCatalogTransaction(context);
+    auto schema = LookupSchema(
+        transaction,
+        EntryLookupInfo(CatalogType::SCHEMA_ENTRY, info.GetQualifiedName()),
+        info.if_not_found);
+    if (!schema) {
+      return;
+    }
+    if (schema->internal ||
+        DefaultSchemaGenerator::IsDefaultSchema(schema->name)) {
+      throw CatalogException("Cannot drop protected Lance schema '%s'",
+                             schema->name);
+    }
+    auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(schema.get());
+    if (!rest_ns || !lance_schema) {
+      throw NotImplementedException(
+          "DROP SCHEMA is not supported for this Lance schema");
+    }
+    const auto name = schema->name;
+    auto child = schema_generator->ChildConfig(name.GetIdentifierName());
+    auto keys = lance_schema->CachedDatasetKeys(context);
+    if (!GetSchemaCatalogSet().DropEntry(transaction, name, info.cascade,
+                                         info.allow_drop_internal)) {
+      if (info.if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+        throw CatalogException("Lance schema '%s' does not exist", name);
+      }
+      return;
+    }
+    string bearer_token;
+    string api_key;
+    child->ResolveAuth(context, bearer_token, api_key);
+    auto rc = lance_namespace_drop_namespace(
+        child->endpoint.c_str(), child->namespace_id.c_str(),
+        bearer_token.c_str(), api_key.c_str(), child->delimiter.c_str(),
+        child->headers_tsv.c_str(),
+        info.if_not_found == OnEntryNotFound::RETURN_NULL, info.cascade);
+    if (rc != 0) {
+      // Throwing rolls back the native schema, view and dependency tombstones.
+      throw IOException("Failed to drop Lance namespace: " +
+                        child->namespace_id + LanceFormatErrorSuffix());
+    }
+    schema_generator->Forget(name);
+    for (const auto &key : keys) {
+      LanceInvalidateDatasetCache(context, key);
+    }
+  }
 
   using DuckCatalog::PlanUpdate;
 
@@ -1218,6 +1566,10 @@ public:
                                       LogicalCreateTable &op,
                                       PhysicalOperator &plan) override {
     auto &create_info = op.info->Base();
+    if (rest_ns && !context.transaction.IsAutoCommit()) {
+      throw NotImplementedException(
+          "Lance table DDL does not support explicit transactions");
+    }
     auto data_storage_version =
         GetCreateTableDataStorageVersionOption(create_info);
     if (create_info.temporary) {
@@ -1648,6 +2000,7 @@ public:
 private:
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
+  optional_ptr<LanceSchemaDefaultGenerator> schema_generator;
 };
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
@@ -1678,7 +2031,6 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto delimiter = GetLanceNamespaceDelimiter(info);
   auto headers_tsv = GetLanceNamespaceHeaders(info);
 
-  unique_ptr<LanceTableGenerator> generator;
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
 
@@ -1735,19 +2087,6 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto system_transaction =
       CatalogTransaction::GetSystemTransaction(db.GetDatabase());
   catalog->ReplaceDefaultSchemaWithLanceSchema(system_transaction);
-  auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
-
-  auto &lance_schema = schema.Cast<LanceSchemaEntry>();
-
-  if (!is_rest_namespace) {
-    generator = make_uniq<LanceDirectoryDefaultGenerator>(*catalog, schema,
-                                                          directory_ns);
-  } else {
-    generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
-        *catalog, schema, endpoint, namespace_id, delimiter,
-        bearer_token_override, api_key_override, headers_tsv);
-  }
-  lance_schema.SetTableDefaultGenerator(std::move(generator));
 
   (void)name;
   return std::move(catalog);

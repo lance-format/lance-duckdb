@@ -62,6 +62,50 @@ Table enumeration accepts either full IDs with the attached namespace prefix
 or relative leaf names. Deeper descendants and IDs from other namespaces are
 excluded from this schema.
 
+### Namespaces and schemas
+
+The attached namespace is exposed as DuckDB `main`. Its direct child namespaces
+are exposed as schemas in the same catalog:
+
+```sql
+ATTACH 'default' AS ns (TYPE LANCE, ENDPOINT 'http://localhost:10024');
+SELECT * FROM ns.main.orders;
+SELECT * FROM ns.analytics.orders;
+CREATE SCHEMA ns.reporting;
+CREATE TABLE ns.reporting.daily AS SELECT 42 AS total;
+DROP TABLE ns.reporting.daily;
+DROP SCHEMA ns.reporting;
+```
+
+Here `ns.analytics.orders` addresses `default$analytics$orders`. Every table
+operation uses the namespace bound to its schema. Deeper namespace trees can
+be accessed through another `ATTACH`; nested schema CREATE/DROP is unsupported.
+Names containing dots or newlines remain single quoted SQL identifiers when
+the configured REST delimiter permits them. Empty names, reserved schema names
+(`main`, `information_schema`, `pg_catalog`), delimiter-bearing names, and
+case-insensitive collisions in child discovery are rejected.
+
+Child discovery is lazy and collects every page before publishing a complete
+snapshot. Each attachment keeps that snapshot; use `DETACH`/`ATTACH` to observe
+external namespace changes. Successful schema CREATE/DROP updates the local
+snapshot. Table discovery and metadata freshness retain their existing behavior.
+Direct `main` table lookup does not require child discovery. DuckDB system
+catalog queries, including `SHOW TABLES`, enumerate schemas before filtering and
+therefore may require namespace listing permission. If the backend explicitly
+does not support namespace listing, system catalog queries expose known local
+entries; named child discovery still reports the unsupported operation.
+Authentication, transport, and malformed-response errors are not hidden.
+
+Schema DDL and REST table DDL require autocommit. `CREATE OR REPLACE SCHEMA`
+is unsupported. `DROP SCHEMA ... RESTRICT` and `... CASCADE` use the backend's
+namespace operation after DuckDB checks local dependencies. A remote failure
+rolls back DuckDB's local schema/view changes; it does not provide a distributed
+rollback guarantee for an uncertain remote outcome. Cross-schema view dependency
+tracking follows DuckDB's `enable_view_dependencies` setting.
+
+Legacy directory attachments have manifest mode disabled and expose `main`
+only; they do not support child schema CREATE.
+
 ### Custom Headers
 
 The `HEADER` option allows passing custom HTTP headers to the REST Namespace server. Multiple headers can be specified using semicolon separation:
