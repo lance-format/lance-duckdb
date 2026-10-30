@@ -52,9 +52,9 @@ statement ok
 DROP TABLE ns.main.dropcase;
 
 statement error
-SELECT count(*) FROM 'test/.tmp/nsroot/DropCase.lance';
+SELECT count(*) FROM '{TEST_DIR}/nsroot/DropCase.lance';
 ----
-IO Error: Failed to open Lance dataset: test/.tmp/nsroot/DropCase.lance (Lance error: dataset open 'test/.tmp/nsroot/DropCase.lance':
+IO Error: Failed to open Lance dataset: {TEST_DIR}/nsroot/DropCase.lance (Lance error: dataset open '{TEST_DIR}/nsroot/DropCase.lance':
 
 statement error
 SELECT count(*) FROM ns.main.dropcase;
