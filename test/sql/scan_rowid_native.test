@@ -20,6 +20,14 @@ Bob
 Bob
 David
 
+# Non-take rowid predicates keep the projected rowid binding valid.
+query TI
+SELECT name, CAST(rowid AS BIGINT) FROM 'test/data/test_data.lance' WHERE rowid > 1 ORDER BY rowid
+----
+Charlie	2
+David	3
+Eve	4
+
 # Project `rowid` (cast to BIGINT for stable test typing)
 query TI
 SELECT name, CAST(rowid AS BIGINT) FROM 'test/data/test_data.lance' WHERE rowid IN (2, 0, 4)

@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 
+struct LanceNamespaceQueryConfig;
+
 namespace duckdb {
 
 string LanceConsumeLastError();
@@ -13,6 +15,8 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
                         DataChunk &chunk, SelectionVector &sel);
 
 void *LanceOpenDataset(ClientContext &context, const string &path);
+void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
+                                const optional_idx &version);
 
 string LanceNormalizeS3Scheme(const string &path);
 void LanceFillStorageOptionsFromSecrets(ClientContext &context,
@@ -32,12 +36,13 @@ static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_FILE = 1024ULL * 1024ULL;
 static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
 static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
+static constexpr const char *LANCE_DEFAULT_DATA_STORAGE_VERSION = "2.2";
 
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
-                               const named_parameter_map_t &options,
+                               const named_argument_map_t &options,
                                string &out_bearer_token, string &out_api_key);
 void ResolveLanceNamespaceAuthOverrides(
     const unordered_map<string, Value> &options, string &out_bearer_token,
@@ -83,18 +88,15 @@ bool TryLanceNamespaceDropTable(ClientContext &context, const string &endpoint,
 struct LanceNamespaceTableConfig;
 class LanceTableEntry;
 
-string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
+void FillLanceNamespaceQueryConfig(
+    ClientContext &context, const LanceNamespaceTableConfig &cfg, uint64_t k,
+    bool prefilter, const string &filter, const vector<string> &columns,
+    vector<const char *> &option_key_ptrs,
+    vector<const char *> &option_value_ptrs, vector<const char *> &column_ptrs,
+    string &bearer_token, string &api_key,
+    ::LanceNamespaceQueryConfig &out_config);
 
-// Resolve a string like "catalog.schema.table" to a LanceTableEntry* if it
-// names a Lance-backed table in an attached catalog.  Returns nullptr for
-// inputs that look like filesystem / URL paths, or when the lookup does not
-// yield a Lance table (missing entry, non-Lance table, malformed qualified
-// name).  This is the canonical way to re-resolve a dataset from its
-// original first-argument literal so we can take the namespace-aware
-// LanceOpenDatasetForTable() path instead of passing the virtual
-// namespace URI directly to lance-io.
-LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
-                                           const string &input);
+string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
@@ -106,12 +108,5 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         vector<string> &out_option_keys,
                                         vector<string> &out_option_values,
                                         string &out_display_uri);
-
-int64_t LanceTruncateDatasetWithStorageOptions(
-    ClientContext &context, const string &open_path,
-    const vector<string> &option_keys, const vector<string> &option_values,
-    const string &display_uri);
-
-int64_t LanceTruncateDataset(ClientContext &context, const string &dataset_uri);
 
 } // namespace duckdb

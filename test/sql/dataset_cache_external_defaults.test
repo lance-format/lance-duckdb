@@ -1,0 +1,77 @@
+# name: test/sql/dataset_cache_external_defaults.test
+# description: Same-schema replacement refreshes defaults used by native DML binding
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/cache_default_ns' AS default_writer (TYPE LANCE);
+
+statement ok
+ATTACH '{TEST_DIR}/cache_default_ns' AS default_reader (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE default_writer.items (id BIGINT, v INTEGER DEFAULT 42);
+
+statement ok
+INSERT INTO default_writer.items VALUES (1, 0);
+
+query I
+SELECT v FROM default_reader.items;
+----
+0
+
+statement ok
+PREPARE default_update AS UPDATE default_reader.items SET v = DEFAULT WHERE id = 1;
+
+statement ok
+CREATE OR REPLACE TABLE default_writer.items (id BIGINT, v INTEGER DEFAULT 99);
+
+statement ok
+INSERT INTO default_writer.items VALUES (1, 0);
+
+statement ok
+EXECUTE default_update;
+
+query I
+SELECT v FROM default_reader.items;
+----
+99
+
+statement ok
+INSERT INTO default_reader.items (id) VALUES (2);
+
+query I
+SELECT v FROM default_reader.items WHERE id = 2;
+----
+99
+
+# Removing the default also changes binding without changing names or types.
+statement ok
+CREATE OR REPLACE TABLE default_writer.items (id BIGINT, v INTEGER);
+
+statement ok
+INSERT INTO default_writer.items VALUES (1, 0);
+
+statement ok
+UPDATE default_reader.items SET v = DEFAULT WHERE id = 1;
+
+query I
+SELECT v FROM default_reader.items;
+----
+NULL
+
+# A newly added expression default must be restored and remain stable on lookup.
+statement ok
+CREATE OR REPLACE TABLE default_writer.items (id BIGINT, v INTEGER DEFAULT (3 + 4));
+
+statement ok
+INSERT INTO default_reader.items (id) VALUES (1);
+
+statement ok
+UPDATE default_reader.items SET v = DEFAULT;
+
+query I
+SELECT v FROM default_reader.items;
+----
+7

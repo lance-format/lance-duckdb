@@ -5,7 +5,9 @@ use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
+use lance::dataset::scanner::Scanner;
 use lance::session::Session;
+use lance_arrow::json::lance_json_to_arrow_json;
 use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
@@ -79,6 +81,17 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char, what: &'static str) -> 
     Ok(s)
 }
 
+pub(crate) unsafe fn optional_cstr_to_str<'a>(
+    ptr: *const c_char,
+    what: &'static str,
+) -> FfiResult<Option<&'a str>> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        unsafe { cstr_to_str(ptr, what) }.map(Some)
+    }
+}
+
 pub(crate) unsafe fn slice_from_ptr<'a, T>(
     ptr: *const T,
     len: usize,
@@ -147,6 +160,36 @@ pub(crate) unsafe fn parse_optional_filter_ir(
     crate::filter_ir::parse_filter_ir(bytes)
         .map(Some)
         .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))
+}
+
+/// Apply named SQL and pushed IR filters after configuring the search so Lance can
+/// resolve system fields such as `_rowid`, `_distance`, and `_score`.
+pub(crate) fn apply_scanner_filter(
+    scanner: &mut Scanner,
+    filter_ir: Option<Expr>,
+    filter_sql: Option<&str>,
+    code: ErrorCode,
+    what: &'static str,
+) -> FfiResult<Option<Expr>> {
+    let filter = if let Some(filter_sql) = filter_sql {
+        scanner
+            .filter(filter_sql)
+            .map_err(|err| FfiError::new(code, format!("{what} parse: {err}")))?;
+        let sql_filter = scanner
+            .get_expr_filter()
+            .map_err(|err| FfiError::new(code, format!("{what} optimize: {err}")))?
+            .ok_or_else(|| FfiError::new(code, format!("{what} produced no expression")))?;
+        Some(match filter_ir {
+            Some(filter_ir) => filter_ir.and(sql_filter),
+            None => sql_filter,
+        })
+    } else {
+        filter_ir
+    };
+    if let Some(filter) = &filter {
+        scanner.filter_expr(filter.clone());
+    }
+    Ok(filter)
 }
 
 pub(crate) fn u64_to_usize(v: u64, what: &'static str) -> FfiResult<usize> {
@@ -223,7 +266,12 @@ pub(crate) unsafe fn batch_handle<'a>(batch: *mut c_void) -> FfiResult<&'a Recor
 pub(crate) fn schema_to_ffi_arrow_schema(
     schema: &Schema,
 ) -> FfiResult<arrow::ffi::FFI_ArrowSchema> {
-    let data_type = arrow::datatypes::DataType::Struct(schema.fields().clone());
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| Arc::new(lance_json_to_arrow_json(field)))
+        .collect::<Vec<_>>();
+    let data_type = arrow::datatypes::DataType::Struct(fields.into());
     arrow::ffi::FFI_ArrowSchema::try_from(&data_type)
         .map_err(|err| FfiError::new(ErrorCode::SchemaExport, format!("schema export: {err}")))
 }

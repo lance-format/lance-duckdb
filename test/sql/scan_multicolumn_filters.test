@@ -1,0 +1,38 @@
+# name: test/sql/scan_multicolumn_filters.test
+# description: Multi-column filters use scan projection mappings and retain residual filtering before LIMIT
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1 AS id, 30 AS a, 20 AS b, 'first' AS label
+      UNION ALL SELECT 2, 10, 20, 'second'
+      UNION ALL SELECT 3, 40, 50, 'third')
+TO '{TEST_DIR}/multicolumn_filters.lance' (FORMAT lance, mode 'overwrite');
+
+query TII
+SELECT label, b, id FROM '{TEST_DIR}/multicolumn_filters.lance'
+WHERE a < b ORDER BY id;
+----
+second	20	2
+third	50	3
+
+query I
+SELECT id FROM '{TEST_DIR}/multicolumn_filters.lance'
+WHERE a < b AND b < 40;
+----
+2
+
+# Arithmetic predicates may require DuckDB residual evaluation.
+query I
+SELECT id FROM '{TEST_DIR}/multicolumn_filters.lance'
+WHERE abs(a - b) = 10 AND a < b ORDER BY id LIMIT 1;
+----
+2
+
+query I
+SELECT id FROM '{TEST_DIR}/multicolumn_filters.lance'
+WHERE a > b OR b > 40 ORDER BY id;
+----
+1
+3

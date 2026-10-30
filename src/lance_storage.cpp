@@ -1,7 +1,6 @@
 #include "duckdb/storage/storage_extension.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -9,16 +8,17 @@
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/exception/catalog_exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/operator/persistent/physical_batch_copy_to_file.hpp"
-#include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/operator/scan/physical_empty_result.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -36,16 +36,18 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
+#include "lance_arrow_compat.hpp"
+#include "lance_blob.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
+#include "lance_write.hpp"
 
 #include <cstring>
 
@@ -147,49 +149,6 @@ static string GetLanceNamespaceHeaders(const AttachInfo &info) {
   return headers_tsv;
 }
 
-static void PopulateColumnsFromArrowSchema(ClientContext &context,
-                                           ArrowSchema &arrow_schema,
-                                           ColumnList &out_columns) {
-  ArrowTableSchema arrow_table;
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               arrow_schema);
-  const auto names = arrow_table.GetNames();
-  const auto types = arrow_table.GetTypes();
-  if (names.size() != types.size()) {
-    throw InternalException(
-        "Arrow table schema returned mismatched names/types sizes");
-  }
-  for (idx_t i = 0; i < names.size(); i++) {
-    out_columns.AddColumn(ColumnDefinition(names[i], types[i]));
-  }
-}
-
-static void PopulateLanceTableColumnsFromDataset(
-    ClientContext &context, void *dataset, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
-  auto *schema_handle = lance_get_schema(dataset);
-  if (!schema_handle) {
-    throw IOException("Failed to get schema from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
-    lance_free_schema(schema_handle);
-    throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_schema(schema_handle);
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  if (out_coerced_columns) {
-    *out_coerced_columns = std::move(coerced);
-  }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
-}
-
 static string JoinNamespacePath(const string &root, const string &child) {
   if (root.empty()) {
     return child;
@@ -229,11 +188,6 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   return out;
 }
 
-// Mirrors ErrorCode::NamespaceTableNotFound in rust/error.rs: the namespace
-// reported that the addressed table (or its parent namespace) does not
-// exist, as opposed to auth/network/server failures.
-static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 56;
-
 static vector<string>
 ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
                         const string &bearer_token, const string &api_key,
@@ -263,16 +217,27 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return out;
 }
 
-static bool
-DirectoryNamespaceTableExists(const LanceDirectoryNamespaceConfig &ns,
-                              const string &table_name) {
+static string
+FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
+                            const string &table_name) {
+  if (!IsSafeDatasetTableName(table_name)) {
+    throw InvalidInputException(
+        "Unsafe Lance dataset name for directory namespace: " + table_name);
+  }
   auto tables = ListDirectoryNamespaceTables(ns);
+  const Identifier requested(table_name);
+  string matched;
   for (auto &t : tables) {
-    if (StringUtil::CIEquals(t, table_name)) {
-      return true;
+    if (Identifier(t) == requested) {
+      if (!matched.empty()) {
+        throw CatalogException(
+            "Ambiguous Lance directory table names '%s' and '%s' in '%s'",
+            matched, t, ns.root);
+      }
+      matched = t;
     }
   }
-  return false;
+  return matched;
 }
 
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
@@ -283,7 +248,8 @@ public:
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
-                     const string &entry_name) override {
+                     const Identifier &entry_name_p) override {
+    const auto &entry_name = entry_name_p.GetIdentifierName();
     if (!ns) {
       throw InternalException("Lance directory namespace config is missing");
     }
@@ -312,46 +278,65 @@ public:
       return nullptr;
     }
 
-    CreateTableInfo info(schema, entry_name);
+    CreateTableInfo info(schema, Identifier(entry_name));
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
+    vector<string> json_columns;
+    vector<bool> blob_columns;
+    vector<string> writable_blob_v2_columns;
     try {
-      PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                           &coerced);
+      auto live = LanceTableSchema::FromDataset(context, dataset);
+      info.columns = std::move(live.columns);
+      info.constraints = std::move(live.constraints);
+      coerced = std::move(live.coerced_columns);
+      json_columns = std::move(live.json_columns);
+      blob_columns = std::move(live.blob_columns);
+      writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
     }
     lance_close_dataset(dataset);
 
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Directory;
     cfg.root = ns->root;
     cfg.table_id = entry_name;
     cfg.option_keys = ns->option_keys;
     cfg.option_values = ns->option_values;
-    cfg.display_uri = std::move(dataset_uri);
+    cfg.display_uri = dataset_uri.empty()
+                          ? LanceDirectoryNamespaceDatasetUri(cfg)
+                          : std::move(dataset_uri);
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
+    entry->SetJsonColumnNames(std::move(json_columns));
+    entry->SetBlobColumns(std::move(blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  vector<string> GetDefaultEntries() override {
+  vector<Identifier> GetDefaultEntries() override {
     if (!ns) {
       return {};
     }
     auto all = ListDirectoryNamespaceTables(*ns);
+    identifier_set_t physical_names;
+    for (auto &name : all) {
+      auto inserted = physical_names.emplace(name);
+      if (!inserted.second) {
+        throw CatalogException(
+            "Ambiguous Lance directory table names '%s' and '%s' in '%s'",
+            inserted.first->GetIdentifierName(), name, ns->root);
+      }
+    }
     // Filter out tables whose datasets cannot be opened (e.g. corrupt
     // manifests). CreateDefaultEntries requires every entry to produce
     // a non-null CatalogEntry, but CreateDefaultEntry must return
     // nullptr for datasets that are not yet written (CTAS planning
     // phase). Filtering here avoids the conflict.
-    vector<string> valid;
+    vector<Identifier> valid;
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
     BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
@@ -368,7 +353,7 @@ public:
       }
       if (ds) {
         lance_close_dataset(ds);
-        valid.push_back(std::move(name));
+        valid.emplace_back(std::move(name));
       }
     }
     return valid;
@@ -379,23 +364,18 @@ private:
   shared_ptr<LanceDirectoryNamespaceConfig> ns;
 };
 
-static void PopulateLanceTableColumnsFromJsonSchema(
-    ClientContext &context, const string &schema_json, ColumnList &out_columns,
-    vector<string> *out_coerced_columns = nullptr) {
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_json_arrow_schema_to_c(schema_json.c_str(),
-                                   &schema_root.arrow_schema) != 0) {
-    throw IOException("Failed to convert JSON Arrow schema to C Data "
-                      "Interface" +
-                      LanceFormatErrorSuffix());
+static LanceTableSchema LanceTableSchemaFromJson(ClientContext &context,
+                                                 const string &schema_json) {
+  ArrowSchemaWrapper root;
+  root.arrow_schema = {};
+  if (lance_json_arrow_schema_to_c(schema_json.c_str(), &root.arrow_schema) !=
+      0) {
+    throw IOException(
+        "Failed to convert JSON Arrow schema to C Data Interface" +
+        LanceFormatErrorSuffix());
   }
-  auto coerced = LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  if (out_coerced_columns) {
-    *out_coerced_columns = std::move(coerced);
-  }
-  PopulateColumnsFromArrowSchema(context, schema_root.arrow_schema,
-                                 out_columns);
+  ArrowTableSchema arrow_table;
+  return LanceTableSchema::FromArrow(context, root.arrow_schema, arrow_table);
 }
 
 class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
@@ -415,7 +395,27 @@ public:
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
-                     const string &entry_name) override {
+                     const Identifier &entry_name_p) override {
+    const auto &entry_name = entry_name_p.GetIdentifierName();
+    // Only resolve names that are real tables in this namespace. DuckDB probes
+    // the active catalog for system names (e.g. duckdb_tables when SHOW TABLES
+    // runs under `USE <lance_catalog>`); without this guard we'd try to open
+    // those as Lance datasets and throw, aborting the statement. Returning
+    // nullptr (not found) lets resolution fall through to the system catalog.
+    {
+      auto known = GetDefaultEntries();
+      bool found = false;
+      for (auto &k : known) {
+        if (k == entry_name) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return nullptr;
+      }
+    }
+
     unordered_map<string, Value> overrides;
     if (!bearer_token_override.empty()) {
       overrides["bearer_token"] = Value(bearer_token_override);
@@ -435,149 +435,49 @@ public:
       resolved_api_key = api_key;
     }
 
-    // Build candidate table IDs with the CANONICAL id FIRST. With a
-    // non-empty namespace_id the namespace-qualified id is the canonical
-    // form; the bare name is only an alias for server dialects that store
-    // unprefixed ids.
-    auto delim = delimiter.empty() ? "$" : delimiter;
-    auto prefix = namespace_id.empty() ? string() : namespace_id + delim;
-    vector<string> candidates;
-    if (prefix.empty() || StringUtil::StartsWith(entry_name, prefix)) {
-      candidates.push_back(entry_name);
-    } else {
-      candidates.push_back(prefix + entry_name);
-      candidates.push_back(entry_name);
+    // Build candidate table IDs (bare name + optional namespace-prefixed).
+    vector<string> candidates = {entry_name};
+    if (!namespace_id.empty()) {
+      auto delim = delimiter.empty() ? "$" : delimiter;
+      auto prefix = namespace_id + delim;
+      if (!StringUtil::StartsWith(entry_name, prefix)) {
+        candidates.push_back(prefix + entry_name);
+      }
     }
-    constexpr idx_t canonical_idx = 0;
-
-    // Existence is decided by the point lookups below, never by listing the
-    // namespace up front: REST credentials may permit describing/opening
-    // specific tables without list permission, and a namespace may
-    // intentionally omit directly accessible tables from listings. DuckDB
-    // also probes the active catalog for system names (e.g. duckdb_tables
-    // when SHOW TABLES runs under `USE <lance_catalog>`).
-    //
-    // Existence precedence — only the CANONICAL candidate is authoritative,
-    // and it is probed FIRST. On a hierarchical server a one-segment id
-    // addresses the ROOT namespace, so the bare alias is doubly guarded:
-    //   - once the canonical id proves existence (describe Found or open
-    //     succeeded, even with an unconvertible schema) the alias is never
-    //     consulted — a same-named root table must not shadow this
-    //     namespace's table;
-    //   - an alias describe/open success only counts after the membership
-    //     listing confirms the name belongs to this namespace (checked
-    //     lazily AFTER the success so system-name probes never pay a list
-    //     round trip); otherwise the alias result is discarded outright;
-    //   - alias NotFound/Error outcomes are never authoritative (arity
-    //     noise from strict multi-level servers must not force the
-    //     membership fallback or an IOException under list-denied
-    //     credentials).
-    // Tail precedence on the canonical outcome ("unconvertible" = describe
-    // or open succeeded but the schema cannot be exposed, tracked across
-    // BOTH loops):
-    //   found but unconvertible -> empty entry (table exists)
-    //   canonical NotFound      -> nullptr: authoritative typed miss
-    //   canonical Error         -> membership fallback below (broken auth
-    //     must surface as an error, not "not found")
-    auto canonical_outcome = DescribeTableOutcome::Error;
-    string canonical_describe_error = "namespace describe_table did not run";
-    // The canonical id proved the table exists (describe Found or open
-    // succeeded, schema convertibility aside): the alias must not be
-    // consulted at all once this is set.
-    bool canonical_exists = false;
-    // A describe or open SUCCEEDED but the schema could not be converted to
-    // DuckDB columns: the table provably exists, so the not-found and
-    // membership branches below must not run for it.
-    bool found_but_unconvertible = false;
-
-    // Memoized membership probe shared by the alias gate and the
-    // canonical-Error fallback tail: at most one list round trip per call.
-    enum class Membership { Listed, NotListed, Unavailable };
-    bool membership_checked = false;
-    auto membership = Membership::Unavailable;
-    auto CheckMembership = [&]() -> Membership {
-      if (membership_checked) {
-        return membership;
-      }
-      membership_checked = true;
-      try {
-        auto known =
-            ListRestNamespaceTables(endpoint, namespace_id, resolved_bearer,
-                                    resolved_api_key, delimiter, headers_tsv);
-        membership = Membership::NotListed;
-        for (auto &k : known) {
-          // Listings may report bare or namespace-prefixed names and the
-          // caller may reference either form; accept any pairing that names
-          // the same table id.
-          if (k == entry_name ||
-              (!prefix.empty() &&
-               (prefix + k == entry_name || k == prefix + entry_name))) {
-            membership = Membership::Listed;
-            break;
-          }
-        }
-      } catch (...) {
-        membership = Membership::Unavailable;
-      }
-      return membership;
-    };
 
     // Fast path: describe_table with schema from REST API (skips S3 open).
-    for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
-         candidate_idx++) {
-      const bool is_canonical = candidate_idx == canonical_idx;
-      if (!is_canonical && canonical_exists) {
-        // The table exists at the canonical id; the alias must neither
-        // resolve nor set flags.
-        break;
-      }
-      auto &table_id = candidates[candidate_idx];
+    for (auto &table_id : candidates) {
       string schema_json;
-      string describe_error;
-      auto outcome = TryDescribeTableWithSchema(table_id, resolved_bearer,
-                                                resolved_api_key, schema_json,
-                                                describe_error);
-      if (is_canonical) {
-        canonical_outcome = outcome;
-        canonical_describe_error = describe_error;
-        canonical_exists = outcome == DescribeTableOutcome::Found;
-      }
-      if (outcome == DescribeTableOutcome::NotFound ||
-          outcome == DescribeTableOutcome::Error) {
+      if (!TryDescribeTableWithSchema(table_id, resolved_bearer,
+                                      resolved_api_key, schema_json)) {
         continue;
       }
-      if (!is_canonical && CheckMembership() != Membership::Listed) {
-        // The alias described, but the name is not confirmed to belong to
-        // this namespace (not listed, or listing unavailable): discard the
-        // result — on a hierarchical server the bare id addressed the root
-        // namespace.
-        continue;
-      }
-      CreateTableInfo info(schema, entry_name);
+      CreateTableInfo info(schema, Identifier(entry_name));
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
+      vector<bool> blob_columns;
+      vector<string> writable_blob_v2_columns;
       try {
-        PopulateLanceTableColumnsFromJsonSchema(context, schema_json,
-                                                info.columns, &coerced);
+        auto live = LanceTableSchemaFromJson(context, schema_json);
+        info.columns = std::move(live.columns);
+        info.constraints = std::move(live.constraints);
+        coerced = std::move(live.coerced_columns);
+        json_columns = std::move(live.json_columns);
+        blob_columns = std::move(live.blob_columns);
+        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
-        // Schema conversion failed on an EXISTING table; try next candidate.
-        found_but_unconvertible = true;
-        continue;
+        continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(json_columns),
+                                std::move(blob_columns),
+                                std::move(writable_blob_v2_columns));
     }
 
     // Slow fallback: open dataset from S3.
-    for (idx_t candidate_idx = 0; candidate_idx < candidates.size();
-         candidate_idx++) {
-      const bool is_canonical = candidate_idx == canonical_idx;
-      if (!is_canonical && canonical_exists) {
-        // Same exclusion as the fast path: canonical existence is proven.
-        break;
-      }
-      auto &table_id = candidates[candidate_idx];
+    for (auto &table_id : candidates) {
       string table_uri;
       void *dataset = nullptr;
       try {
@@ -588,102 +488,51 @@ public:
         // Unresolvable candidate (e.g. a DuckDB system name like
         // duckdb_tables that SHOW TABLES resolves against the active catalog,
         // or an invalid 1-segment id) — skip it instead of aborting the
-        // whole statement. The FFI may have recorded a thread-local error
-        // before the exception surfaced; consume it so it cannot leak into
-        // an unrelated LanceFormatErrorSuffix() later.
-        (void)LanceConsumeLastError();
+        // whole statement.
         continue;
       }
       if (!dataset) {
-        // A failed open leaves a thread-local FFI error behind; consume it
-        // so it cannot leak into an unrelated LanceFormatErrorSuffix() later.
-        (void)LanceConsumeLastError();
         continue;
       }
-      if (is_canonical) {
-        canonical_exists = true;
-      }
-      if (!is_canonical && CheckMembership() != Membership::Listed) {
-        // Alias gate mirrors the fast path; the dataset is not ours to keep.
-        lance_close_dataset(dataset);
-        continue;
-      }
-      CreateTableInfo info(schema, entry_name);
+      CreateTableInfo info(schema, Identifier(entry_name));
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
+      vector<bool> blob_columns;
+      vector<string> writable_blob_v2_columns;
       try {
-        PopulateLanceTableColumnsFromDataset(context, dataset, info.columns,
-                                             &coerced);
+        auto live = LanceTableSchema::FromDataset(context, dataset);
+        info.columns = std::move(live.columns);
+        info.constraints = std::move(live.constraints);
+        coerced = std::move(live.coerced_columns);
+        json_columns = std::move(live.json_columns);
+        blob_columns = std::move(live.blob_columns);
+        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
-        // The dataset opened, so the table exists; only its schema failed.
-        found_but_unconvertible = true;
         lance_close_dataset(dataset);
         continue;
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced));
+                                std::move(coerced), std::move(json_columns),
+                                std::move(blob_columns),
+                                std::move(writable_blob_v2_columns));
     }
 
-    // Neither describe nor open resolved any candidate.
-    if (found_but_unconvertible) {
-      // The table exists but its schema cannot be exposed as DuckDB columns.
-      // Fall through to the empty-entry tail below (the pre-existing
-      // contract for unconvertible-but-existing tables): enumeration keeps
-      // working, and using the entry surfaces the real incompatibility with
-      // proper context instead of a misleading "does not exist".
-    } else if (canonical_outcome == DescribeTableOutcome::NotFound) {
-      // Authoritative typed not-found from the canonical id (alias errors,
-      // if any, suppressed per the precedence above): the name is not a
-      // table in this namespace. Fall through to the system catalog —
-      // system-name probes land here, and genuinely missing tables surface
-      // the caller's usual "does not exist" error. (A server that lists a
-      // name it persistently 404s on describe would make the enumeration
-      // path (CreateDefaultEntries) throw on this nullptr; that pathology —
-      // and the delete-between-list-and-describe race, which predates this
-      // code — is accepted rather than second-guessing the server's own
-      // existence answer with a list round trip.)
-      return nullptr;
-    } else {
-      // The canonical describe failed for infrastructure-ish reasons, so
-      // existence is still unknown: some server dialects report not-found
-      // through non-spec error bodies that deserialize as generic errors.
-      // Disambiguate with the (memoized) membership listing when we are
-      // allowed to list.
-      auto member = CheckMembership();
-      if (member == Membership::Unavailable) {
-        // No list access either: surface the real describe failure on the
-        // canonical id instead of reporting a possibly-existing table as
-        // not found.
-        throw IOException("Failed to describe Lance namespace table '" +
-                          entry_name + "': " + canonical_describe_error);
-      }
-      if (member == Membership::NotListed) {
-        // The namespace lists fine and the name is not there: treat the
-        // ambiguous describe errors as this server's not-found dialect.
-        return nullptr;
-      }
-    }
-    // The table exists (found_but_unconvertible) or is listed but cannot be
-    // described or opened right now. Return an empty entry: the enumeration
-    // path (SHOW TABLES via CatalogSet::CreateDefaultEntries) requires a
-    // non-null entry for every listed name — nullptr would raise an
-    // InternalException — matching the pre-existing behavior for
-    // listed-but-unreadable and unconvertible-but-existing tables.
-    CreateTableInfo info(schema, entry_name);
+    // All paths failed — return an empty entry to prevent DuckDB crash.
+    CreateTableInfo info(schema, Identifier(entry_name));
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    // table_id stays the bare entry_name — the value candidates.front()
-    // carried before the canonical-first reordering.
-    return MakeNamespaceEntry(entry_name, entry_name, std::move(info), {});
+    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
+                              {}, {}, {}, {});
   }
 
-  vector<string> GetDefaultEntries() override {
+  vector<Identifier> GetDefaultEntries() override {
     auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
                                           api_key, delimiter, headers_tsv);
     if (namespace_id.empty()) {
-      return tables;
+      return vector<Identifier>(tables.begin(), tables.end());
     }
     auto delim = delimiter.empty() ? "$" : delimiter;
     auto prefix = namespace_id + delim;
@@ -692,14 +541,15 @@ public:
         t = t.substr(prefix.size());
       }
     }
-    return tables;
+    return vector<Identifier>(tables.begin(), tables.end());
   }
 
 private:
-  unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
-                                              const string &table_id,
-                                              CreateTableInfo info,
-                                              vector<string> coerced_columns) {
+  unique_ptr<CatalogEntry>
+  MakeNamespaceEntry(const string &entry_name, const string &table_id,
+                     CreateTableInfo info, vector<string> coerced_columns,
+                     vector<string> json_columns, vector<bool> blob_columns,
+                     vector<string> writable_blob_v2_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -711,20 +561,16 @@ private:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
+    entry->SetJsonColumnNames(std::move(json_columns));
+    entry->SetBlobColumns(std::move(blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  // Outcome of a point describe: existence questions must not conflate a
-  // genuine "table not found" with infrastructure failures (auth, network,
-  // server errors) — CreateDefaultEntry fails soft on the former and keeps
-  // the latter visible.
-  enum class DescribeTableOutcome { Found, NotFound, Error };
-
-  DescribeTableOutcome
-  TryDescribeTableWithSchema(const string &table_id,
-                             const string &resolved_bearer,
-                             const string &resolved_api_key,
-                             string &out_schema_json, string &out_error) {
+  bool TryDescribeTableWithSchema(const string &table_id,
+                                  const string &resolved_bearer,
+                                  const string &resolved_api_key,
+                                  string &out_schema_json) {
     const char *bearer_ptr =
         resolved_bearer.empty() ? nullptr : resolved_bearer.c_str();
     const char *api_key_ptr =
@@ -738,24 +584,11 @@ private:
         endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
         delimiter_ptr, headers_ptr, &schema_ptr);
     if (rc != 0 || !schema_ptr) {
-      auto not_found =
-          lance_last_error_code() == LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND;
-      // Consume the thread-local error either way so it cannot leak into an
-      // unrelated LanceFormatErrorSuffix() later.
-      auto message = LanceConsumeLastError();
-      if (not_found) {
-        return DescribeTableOutcome::NotFound;
-      }
-      out_error = message.empty() ? "namespace describe_table failed" : message;
-      return DescribeTableOutcome::Error;
+      return false;
     }
     out_schema_json = schema_ptr;
     lance_free_string(schema_ptr);
-    if (out_schema_json.empty()) {
-      out_error = "namespace describe_table returned an empty schema";
-      return DescribeTableOutcome::Error;
-    }
-    return DescribeTableOutcome::Found;
+    return !out_schema_json.empty();
   }
 
   SchemaCatalogEntry &schema;
@@ -805,27 +638,53 @@ static string
 GetCreateTableDataStorageVersionOption(const CreateTableInfo &create_info) {
   auto it = create_info.options.find("data_storage_version");
   if (it == create_info.options.end()) {
-    return "";
+    return LANCE_DEFAULT_DATA_STORAGE_VERSION;
   }
   if (!it->second) {
     throw BinderException("data_storage_version option cannot be NULL");
   }
   auto &expr = *it->second;
-  if (expr.expression_class != ExpressionClass::CONSTANT) {
+  if (expr.GetExpressionClass() != ExpressionClass::CONSTANT) {
     throw BinderException(
         "data_storage_version option must be a constant string");
   }
   auto &constant = expr.Cast<ConstantExpression>();
-  if (constant.value.IsNull()) {
+  if (constant.GetLiteral().ToValue().IsNull()) {
     throw BinderException("data_storage_version option cannot be NULL");
   }
-  auto value =
-      constant.value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+  auto value = constant.GetLiteral()
+                   .ToValue()
+                   .DefaultCastAs(LogicalType::VARCHAR)
+                   .GetValue<string>();
   StringUtil::Trim(value);
   if (value.empty()) {
     throw BinderException("data_storage_version option cannot be empty");
   }
   return value;
+}
+
+// The namespace is authoritative; these entries are an in-memory metadata
+// cache, not DuckDB native storage. Queries pin every generation they bind so a
+// refresh, ALTER or DROP cannot destroy an entry still used by another
+// executing plan.
+class LanceCatalogQueryState final : public ClientContextState {
+public:
+  void Pin(const shared_ptr<CatalogEntry> &entry) {
+    entries.emplace(entry.get(), entry);
+  }
+  void QueryEnd() override { entries.clear(); }
+
+private:
+  unordered_map<CatalogEntry *, shared_ptr<CatalogEntry>> entries;
+};
+
+static optional_ptr<CatalogEntry>
+PinLanceCatalogEntry(ClientContext &context,
+                     const shared_ptr<CatalogEntry> &entry) {
+  context.registered_state
+      ->GetOrCreate<LanceCatalogQueryState>("lance_catalog_entries")
+      ->Pin(entry);
+  return entry.get();
 }
 
 class LanceSchemaEntry final : public DuckSchemaEntry {
@@ -836,13 +695,13 @@ public:
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
 
-  void SetTableDefaultGenerator(DefaultGenerator *generator) {
-    table_default_generator = generator;
+  void SetTableDefaultGenerator(unique_ptr<DefaultGenerator> generator) {
+    table_default_generator = std::move(generator);
   }
 
   void Alter(CatalogTransaction transaction, AlterInfo &info) override {
-    auto &set = GetCatalogSet(info.GetCatalogType());
-    auto entry = set.GetEntry(transaction, info.name);
+    auto entry = GetEntry(transaction, info.GetCatalogType(),
+                          info.GetQualifiedName().Name());
     auto *lance_entry =
         entry ? dynamic_cast<LanceTableEntry *>(entry.get()) : nullptr;
 
@@ -857,8 +716,12 @@ public:
           "Lance DDL does not support explicit transactions yet");
     }
 
-    // Allow altering internal entries for attached Lance catalogs.
-    info.allow_internal = true;
+    lock_guard<mutex> guard(table_lock);
+    auto current = tables.find(lance_entry->name);
+    if (current == tables.end() || current->second.get() != lance_entry) {
+      throw TransactionException(
+          "Lance table changed concurrently; retry ALTER");
+    }
 
     if (info.type == AlterType::SET_COMMENT) {
       auto &comment = info.Cast<SetCommentInfo>();
@@ -887,21 +750,66 @@ public:
       LanceInvalidateDatasetCacheForTable(context, *lance_entry);
     }
 
-    auto system_tx =
-        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
-    system_tx.context = &context;
+    auto updated = info.type == AlterType::SET_COMMENT
+                       ? lance_entry->Rebuild(context)
+                       : lance_entry->AlterEntry(context, info);
+    if (updated) {
+      current->second = shared_ptr<CatalogEntry>(std::move(updated));
+    }
+  }
 
-    if (info.type == AlterType::CHANGE_OWNERSHIP) {
-      if (!set.AlterOwnership(system_tx, info.Cast<ChangeOwnershipInfo>())) {
-        throw CatalogException("Couldn't change ownership!");
-      }
+  optional_ptr<CatalogEntry>
+  LookupEntry(CatalogTransaction transaction,
+              const EntryLookupInfo &lookup_info) override {
+    return LookupEntryInternal(transaction, lookup_info);
+  }
+
+  CatalogSet::EntryLookup
+  LookupEntryDetailed(CatalogTransaction transaction,
+                      const EntryLookupInfo &info) override {
+    return SchemaCatalogEntry::LookupEntryDetailed(transaction, info);
+  }
+
+  SimilarCatalogEntry GetSimilarEntry(CatalogTransaction transaction,
+                                      const EntryLookupInfo &info) override {
+    return SchemaCatalogEntry::GetSimilarEntry(transaction, info);
+  }
+
+  // Keep the native context-free scan used by DuckDB checkpoints.
+  using DuckSchemaEntry::Scan;
+
+  void Scan(CatalogTransaction transaction, CatalogType type,
+            const std::function<void(CatalogEntry &)> &callback) override {
+    DuckSchemaEntry::Scan(transaction, type, callback);
+    if (type != CatalogType::TABLE_ENTRY || !transaction.context) {
       return;
     }
-
-    if (!set.AlterEntry(system_tx, info.name, info)) {
-      throw CatalogException::MissingEntry(info.GetCatalogType(), info.name,
-                                           string());
+    vector<Identifier> names;
+    {
+      lock_guard<mutex> guard(table_lock);
+      names = table_default_generator->GetDefaultEntries();
     }
+    for (auto &name : names) {
+      auto entry = LookupEntryInternal(
+          transaction, EntryLookupInfo(type, QualifiedName(name)),
+          directory_ns ? &name : nullptr);
+      if (entry && dynamic_cast<LanceTableEntry *>(entry.get())) {
+        callback(*entry);
+      }
+    }
+  }
+
+  optional_ptr<CatalogEntry> CreateView(CatalogTransaction transaction,
+                                        CreateViewInfo &info) override {
+    auto entry =
+        GetEntry(transaction, CatalogType::TABLE_ENTRY, info.GetViewName());
+    if (entry && dynamic_cast<LanceTableEntry *>(entry.get())) {
+      if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+        return nullptr;
+      }
+      throw CatalogException("Cannot replace a Lance table with a view");
+    }
+    return DuckSchemaEntry::CreateView(transaction, info);
   }
 
   void DropEntry(ClientContext &context, DropInfo &info) override {
@@ -914,11 +822,12 @@ public:
     // DuckSchemaEntry::GetCatalogSet), so we need to resolve the existing entry
     // type explicitly before attempting to drop anything.
     auto transaction = GetCatalogTransaction(context);
-    auto &set = GetCatalogSet(info.type);
-    auto existing_entry = set.GetEntry(transaction, info.name);
+    auto existing_entry =
+        GetEntry(transaction, info.type, info.GetQualifiedName().Name());
     if (!existing_entry) {
       throw InternalException(
-          "Failed to drop entry \"%s\" - entry could not be found", info.name);
+          "Failed to drop entry \"%s\" - entry could not be found",
+          info.GetQualifiedName().Name());
     }
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(existing_entry.get());
     if (!lance_entry) {
@@ -926,7 +835,12 @@ public:
       return;
     }
     auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
-    auto existing_type = existing_entry->type;
+    lock_guard<mutex> guard(table_lock);
+    auto current = tables.find(lance_entry->name);
+    if (current == tables.end() || current->second.get() != lance_entry) {
+      throw TransactionException(
+          "Lance table changed concurrently; retry DROP");
+    }
 
     if (rest_ns) {
       unordered_map<string, Value> overrides;
@@ -942,7 +856,7 @@ public:
       ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
-      auto leaf_id = info.name;
+      auto leaf_id = info.GetQualifiedName().Name().GetIdentifierName();
       string prefixed_id;
       if (!rest_ns->namespace_id.empty()) {
         auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
@@ -981,9 +895,11 @@ public:
                           (drop_error.empty() ? "unknown error" : drop_error));
       }
     } else {
-      if (!IsSafeDatasetTableName(info.name)) {
+      if (!IsSafeDatasetTableName(
+              info.GetQualifiedName().Name().GetIdentifierName())) {
         throw InvalidInputException(
-            "Unsafe Lance dataset name for DROP TABLE: " + info.name);
+            "Unsafe Lance dataset name for DROP TABLE: " +
+            info.GetQualifiedName().Name());
       }
 
       if (!directory_ns || directory_ns->root.empty()) {
@@ -1002,47 +918,19 @@ public:
                                       value_ptrs);
 
       auto rc = lance_dir_namespace_drop_table(
-          root.c_str(), info.name.c_str(),
+          root.c_str(), lance_entry->NamespaceConfig().table_id.c_str(),
           key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
       if (rc != 0) {
-        throw IOException("Failed to drop Lance dataset: " + root + "/" +
-                          GetDatasetDirName(info.name) +
-                          LanceFormatErrorSuffix());
+        throw IOException(
+            "Failed to drop Lance dataset: " + root + "/" +
+            GetDatasetDirName(lance_entry->NamespaceConfig().table_id) +
+            LanceFormatErrorSuffix());
       }
     }
 
-    // Drop the DuckDB catalog entry after the dataset has been deleted
-    // successfully.
-    //
-    // Note: TABLE_ENTRY and VIEW_ENTRY share the same underlying catalog set.
-    // DuckDB's transactional DROP path assumes TABLE_ENTRY is always a
-    // DuckTableEntry (and will fail for extension-backed TableCatalogEntry
-    // implementations). To avoid that, perform the catalog drop using a system
-    // (non-transactional) CatalogTransaction.
-    if (existing_type != CatalogType::TABLE_ENTRY &&
-        existing_type != CatalogType::VIEW_ENTRY) {
-      throw InternalException(
-          "Unexpected catalog entry type for DROP TABLE: %s",
-          CatalogTypeToString(existing_type));
-    }
-    auto system_transaction =
-        CatalogTransaction::GetSystemTransaction(catalog.GetDatabase());
-    if (!set.DropEntry(system_transaction, info.name, info.cascade, true)) {
-      throw InternalException(
-          "Could not drop element because of an internal error");
-    }
-
-    // DropEntry with a system (committed) CatalogTransaction leaves a committed
-    // tombstone behind. This blocks subsequent lazy discovery of a recreated
-    // dataset with the same name, because CatalogSet::GetEntryDetailed will
-    // find the tombstone and never consult the default generator. Since ATTACH
-    // TYPE LANCE catalogs are ephemeral, we can eagerly clean up the entry
-    // chain (old entry + tombstone).
-    set.CleanupEntry(*existing_entry);
-
+    tables.erase(current);
     LanceInvalidateDatasetCache(context, cache_key);
-    InvalidateTableDefaults();
   }
 
   optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction,
@@ -1077,7 +965,7 @@ public:
       ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
-      auto leaf_id = create_info.table;
+      auto leaf_id = create_info.GetTableName().GetIdentifierName();
       string prefixed_id;
       if (!rest_ns->namespace_id.empty()) {
         auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
@@ -1114,7 +1002,7 @@ public:
           exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
-        InvalidateTableDefaults();
+        InvalidateTableEntry(create_info.GetTableName());
         return nullptr;
       }
       if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
@@ -1167,22 +1055,27 @@ public:
       }
       dataset_path = LanceNormalizeS3Scheme(dataset_path);
     } else {
-      if (!IsSafeDatasetTableName(create_info.table)) {
+      if (!IsSafeDatasetTableName(
+              create_info.GetTableName().GetIdentifierName())) {
         throw InvalidInputException(
-            "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
+            "Unsafe Lance dataset name for CREATE TABLE: " +
+            create_info.GetTableName().GetIdentifierName());
       }
       if (!directory_ns || directory_ns->root.empty()) {
         throw InternalException("Lance directory namespace root is empty");
       }
 
+      auto physical_table = FindDirectoryNamespaceTable(
+          *directory_ns, create_info.GetTableName().GetIdentifierName());
+      auto exists = !physical_table.empty();
+      if (!exists) {
+        physical_table = create_info.GetTableName().GetIdentifierName();
+      }
       dataset_path = JoinNamespacePath(directory_ns->root,
-                                       GetDatasetDirName(create_info.table));
-
-      auto exists =
-          DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                       GetDatasetDirName(physical_table));
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
-        InvalidateTableDefaults();
+        InvalidateTableEntry(create_info.GetTableName());
         return nullptr;
       }
       if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
@@ -1199,7 +1092,7 @@ public:
     names.reserve(create_info.columns.LogicalColumnCount());
     types.reserve(create_info.columns.LogicalColumnCount());
     for (auto &col : create_info.columns.Logical()) {
-      names.push_back(col.Name());
+      names.push_back(col.Name().GetIdentifierName());
       types.push_back(col.Type());
     }
 
@@ -1208,6 +1101,7 @@ public:
     auto props = context.GetClientProperties();
     ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, types, names,
                                   props);
+    LanceNormalizeArrowListFieldNames(&schema_root.arrow_schema);
 
     auto mode = CreateTableModeFromConflict(create_info.on_conflict);
     vector<const char *> key_ptrs;
@@ -1216,6 +1110,7 @@ public:
                                     value_ptrs);
     const char *data_storage_version_ptr =
         data_storage_version.empty() ? nullptr : data_storage_version.c_str();
+    auto blob_flags = LanceBlobFlagsForTypes(types);
 
     auto *writer = lance_open_writer_with_storage_options(
         dataset_path.c_str(), mode.c_str(),
@@ -1223,7 +1118,9 @@ public:
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
         LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-        LanceGetSessionHandle(context), &schema_root.arrow_schema);
+        LanceGetSessionHandle(context), &schema_root.arrow_schema,
+        blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
+        LanceBlobIngestBatchBudget(context));
     if (!writer) {
       throw IOException("Failed to open Lance writer: " + dataset_path +
                         LanceFormatErrorSuffix());
@@ -1236,9 +1133,8 @@ public:
     }
 
     // Best-effort persistence of DuckDB column defaults in Lance field
-    // metadata. Lance itself does not currently expose defaults through
-    // DuckDB's catalog, but we can still use the metadata during UPDATE
-    // execution to resolve SET col = DEFAULT.
+    // metadata. Catalog discovery restores these expressions so DuckDB can
+    // bind INSERT and UPDATE DEFAULT through its native binder.
     if (create_info.columns.LogicalColumnCount() > 0) {
       void *dataset = nullptr;
       if (option_keys.empty()) {
@@ -1262,22 +1158,100 @@ public:
       }
     }
 
-    InvalidateTableDefaults();
+    InvalidateTableEntry(create_info.GetTableName());
     return nullptr;
   }
 
-private:
-  void InvalidateTableDefaults() {
-    if (!table_default_generator) {
-      return;
+  bool ReplaceStaleTableEntry(CatalogTransaction transaction,
+                              LanceTableEntry &table) {
+    if (!transaction.context) {
+      return false;
     }
-    table_default_generator->created_all_entries = false;
+    lock_guard<mutex> guard(table_lock);
+    auto found = tables.find(table.name);
+    if (found == tables.end() || found->second.get() != &table) {
+      return false;
+    }
+    try {
+      found->second =
+          shared_ptr<CatalogEntry>(table.Rebuild(*transaction.context));
+    } catch (IOException &) {
+      return false;
+    }
+    return true;
+  }
+
+private:
+  optional_ptr<CatalogEntry>
+  LookupEntryInternal(CatalogTransaction transaction,
+                      const EntryLookupInfo &lookup_info,
+                      optional_ptr<const Identifier> physical_name = nullptr) {
+    auto native = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+    if (native || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
+        !transaction.context) {
+      return native;
+    }
+    lock_guard<mutex> guard(table_lock);
+    auto &name = lookup_info.GetEntryIdentifier();
+    auto found = tables.find(name);
+    if (found == tables.end()) {
+      Identifier backend_name = name;
+      if (directory_ns) {
+        if (physical_name) {
+          backend_name = *physical_name;
+        } else {
+          auto matched = FindDirectoryNamespaceTable(*directory_ns,
+                                                     name.GetIdentifierName());
+          if (matched.empty()) {
+            return nullptr;
+          }
+          backend_name = Identifier(std::move(matched));
+        }
+      }
+      auto entry = table_default_generator->CreateDefaultEntry(
+          *transaction.context, backend_name);
+      if (!entry) {
+        return nullptr;
+      }
+      found = tables.emplace(name, shared_ptr<CatalogEntry>(std::move(entry)))
+                  .first;
+    }
+    {
+      auto &table = found->second->Cast<LanceTableEntry>();
+      try {
+        if (table.IsSchemaStale(*transaction.context)) {
+          found->second =
+              shared_ptr<CatalogEntry>(table.Rebuild(*transaction.context));
+        }
+      } catch (IOException &) {
+        // Preserve metadata access and DROP when storage is unavailable.
+        // Scan and DML binding still validate the live schema and fail closed.
+      }
+    }
+    return PinLanceCatalogEntry(*transaction.context, found->second);
+  }
+
+  void InvalidateTableEntry(const Identifier &name) {
+    lock_guard<mutex> guard(table_lock);
+    tables.erase(name);
   }
 
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
-  DefaultGenerator *table_default_generator = nullptr;
+  unique_ptr<DefaultGenerator> table_default_generator;
+  mutex table_lock;
+  identifier_map_t<shared_ptr<CatalogEntry>> tables;
 };
+
+bool LanceTryReplaceStaleTableEntry(ClientContext &context,
+                                    LanceTableEntry &table) {
+  auto *lance_schema = dynamic_cast<LanceSchemaEntry *>(&table.schema);
+  if (!lance_schema) {
+    return false;
+  }
+  auto transaction = table.ParentCatalog().GetCatalogTransaction(context);
+  return lance_schema->ReplaceStaleTableEntry(transaction, table);
+}
 
 class LanceDuckCatalog final : public DuckCatalog {
 public:
@@ -1291,6 +1265,23 @@ public:
         rest_ns(std::move(rest_ns)) {}
 
   using DuckCatalog::PlanUpdate;
+
+  // Lance table entries mirror external datasets whose commits never bump any
+  // DuckDB catalog version, so a "current" version number would vouch for
+  // state this catalog cannot actually track. Returning an invalid version
+  // opts the catalog out of catalog-version identity checks - the documented
+  // escape hatch in CheckCatalogIdentity (prepared_statement_data.cpp) for
+  // catalogs that don't support catalog versions - which forces every EXECUTE
+  // of a prepared statement that reads or writes this catalog to rebind and
+  // observe the same latest state as ad-hoc statements. Scans already force
+  // this through LanceScanBindData::SupportStatementCache() returning false,
+  // but target-only DML (INSERT/UPDATE/DELETE/MERGE without a scan of the
+  // target, e.g. INSERT ... VALUES) binds no scan: its cached physical plan
+  // pins a LanceTableEntry reference that would outlive a catalog-entry
+  // replacement and bypass all bind-time freshness checks.
+  optional_idx GetCatalogVersion(ClientContext &) override {
+    return optional_idx();
+  }
 
   ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override {
     auto &base = info.Base().Cast<CreateTableInfo>();
@@ -1319,11 +1310,12 @@ public:
 
   PhysicalOperator &PlanUpdate(ClientContext &context,
                                PhysicalPlanGenerator &planner,
-                               LogicalUpdate &op) override {
+                               LogicalUpdate &op,
+                               PhysicalOperator &plan) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
-      return PlanLanceUpdateOverwrite(context, planner, op);
+      return PlanLanceUpdateOverwrite(context, planner, op, plan);
     }
-    return Catalog::PlanUpdate(context, planner, op);
+    return DuckCatalog::PlanUpdate(context, planner, op, plan);
   }
 
   PhysicalOperator &PlanInsert(ClientContext &context,
@@ -1456,6 +1448,7 @@ public:
           ArrowConverter::ToArrowSchema(&state->schema_root.arrow_schema,
                                         state->column_types,
                                         state->column_names, props);
+          LanceNormalizeArrowListFieldNames(&state->schema_root.arrow_schema);
 
           unordered_map<string, Value> overrides;
           if (!state->bearer_token_override.empty()) {
@@ -1503,7 +1496,12 @@ public:
             }
           }
 
-          // If overwriting, drop any existing table first.
+          // REST namespace metadata changes (DROP + CREATE empty table) happen
+          // before the writer starts and are not part of the Lance data
+          // transaction. A failed write therefore publishes no Lance data
+          // version, but an overwrite cannot roll the namespace catalog entry
+          // back; this is the existing REST service boundary, not a
+          // distributed namespace transaction.
           if (state->writer_mode == "overwrite") {
             string drop_error;
             if (!TryLanceNamespaceDropTable(context, state->endpoint,
@@ -1558,6 +1556,7 @@ public:
               state->data_storage_version.empty()
                   ? nullptr
                   : state->data_storage_version.c_str();
+          auto blob_flags = LanceBlobFlagsForTypes(state->column_types);
           state->writer = lance_open_writer_with_storage_options(
               state->open_path.c_str(), state->writer_mode.c_str(),
               key_ptrs.empty() ? nullptr : key_ptrs.data(),
@@ -1565,7 +1564,9 @@ public:
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
               LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-              LanceGetSessionHandle(context), &state->schema_root.arrow_schema);
+              LanceGetSessionHandle(context), &state->schema_root.arrow_schema,
+              blob_flags.empty() ? nullptr : blob_flags.data(),
+              blob_flags.size(), LanceBlobIngestBatchBudget(context));
           if (!state->writer) {
             throw IOException("Failed to open Lance writer: " +
                               state->open_path + LanceFormatErrorSuffix());
@@ -1593,12 +1594,18 @@ public:
               extension_type_cast;
           auto props = context.client.GetClientProperties();
 
+          // Resolve and validate source access before exporting the Arrow
+          // array so a policy/secret failure cannot leak it.
+          LanceBatchSourceOptions source_options;
+          LanceCollectIngestSourceOptions(context.client, chunk,
+                                          source_options);
+
           ArrowArray array;
           memset(&array, 0, sizeof(array));
           ArrowConverter::ToArrowArray(chunk, &array, props,
                                        extension_type_cast);
 
-          auto rc = lance_writer_write_batch(gstate.writer, &array);
+          auto rc = LanceWriteBlobBatch(gstate.writer, &array, source_options);
           if (array.release) {
             array.release(&array);
           }
@@ -1655,9 +1662,8 @@ public:
           state.emitted = true;
 
           auto &gstate = sink_state->Cast<GlobalState>();
-          chunk.SetCardinality(1);
-          chunk.SetValue(
-              0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
+          chunk.data[0].Append(
+              Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
           return SourceResultType::FINISHED;
         }
 
@@ -1705,7 +1711,7 @@ public:
       auto prefix = rest_ns->namespace_id.empty()
                         ? string()
                         : (rest_ns->namespace_id + delim);
-      auto leaf_id = create_info.table;
+      auto leaf_id = create_info.GetTableName().GetIdentifierName();
       string prefixed_id;
       if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
         prefixed_id = prefix + leaf_id;
@@ -1742,26 +1748,32 @@ public:
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
           op.types, rest_ns->endpoint, rest_ns->namespace_id,
           rest_ns->delimiter, rest_ns->bearer_token_override,
-          rest_ns->api_key_override, rest_ns->headers_tsv, create_info.table,
-          mode, data_storage_version, std::move(names), std::move(types),
+          rest_ns->api_key_override, rest_ns->headers_tsv,
+          create_info.GetTableName().GetIdentifierName(), mode,
+          data_storage_version, std::move(names), std::move(types),
           op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
 
-    if (!IsSafeDatasetTableName(create_info.table)) {
+    if (!IsSafeDatasetTableName(
+            create_info.GetTableName().GetIdentifierName())) {
       throw InvalidInputException(
-          "Unsafe Lance dataset name for CREATE TABLE: " + create_info.table);
+          "Unsafe Lance dataset name for CREATE TABLE: " +
+          create_info.GetTableName().GetIdentifierName());
     }
     if (!directory_ns || directory_ns->root.empty()) {
       throw InternalException("Lance directory namespace root is empty");
     }
 
+    auto physical_table = FindDirectoryNamespaceTable(
+        *directory_ns, create_info.GetTableName().GetIdentifierName());
+    auto exists = !physical_table.empty();
+    if (!exists) {
+      physical_table = create_info.GetTableName().GetIdentifierName();
+    }
     auto dataset_path = JoinNamespacePath(directory_ns->root,
-                                          GetDatasetDirName(create_info.table));
-
-    auto exists =
-        DirectoryNamespaceTableExists(*directory_ns, create_info.table);
+                                          GetDatasetDirName(physical_table));
 
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {
@@ -1784,77 +1796,19 @@ public:
       copy_info.options["data_storage_version"] = {Value(data_storage_version)};
     }
 
-    auto &system_catalog = Catalog::GetSystemCatalog(context);
-    auto entry = system_catalog.GetEntry(
-        context, CatalogType::COPY_FUNCTION_ENTRY, DEFAULT_SCHEMA, "lance",
-        OnEntryNotFound::THROW_EXCEPTION);
-    auto &copy_function = entry->Cast<CopyFunctionCatalogEntry>().function;
-
-    if (!copy_function.copy_to_bind) {
-      throw NotImplementedException(
-          "COPY TO is not supported for FORMAT \"lance\"");
-    }
-
-    auto names = create_info.columns.GetColumnNames();
-    auto types = create_info.columns.GetColumnTypes();
-    CopyFunctionBindInput bind_input(copy_info);
-    auto bind_data =
-        copy_function.copy_to_bind(context, bind_input, names, types);
-
-    bool preserve_insertion_order =
-        PhysicalPlanGenerator::PreserveInsertionOrder(context, plan);
-    bool supports_batch_index =
-        PhysicalPlanGenerator::UseBatchIndex(context, plan);
-    auto execution_mode = CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
-    if (copy_function.execution_mode) {
-      execution_mode = copy_function.execution_mode(preserve_insertion_order,
-                                                    supports_batch_index);
-    }
-
-    if (execution_mode == CopyFunctionExecutionMode::BATCH_COPY_TO_FILE) {
-      auto &copy = planner.Make<PhysicalBatchCopyToFile>(
-          op.types, copy_function, std::move(bind_data),
-          op.estimated_cardinality);
-      auto &cast_copy = copy.Cast<PhysicalBatchCopyToFile>();
-      cast_copy.file_path = dataset_path;
-      cast_copy.use_tmp_file = false;
-      cast_copy.return_type = CopyFunctionReturnType::CHANGED_ROWS;
-      cast_copy.write_empty_file = true;
-      cast_copy.children.push_back(plan);
-      return copy;
-    }
-
-    auto &copy = planner.Make<PhysicalCopyToFile>(op.types, copy_function,
-                                                  std::move(bind_data),
-                                                  op.estimated_cardinality);
-    auto &cast_copy = copy.Cast<PhysicalCopyToFile>();
-    cast_copy.file_path = dataset_path;
-    cast_copy.use_tmp_file = false;
-    cast_copy.filename_pattern = FilenamePattern();
-    cast_copy.file_extension = "";
-    cast_copy.overwrite_mode = CopyOverwriteMode::COPY_ERROR_ON_CONFLICT;
-    cast_copy.return_type = CopyFunctionReturnType::CHANGED_ROWS;
-    cast_copy.per_thread_output = false;
-    cast_copy.file_size_bytes = optional_idx();
-    cast_copy.rotate = false;
-    cast_copy.write_empty_file = true;
-    cast_copy.partition_output = false;
-    cast_copy.write_partition_columns = false;
-    cast_copy.hive_file_pattern = false;
-    cast_copy.partition_columns.clear();
-    cast_copy.names = names;
-    cast_copy.expected_types = types;
-    cast_copy.parallel =
-        execution_mode == CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
-    cast_copy.children.push_back(plan);
-    return copy;
+    return PlanLanceCopy(
+        context, planner, copy_info,
+        StringsToIdentifiers(create_info.columns.GetColumnNames()),
+        create_info.columns.GetColumnTypes(), plan);
   }
 
+  // Lance plans DELETE before the child plan exists, so a plain
+  // `DELETE FROM t` can drop whole fragments instead of scanning every row id.
   PhysicalOperator &PlanDelete(ClientContext &context,
                                PhysicalPlanGenerator &planner,
                                LogicalDelete &op) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
-      return PlanLanceDelete(context, planner, op);
+      return PlanLanceDelete(context, planner, op, nullptr);
     }
     return Catalog::PlanDelete(context, planner, op);
   }
@@ -1864,14 +1818,14 @@ public:
     (void)schemas.DropEntry(transaction, DEFAULT_SCHEMA, true, true);
 
     CreateSchemaInfo info;
-    info.schema = DEFAULT_SCHEMA;
+    info.SetSchema(DEFAULT_SCHEMA);
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
     LogicalDependencyList dependencies;
     auto entry =
         make_uniq<LanceSchemaEntry>(*this, info, directory_ns, rest_ns);
-    if (!schemas.CreateEntry(transaction, info.schema, std::move(entry),
+    if (!schemas.CreateEntry(transaction, info.SchemaName(), std::move(entry),
                              dependencies)) {
       throw InternalException("Failed to replace Lance schema entry");
     }
@@ -1890,8 +1844,7 @@ PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
   if (!lance_table) {
     return DuckCatalog::PlanDelete(context, planner, op, plan);
   }
-  (void)plan;
-  return PlanLanceDelete(context, planner, op);
+  return PlanLanceDelete(context, planner, op, &plan);
 }
 
 static unique_ptr<Catalog>
@@ -1985,8 +1938,6 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto &schema = catalog->GetSchema(system_transaction, DEFAULT_SCHEMA);
 
   auto &lance_schema = schema.Cast<LanceSchemaEntry>();
-  auto &duck_schema = schema.Cast<DuckSchemaEntry>();
-  auto &catalog_set = duck_schema.GetCatalogSet(CatalogType::TABLE_ENTRY);
 
   if (!is_rest_namespace) {
     generator = make_uniq<LanceDirectoryDefaultGenerator>(*catalog, schema,
@@ -1997,9 +1948,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
         std::move(api_key), delimiter, bearer_token_override, api_key_override,
         headers_tsv);
   }
-  auto *generator_ptr = generator.get();
-  catalog_set.SetDefaultGenerator(std::move(generator));
-  lance_schema.SetTableDefaultGenerator(generator_ptr);
+  lance_schema.SetTableDefaultGenerator(std::move(generator));
 
   (void)name;
   return std::move(catalog);
@@ -2011,6 +1960,7 @@ struct LancePendingAppend {
   vector<string> option_values;
   string cache_key;
   void *transaction = nullptr;
+  shared_ptr<LanceDatasetCacheEntry> pinned_dataset;
 };
 
 class LanceTransactionManager final : public DuckTransactionManager {
@@ -2022,7 +1972,13 @@ public:
                              LancePendingAppend pending) {
     auto &transaction = transaction_p.Cast<DuckTransaction>();
     lock_guard<mutex> guard(pending_lock);
-    pending_appends[transaction.transaction_id].push_back(std::move(pending));
+    pending_appends[transaction.GetTransactionId()].push_back(
+        std::move(pending));
+  }
+
+  bool HasPendingAppends() {
+    lock_guard<mutex> guard(pending_lock);
+    return !pending_appends.empty();
   }
 
   ErrorData CommitTransaction(ClientContext &context,
@@ -2031,7 +1987,7 @@ public:
     vector<LancePendingAppend> appends;
     {
       lock_guard<mutex> guard(pending_lock);
-      auto it = pending_appends.find(transaction.transaction_id);
+      auto it = pending_appends.find(transaction.GetTransactionId());
       if (it != pending_appends.end()) {
         appends = std::move(it->second);
         pending_appends.erase(it);
@@ -2045,11 +2001,15 @@ public:
       BuildStorageOptionPointerArrays(
           pending.option_keys, pending.option_values, key_ptrs, value_ptrs);
 
-      auto rc = lance_commit_transaction_with_storage_options(
-          pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          pending.option_keys.size(), LanceGetSessionHandle(context),
-          pending.transaction);
+      auto rc = pending.pinned_dataset
+                    ? lance_commit_transaction_to_dataset(
+                          pending.pinned_dataset->Handle(), pending.transaction)
+                    : lance_commit_transaction_with_storage_options(
+                          pending.path.c_str(),
+                          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                          value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                          pending.option_keys.size(),
+                          LanceGetSessionHandle(context), pending.transaction);
       if (rc != 0) {
         // Best-effort cleanup of any remaining pending transactions.
         // Note: the transaction pointer is consumed by the commit call, even on
@@ -2080,7 +2040,7 @@ public:
     vector<LancePendingAppend> appends;
     {
       lock_guard<mutex> guard(pending_lock);
-      auto it = pending_appends.find(transaction.transaction_id);
+      auto it = pending_appends.find(transaction.GetTransactionId());
       if (it != pending_appends.end()) {
         appends = std::move(it->second);
         pending_appends.erase(it);
@@ -2110,10 +2070,11 @@ void RegisterLanceStorage(DBConfig &config) {
   StorageExtension::Register(config, "lance", std::move(ext));
 }
 
-void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
-                                string dataset_uri, vector<string> option_keys,
-                                vector<string> option_values, string cache_key,
-                                void *lance_transaction) {
+void RegisterLancePendingAppend(
+    ClientContext &context, Catalog &catalog, string dataset_uri,
+    vector<string> option_keys, vector<string> option_values, string cache_key,
+    void *lance_transaction,
+    shared_ptr<LanceDatasetCacheEntry> pinned_dataset) {
   auto &txn = Transaction::Get(context, catalog);
   auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
   if (!tm) {
@@ -2127,7 +2088,22 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.option_values = std::move(option_values);
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
+  pending.pinned_dataset = std::move(pinned_dataset);
   tm->RegisterPendingAppend(txn, std::move(pending));
+}
+
+// Checks every attached Lance catalog, not only the one a caller targets: the
+// same dataset can be reached through a catalog name and through a path, so a
+// match on the dataset URI could miss it.
+bool LanceHasUncommittedWrites(ClientContext &context) {
+  for (auto &db : DatabaseManager::Get(context).GetDatabases(context)) {
+    auto *tm =
+        dynamic_cast<LanceTransactionManager *>(&db->GetTransactionManager());
+    if (tm && tm->HasPendingAppends()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace duckdb

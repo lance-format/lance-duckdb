@@ -7,17 +7,22 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use arrow::compute;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::{Duration, Utc};
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
 use lance::index::DatasetIndexExt;
 use lance::Dataset;
+use lance_arrow::json::has_json_fields;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 
+use super::blob::{
+    apply_blob_output_fields, blob_v2_array_from_bytes, is_blob_v2_field, plan_blob_conversions,
+    version_supports_blob_v2,
+};
 use super::util::{
     canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
     FfiResult,
@@ -29,6 +34,65 @@ fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
         .get("lance.add_columns.batch_size")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| *v > 0)
+}
+
+/// Apply the SQL BLOB contract to columns introduced by ALTER ADD COLUMN.
+///
+/// DuckDB exports BLOB as a plain binary Arrow field. At file version >= 2.2
+/// the flagged top-level fields must instead carry the logical Blob v2 shape,
+/// matching what COPY/CTAS writes. The planner rejects nested
+/// `LANCE_BLOB_INPUT` values in non-BLOB containers and a top-level
+/// `LANCE_BLOB_INPUT` column, which ALTER has no stored-default contract for.
+/// Older datasets keep the binary encoding and existing fields are never
+/// rewritten by this path.
+fn add_blob_v2_schema_fields(
+    dataset: &Dataset,
+    schema: Arc<ArrowSchema>,
+    blob_flags: &[bool],
+) -> FfiResult<Arc<ArrowSchema>> {
+    if !blob_flags.iter().any(|flag| *flag) {
+        return Ok(schema);
+    }
+    for (idx, flag) in blob_flags.iter().enumerate() {
+        if *flag && matches!(schema.fields()[idx].data_type(), DataType::Union(_, _)) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "top-level LANCE_BLOB_INPUT columns are not supported in ALTER TABLE ADD COLUMN",
+            ));
+        }
+    }
+    let version = dataset
+        .manifest
+        .data_storage_format
+        .lance_file_format()
+        .to_manifest_string();
+    let flag_bytes: Vec<u8> = blob_flags.iter().map(|flag| u8::from(*flag)).collect();
+    let conversions = plan_blob_conversions(
+        schema.as_ref(),
+        None,
+        version_supports_blob_v2(version),
+        &flag_bytes,
+    )
+    .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err))?;
+    if conversions.is_empty() {
+        return Ok(schema);
+    }
+    let output_schema = apply_blob_output_fields(schema.as_ref(), &conversions);
+    Ok(Arc::new(ArrowSchema::new_with_metadata(
+        output_schema.fields().to_vec(),
+        schema.metadata().clone(),
+    )))
+}
+
+/// Treat a zero size/count option as unset so Lance applies its own default.
+///
+/// `docs/sql.md` documents `OPTIMIZE ... WITH (max_bytes_per_file = 0,
+/// num_threads = 0, batch_size = 0)`, i.e. zero reads as "use the default".
+/// Forwarding `Some(0)` instead is not merely ignored: `num_threads` becomes
+/// `buffer_unordered(0)`, which never polls a task, so compaction of a dataset
+/// with two or more compactable fragments never completes.
+fn zero_as_unset(value: Option<usize>) -> Option<usize> {
+    value.filter(|v| *v > 0)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -57,6 +121,7 @@ struct CleanupOldVersionsOptionsInput {
 struct CleanupOldVersionsMetricsOutput {
     bytes_removed: u64,
     old_versions: u64,
+    failed_deletes: u64,
 }
 
 impl Default for CleanupOldVersionsOptionsInput {
@@ -89,13 +154,13 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
     })?;
 
     let mut options = CompactionOptions::default();
-    if let Some(v) = input.target_rows_per_fragment {
+    if let Some(v) = zero_as_unset(input.target_rows_per_fragment) {
         options.target_rows_per_fragment = v;
     }
-    if let Some(v) = input.max_rows_per_group {
+    if let Some(v) = zero_as_unset(input.max_rows_per_group) {
         options.max_rows_per_group = v;
     }
-    if let Some(v) = input.max_bytes_per_file {
+    if let Some(v) = zero_as_unset(input.max_bytes_per_file) {
         options.max_bytes_per_file = Some(v);
     }
     if let Some(v) = input.materialize_deletions {
@@ -104,16 +169,21 @@ fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<Compa
     if let Some(v) = input.materialize_deletions_threshold {
         options.materialize_deletions_threshold = v;
     }
-    if let Some(v) = input.num_threads {
+    if let Some(v) = zero_as_unset(input.num_threads) {
         options.num_threads = Some(v);
     }
-    if let Some(v) = input.batch_size {
+    if let Some(v) = zero_as_unset(input.batch_size) {
         options.batch_size = Some(v);
     }
     if let Some(v) = input.defer_index_remap {
         options.defer_index_remap = v;
     }
-    options.validate();
+    options.validate().map_err(|err| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("compact_files options validate: {err}"),
+        )
+    })?;
     Ok(options)
 }
 
@@ -185,6 +255,8 @@ pub unsafe extern "C" fn lance_dataset_add_columns(
     expressions: *const *const c_char,
     expressions_len: usize,
     batch_size: u32,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
 ) -> i32 {
     match dataset_add_columns_inner(
         dataset,
@@ -192,6 +264,8 @@ pub unsafe extern "C" fn lance_dataset_add_columns(
         expressions,
         expressions_len,
         batch_size,
+        blob_columns,
+        blob_columns_len,
     ) {
         Ok(()) => {
             clear_last_error();
@@ -210,6 +284,8 @@ fn dataset_add_columns_inner(
     expressions: *const *const c_char,
     expressions_len: usize,
     batch_size: u32,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
 ) -> FfiResult<()> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let mut ds = (*handle.dataset).clone();
@@ -221,6 +297,27 @@ fn dataset_add_columns_inner(
             "new_columns_schema must have at least one field",
         ));
     }
+    if blob_columns_len != 0 && blob_columns_len != output_schema.fields().len() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "blob_columns_len must be zero or match new_columns_schema field count",
+        ));
+    }
+    let blob_flags = if blob_columns_len == 0 {
+        vec![false; output_schema.fields().len()]
+    } else {
+        if blob_columns.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "blob_columns must not be null when blob_columns_len is non-zero",
+            ));
+        }
+        unsafe { std::slice::from_raw_parts(blob_columns, blob_columns_len) }
+            .iter()
+            .map(|flag| *flag != 0)
+            .collect()
+    };
+    let output_schema = add_blob_v2_schema_fields(&ds, output_schema, &blob_flags)?;
 
     let batch_size = if batch_size == 0 {
         parse_batch_size_from_config(&ds)
@@ -314,7 +411,22 @@ fn dataset_add_columns_inner(
                     .map_err(|err| {
                         lance::Error::invalid_input(format!("expression[{idx}] into_array: {err}"))
                     })?;
-                let arr = if arr.data_type() != field.data_type() {
+                let arr = if is_blob_v2_field(field) {
+                    let arr = if matches!(
+                        arr.data_type(),
+                        DataType::Binary | DataType::LargeBinary | DataType::Null
+                    ) {
+                        arr
+                    } else {
+                        compute::cast(&arr, &DataType::LargeBinary).map_err(|err| {
+                            lance::Error::invalid_input(format!(
+                                "expression[{idx}] blob cast: {err}"
+                            ))
+                        })?
+                    };
+                    blob_v2_array_from_bytes(field.name(), arr.as_ref())
+                        .map_err(lance::Error::invalid_input)?
+                } else if arr.data_type() != field.data_type() {
                     compute::cast(&arr, field.data_type()).map_err(|err| {
                         lance::Error::invalid_input(format!("expression[{idx}] cast: {err}"))
                     })?
@@ -508,6 +620,17 @@ fn dataset_alter_columns_cast_inner(
     let new_type = type_schema.fields()[0].data_type().clone();
 
     let mut ds = (*handle.dataset).clone();
+    // ColumnAlteration carries only the target DataType, not the source
+    // field's JSON metadata, so reject the physical JSON source first.
+    if let Some(source_field) = ds.schema().field(&path) {
+        let source_field = ArrowField::from(source_field);
+        if has_json_fields(&source_field) {
+            return Err(FfiError::new(
+                ErrorCode::DatasetAlterColumns,
+                format!("ALTER COLUMN TYPE does not support Lance JSON source column '{path}'"),
+            ));
+        }
+    }
     let alteration = ColumnAlteration::new(path).cast_to(new_type);
     match runtime::block_on(ds.alter_columns(&[alteration])) {
         Ok(Ok(())) => Ok(()),
@@ -807,6 +930,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
     options_json: *const c_char,
+    has_uncommitted_writes: u8,
     out_metrics_json: *mut *const c_char,
 ) -> i32 {
     if !out_metrics_json.is_null() {
@@ -814,9 +938,20 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
             ptr::write_unaligned(out_metrics_json, ptr::null());
         }
     }
-    match parse_cleanup_options_json(options_json).and_then(|options| {
+    let result = parse_cleanup_options_json(options_json).and_then(|options| {
+        // delete_unverified lists data files with no age cutoff
+        // (lance-format/lance#8944), so it would delete the files of writes still
+        // pending in an open transaction, whose commit then publishes a table
+        // that cannot be read.
+        if options.delete_unverified && has_uncommitted_writes != 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "delete_unverified cannot run while a transaction has uncommitted Lance writes",
+            ));
+        }
         dataset_cleanup_old_versions_with_options_struct(dataset, options, out_metrics_json)
-    }) {
+    });
+    match result {
         Ok(()) => {
             clear_last_error();
             0
@@ -878,6 +1013,9 @@ fn dataset_cleanup_old_versions_with_options_struct(
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
                 old_versions: stats.old_versions,
+                // Lance keeps going past files it cannot delete; report them so
+                // a partial cleanup is not mistaken for a complete one.
+                failed_deletes: stats.failed_deletes,
             };
             write_metrics_json(
                 &metrics,
@@ -1104,5 +1242,44 @@ fn dataset_create_scalar_index_inner(
             format!("dataset create_index(scalar): {err}"),
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn compaction_options_from_json(json: &str) -> CompactionOptions {
+        let owned = CString::new(json).expect("json holds no interior nul");
+        parse_compaction_options_json(owned.as_ptr()).expect("options parse")
+    }
+
+    #[test]
+    fn zero_sizes_and_counts_fall_back_to_lance_defaults() {
+        // docs/sql.md spells all three of these as 0 in the OPTIMIZE example.
+        let options = compaction_options_from_json(
+            r#"{"max_bytes_per_file": 0, "num_threads": 0, "batch_size": 0}"#,
+        );
+        let defaults = CompactionOptions::default();
+
+        // Some(0) here reaches buffer_unordered(0), which never polls a task.
+        assert_eq!(options.num_threads, defaults.num_threads);
+        assert_eq!(options.batch_size, defaults.batch_size);
+        assert_eq!(options.max_bytes_per_file, defaults.max_bytes_per_file);
+    }
+
+    #[test]
+    fn positive_sizes_and_counts_are_forwarded() {
+        let options = compaction_options_from_json(
+            r#"{"target_rows_per_fragment": 1024, "max_rows_per_group": 128,
+                "max_bytes_per_file": 4096, "num_threads": 4, "batch_size": 512}"#,
+        );
+
+        assert_eq!(options.target_rows_per_fragment, 1024);
+        assert_eq!(options.max_rows_per_group, 128);
+        assert_eq!(options.max_bytes_per_file, Some(4096));
+        assert_eq!(options.num_threads, Some(4));
+        assert_eq!(options.batch_size, Some(512));
     }
 }

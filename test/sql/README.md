@@ -32,3 +32,21 @@ For environment-gated tests, use this order:
 3. `require lance`
 
 Prefer small, focused files with section comments for setup, correctness, and diagnostics.
+
+## Temporary data and fixtures
+
+Use `{TEST_DIR}` for generated files and namespace roots. DuckDB creates a private
+directory per test, so tests can run repeatedly or concurrently without sharing
+Lance manifests. Use `{variable}` for loop and environment substitutions.
+
+Treat `test/data/` fixtures as read-only. Tests that must evolve an on-disk Arrow
+type copy the fixture bytes into `{TEST_DIR}` using DuckDB's `read_blob` and
+`COPY ... (FORMAT BLOB)` before attaching it. Do not clone these fixtures through
+`COPY ... (FORMAT lance)`: the reader widens float16, and the writer normalizes
+floating-point lists to fixed-size vectors, erasing the schema being tested.
+
+Build the desired configuration before running `make test_debug` or
+`make test_release`; those targets run tests without rebuilding the extension.
+To include the MinIO suites, set `LANCE_TEST_S3=1` and configure the test
+environment variables listed at the top of each S3 test. REST namespace tests
+require a separate server and their own `LANCE_NAMESPACE_*` variables.

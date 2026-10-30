@@ -13,12 +13,12 @@ COPY (
     id::BIGINT AS id,
     TIMESTAMP '2020-01-01 00:00:00' + (id * INTERVAL '1 DAY') AS ts
   FROM generate_series(1, 10) t(id)
-) TO 'test/.tmp/limit_filter_fallback.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/limit_filter_fallback.lance' (FORMAT lance, mode 'overwrite');
 
 # Baseline: without LIMIT, the unpushable filter runs correctly (Lance returns
 # all rows, DuckDB applies the filter). Returns 10.
 query I
-SELECT count(*) FROM 'test/.tmp/limit_filter_fallback.lance' WHERE ts < 'infinity'::TIMESTAMP;
+SELECT count(*) FROM '{TEST_DIR}/limit_filter_fallback.lance' WHERE ts < 'infinity'::TIMESTAMP;
 ----
 10
 
@@ -28,7 +28,7 @@ SELECT count(*) FROM 'test/.tmp/limit_filter_fallback.lance' WHERE ts < 'infinit
 # full-table scan, returning correct results.
 query I
 SELECT count(*) FROM (
-  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  SELECT * FROM '{TEST_DIR}/limit_filter_fallback.lance'
   WHERE ts < 'infinity'::TIMESTAMP
   LIMIT 3
 );
@@ -38,7 +38,7 @@ SELECT count(*) FROM (
 # With OFFSET as well
 query I
 SELECT count(*) FROM (
-  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  SELECT * FROM '{TEST_DIR}/limit_filter_fallback.lance'
   WHERE ts < 'infinity'::TIMESTAMP
   LIMIT 3 OFFSET 2
 );
@@ -48,7 +48,7 @@ SELECT count(*) FROM (
 # LIMIT larger than row count still works (returns all rows post-filter)
 query I
 SELECT count(*) FROM (
-  SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+  SELECT * FROM '{TEST_DIR}/limit_filter_fallback.lance'
   WHERE ts < 'infinity'::TIMESTAMP
   LIMIT 100
 );
@@ -57,7 +57,7 @@ SELECT count(*) FROM (
 
 # Results are semantically correct (not just row count): IDs come back
 query I
-SELECT id FROM 'test/.tmp/limit_filter_fallback.lance'
+SELECT id FROM '{TEST_DIR}/limit_filter_fallback.lance'
 WHERE ts < 'infinity'::TIMESTAMP
 ORDER BY id
 LIMIT 2;
@@ -67,7 +67,7 @@ LIMIT 2;
 
 # OFFSET pushed down with unpushable filter
 query I
-SELECT id FROM 'test/.tmp/limit_filter_fallback.lance'
+SELECT id FROM '{TEST_DIR}/limit_filter_fallback.lance'
 WHERE ts < 'infinity'::TIMESTAMP
 ORDER BY id
 LIMIT 2 OFFSET 5;
@@ -79,7 +79,7 @@ LIMIT 2 OFFSET 5;
 # leaves the LogicalLimit in the plan (Lance Limit Offset Pushdown=false)
 # so DuckDB applies LIMIT on top of the filtered stream.
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/limit_filter_fallback.lance'
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/limit_filter_fallback.lance'
 WHERE ts < 'infinity'::TIMESTAMP
 LIMIT 3;
 ----
@@ -89,10 +89,10 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
 statement ok
 COPY (
   SELECT id::BIGINT AS id FROM generate_series(1, 20) t(id)
-) TO 'test/.tmp/limit_filter_pushable.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/limit_filter_pushable.lance' (FORMAT lance, mode 'overwrite');
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/limit_filter_pushable.lance'
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/limit_filter_pushable.lance'
 WHERE id > 5
 LIMIT 3;
 ----
@@ -101,7 +101,7 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
 # And returns correct results.
 query I
 SELECT count(*) FROM (
-  SELECT * FROM 'test/.tmp/limit_filter_pushable.lance' WHERE id > 5 LIMIT 3
+  SELECT * FROM '{TEST_DIR}/limit_filter_pushable.lance' WHERE id > 5 LIMIT 3
 );
 ----
 3
@@ -119,12 +119,12 @@ COPY (
     id::BIGINT AS id,
     TIMESTAMP '2020-01-01 00:00:00' + (id * INTERVAL '1 DAY') AS ts
   FROM generate_series(1, 20) t(id)
-) TO 'test/.tmp/limit_filter_selective.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/limit_filter_selective.lance' (FORMAT lance, mode 'overwrite');
 
 # Filter selects ids > 15 (5 matches). With LIMIT 3 we should get 3 of those
 # matches, NOT first 3 rows of the table (ids 1, 2, 3) which would be wrong.
 query I
-SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+SELECT id FROM '{TEST_DIR}/limit_filter_selective.lance'
 WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
 ORDER BY id
 LIMIT 3;
@@ -135,7 +135,7 @@ LIMIT 3;
 
 # Same semantics with OFFSET: skip 2 matches, take next 2.
 query I
-SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+SELECT id FROM '{TEST_DIR}/limit_filter_selective.lance'
 WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
 ORDER BY id
 LIMIT 2 OFFSET 2;
@@ -148,7 +148,7 @@ LIMIT 2 OFFSET 2;
 # probe's column_ids layout doesn't diverge from real init when projection
 # is pruned.
 query I
-SELECT id FROM 'test/.tmp/limit_filter_selective.lance'
+SELECT id FROM '{TEST_DIR}/limit_filter_selective.lance'
 WHERE id > 15 AND ts < 'infinity'::TIMESTAMP
 ORDER BY id
 LIMIT 3;

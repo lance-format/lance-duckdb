@@ -10,15 +10,15 @@ namespace duckdb {
 // the internal __lance_exec table function.
 class LogicalLanceExec final : public LogicalExtensionOperator {
 public:
-  LogicalLanceExec(idx_t group_index, idx_t aggregate_index, idx_t group_count,
-                   vector<LogicalType> output_types,
+  LogicalLanceExec(TableIndex group_index, TableIndex aggregate_index,
+                   idx_t group_count, vector<LogicalType> output_types,
                    unique_ptr<LogicalOperator> child_get);
 
   PhysicalOperator &CreatePlan(ClientContext &context,
                                PhysicalPlanGenerator &planner) override;
 
   vector<ColumnBinding> GetColumnBindings() override;
-  vector<idx_t> GetTableIndex() const override;
+  vector<TableIndex> GetTableIndex() const override;
 
   string GetName() const override;
   InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -29,8 +29,8 @@ protected:
   void ResolveTypes() override;
 
 private:
-  idx_t group_index_;
-  idx_t aggregate_index_;
+  TableIndex group_index_;
+  TableIndex aggregate_index_;
   idx_t group_count_;
   vector<LogicalType> output_types_;
 };

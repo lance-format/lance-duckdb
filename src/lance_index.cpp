@@ -1,3 +1,5 @@
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "lance_parser.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -17,6 +19,7 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 
 #include "lance_common.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_table_entry.hpp"
@@ -218,8 +221,9 @@ static string NormalizeTableIndexColumnPath(const string &column,
     return column;
   }
 
-  vector<string> table_qualifier = {table_name.catalog, table_name.schema,
-                                    table_name.name};
+  vector<string> table_qualifier = {table_name.Catalog().GetIdentifierName(),
+                                    table_name.Schema().GetIdentifierName(),
+                                    table_name.Name().GetIdentifierName()};
   return FormatLanceFieldPath(
       StripMatchingColumnQualifier(segments, table_qualifier));
 }
@@ -376,6 +380,34 @@ static string EscapeJsonString(const string &s) {
   return out;
 }
 
+static bool TryParseWithBool(const string &raw_val, const char *key, bool &out,
+                             string &out_error) {
+  string val = raw_val;
+  // Honor a single-quoted literal (e.g. replace='true') like a bare token,
+  // matching the spellings the DuckDB-native ValueToBoolOrThrow accepts.
+  if (StartsWithQuotedString(val)) {
+    string lit;
+    idx_t lit_consumed = 0;
+    if (!TryParseSqlStringLiteral(val, lit, lit_consumed) ||
+        !TrimCopy(val.substr(lit_consumed)).empty()) {
+      out_error = string("WITH ") + key + " must be a boolean";
+      return false;
+    }
+    val = lit;
+  }
+  auto lowered = StringUtil::Lower(val);
+  if (lowered == "true" || lowered == "1") {
+    out = true;
+    return true;
+  }
+  if (lowered == "false" || lowered == "0") {
+    out = false;
+    return true;
+  }
+  out_error = string("WITH ") + key + " must be a boolean";
+  return false;
+}
+
 static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
                                              bool &out_replace, bool &out_train,
                                              bool &out_retrain,
@@ -428,15 +460,21 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
     }
     auto key_lower = StringUtil::Lower(key);
     if (key_lower == "replace") {
-      out_replace = StringUtil::Lower(val) == "true" || val == "1";
+      if (!TryParseWithBool(val, "replace", out_replace, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "train") {
-      out_train = !(StringUtil::Lower(val) == "false" || val == "0");
+      if (!TryParseWithBool(val, "train", out_train, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "retrain") {
-      out_retrain = StringUtil::Lower(val) == "true" || val == "1";
+      if (!TryParseWithBool(val, "retrain", out_retrain, out_error)) {
+        return false;
+      }
       continue;
     }
     if (key_lower == "params") {
@@ -460,6 +498,13 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
   }
 
   if (has_raw_params_json) {
+    // A raw `params` JSON is the complete parameter set. Silently dropping any
+    // sibling index options (e.g. metric_type) would build a different index
+    // than the user asked for, so reject the combination instead.
+    if (!passthrough.empty()) {
+      out_error = "WITH params cannot be combined with other index options";
+      return false;
+    }
     out_params_json = raw_params_json;
     return true;
   }
@@ -628,6 +673,12 @@ static void BuildLanceParamsJsonFromDuckdbWithOptions(
   }
 
   if (has_raw_params_json) {
+    // Mirror the SQL-string path: a raw `params` JSON is authoritative, so a
+    // sibling option would be silently dropped. Reject rather than mislead.
+    if (!passthrough.empty()) {
+      throw BinderException(
+          "WITH params cannot be combined with other index options");
+    }
     out_params_json = raw_params_json;
     return;
   }
@@ -700,7 +751,8 @@ struct LanceIndexListLocalState final : public ArrowScanLocalState {
 
 static unique_ptr<FunctionData>
 LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
-                   vector<LogicalType> &return_types, vector<string> &names) {
+                   vector<LogicalType> &return_types,
+                   vector<Identifier> &names) {
   if (input.inputs.size() != 1) {
     throw BinderException("__lance_indexes requires exactly one input");
   }
@@ -740,7 +792,10 @@ LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
-  names = result->names;
+  names.clear();
+  for (const auto &name : result->names) {
+    names.emplace_back(name);
+  }
   return_types = result->types;
   return std::move(result);
 }
@@ -748,7 +803,7 @@ LanceIndexListBind(ClientContext &context, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   if (input.inputs.size() != 3) {
     throw BinderException(
         "__lance_indexes_table requires (catalog, schema, table)");
@@ -766,8 +821,10 @@ LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
         "__lance_indexes_table catalog/schema/table cannot be empty");
   }
 
-  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
-                                  schema, table);
+  auto &entry =
+      Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                        QualifiedName(Identifier(catalog), Identifier(schema),
+                                      Identifier(table)));
   auto &table_entry = entry.Cast<TableCatalogEntry>();
   auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
   if (!lance_entry) {
@@ -809,7 +866,10 @@ LanceIndexListTableBind(ClientContext &context, TableFunctionBindInput &input,
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
-  names = result->names;
+  names.clear();
+  for (const auto &name : result->names) {
+    names.emplace_back(name);
+  }
   return_types = result->types;
   return std::move(result);
 }
@@ -859,26 +919,12 @@ static bool LanceIndexListLoadNextBatch(LanceIndexListLocalState &local_state,
                       LanceFormatErrorSuffix());
   }
 
-  auto new_chunk = make_shared_ptr<ArrowArrayWrapper>();
-  memset(&new_chunk->arrow_array, 0, sizeof(new_chunk->arrow_array));
-  ArrowSchema tmp_schema;
-  memset(&tmp_schema, 0, sizeof(tmp_schema));
-
-  if (lance_batch_to_arrow(batch, &new_chunk->arrow_array, &tmp_schema) != 0) {
-    lance_free_batch(batch);
-    throw IOException(
-        "Failed to export Lance RecordBatch to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-  lance_free_batch(batch);
+  LanceArrowBatch exported(batch);
+  auto &new_chunk = exported.array;
 
   global.record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   global.record_batch_rows.fetch_add(rows);
-
-  if (tmp_schema.release) {
-    tmp_schema.release(&tmp_schema);
-  }
 
   local_state.chunk = std::move(new_chunk);
   local_state.chunk_offset = 0;
@@ -909,7 +955,7 @@ static void LanceIndexListFunc(ClientContext &context, TableFunctionInput &data,
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     global_state.lines_read.fetch_add(output_size);
 
-    output.SetCardinality(output_size);
+    output.SetChildCardinality(output_size);
     // The Lance index list stream always returns all columns (no projection
     // pushdown), so we must map DuckDB projection column ids to Arrow children.
     ArrowTableFunction::ArrowToDuckDB(
@@ -1015,7 +1061,8 @@ struct LanceIndexDdlGlobalState final : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData>
 LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
-                     vector<LogicalType> &return_types, vector<string> &names) {
+                     vector<LogicalType> &return_types,
+                     vector<Identifier> &names) {
   if (input.inputs.size() != 7) {
     throw BinderException("__lance_create_index requires 7 inputs");
   }
@@ -1058,7 +1105,7 @@ LanceCreateIndexBind(ClientContext &, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
                           vector<LogicalType> &return_types,
-                          vector<string> &names) {
+                          vector<Identifier> &names) {
   if (input.inputs.size() != 9) {
     throw BinderException("__lance_create_index_table requires 9 inputs");
   }
@@ -1092,8 +1139,10 @@ LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
         "__lance_create_index_table index type cannot be empty");
   }
 
-  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
-                                  schema, table);
+  auto &entry =
+      Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                        QualifiedName(Identifier(catalog), Identifier(schema),
+                                      Identifier(table)));
   auto &table_entry = entry.Cast<TableCatalogEntry>();
   auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
   if (!lance_entry) {
@@ -1114,7 +1163,8 @@ LanceCreateIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
 
 static unique_ptr<FunctionData>
 LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
-                   vector<LogicalType> &return_types, vector<string> &names) {
+                   vector<LogicalType> &return_types,
+                   vector<Identifier> &names) {
   if (input.inputs.size() != 2) {
     throw BinderException("__lance_drop_index requires 2 inputs");
   }
@@ -1142,7 +1192,7 @@ LanceDropIndexBind(ClientContext &, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   if (input.inputs.size() != 4) {
     throw BinderException("__lance_drop_index_table requires 4 inputs");
   }
@@ -1165,8 +1215,10 @@ LanceDropIndexTableBind(ClientContext &context, TableFunctionBindInput &input,
         "__lance_drop_index_table index name cannot be empty");
   }
 
-  auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, catalog,
-                                  schema, table);
+  auto &entry =
+      Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                        QualifiedName(Identifier(catalog), Identifier(schema),
+                                      Identifier(table)));
   auto &table_entry = entry.Cast<TableCatalogEntry>();
   auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
   if (!lance_entry) {
@@ -1190,7 +1242,6 @@ static void LanceCreateIndexFunc(ClientContext &context,
                                  TableFunctionInput &data, DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceIndexDdlGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -1199,9 +1250,10 @@ static void LanceCreateIndexFunc(ClientContext &context,
   void *dataset = nullptr;
   string display_uri = bind_data.dataset_uri;
   if (bind_data.target_is_table) {
-    auto &entry =
-        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
-                          bind_data.schema, bind_data.table);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    QualifiedName(Identifier(bind_data.catalog),
+                                                  Identifier(bind_data.schema),
+                                                  Identifier(bind_data.table)));
     auto &table_entry = entry.Cast<TableCatalogEntry>();
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
     if (!lance_entry) {
@@ -1237,9 +1289,10 @@ static void LanceCreateIndexFunc(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
   if (bind_data.target_is_table) {
-    auto &entry =
-        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
-                          bind_data.schema, bind_data.table);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    QualifiedName(Identifier(bind_data.catalog),
+                                                  Identifier(bind_data.schema),
+                                                  Identifier(bind_data.table)));
     auto &table_entry = entry.Cast<TableCatalogEntry>();
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
     if (!lance_entry) {
@@ -1250,15 +1303,12 @@ static void LanceCreateIndexFunc(ClientContext &context,
   } else {
     LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
   }
-
-  output.SetCardinality(0);
 }
 
 static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
                                DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceIndexDdlGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -1267,9 +1317,10 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   void *dataset = nullptr;
   string display_uri = bind_data.dataset_uri;
   if (bind_data.target_is_table) {
-    auto &entry =
-        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
-                          bind_data.schema, bind_data.table);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    QualifiedName(Identifier(bind_data.catalog),
+                                                  Identifier(bind_data.schema),
+                                                  Identifier(bind_data.table)));
     auto &table_entry = entry.Cast<TableCatalogEntry>();
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
     if (!lance_entry) {
@@ -1291,9 +1342,10 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
     throw IOException("Failed to drop Lance index" + LanceFormatErrorSuffix());
   }
   if (bind_data.target_is_table) {
-    auto &entry =
-        Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, bind_data.catalog,
-                          bind_data.schema, bind_data.table);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY,
+                                    QualifiedName(Identifier(bind_data.catalog),
+                                                  Identifier(bind_data.schema),
+                                                  Identifier(bind_data.table)));
     auto &table_entry = entry.Cast<TableCatalogEntry>();
     auto *lance_entry = dynamic_cast<LanceTableEntry *>(&table_entry);
     if (!lance_entry) {
@@ -1304,8 +1356,6 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   } else {
     LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
   }
-
-  output.SetCardinality(0);
 }
 
 static TableFunction LanceCreateIndexTableFunction() {
@@ -1391,8 +1441,6 @@ public:
                         LanceFormatErrorSuffix());
     }
     LanceInvalidateDatasetCacheForTable(client_context, table);
-
-    chunk.SetCardinality(0);
     return SourceResultType::FINISHED;
   }
 
@@ -1420,13 +1468,15 @@ static string GetSingleColumnNameOrThrow(const CreateIndexInfo &info,
         "Lance CREATE INDEX currently supports a single column");
   }
   auto &col_ref = expr.Cast<ColumnRefExpression>();
-  if (col_ref.column_names.empty()) {
+  if (col_ref.ColumnNames().empty()) {
     throw InternalException("column ref has no column names");
   }
-  vector<string> table_qualifier = {table.catalog.GetName(),
-                                    table.ParentSchema().name, table.name};
-  auto field_path_segments =
-      StripMatchingColumnQualifier(col_ref.column_names, table_qualifier);
+  vector<string> table_qualifier = {
+      table.catalog.GetName().GetIdentifierName(),
+      table.ParentSchema().name.GetIdentifierName(),
+      table.name.GetIdentifierName()};
+  auto field_path_segments = StripMatchingColumnQualifier(
+      IdentifiersToStrings(col_ref.ColumnNames()), table_qualifier);
   return FormatLanceFieldPath(field_path_segments);
 }
 
@@ -1450,9 +1500,9 @@ static PhysicalOperator &LanceBtreeCreatePlan(PlanIndexInput &input) {
                                             params_json);
 
   return planner.Make<PhysicalLanceCreateIndex>(
-      op.types, *lance_table, op.info->index_name, std::move(column),
-      std::move(index_type), std::move(params_json), replace, train,
-      op.estimated_cardinality);
+      op.types, *lance_table, op.info->GetIndexName().GetIdentifierName(),
+      std::move(column), std::move(index_type), std::move(params_json), replace,
+      train, op.estimated_cardinality);
 }
 
 // --- Parser extension ---
@@ -1747,13 +1797,9 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
   QualifiedName parsed;
   if (!parse_data->target_is_path) {
     parsed = QualifiedName::Parse(parse_data->target_sql);
-    // Fill in default catalog/schema if not specified
-    if (parsed.catalog.empty()) {
-      parsed.catalog = DatabaseManager::GetDefaultDatabase(context);
-    }
-    if (parsed.schema.empty()) {
-      parsed.schema = DEFAULT_SCHEMA;
-    }
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, parsed)
+                      .Cast<TableCatalogEntry>();
+    parsed = entry.schema.GetQualifiedName(entry.name);
     qname = &parsed;
   }
   switch (parse_data->kind) {
@@ -1784,9 +1830,9 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
           NormalizeTableIndexColumnPath(parse_data->columns[0], *qname);
       result.function = LanceCreateIndexTableTableFunction();
       result.parameters = {
-          Value(qname->catalog),
-          Value(qname->schema),
-          Value(qname->name),
+          Value(qname->Catalog().GetIdentifierName()),
+          Value(qname->Schema().GetIdentifierName()),
+          Value(qname->Name().GetIdentifierName()),
           Value(parse_data->index_name),
           Value(std::move(column)),
           Value(parse_data->index_type),
@@ -1811,8 +1857,10 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
         throw InternalException("DROP INDEX is missing a target");
       }
       result.function = LanceDropIndexTableTableFunction();
-      result.parameters = {Value(qname->catalog), Value(qname->schema),
-                           Value(qname->name), Value(parse_data->index_name)};
+      result.parameters = {Value(qname->Catalog().GetIdentifierName()),
+                           Value(qname->Schema().GetIdentifierName()),
+                           Value(qname->Name().GetIdentifierName()),
+                           Value(parse_data->index_name)};
     }
     result.return_type = StatementReturnType::NOTHING;
     break;
@@ -1829,8 +1877,9 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
         throw InternalException("SHOW INDEX is missing a target");
       }
       result.function = LanceInternalIndexesTableTableFunction();
-      result.parameters = {Value(qname->catalog), Value(qname->schema),
-                           Value(qname->name)};
+      result.parameters = {Value(qname->Catalog().GetIdentifierName()),
+                           Value(qname->Schema().GetIdentifierName()),
+                           Value(qname->Name().GetIdentifierName())};
     }
     result.return_type = StatementReturnType::QUERY_RESULT;
     break;
@@ -1844,7 +1893,10 @@ LanceIndexPlan(ParserExtensionInfo *, ClientContext &context,
 
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader) {
   ParserExtension extension;
-  extension.parse_function = LanceIndexParse;
+  extension.parse_function = [](ParserExtensionInfo *info,
+                                const vector<SimpleToken> &tokens) {
+    return ParseLanceStatement(info, tokens, LanceIndexParse);
+  };
   extension.plan_function = LanceIndexPlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
   ParserExtension::Register(config, std::move(extension));

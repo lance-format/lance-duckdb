@@ -1,0 +1,111 @@
+# name: test/sql/dml_update_blob.test
+# description: UPDATE replaces BLOB values through Lance column updates while preserving unassigned columns
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 'old-a'::BLOB AS payload
+  UNION ALL SELECT 2, 'b', repeat('b', 5000)::BLOB
+  UNION ALL SELECT 3, 'c', NULL::BLOB
+  UNION ALL SELECT 4, 'd', 'old-d'::BLOB
+) TO '{TEST_DIR}/lance_update_blob.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+# Updating an unrelated column must not change BLOB values or their byte layout.
+statement ok
+UPDATE ns.main.lance_update_blob SET s = 'a2' WHERE id = 1;
+
+query II
+SELECT s = 'a2', payload = 'old-a'::BLOB FROM ns.main.lance_update_blob WHERE id = 1;
+----
+true	true
+
+statement ok
+UPDATE ns.main.lance_update_blob SET s = 'b2' WHERE id = 2;
+
+query II
+SELECT s = 'b2', octet_length(payload) FROM ns.main.lance_update_blob WHERE id = 2;
+----
+true	5000
+
+# Replace a BLOB with new bytes.
+statement ok
+UPDATE ns.main.lance_update_blob SET payload = 'new-a'::BLOB WHERE id = 1;
+
+query I
+SELECT payload = 'new-a'::BLOB FROM ns.main.lance_update_blob WHERE id = 1;
+----
+true
+
+# Set a BLOB to NULL and back to bytes.
+statement ok
+UPDATE ns.main.lance_update_blob SET payload = NULL::BLOB WHERE id = 2;
+
+query I
+SELECT payload IS NULL FROM ns.main.lance_update_blob WHERE id = 2;
+----
+true
+
+statement ok
+UPDATE ns.main.lance_update_blob SET payload = repeat('z', 7000)::BLOB WHERE id = 2;
+
+query I
+SELECT octet_length(payload) = 7000 FROM ns.main.lance_update_blob WHERE id = 2;
+----
+true
+
+# Multiple assigned columns in one statement, including one unchanged BLOB sibling.
+statement ok
+UPDATE ns.main.lance_update_blob
+SET s = 'd2', id = id + 10, payload = 'new-d'::BLOB
+WHERE id = 4;
+
+query III
+SELECT id = 14, s = 'd2', payload = 'new-d'::BLOB FROM ns.main.lance_update_blob WHERE id = 14;
+----
+true	true	true
+
+# Unmatched UPDATE leaves every row untouched.
+statement ok
+UPDATE ns.main.lance_update_blob SET payload = 'nope'::BLOB WHERE id = 999;
+
+query I
+SELECT count(*) FROM ns.main.lance_update_blob WHERE payload = 'nope'::BLOB;
+----
+0
+
+# Rolled-back UPDATE does not publish any column rewrite.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE ns.main.lance_update_blob SET payload = 'rolled-back'::BLOB WHERE id = 3;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT payload IS NULL FROM ns.main.lance_update_blob WHERE id = 3;
+----
+true
+
+# A runtime failure while evaluating SET values publishes no partial state.
+statement error
+UPDATE ns.main.lance_update_blob SET id = CASE WHEN id = 1 THEN CAST('not-an-integer' AS BIGINT) ELSE id END;
+----
+Conversion Error
+
+query II
+SELECT id = 1, payload = 'new-a'::BLOB FROM ns.main.lance_update_blob WHERE payload = 'new-a'::BLOB;
+----
+true	true
+
+# The dataset stays readable after all rewrites.
+query I
+SELECT count(*) FROM ns.main.lance_update_blob;
+----
+4

@@ -1,0 +1,107 @@
+# name: test/sql/dataset_resolution.test
+# description: Dataset resolution retains catalog identity across deferred execution
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/search_test_data.lance')
+TO '{TEST_DIR}/resolution/quoted.table.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/resolution' AS "quoted/catalog" (TYPE LANCE);
+
+# Quoted components are table identities, not dot-separated file paths.
+query I
+SELECT count(*) > 0 FROM lance_fts('"quoted/catalog".main."quoted.table"', 'text', 'puppy', k = 10);
+----
+true
+
+query T
+SELECT Operation FROM __lance_compact_files('"quoted/catalog".main."quoted.table"', '{}');
+----
+compact
+
+statement ok
+COPY (SELECT * FROM 'test/data/search_test_data.lance')
+TO '{TEST_DIR}/resolution/bare' (FORMAT lance, mode 'overwrite');
+
+statement ok
+USE "quoted/catalog";
+
+# An extensionless path bypasses table discovery even with a Lance catalog active.
+query TT
+SELECT * FROM __lance_show_auto_cleanup('{TEST_DIR}/resolution/bare');
+----
+enabled	false
+
+query I
+SELECT count(*) FROM lance_fts('{TEST_DIR}/resolution/bare', 'text', 'puppy');
+----
+2
+
+# Execution uses the fully qualified bind-time identity even after USE changes.
+statement ok
+PREPARE set_config AS SELECT Operation FROM __lance_set_auto_cleanup('"quoted.table"', 60, '1 day', NULL, false);
+
+statement ok
+PREPARE show_config AS SELECT * FROM __lance_show_auto_cleanup('"quoted.table"');
+
+statement ok
+USE memory;
+
+query T
+EXECUTE set_config;
+----
+set_auto_cleanup
+
+query TT rowsort
+EXECUTE show_config;
+----
+enabled	true
+interval	60
+older_than	1 day
+
+# A direct path keeps its path identity through the same deferred execution.
+statement ok
+PREPARE show_path AS SELECT * FROM __lance_show_auto_cleanup('{TEST_DIR}/resolution/quoted.table.lance');
+
+query TT rowsort
+EXECUTE show_path;
+----
+enabled	true
+interval	60
+older_than	1 day
+
+# A bound table must not fall back to its old URI after DETACH.
+statement ok
+DETACH "quoted/catalog";
+
+statement error
+EXECUTE show_config;
+----
+<REGEX>:.*(not found|does not exist).*quoted/catalog.*|.*quoted/catalog.*(not found|does not exist).*
+
+# Inputs that never resolved to a Lance table retain the path fallback.
+statement ok
+CREATE TABLE not_lance(id INTEGER);
+
+statement error
+SELECT * FROM __lance_show_auto_cleanup('not_lance');
+----
+Failed to open Lance dataset: not_lance
+
+statement error
+SELECT * FROM __lance_show_auto_cleanup('missing_dataset');
+----
+Failed to open Lance dataset: missing_dataset
+
+statement error
+SELECT * FROM __lance_show_auto_cleanup('');
+----
+requires a non-empty dataset path or table name
+
+statement error
+SELECT * FROM __lance_show_auto_cleanup(NULL);
+----
+requires a non-null dataset path or table name

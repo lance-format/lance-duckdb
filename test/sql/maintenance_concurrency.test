@@ -4,21 +4,12 @@
 
 require lance
 
-# Upstream Lance (v4.0.0) panics in
-#   lance-<ver>/src/io/commit/conflict_resolver.rs:1659
-# during concurrent OPTIMIZE/VACUUM/INSERT when a freshly VACUUM-ed
-# manifest (e.g. _versions/99.manifest) disappears before a peer commit
-# attempts to read it. Reproduces on Windows CI runners only; this test
-# never ran on Windows until PR #195 touched CMakeLists.txt, which is
-# what triggers the distribution workflow's Windows job.
-require notwindows
-
 statement ok
 COPY (SELECT * FROM 'test/data/test_data.lance')
-TO 'test/.tmp/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/maintenance_concurrency.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS maintenance_cc (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS maintenance_cc (TYPE LANCE);
 
 statement ok
 CREATE INDEX id_idx_cc
@@ -31,10 +22,10 @@ loop i 0 8
 
 statement maybe
 INSERT INTO maintenance_cc.main.maintenance_concurrency VALUES (
-  100000 + ${threadid} * 1000 + ${i},
+  100000 + {threadid} * 1000 + {i},
   'worker',
-  ${i},
-  ${i}::DOUBLE
+  {i},
+  {i}::DOUBLE
 )
 ----
 <REGEX>:.*
@@ -56,30 +47,30 @@ loop i 0 8
 statement maybe
 UPDATE maintenance_cc.main.maintenance_concurrency
 SET age = age + 1
-WHERE id % 8 = ${i}
+WHERE id % 8 = {i}
 ----
 <REGEX>:.*
 
 statement maybe
 DELETE FROM maintenance_cc.main.maintenance_concurrency
-WHERE id = 100000 + ${threadid} * 1000 + ${i}
+WHERE id = 100000 + {threadid} * 1000 + {i}
 ----
 <REGEX>:.*
 
-statement maybe
+endloop
+
+endloop
+
+# In-flight commits need their read-version manifests for conflict resolution,
+# so destructive cleanup must wait until all writers have quiesced.
+statement ok
 VACUUM LANCE maintenance_cc.main.maintenance_concurrency
 WITH (
   older_than_seconds = 0,
   delete_unverified = false,
   error_if_tagged_old_versions = true,
   retain_n_versions = 2
-)
-----
-<REGEX>:.*
-
-endloop
-
-endloop
+);
 
 concurrentloop threadid 0 4
 

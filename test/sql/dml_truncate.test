@@ -5,7 +5,7 @@
 require lance
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.truncate_table_test AS

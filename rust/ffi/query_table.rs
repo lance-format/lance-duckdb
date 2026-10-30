@@ -5,6 +5,9 @@ use std::ptr;
 
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::{FileReader, StreamReader};
+use datafusion_expr::Expr;
+use datafusion_sql::unparser::dialect::CustomDialectBuilder;
+use datafusion_sql::unparser::Unparser;
 use lance_namespace::models::{
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestFullTextQuery,
     QueryTableRequestVector, StringFtsQuery,
@@ -16,13 +19,13 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::StreamHandle;
-use super::util::{cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
 
 const NAMESPACE_KIND_DIRECTORY: u8 = 0;
 const NAMESPACE_KIND_REST: u8 = 1;
 
 #[repr(C)]
-pub struct LanceNamespaceSearchConfig {
+pub struct LanceNamespaceQueryConfig {
     namespace_kind: u8,
     root: *const c_char,
     option_keys: *const *const c_char,
@@ -71,7 +74,7 @@ enum NamespaceBackend {
     },
 }
 
-struct ParsedConfig {
+struct ParsedNamespaceQueryConfig {
     backend: NamespaceBackend,
     table_id: String,
     columns: Vec<String>,
@@ -159,21 +162,23 @@ fn parse_headers_tsv(headers_tsv: Option<&str>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-unsafe fn parse_config(config: *const LanceNamespaceSearchConfig) -> FfiResult<ParsedConfig> {
+unsafe fn parse_config(
+    config: *const LanceNamespaceQueryConfig,
+) -> FfiResult<ParsedNamespaceQueryConfig> {
     if config.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
-            "namespace search config is null",
+            "namespace query config is null",
         ));
     }
     let config = unsafe { &*config };
     let table_id = unsafe { cstr_to_str(config.table_id, "table_id")? }.to_string();
     let columns = unsafe { parse_string_array(config.columns, config.columns_len, "columns")? };
     let filter = unsafe { optional_cstr_to_string(config.filter, "filter")? };
-    let k = if config.k == 0 || config.k > i32::MAX as u64 {
+    let k = if config.k > i32::MAX as u64 {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
-            "k must be in the range 1..=i32::MAX",
+            "k must fit in i32",
         ));
     } else {
         config.k as i32
@@ -215,7 +220,7 @@ unsafe fn parse_config(config: *const LanceNamespaceSearchConfig) -> FfiResult<P
         }
     };
 
-    Ok(ParsedConfig {
+    Ok(ParsedNamespaceQueryConfig {
         backend,
         table_id,
         columns,
@@ -225,8 +230,18 @@ unsafe fn parse_config(config: *const LanceNamespaceSearchConfig) -> FfiResult<P
     })
 }
 
-fn apply_base_request(config: &ParsedConfig, request: &mut QueryTableRequest) {
-    request.id = Some(vec![config.table_id.clone()]);
+fn apply_base_request(config: &ParsedNamespaceQueryConfig, request: &mut QueryTableRequest) {
+    request.id = Some(match &config.backend {
+        NamespaceBackend::Rest { delimiter, .. } => {
+            let delimiter = delimiter.as_deref().unwrap_or("$");
+            config
+                .table_id
+                .split(delimiter)
+                .map(str::to_string)
+                .collect()
+        }
+        NamespaceBackend::Directory { .. } => vec![config.table_id.clone()],
+    });
     request.prefilter = Some(config.prefilter);
     if !config.columns.is_empty() {
         let mut columns = QueryTableRequestColumns::new();
@@ -239,7 +254,7 @@ fn apply_base_request(config: &ParsedConfig, request: &mut QueryTableRequest) {
 }
 
 async fn execute_query_table(
-    config: ParsedConfig,
+    config: ParsedNamespaceQueryConfig,
     request: QueryTableRequest,
 ) -> FfiResult<Vec<u8>> {
     match config.backend {
@@ -330,19 +345,183 @@ fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
     }
 }
 
-fn execute_to_stream(config: ParsedConfig, request: QueryTableRequest) -> FfiResult<StreamHandle> {
+fn execute_to_stream(
+    config: ParsedNamespaceQueryConfig,
+    request: QueryTableRequest,
+) -> FfiResult<StreamHandle> {
     let bytes = runtime::block_on(execute_query_table(config, request))
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
     let batches = ipc_bytes_to_batches(bytes)?;
     Ok(StreamHandle::Batches(batches.into_iter()))
 }
 
+fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
+    let dialect = CustomDialectBuilder::new()
+        .with_identifier_quote_style('`')
+        .build();
+    Unparser::new(&dialect)
+        .expr_to_sql(expr)
+        .map(|sql| sql.to_string())
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("unparse namespace filter: {err}"),
+            )
+        })
+}
+
+// A pushed filter arrives as a DataFusion `Expr`, but namespace query_table only accepts a
+// filter string, so it is unparsed here and ANDed with whatever the caller passed as the
+// explicit `filter :=` argument.
+fn apply_filter_expr(request: &mut QueryTableRequest, filter_expr: Option<&Expr>) -> FfiResult<()> {
+    let Some(filter_expr) = filter_expr else {
+        return Ok(());
+    };
+    let filter_sql = filter_expr_to_sql(filter_expr)?;
+    request.filter = Some(match request.filter.take() {
+        Some(existing) => format!("({existing}) AND ({filter_sql})"),
+        None => filter_sql,
+    });
+    Ok(())
+}
+
+fn build_namespace_scan_request(
+    config: &ParsedNamespaceQueryConfig,
+    filter_expr: Option<&Expr>,
+    limit: i64,
+    offset: i64,
+    with_row_id: bool,
+) -> FfiResult<QueryTableRequest> {
+    if limit < -1 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace scan limit must be >= -1",
+        ));
+    }
+    if offset < 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace scan offset must be non-negative",
+        ));
+    }
+    if limit == -1 && offset != 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace query_table cannot apply OFFSET without LIMIT",
+        ));
+    }
+
+    let k = if limit == -1 {
+        0
+    } else {
+        i32::try_from(limit).map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "namespace scan limit must fit in i32",
+            )
+        })?
+    };
+    let offset = i32::try_from(offset).map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace scan offset must fit in i32",
+        )
+    })?;
+
+    let mut request = QueryTableRequest::new(k, QueryTableRequestVector::new());
+    apply_base_request(config, &mut request);
+    request.prefilter = None;
+    if offset != 0 {
+        request.offset = Some(offset);
+    }
+    if with_row_id {
+        request.with_row_id = Some(true);
+        let mut clear_columns = false;
+        if let Some(columns) = request.columns.as_mut() {
+            if let Some(column_names) = columns.column_names.as_mut() {
+                column_names.retain(|name| name != "_rowid");
+                clear_columns = column_names.is_empty();
+            }
+        }
+        if clear_columns {
+            request.columns = None;
+        }
+    }
+
+    apply_filter_expr(&mut request, filter_expr)?;
+    Ok(request)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_namespace_scan_stream_ir(
+    config: *const LanceNamespaceQueryConfig,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
+    with_row_id: u8,
+) -> *mut c_void {
+    match unsafe {
+        create_namespace_scan_stream_ir_inner(
+            config,
+            filter_ir,
+            filter_ir_len,
+            limit,
+            offset,
+            with_row_id,
+        )
+    } {
+        Ok(stream) => {
+            clear_last_error();
+            Box::into_raw(Box::new(stream)) as *mut c_void
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
+}
+
+unsafe fn create_namespace_scan_stream_ir_inner(
+    config: *const LanceNamespaceQueryConfig,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    limit: i64,
+    offset: i64,
+    with_row_id: u8,
+) -> FfiResult<StreamHandle> {
+    let config = unsafe { parse_config(config)? };
+    let filter_expr = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::NamespaceQueryTable,
+            "namespace scan filter_ir",
+        )?
+    };
+    let request = build_namespace_scan_request(
+        &config,
+        filter_expr.as_ref(),
+        limit,
+        offset,
+        with_row_id != 0,
+    )?;
+    if limit == 0 {
+        return Ok(StreamHandle::Batches(Vec::new().into_iter()));
+    }
+    execute_to_stream(config, request)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_namespace_vector_search_stream(
-    config: *const LanceNamespaceSearchConfig,
+    config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceVectorSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> *mut c_void {
-    match create_namespace_vector_search_stream_inner(config, options) {
+    match unsafe {
+        create_namespace_vector_search_stream_inner(config, options, filter_ir, filter_ir_len)
+    } {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -355,8 +534,10 @@ pub unsafe extern "C" fn lance_create_namespace_vector_search_stream(
 }
 
 unsafe fn create_namespace_vector_search_stream_inner(
-    config: *const LanceNamespaceSearchConfig,
+    config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceVectorSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> FfiResult<StreamHandle> {
     if options.is_null() {
         return Err(FfiError::new(
@@ -365,6 +546,12 @@ unsafe fn create_namespace_vector_search_stream_inner(
         ));
     }
     let config = unsafe { parse_config(config)? };
+    if config.k == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace vector search k must be positive",
+        ));
+    }
     let options = unsafe { &*options };
     let vector_column = unsafe { cstr_to_str(options.vector_column, "vector_column")? };
     let query_values =
@@ -378,8 +565,18 @@ unsafe fn create_namespace_vector_search_stream_inner(
 
     let mut vector = QueryTableRequestVector::new();
     vector.single_vector = Some(query_values.to_vec());
+    let filter_expr = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::NamespaceQueryTable,
+            "namespace vector search filter_ir",
+        )?
+    };
+
     let mut request = QueryTableRequest::new(config.k, vector);
     apply_base_request(&config, &mut request);
+    apply_filter_expr(&mut request, filter_expr.as_ref())?;
     request.vector_column = Some(vector_column.to_string());
     if options.nprobes != 0 {
         request.nprobes =
@@ -399,10 +596,14 @@ unsafe fn create_namespace_vector_search_stream_inner(
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_create_namespace_fts_search_stream(
-    config: *const LanceNamespaceSearchConfig,
+    config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceFtsSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> *mut c_void {
-    match create_namespace_fts_search_stream_inner(config, options) {
+    match unsafe {
+        create_namespace_fts_search_stream_inner(config, options, filter_ir, filter_ir_len)
+    } {
         Ok(stream) => {
             clear_last_error();
             Box::into_raw(Box::new(stream)) as *mut c_void
@@ -415,8 +616,10 @@ pub unsafe extern "C" fn lance_create_namespace_fts_search_stream(
 }
 
 unsafe fn create_namespace_fts_search_stream_inner(
-    config: *const LanceNamespaceSearchConfig,
+    config: *const LanceNamespaceQueryConfig,
     options: *const LanceNamespaceFtsSearchOptions,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
 ) -> FfiResult<StreamHandle> {
     if options.is_null() {
         return Err(FfiError::new(
@@ -425,12 +628,28 @@ unsafe fn create_namespace_fts_search_stream_inner(
         ));
     }
     let config = unsafe { parse_config(config)? };
+    if config.k == 0 {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "namespace FTS search k must be positive",
+        ));
+    }
     let options = unsafe { &*options };
     let text_column = unsafe { cstr_to_str(options.text_column, "text_column")? };
     let query = unsafe { cstr_to_str(options.query, "query")? };
 
+    let filter_expr = unsafe {
+        parse_optional_filter_ir(
+            filter_ir,
+            filter_ir_len,
+            ErrorCode::NamespaceQueryTable,
+            "namespace FTS search filter_ir",
+        )?
+    };
+
     let mut request = QueryTableRequest::new(config.k, QueryTableRequestVector::new());
     apply_base_request(&config, &mut request);
+    apply_filter_expr(&mut request, filter_expr.as_ref())?;
 
     let mut string_query = StringFtsQuery::new(query.to_string());
     string_query.columns = Some(vec![text_column.to_string()]);
@@ -439,4 +658,62 @@ unsafe fn create_namespace_fts_search_stream_inner(
     request.full_text_query = Some(Box::new(fts_query));
 
     execute_to_stream(config, request)
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion_expr::{col, lit};
+
+    use super::*;
+
+    fn rest_config(columns: &[&str]) -> ParsedNamespaceQueryConfig {
+        ParsedNamespaceQueryConfig {
+            backend: NamespaceBackend::Rest {
+                endpoint: "http://localhost:8000".to_string(),
+                bearer_token: None,
+                api_key: None,
+                delimiter: Some("$".to_string()),
+                headers: Vec::new(),
+            },
+            table_id: "parent$child$table".to_string(),
+            columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            filter: None,
+            k: 0,
+            prefilter: true,
+        }
+    }
+
+    #[test]
+    fn namespace_scan_request_pushes_query_shape() {
+        let config = rest_config(&["name", "_rowid"]);
+        let filter = col("age").gt(lit(21));
+        let request = build_namespace_scan_request(&config, Some(&filter), 5, 2, true).unwrap();
+
+        assert_eq!(
+            request.id,
+            Some(vec![
+                "parent".to_string(),
+                "child".to_string(),
+                "table".to_string()
+            ])
+        );
+        assert_eq!(request.k, 5);
+        assert_eq!(request.offset, Some(2));
+        assert_eq!(request.with_row_id, Some(true));
+        assert_eq!(request.prefilter, None);
+        assert_eq!(
+            request.columns.unwrap().column_names,
+            Some(vec!["name".to_string()])
+        );
+        let filter = request.filter.unwrap();
+        assert!(filter.contains("age"));
+        assert!(filter.contains("21"));
+    }
+
+    #[test]
+    fn namespace_scan_request_rejects_offset_without_limit() {
+        let config = rest_config(&["name"]);
+        let error = build_namespace_scan_request(&config, None, -1, 1, false).unwrap_err();
+        assert!(error.message.contains("cannot apply OFFSET without LIMIT"));
+    }
 }
