@@ -5,8 +5,8 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 
-#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -17,8 +17,8 @@
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
@@ -125,7 +125,7 @@ LanceNamespaceDisplayUri(const LanceNamespaceTableConfig &config) {
     return config.display_uri;
   }
   if (config.IsDirectory()) {
-    return config.root + "/" + config.table_id;
+    return LanceDirectoryNamespaceDatasetUri(config);
   }
   return config.endpoint + "/" + config.table_id;
 }

@@ -36,12 +36,12 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
-#include "lance_common.hpp"
+#include "lance_arrow_compat.hpp"
 #include "lance_blob.hpp"
+#include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
@@ -217,16 +217,27 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return out;
 }
 
-static bool
-DirectoryNamespaceTableExists(const LanceDirectoryNamespaceConfig &ns,
-                              const string &table_name) {
+static string
+FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
+                            const string &table_name) {
+  if (!IsSafeDatasetTableName(table_name)) {
+    throw InvalidInputException(
+        "Unsafe Lance dataset name for directory namespace: " + table_name);
+  }
   auto tables = ListDirectoryNamespaceTables(ns);
+  const Identifier requested(table_name);
+  string matched;
   for (auto &t : tables) {
-    if (StringUtil::CIEquals(t, table_name)) {
-      return true;
+    if (Identifier(t) == requested) {
+      if (!matched.empty()) {
+        throw CatalogException(
+            "Ambiguous Lance directory table names '%s' and '%s' in '%s'",
+            matched, t, ns.root);
+      }
+      matched = t;
     }
   }
-  return false;
+  return matched;
 }
 
 class LanceDirectoryDefaultGenerator : public DefaultGenerator {
@@ -288,16 +299,15 @@ public:
     }
     lance_close_dataset(dataset);
 
-    if (dataset_uri.empty()) {
-      dataset_uri = JoinNamespacePath(ns->root, GetDatasetDirName(entry_name));
-    }
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Directory;
     cfg.root = ns->root;
     cfg.table_id = entry_name;
     cfg.option_keys = ns->option_keys;
     cfg.option_values = ns->option_values;
-    cfg.display_uri = std::move(dataset_uri);
+    cfg.display_uri = dataset_uri.empty()
+                          ? LanceDirectoryNamespaceDatasetUri(cfg)
+                          : std::move(dataset_uri);
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
@@ -312,6 +322,15 @@ public:
       return {};
     }
     auto all = ListDirectoryNamespaceTables(*ns);
+    identifier_set_t physical_names;
+    for (auto &name : all) {
+      auto inserted = physical_names.emplace(name);
+      if (!inserted.second) {
+        throw CatalogException(
+            "Ambiguous Lance directory table names '%s' and '%s' in '%s'",
+            inserted.first->GetIdentifierName(), name, ns->root);
+      }
+    }
     // Filter out tables whose datasets cannot be opened (e.g. corrupt
     // manifests). CreateDefaultEntries requires every entry to produce
     // a non-null CatalogEntry, but CreateDefaultEntry must return
@@ -742,36 +761,7 @@ public:
   optional_ptr<CatalogEntry>
   LookupEntry(CatalogTransaction transaction,
               const EntryLookupInfo &lookup_info) override {
-    auto native = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
-    if (native || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
-        !transaction.context) {
-      return native;
-    }
-    lock_guard<mutex> guard(table_lock);
-    auto &name = lookup_info.GetEntryIdentifier();
-    auto found = tables.find(name);
-    if (found == tables.end()) {
-      auto entry = table_default_generator->CreateDefaultEntry(
-          *transaction.context, name);
-      if (!entry) {
-        return nullptr;
-      }
-      found = tables.emplace(name, shared_ptr<CatalogEntry>(std::move(entry)))
-                  .first;
-    }
-    {
-      auto &table = found->second->Cast<LanceTableEntry>();
-      try {
-        if (table.IsSchemaStale(*transaction.context)) {
-          found->second =
-              shared_ptr<CatalogEntry>(table.Rebuild(*transaction.context));
-        }
-      } catch (IOException &) {
-        // Preserve metadata access and DROP when storage is unavailable.
-        // Scan and DML binding still validate the live schema and fail closed.
-      }
-    }
-    return PinLanceCatalogEntry(*transaction.context, found->second);
+    return LookupEntryInternal(transaction, lookup_info);
   }
 
   CatalogSet::EntryLookup
@@ -800,8 +790,9 @@ public:
       names = table_default_generator->GetDefaultEntries();
     }
     for (auto &name : names) {
-      auto entry =
-          LookupEntry(transaction, EntryLookupInfo(type, QualifiedName(name)));
+      auto entry = LookupEntryInternal(
+          transaction, EntryLookupInfo(type, QualifiedName(name)),
+          directory_ns ? &name : nullptr);
       if (entry && dynamic_cast<LanceTableEntry *>(entry.get())) {
         callback(*entry);
       }
@@ -927,14 +918,13 @@ public:
                                       value_ptrs);
 
       auto rc = lance_dir_namespace_drop_table(
-          root.c_str(), info.GetQualifiedName().Name().c_str(),
+          root.c_str(), lance_entry->NamespaceConfig().table_id.c_str(),
           key_ptrs.empty() ? nullptr : key_ptrs.data(),
           value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
       if (rc != 0) {
         throw IOException(
             "Failed to drop Lance dataset: " + root + "/" +
-            GetDatasetDirName(
-                info.GetQualifiedName().Name().GetIdentifierName()) +
+            GetDatasetDirName(lance_entry->NamespaceConfig().table_id) +
             LanceFormatErrorSuffix());
       }
     }
@@ -1075,12 +1065,14 @@ public:
         throw InternalException("Lance directory namespace root is empty");
       }
 
-      dataset_path = JoinNamespacePath(
-          directory_ns->root,
-          GetDatasetDirName(create_info.GetTableName().GetIdentifierName()));
-
-      auto exists = DirectoryNamespaceTableExists(
+      auto physical_table = FindDirectoryNamespaceTable(
           *directory_ns, create_info.GetTableName().GetIdentifierName());
+      auto exists = !physical_table.empty();
+      if (!exists) {
+        physical_table = create_info.GetTableName().GetIdentifierName();
+      }
+      dataset_path = JoinNamespacePath(directory_ns->root,
+                                       GetDatasetDirName(physical_table));
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableEntry(create_info.GetTableName());
@@ -1190,6 +1182,55 @@ public:
   }
 
 private:
+  optional_ptr<CatalogEntry>
+  LookupEntryInternal(CatalogTransaction transaction,
+                      const EntryLookupInfo &lookup_info,
+                      optional_ptr<const Identifier> physical_name = nullptr) {
+    auto native = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
+    if (native || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
+        !transaction.context) {
+      return native;
+    }
+    lock_guard<mutex> guard(table_lock);
+    auto &name = lookup_info.GetEntryIdentifier();
+    auto found = tables.find(name);
+    if (found == tables.end()) {
+      Identifier backend_name = name;
+      if (directory_ns) {
+        if (physical_name) {
+          backend_name = *physical_name;
+        } else {
+          auto matched = FindDirectoryNamespaceTable(*directory_ns,
+                                                     name.GetIdentifierName());
+          if (matched.empty()) {
+            return nullptr;
+          }
+          backend_name = Identifier(std::move(matched));
+        }
+      }
+      auto entry = table_default_generator->CreateDefaultEntry(
+          *transaction.context, backend_name);
+      if (!entry) {
+        return nullptr;
+      }
+      found = tables.emplace(name, shared_ptr<CatalogEntry>(std::move(entry)))
+                  .first;
+    }
+    {
+      auto &table = found->second->Cast<LanceTableEntry>();
+      try {
+        if (table.IsSchemaStale(*transaction.context)) {
+          found->second =
+              shared_ptr<CatalogEntry>(table.Rebuild(*transaction.context));
+        }
+      } catch (IOException &) {
+        // Preserve metadata access and DROP when storage is unavailable.
+        // Scan and DML binding still validate the live schema and fail closed.
+      }
+    }
+    return PinLanceCatalogEntry(*transaction.context, found->second);
+  }
+
   void InvalidateTableEntry(const Identifier &name) {
     lock_guard<mutex> guard(table_lock);
     tables.erase(name);
@@ -1725,12 +1766,14 @@ public:
       throw InternalException("Lance directory namespace root is empty");
     }
 
-    auto dataset_path = JoinNamespacePath(
-        directory_ns->root,
-        GetDatasetDirName(create_info.GetTableName().GetIdentifierName()));
-
-    auto exists = DirectoryNamespaceTableExists(
+    auto physical_table = FindDirectoryNamespaceTable(
         *directory_ns, create_info.GetTableName().GetIdentifierName());
+    auto exists = !physical_table.empty();
+    if (!exists) {
+      physical_table = create_info.GetTableName().GetIdentifierName();
+    }
+    auto dataset_path = JoinNamespacePath(directory_ns->root,
+                                          GetDatasetDirName(physical_table));
 
     if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
         exists) {

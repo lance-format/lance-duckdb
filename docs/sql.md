@@ -379,6 +379,12 @@ Namespaces let you treat a directory (or a remote namespace service) as a databa
 
 ### Directory namespace
 
+SQL identifiers follow DuckDB's case-insensitive matching while dataset names
+retain their physical spelling. `CREATE OR REPLACE`, CTAS, and `DROP TABLE` use
+the resolved dataset name. Discovery reports an ambiguity error if physical
+names such as `Foo.lance` and `foo.lance` have the same DuckDB identifier.
+Rename one dataset outside DuckDB to resolve that ambiguity.
+
 ```sql
 ATTACH 'path/to/dir' AS ns (TYPE LANCE);
 
