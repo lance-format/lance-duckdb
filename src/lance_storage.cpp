@@ -726,7 +726,7 @@ public:
     vector<Identifier> names;
     {
       lock_guard<mutex> guard(table_lock);
-      names = table_default_generator->GetDefaultEntries(context);
+      names = table_default_generator->GetDefaultEntries(*transaction.context);
     }
     for (auto &name : names) {
       auto entry = LookupEntryInternal(
