@@ -146,7 +146,7 @@ true
 statement ok
 DETACH del_ns;
 
-# Identifier quoting survives the DELETE predicate's SQL conversion.
+# DELETE predicates on quoted, keyword, and mixed-case column names.
 statement ok
 ATTACH '{TEST_DIR}/delete_quoted_namespace' AS quoted_delete (TYPE LANCE);
 

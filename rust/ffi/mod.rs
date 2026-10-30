@@ -1,6 +1,8 @@
 mod arrow_export;
+mod blob;
 mod blob_range;
 mod dataset;
+mod delete;
 mod dir_namespace;
 mod exec;
 mod index;

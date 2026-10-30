@@ -9,7 +9,11 @@ struct ArrowSchema;
 namespace duckdb {
 
 struct AlterInfo;
+struct Binder;
 struct CatalogTransaction;
+class LogicalGet;
+class LogicalProjection;
+class LogicalUpdate;
 class CatalogEntry;
 class ClientContext;
 struct ArrowTableSchema;
@@ -28,6 +32,11 @@ struct LanceTableSchema {
   vector<string> coerced_columns;
   // Top-level columns whose source Arrow field contains an actual Lance blob.
   vector<bool> blob_columns;
+  // Top-level columns whose Lance field is genuinely Blob v2. Only these
+  // accept the LANCE_BLOB_INPUT write type; plain binary/legacy Blob columns
+  // keep the ordinary BLOB cast path and reject URI values at the write
+  // boundary. Kept distinct from the read-side per-column encoding markers.
+  vector<string> writable_blob_v2_columns;
 };
 
 enum class LanceNamespaceKind { Directory, Rest };
@@ -72,6 +81,21 @@ public:
   TableFunction GetScanFunction(ClientContext &context,
                                 unique_ptr<FunctionData> &bind_data) override;
 
+  // BLOB columns read as BLOB bytes but accept the shared Blob write input so
+  // SQL can express bytes, external references, and managed ingest through the
+  // same INSERT/UPDATE/MERGE value contract. Whether a URI value is legal
+  // depends on the destination field's encoding and is enforced at the write
+  // boundary.
+  LogicalType
+  GetExpectedTypeForInsert(const ColumnDefinition &column) const override;
+
+  // Preserve an already-input-typed value on DEFAULT/omitted-column binding
+  // instead of casting it back to the declared BLOB read type.
+  unique_ptr<Expression> GetDefaultExpressionForColumn(
+      ClientContext &context, const LogicalType &input_type,
+      const LogicalType &result_type, ColumnBinding binding,
+      const Expression &constant_value) const override;
+
   // Validate that this entry's declared schema state (columns, coerced
   // columns, NOT NULL constraints) still matches the dataset on storage.
   // Statements that bind a scan get this implicitly via GetScanFunction;
@@ -96,6 +120,14 @@ public:
 
   TableStorageInfo GetStorageInfo(ClientContext &) override { return {}; }
 
+  // Lance tables have no local CHECK constraints or secondary-index
+  // maintenance for UPDATE. DuckDB's default also binds every physical column
+  // whenever RETURNING is present; the Lance MERGE sink builds the returned row
+  // image itself from the columns the RETURNING projection references.
+  void BindUpdateConstraints(Binder &binder, LogicalGet &get,
+                             LogicalProjection &proj, LogicalUpdate &update,
+                             ClientContext &context) override {}
+
   const string &DatasetUri() const { return dataset_uri; }
   bool IsNamespaceBacked() const { return namespace_config != nullptr; }
   const LanceNamespaceTableConfig &NamespaceConfig() const {
@@ -117,6 +149,11 @@ public:
   void SetCoercedColumnNames(vector<string> names) {
     coerced_column_names = std::move(names);
   }
+  void SetWritableBlobV2Columns(vector<string> names) {
+    writable_blob_v2_columns = std::move(names);
+  }
+
+  bool IsWritableBlobV2Column(const ColumnDefinition &column) const;
 
   const vector<bool> &GetBlobColumns() const { return blob_column_flags; }
   bool HasBlobColumns() const {
@@ -150,6 +187,7 @@ private:
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;
   vector<bool> blob_column_flags;
+  vector<string> writable_blob_v2_columns;
 };
 
 // Rebuild a stale cache entry without changing storage. Executing queries pin

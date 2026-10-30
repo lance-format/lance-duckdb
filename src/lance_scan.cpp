@@ -533,6 +533,7 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   vector<idx_t> output_to_scan_converted_idx;
   vector<bool> output_is_duckdb_rowid;
   vector<bool> output_is_empty;
+  vector<bool> output_is_forced_null;
 
   vector<column_t> scan_column_ids;
   vector<string> scan_column_names;
@@ -691,7 +692,7 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   }
 
   UnifiedVectorFormat format;
-  src.ToUnifiedFormat(count, format);
+  src.ToUnifiedFormat(format);
   auto src_data = UnifiedVectorFormat::GetData<uint64_t>(format);
 
   dst.SetVectorType(VectorType::FLAT_VECTOR);
@@ -1211,6 +1212,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   scan_state.output_to_scan_converted_idx.reserve(input.column_ids.size());
   scan_state.output_is_duckdb_rowid.reserve(input.column_ids.size());
   scan_state.output_is_empty.reserve(input.column_ids.size());
+  scan_state.output_is_forced_null.reserve(input.column_ids.size());
 
   unordered_map<column_t, idx_t> scan_idx_by_col_id;
   scan_idx_by_col_id.reserve(input.column_ids.size());
@@ -1237,6 +1239,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
           DConstants::INVALID_INDEX);
       scan_state.output_is_duckdb_rowid.push_back(false);
       scan_state.output_is_empty.push_back(true);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
@@ -1248,6 +1251,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.output_to_scan_converted_idx.push_back(scan_idx);
       scan_state.output_is_duckdb_rowid.push_back(true);
       scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
@@ -1259,11 +1263,21 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       scan_state.output_to_scan_converted_idx.push_back(scan_idx);
       scan_state.output_is_duckdb_rowid.push_back(false);
       scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(false);
       continue;
     }
 
     if (col_id >= bind_data.types.size() || col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
+    }
+    if (bind_data.forced_null_columns.count(col_id)) {
+      scan_state.scanned_types.push_back(bind_data.types[col_id]);
+      scan_state.output_to_scan_converted_idx.push_back(
+          DConstants::INVALID_INDEX);
+      scan_state.output_is_duckdb_rowid.push_back(false);
+      scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(true);
+      continue;
     }
     auto scan_idx = add_scan_column(col_id, bind_data.names[col_id],
                                     bind_data.types[col_id]);
@@ -1275,10 +1289,17 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.output_to_scan_converted_idx.push_back(scan_idx);
     scan_state.output_is_duckdb_rowid.push_back(false);
     scan_state.output_is_empty.push_back(false);
+    scan_state.output_is_forced_null.push_back(false);
   }
 
-  // Blob projection forces native access, but the bind schema stays unchanged.
-  // Store the native Arrow schema here so byte buffers decode with its layout.
+  shared_ptr<LanceDatasetCacheEntry> write_dataset;
+  if (bind_data.UsesNamespaceQuery() && bind_data.table_entry) {
+    write_dataset = LanceGetDatasetPinnedForWrite(
+        context, bind_data.table_entry->Cast<LanceTableEntry>());
+  }
+
+  // Blob projection and a write's statement-pinned dataset force native access,
+  // but the bind schema stays unchanged. Decode with the native Arrow schema.
   auto open_native_dataset = [&]() {
     if (scan_state.native_dataset) {
       return;
@@ -1289,8 +1310,13 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
     auto &table = bind_data.table_entry.get_mutable()->Cast<LanceTableEntry>();
     string display_uri;
-    scan_state.native_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
-        context, table, display_uri, &scan_state.native_dataset_cache_hit);
+    scan_state.native_dataset_entry = write_dataset;
+    if (!scan_state.native_dataset_entry) {
+      scan_state.native_dataset_entry = LanceGetOrOpenDatasetEntryForTable(
+          context, table, display_uri, &scan_state.native_dataset_cache_hit);
+    } else {
+      display_uri = scan_state.native_dataset_entry->DisplayUri();
+    }
     scan_state.native_dataset = scan_state.native_dataset_entry
                                     ? scan_state.native_dataset_entry->Handle()
                                     : nullptr;
@@ -1342,7 +1368,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         context, scan_state.native_scan_arrow_table,
         scan_state.native_scan_schema_root.arrow_schema);
   };
-  if (bind_data.UsesNamespaceQuery() && has_projected_blob) {
+  if (bind_data.UsesNamespaceQuery() && (has_projected_blob || write_dataset)) {
     open_native_dataset();
   }
 
@@ -2095,7 +2121,7 @@ static void LanceFillDeferredColumns(ClientContext &context,
 
   try {
     local_state.deferred_converted.Reset();
-    local_state.deferred_converted.SetCardinality(surviving_count);
+    local_state.deferred_converted.SetChildCardinality(surviving_count);
     ArrowTableFunction::ArrowToDuckDB(local_state, take_table.GetColumns(),
                                       local_state.deferred_converted);
   } catch (...) {
@@ -2179,7 +2205,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     local_state.rows_scanned += output_size;
 
     local_state.scan_converted.Reset();
-    local_state.scan_converted.SetCardinality(output_size);
+    local_state.scan_converted.SetChildCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
                                       local_state.scan_converted);
 
@@ -2189,10 +2215,14 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
         throw InternalException(
             "Lance scan output column count does not match mapping");
       }
-      target.SetCardinality(output_size);
       for (idx_t i = 0; i < target.ColumnCount(); i++) {
         if (global_state.output_is_empty[i]) {
           target.data[i].Reference(Value::BOOLEAN(true), count_t(output_size));
+          continue;
+        }
+        if (global_state.output_is_forced_null[i]) {
+          target.data[i].Reference(Value(target.data[i].GetType()),
+                                   count_t(output_size));
           continue;
         }
         auto scan_idx = global_state.output_to_scan_converted_idx[i];
@@ -2221,11 +2251,11 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
         }
         target.data[i].Reference(local_state.scan_converted.data[scan_idx]);
       }
+      target.CheckCardinality(output_size);
     };
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
       fill_output_from_converted(local_state.all_columns);
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
@@ -2239,7 +2269,6 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
       fill_output_from_converted(output);
       local_state.chunk_offset += output_size;
@@ -3591,7 +3620,7 @@ static void LanceExecFunc(ClientContext &context, TableFunctionInput &data,
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     global_state.lines_read.fetch_add(output_size);
 
-    output.SetCardinality(output_size);
+    output.SetChildCardinality(output_size);
     ArrowTableFunction::ArrowToDuckDB(
         local_state, bind_data.arrow_table.GetColumns(), output, false);
     local_state.chunk_offset += output_size;

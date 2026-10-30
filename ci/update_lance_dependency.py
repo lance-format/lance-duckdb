@@ -22,12 +22,21 @@ LANCE_CRATES = (
     "lance",
     "lance-arrow",
     "lance-core",
+    "lance-datafusion",
+    "lance-file",
     "lance-index",
+    "lance-io",
     "lance-linalg",
     "lance-namespace",
     "lance-namespace-impls",
     "lance-table",
 )
+
+DEPENDENCY_SECTIONS = {
+    "[dependencies]",
+    "[dev-dependencies]",
+    "[build-dependencies]",
+}
 
 
 def normalize_version(raw: str) -> str:
@@ -94,7 +103,7 @@ def update_lance_versions_in_dependencies(lines: list[str], version: str) -> set
     for index, line in enumerate(lines):
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            in_dependencies = stripped == "[dependencies]"
+            in_dependencies = stripped in DEPENDENCY_SECTIONS
             continue
         if not in_dependencies or not stripped or stripped.startswith("#"):
             continue

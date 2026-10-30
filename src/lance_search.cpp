@@ -775,7 +775,7 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
+      local_state.all_columns.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, false);
@@ -786,9 +786,8 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
-      output.SetCardinality(output_size);
+      output.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;
@@ -1527,7 +1526,7 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
+      local_state.all_columns.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, false);
@@ -1538,9 +1537,8 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
-      output.SetCardinality(output_size);
+      output.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;
