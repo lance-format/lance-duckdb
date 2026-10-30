@@ -1749,11 +1749,13 @@ public:
         create_info.columns.GetColumnTypes(), plan);
   }
 
+  // Lance plans DELETE before the child plan exists, so a plain
+  // `DELETE FROM t` can drop whole fragments instead of scanning every row id.
   PhysicalOperator &PlanDelete(ClientContext &context,
                                PhysicalPlanGenerator &planner,
                                LogicalDelete &op) override {
     if (dynamic_cast<LanceTableEntry *>(&op.table)) {
-      return PlanLanceDelete(context, planner, op);
+      return PlanLanceDelete(context, planner, op, nullptr);
     }
     return Catalog::PlanDelete(context, planner, op);
   }
@@ -1789,8 +1791,7 @@ PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
   if (!lance_table) {
     return DuckCatalog::PlanDelete(context, planner, op, plan);
   }
-  (void)plan;
-  return PlanLanceDelete(context, planner, op);
+  return PlanLanceDelete(context, planner, op, &plan);
 }
 
 static unique_ptr<Catalog>
@@ -1906,6 +1907,7 @@ struct LancePendingAppend {
   vector<string> option_values;
   string cache_key;
   void *transaction = nullptr;
+  shared_ptr<LanceDatasetCacheEntry> pinned_dataset;
 };
 
 class LanceTransactionManager final : public DuckTransactionManager {
@@ -1946,11 +1948,15 @@ public:
       BuildStorageOptionPointerArrays(
           pending.option_keys, pending.option_values, key_ptrs, value_ptrs);
 
-      auto rc = lance_commit_transaction_with_storage_options(
-          pending.path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          pending.option_keys.size(), LanceGetSessionHandle(context),
-          pending.transaction);
+      auto rc = pending.pinned_dataset
+                    ? lance_commit_transaction_to_dataset(
+                          pending.pinned_dataset->Handle(), pending.transaction)
+                    : lance_commit_transaction_with_storage_options(
+                          pending.path.c_str(),
+                          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+                          value_ptrs.empty() ? nullptr : value_ptrs.data(),
+                          pending.option_keys.size(),
+                          LanceGetSessionHandle(context), pending.transaction);
       if (rc != 0) {
         // Best-effort cleanup of any remaining pending transactions.
         // Note: the transaction pointer is consumed by the commit call, even on
@@ -2011,10 +2017,11 @@ void RegisterLanceStorage(DBConfig &config) {
   StorageExtension::Register(config, "lance", std::move(ext));
 }
 
-void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
-                                string dataset_uri, vector<string> option_keys,
-                                vector<string> option_values, string cache_key,
-                                void *lance_transaction) {
+void RegisterLancePendingAppend(
+    ClientContext &context, Catalog &catalog, string dataset_uri,
+    vector<string> option_keys, vector<string> option_values, string cache_key,
+    void *lance_transaction,
+    shared_ptr<LanceDatasetCacheEntry> pinned_dataset) {
   auto &txn = Transaction::Get(context, catalog);
   auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
   if (!tm) {
@@ -2028,6 +2035,7 @@ void RegisterLancePendingAppend(ClientContext &context, Catalog &catalog,
   pending.option_values = std::move(option_values);
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
+  pending.pinned_dataset = std::move(pinned_dataset);
   tm->RegisterPendingAppend(txn, std::move(pending));
 }
 

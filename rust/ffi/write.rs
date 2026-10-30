@@ -29,7 +29,9 @@ use super::blob::{
     BlobWriteContext, SourceOptionsMap,
 };
 use super::session::record_commit;
-use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, dataset_handle, optional_session_handle, slice_from_ptr, FfiError, FfiResult,
+};
 
 #[repr(C)]
 struct RawArrowArray {
@@ -1721,6 +1723,57 @@ fn commit_transaction_inner(
     }
     let fut = builder.execute(*txn);
     match runtime::block_on(fut) {
+        Ok(Ok(_)) => {
+            record_commit();
+            Ok(())
+        }
+        Ok(Err(err)) => Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            err.to_string(),
+        )),
+        Err(err) => Err(FfiError::new(
+            ErrorCode::DatasetCommitTransaction,
+            format!("runtime: {err}"),
+        )),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_commit_transaction_to_dataset(
+    dataset: *mut c_void,
+    transaction: *mut c_void,
+) -> i32 {
+    match commit_transaction_to_dataset_inner(dataset, transaction) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn commit_transaction_to_dataset_inner(
+    dataset: *mut c_void,
+    transaction: *mut c_void,
+) -> FfiResult<()> {
+    if transaction.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "transaction is null",
+        ));
+    }
+    // SAFETY: the caller transfers the transaction returned by an uncommitted
+    // write. Consume it even if validating the destination fails.
+    let transaction =
+        unsafe { Box::from_raw(transaction as *mut lance::dataset::transaction::Transaction) };
+    // SAFETY: the pending write retains the dataset cache entry until commit.
+    let dataset = unsafe { dataset_handle(dataset)? }.dataset.clone();
+    // A Dataset destination reuses its object store, base path, credentials,
+    // commit handler and session, without re-resolving a mutable namespace.
+    match runtime::block_on(CommitBuilder::new(dataset).execute(*transaction)) {
         Ok(Ok(_)) => {
             record_commit();
             Ok(())

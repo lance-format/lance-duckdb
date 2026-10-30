@@ -130,12 +130,15 @@ void lance_free_string(const char *s);
 int32_t lance_normalize_source_uri(const char *uri, const char **out_uri);
 
 int64_t lance_dataset_count_rows(void *dataset);
-int32_t lance_dataset_delete(void *dataset, const uint8_t *filter_ir,
-                             size_t filter_ir_len, int64_t *out_deleted_rows);
-int32_t lance_delete_transaction_with_storage_options(
-    const char *path, const char **option_keys, const char **option_values,
-    size_t options_len, const uint8_t *filter_ir, size_t filter_ir_len,
-    void *session, void **out_transaction, int64_t *out_deleted_rows);
+int32_t lance_delete_begin(void *dataset, void **out_delete_handle);
+int32_t lance_delete_add_rowids(void *delete_handle, const uint64_t *row_ids,
+                                size_t row_ids_len);
+int32_t lance_delete_finish_uncommitted(void *delete_handle,
+                                        void **out_transaction,
+                                        int64_t *out_deleted_rows);
+void lance_delete_abort(void *delete_handle);
+int32_t lance_delete_all_uncommitted(void *dataset, void **out_transaction,
+                                     int64_t *out_deleted_rows);
 
 int32_t lance_dataset_add_columns(void *dataset,
                                   const ArrowSchema *new_columns_schema,
@@ -260,6 +263,7 @@ void lance_close_writer(void *writer);
 int32_t lance_commit_transaction_with_storage_options(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, void *transaction);
+int32_t lance_commit_transaction_to_dataset(void *dataset, void *transaction);
 void lance_free_transaction(void *transaction);
 
 int32_t lance_update_begin_with_storage_options(

@@ -83,6 +83,26 @@ public:
     revalidated_keys.insert(key);
   }
 
+  void PinForWrite(idx_t query_id, const string &key,
+                   shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      write_datasets.clear();
+      write_query_id = query_id;
+    }
+    write_datasets[key] = std::move(entry);
+  }
+
+  shared_ptr<LanceDatasetCacheEntry> GetPinnedForWrite(idx_t query_id,
+                                                       const string &key) {
+    lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      return nullptr;
+    }
+    auto entry = write_datasets.find(key);
+    return entry == write_datasets.end() ? nullptr : entry->second;
+  }
+
   void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
     entries.erase(key);
@@ -97,6 +117,12 @@ public:
     query_misses = 0;
     query_revalidations = 0;
     revalidated_keys.clear();
+    write_datasets.clear();
+  }
+
+  void QueryEnd() override {
+    lock_guard<mutex> guard(lock);
+    write_datasets.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
@@ -112,6 +138,12 @@ private:
   // Keys whose entry has already been revalidated (or freshly opened) during
   // the current statement; cleared in QueryBegin.
   unordered_set<string> revalidated_keys;
+  // Retained independently of the cache map so invalidation cannot change a
+  // write's target generation while other pipelines in the statement read it.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> write_datasets;
+  // QueryBegin/QueryEnd may span a submission expanded into several statements.
+  // DuckDB's active query number distinguishes those statement boundaries.
+  idx_t write_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
   idx_t query_revalidations = 0;
@@ -132,6 +164,22 @@ static shared_ptr<LanceDatasetCacheState>
 GetOrCreateLanceDatasetCacheState(ClientContext &context) {
   return context.registered_state->GetOrCreate<LanceDatasetCacheState>(
       LANCE_DATASET_CACHE_STATE_KEY);
+}
+
+void LancePinDatasetForWrite(ClientContext &context,
+                             const LanceTableEntry &table,
+                             shared_ptr<LanceDatasetCacheEntry> dataset) {
+  GetOrCreateLanceDatasetCacheState(context)->PinForWrite(
+      context.transaction.GetActiveQuery(),
+      LanceBuildDatasetCacheKeyForTable(context, table), std::move(dataset));
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetDatasetPinnedForWrite(ClientContext &context,
+                              const LanceTableEntry &table) {
+  return GetOrCreateLanceDatasetCacheState(context)->GetPinnedForWrite(
+      context.transaction.GetActiveQuery(),
+      LanceBuildDatasetCacheKeyForTable(context, table));
 }
 
 static void AppendCacheKeyPart(string &key, const string &value) {

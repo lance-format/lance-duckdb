@@ -484,6 +484,8 @@ DETACH ns;
 ATTACH 'path/to/dir' AS ns (TYPE LANCE);
 
 DELETE FROM ns.main.my_table WHERE id <= 2;
+DELETE FROM ns.main.my_table WHERE id IN (SELECT id FROM staging);
+DELETE FROM ns.main.my_table USING staging s WHERE my_table.id = s.id;
 DELETE FROM ns.main.my_table; -- delete all rows
 
 DETACH ns;
