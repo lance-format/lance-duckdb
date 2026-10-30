@@ -252,6 +252,7 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
   vector<string> namespace_columns;
+  vector<string> native_columns;
 
   std::atomic<bool> explain_computed{false};
   string explain_plan;
@@ -521,18 +522,22 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                                     "lance_vector_search");
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    result->namespace_backed = true;
-    result->namespace_config = table->NamespaceConfig();
-    result->file_path = table->DatasetUri();
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    PopulateNamespaceSearchSchema(
-        context, *table, "_distance", result->schema_root, result->arrow_table,
-        result->names, result->types, names, return_types);
-    return std::move(result);
+    if (!table->HasBlobColumns()) {
+      result->namespace_backed = true;
+      result->namespace_config = table->NamespaceConfig();
+      result->file_path = table->DatasetUri();
+      PopulateNamespaceSearchSchema(context, *table, "_distance",
+                                    result->schema_root, result->arrow_table,
+                                    result->names, result->types, names,
+                                    return_types);
+      return std::move(result);
+    }
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      !(table && table->IsNamespaceBacked())) {
     throw InvalidInputException(
         "lance_vector_search filter parameter is only supported for "
         "namespace-backed tables");
@@ -588,6 +593,12 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &global = state->Cast<LanceKnnGlobalState>();
 
   global.projection_ids = input.projection_ids;
+  global.native_columns.reserve(input.column_ids.size());
+  for (auto col_id : input.column_ids) {
+    if (col_id < bind_data.names.size()) {
+      global.native_columns.push_back(bind_data.names[col_id]);
+    }
+  }
   if (!input.projection_ids.empty()) {
     global.scanned_types.reserve(input.column_ids.size());
     for (auto col_id : input.column_ids) {
@@ -681,13 +692,23 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     return std::move(result);
   }
 
+  vector<const char *> native_column_ptrs;
+  native_column_ptrs.reserve(global.native_columns.size());
+  for (auto &name : global.native_columns) {
+    native_column_ptrs.push_back(name.c_str());
+  }
   result->stream = CreateLanceSearchStreamWithFallback(
       global, *result, bind_data.prefilter,
       [&](const uint8_t *ir, size_t ir_len) {
         return lance_create_knn_stream_ir(
             bind_data.dataset, bind_data.vector_column.c_str(),
             bind_data.query.data(), bind_data.query.size(), bind_data.k,
-            bind_data.nprobes, bind_data.refine_factor, ir, ir_len,
+            bind_data.nprobes, bind_data.refine_factor,
+            native_column_ptrs.empty() ? nullptr : native_column_ptrs.data(),
+            native_column_ptrs.size(), ir, ir_len,
+            bind_data.namespace_filter.empty()
+                ? nullptr
+                : bind_data.namespace_filter.c_str(),
             bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0);
       });
   if (!result->stream) {
@@ -754,7 +775,7 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
+      local_state.all_columns.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, false);
@@ -765,9 +786,8 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
-      output.SetCardinality(output_size);
+      output.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;
@@ -1001,6 +1021,7 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
   vector<string> namespace_columns;
+  vector<string> native_columns;
 
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -1054,23 +1075,36 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                           LanceFormatErrorSuffix());
       }
     } else {
+      vector<const char *> native_column_ptrs;
+      native_column_ptrs.reserve(global.native_columns.size());
+      for (auto &name : global.native_columns) {
+        native_column_ptrs.push_back(name.c_str());
+      }
       local_state.stream = CreateLanceSearchStreamWithFallback(
           global, local_state, bind_data.prefilter,
           [&](const uint8_t *ir, size_t ir_len) -> void * {
             if (bind_data.mode == LanceSearchMode::Fts) {
               return lance_create_fts_stream_ir(
                   bind_data.dataset, bind_data.text_column.c_str(),
-                  bind_data.query.c_str(), bind_data.k, ir, ir_len,
+                  bind_data.query.c_str(), bind_data.k,
+                  native_column_ptrs.empty() ? nullptr
+                                             : native_column_ptrs.data(),
+                  native_column_ptrs.size(), ir, ir_len,
+                  bind_data.namespace_filter.empty()
+                      ? nullptr
+                      : bind_data.namespace_filter.c_str(),
                   bind_data.prefilter ? 1 : 0);
             }
             return lance_create_hybrid_stream_ir(
                 bind_data.dataset, bind_data.vector_column.c_str(),
                 bind_data.vector_query.data(), bind_data.vector_query.size(),
                 bind_data.text_column.c_str(), bind_data.text_query.c_str(),
-                bind_data.k, bind_data.nprobes, bind_data.refine_factor, ir,
-                ir_len, bind_data.prefilter ? 1 : 0,
-                bind_data.use_index ? 1 : 0, bind_data.alpha,
-                bind_data.oversample_factor);
+                bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+                native_column_ptrs.empty() ? nullptr
+                                           : native_column_ptrs.data(),
+                native_column_ptrs.size(), ir, ir_len,
+                bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0,
+                bind_data.alpha, bind_data.oversample_factor);
           });
       if (!local_state.stream) {
         throw IOException("Failed to create Lance search stream" +
@@ -1151,18 +1185,21 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
                           LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    result->namespace_backed = true;
-    result->namespace_config = table->NamespaceConfig();
-    result->file_path = table->DatasetUri();
     result->text_column = RequireNamespaceSearchColumn(
         *table, result->text_column, "lance_fts", "text_column");
-    PopulateNamespaceSearchSchema(
-        context, *table, "_score", result->schema_root, result->arrow_table,
-        result->names, result->types, names, return_types);
-    return std::move(result);
+    if (!table->HasBlobColumns()) {
+      result->namespace_backed = true;
+      result->namespace_config = table->NamespaceConfig();
+      result->file_path = table->DatasetUri();
+      PopulateNamespaceSearchSchema(
+          context, *table, "_score", result->schema_root, result->arrow_table,
+          result->names, result->types, names, return_types);
+      return std::move(result);
+    }
   }
 
-  if (!result->namespace_filter.empty()) {
+  if (!result->namespace_filter.empty() &&
+      !(table && table->IsNamespaceBacked())) {
     throw InvalidInputException(
         "lance_fts filter parameter is only supported for namespace-backed "
         "tables");
@@ -1392,6 +1429,12 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   auto &global = state->Cast<LanceSearchGlobalState>();
 
   global.projection_ids = input.projection_ids;
+  global.native_columns.reserve(input.column_ids.size());
+  for (auto col_id : input.column_ids) {
+    if (col_id < bind_data.names.size()) {
+      global.native_columns.push_back(bind_data.names[col_id]);
+    }
+  }
   if (!input.projection_ids.empty()) {
     global.scanned_types.reserve(input.column_ids.size());
     for (auto col_id : input.column_ids) {
@@ -1483,7 +1526,7 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
 
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
-      local_state.all_columns.SetCardinality(output_size);
+      local_state.all_columns.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(local_state,
                                         bind_data.arrow_table.GetColumns(),
                                         local_state.all_columns, false);
@@ -1494,9 +1537,8 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
       }
       output.ReferenceColumns(local_state.all_columns,
                               global_state.projection_ids);
-      output.SetCardinality(local_state.all_columns);
     } else {
-      output.SetCardinality(output_size);
+      output.SetChildCardinality(output_size);
       ArrowTableFunction::ArrowToDuckDB(
           local_state, bind_data.arrow_table.GetColumns(), output, false);
       local_state.chunk_offset += output_size;

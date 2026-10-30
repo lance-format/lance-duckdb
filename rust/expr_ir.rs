@@ -9,8 +9,6 @@ use std::sync::{Arc, OnceLock};
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions_nested::array_has::{array_has_all_udf, array_has_any_udf};
 
-const MAGIC: &[u8; 4] = b"LUE1";
-
 const TAG_COLUMN_REF: u8 = 1;
 const TAG_LITERAL: u8 = 2;
 const TAG_CAST: u8 = 3;
@@ -130,17 +128,6 @@ fn upper_udf() -> Arc<ScalarUDF> {
     UPPER_UDF
         .get_or_init(datafusion_functions::string::upper)
         .clone()
-}
-
-pub fn parse_expr_ir(bytes: &[u8], ctx: Option<&SessionContext>) -> Result<Expr, String> {
-    if bytes.len() < MAGIC.len() {
-        return Err("expr_ir is too short".to_string());
-    }
-    if &bytes[..MAGIC.len()] != MAGIC {
-        return Err("expr_ir magic mismatch".to_string());
-    }
-
-    parse_expr_ir_payload(&bytes[MAGIC.len()..], ctx)
 }
 
 pub(crate) fn parse_expr_ir_payload(

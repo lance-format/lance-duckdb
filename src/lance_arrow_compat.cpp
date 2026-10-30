@@ -2,6 +2,7 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/arrow/schema_metadata.hpp"
 
 #include <memory>
 
@@ -14,6 +15,26 @@
 #include <vector>
 
 namespace duckdb {
+
+bool LanceArrowFieldContainsBlob(const ArrowSchema &field) {
+  if (field.metadata) {
+    ArrowSchemaMetadata metadata(field.metadata);
+    if (metadata.GetOption("lance-encoding:blob") == "true" ||
+        metadata.GetOption("ARROW:extension:name") == "lance.blob.v2") {
+      return true;
+    }
+  }
+  if (field.dictionary && LanceArrowFieldContainsBlob(*field.dictionary)) {
+    return true;
+  }
+  for (int64_t child_idx = 0; child_idx < field.n_children; child_idx++) {
+    if (field.children && field.children[child_idx] &&
+        LanceArrowFieldContainsBlob(*field.children[child_idx])) {
+      return true;
+    }
+  }
+  return false;
+}
 
 LanceArrowBatch::LanceArrowBatch(void *batch, const char *export_error) {
   std::unique_ptr<void, decltype(&lance_free_batch)> batch_owner(

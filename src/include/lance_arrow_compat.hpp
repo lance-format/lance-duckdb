@@ -56,6 +56,10 @@ struct LanceArrowBatch {
 // helpers above would rewrite.
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema);
 
+// True when this field, or any nested child, carries a Lance blob marker
+// (Blob v1 or Blob v2). Ordinary Arrow binary fields do not match.
+bool LanceArrowFieldContainsBlob(const ArrowSchema &field);
+
 // DuckDB's Arrow exporter names list child fields `l`; Arrow (and therefore
 // Lance, pyarrow and DataFusion) call them `item`. Lance persists the name, and
 // DataFusion's array-function coercion rewrites any list argument to an `item`

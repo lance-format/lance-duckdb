@@ -942,7 +942,7 @@ static void LanceIndexListFunc(ClientContext &context, TableFunctionInput &data,
     auto output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
     global_state.lines_read.fetch_add(output_size);
 
-    output.SetCardinality(output_size);
+    output.SetChildCardinality(output_size);
     // The Lance index list stream always returns all columns (no projection
     // pushdown), so we must map DuckDB projection column ids to Arrow children.
     ArrowTableFunction::ArrowToDuckDB(
@@ -1229,7 +1229,6 @@ static void LanceCreateIndexFunc(ClientContext &context,
                                  TableFunctionInput &data, DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceIndexDdlGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -1291,15 +1290,12 @@ static void LanceCreateIndexFunc(ClientContext &context,
   } else {
     LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
   }
-
-  output.SetCardinality(0);
 }
 
 static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
                                DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceIndexDdlGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -1347,8 +1343,6 @@ static void LanceDropIndexFunc(ClientContext &context, TableFunctionInput &data,
   } else {
     LanceInvalidateDatasetCacheForPath(context, bind_data.dataset_uri);
   }
-
-  output.SetCardinality(0);
 }
 
 static TableFunction LanceCreateIndexTableFunction() {
@@ -1434,8 +1428,6 @@ public:
                         LanceFormatErrorSuffix());
     }
     LanceInvalidateDatasetCacheForTable(client_context, table);
-
-    chunk.SetCardinality(0);
     return SourceResultType::FINISHED;
   }
 

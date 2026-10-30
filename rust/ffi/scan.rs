@@ -66,6 +66,7 @@ fn create_fragment_stream_ir_inner(
         })?;
 
     let mut scan = fragment.scan();
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {
@@ -153,6 +154,7 @@ fn create_dataset_stream_ir_inner(
     }
 
     let mut scan = handle.dataset.scan();
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {
@@ -340,6 +342,7 @@ fn explain_dataset_scan_ir_inner(
 ) -> FfiResult<String> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let mut scan = handle.dataset.scan();
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {

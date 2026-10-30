@@ -188,7 +188,6 @@ static void LanceMaintenanceFunc(ClientContext &context,
                                  TableFunctionInput &data, DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceMaintenanceGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -243,10 +242,9 @@ static void LanceMaintenanceFunc(ClientContext &context,
     lance_free_string(metrics_ptr);
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  output.data[0].Append(Value(op_name));
+  output.data[1].Append(Value(display_uri));
+  output.data[2].Append(Value(metrics_json));
 }
 
 struct LanceAutoCleanupSetBindData final : public FunctionData {
@@ -397,7 +395,6 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
                                     DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceMaintenanceGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -460,10 +457,9 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
   }
   lance_close_dataset(dataset);
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  output.data[0].Append(Value(op_name));
+  output.data[1].Append(Value(display_uri));
+  output.data[2].Append(Value(metrics_json));
 }
 
 static unique_ptr<GlobalTableFunctionState>
@@ -518,18 +514,16 @@ static void LanceShowAutoCleanupFunc(ClientContext &, TableFunctionInput &data,
                                      DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceAutoCleanupShowGlobalState>();
   if (gstate.offset >= gstate.rows.size()) {
-    output.SetCardinality(0);
     return;
   }
 
   auto remaining = gstate.rows.size() - gstate.offset;
   auto count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-  output.SetCardinality(count);
 
   for (idx_t i = 0; i < count; i++) {
     auto &kv = gstate.rows[gstate.offset + i];
-    output.SetValue(0, i, Value(kv.first));
-    output.SetValue(1, i, Value(kv.second));
+    output.data[0].Append(Value(kv.first));
+    output.data[1].Append(Value(kv.second));
   }
   gstate.offset += count;
 }

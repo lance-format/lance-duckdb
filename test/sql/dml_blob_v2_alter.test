@@ -1,0 +1,169 @@
+# name: test/sql/dml_blob_v2_alter.test
+# description: UPDATE and MERGE write Blob v2 columns added after rows were written
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS label
+  UNION ALL SELECT 2, 'b'
+  UNION ALL SELECT 3, 'c'
+) TO '{TEST_DIR}/dml_blob_v2_alter.lance'
+  (FORMAT lance, mode 'overwrite', data_storage_version '2.2', max_rows_per_file 1);
+
+statement ok
+COPY (SELECT 'ref-updated'::BLOB)
+  TO '{TEST_DIR}/dml_blob_v2_alter_ref.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT 'ingest-updated'::BLOB)
+  TO '{TEST_DIR}/dml_blob_v2_alter_ingest.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT 'ref-merge-updated'::BLOB)
+  TO '{TEST_DIR}/dml_blob_v2_alter_ref_merge.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT 'ingest-merge-inserted'::BLOB)
+  TO '{TEST_DIR}/dml_blob_v2_alter_ingest_merge.bin' (FORMAT BLOB);
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+# The existing fragments do not contain the new column. Adding it must use
+# AllNulls without rewriting those data files.
+statement ok
+CREATE TEMP TABLE alter_files_before AS
+  SELECT count(*) AS file_count
+  FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/data/*.lance');
+
+statement ok
+ALTER TABLE ns.main.dml_blob_v2_alter ADD COLUMN payload BLOB;
+
+query I
+SELECT count(*) = (SELECT file_count FROM alter_files_before)
+FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/data/*.lance');
+----
+true
+
+query I
+SELECT count(*) FROM ns.main.dml_blob_v2_alter WHERE payload IS NULL;
+----
+3
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1;
+----
+1
+
+statement ok
+ALTER TABLE ns.main.dml_blob_v2_alter
+  ADD COLUMN note BLOB DEFAULT 'legacy'::BLOB;
+
+query I
+SELECT count(*) FROM ns.main.dml_blob_v2_alter WHERE note = 'legacy'::BLOB;
+----
+3
+
+statement ok
+CREATE TEMP TABLE alter_versions_before_update AS
+  SELECT count(*) AS version_count
+  FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/_versions/*.manifest');
+
+# One UPDATE reaches all three old fragments and assigns each write mode.
+statement ok
+UPDATE ns.main.dml_blob_v2_alter
+SET payload = CASE id
+  WHEN 1 THEN 'bytes-updated'::BLOB
+  WHEN 2 THEN lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/dml_blob_v2_alter_ref.bin')
+  WHEN 3 THEN lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/dml_blob_v2_alter_ingest.bin')
+END;
+
+query TI
+SELECT id, hex(payload)
+FROM ns.main.dml_blob_v2_alter
+ORDER BY id;
+----
+1	62797465732D75706461746564
+2	7265662D75706461746564
+3	696E676573742D75706461746564
+
+query I
+SELECT (SELECT count(*)
+        FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/_versions/*.manifest'))
+       = version_count + 1
+FROM alter_versions_before_update;
+----
+true
+
+query I
+SELECT count(*) FROM ns.main.dml_blob_v2_alter WHERE note = 'legacy'::BLOB;
+----
+3
+
+statement ok
+CREATE TEMP TABLE merge_source AS
+  SELECT 1::BIGINT AS id,
+         lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/dml_blob_v2_alter_ref_merge.bin') AS payload
+  UNION ALL
+  SELECT 4,
+         lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/dml_blob_v2_alter_ingest_merge.bin');
+
+statement ok
+CREATE TEMP TABLE alter_versions_before_merge AS
+  SELECT count(*) AS version_count
+  FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/_versions/*.manifest');
+
+statement ok
+MERGE INTO ns.main.dml_blob_v2_alter AS target
+USING merge_source AS source ON target.id = source.id
+WHEN MATCHED THEN
+  UPDATE SET payload = source.payload
+WHEN NOT MATCHED THEN
+  INSERT (id, payload) VALUES (source.id, source.payload);
+
+query TI
+SELECT id,
+       union_tag(CAST(payload AS UNION(
+         bytes BLOB,
+         reference STRUCT(uri VARCHAR, position UBIGINT, size UBIGINT),
+         ingest STRUCT(uri VARCHAR, position UBIGINT, size UBIGINT)
+       )))
+FROM merge_source
+ORDER BY id;
+----
+1	reference
+4	ingest
+
+query TI
+SELECT id, hex(payload)
+FROM ns.main.dml_blob_v2_alter
+WHERE id IN (1, 4)
+ORDER BY id;
+----
+1	7265662D6D657267652D75706461746564
+4	696E676573742D6D657267652D696E736572746564
+
+query TI
+SELECT id, hex(note)
+FROM ns.main.dml_blob_v2_alter
+WHERE id IN (1, 4)
+ORDER BY id;
+----
+1	6C6567616379
+4	6C6567616379
+
+query I
+SELECT (SELECT count(*)
+        FROM read_blob('{TEST_DIR}/dml_blob_v2_alter.lance/_versions/*.manifest'))
+       = version_count + 1
+FROM alter_versions_before_merge;
+----
+true

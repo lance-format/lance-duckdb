@@ -1,50 +1,40 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
-use std::ptr;
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
-use arrow_array::{make_array, RecordBatch, StructArray};
+use arrow_array::RecordBatch;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
-use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+use lance::dataset::{ExternalBlobMode, InsertBuilder, WriteMode, WriteParams};
 use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance_table::transaction::UpdatedFragmentOffsets;
 use roaring::RoaringTreemap;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::update::{apply_deletions, build_row_id_index, lookup_row_address};
+use super::blob::{BlobWriteContext, SourceOptionsMap};
+use super::update::{
+    apply_deletions, build_row_id_index, compose_column_updates, convert_blob_batch,
+    lookup_row_address, UpdateValueBatch,
+};
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 
 struct MergeHandle {
     input_schema: Arc<arrow_schema::Schema>,
-    data_type: DataType,
     path: String,
     session: Option<Arc<lance::session::Session>>,
     storage_options: HashMap<String, String>,
     max_rows_per_file: usize,
     max_rows_per_group: usize,
     max_bytes_per_file: usize,
+    ingest_batch_budget: usize,
     delete_row_ids: RoaringTreemap,
-    insert_batches: Vec<RecordBatch>,
-}
-
-#[repr(C)]
-struct RawArrowArray {
-    length: i64,
-    null_count: i64,
-    offset: i64,
-    n_buffers: i64,
-    n_children: i64,
-    buffers: *mut *const c_void,
-    children: *mut *mut RawArrowArray,
-    dictionary: *mut RawArrowArray,
-    release: Option<unsafe extern "C" fn(arg1: *mut RawArrowArray)>,
-    private_data: *mut c_void,
+    update_batches: Vec<UpdateValueBatch>,
+    insert_batches: Vec<(RecordBatch, SourceOptionsMap)>,
 }
 
 #[no_mangle]
@@ -56,6 +46,7 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    ingest_batch_budget: u64,
     session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> i32 {
@@ -67,6 +58,7 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        ingest_batch_budget,
         session,
         out_merge_handle,
     ) {
@@ -90,6 +82,7 @@ fn merge_begin_with_storage_options_inner(
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
+    ingest_batch_budget: u64,
     session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
@@ -156,6 +149,16 @@ fn merge_begin_with_storage_options_inner(
         )
     })?;
     let session = unsafe { optional_session_handle(session)? };
+    let ingest_batch_budget = if ingest_batch_budget == 0 {
+        super::blob::DEFAULT_INGEST_BATCH_BUDGET
+    } else {
+        usize::try_from(ingest_batch_budget).map_err(|err| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid ingest memory budget: {err}"),
+            )
+        })?
+    };
 
     let input_schema: Arc<arrow_schema::Schema> = match runtime::block_on(async {
         let mut builder =
@@ -180,17 +183,17 @@ fn merge_begin_with_storage_options_inner(
         }
     };
 
-    let data_type = DataType::Struct(input_schema.fields().clone());
     let handle = Box::new(MergeHandle {
         input_schema,
-        data_type,
         path,
         session,
         storage_options,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
+        ingest_batch_budget,
         delete_row_ids: RoaringTreemap::new(),
+        update_batches: Vec::new(),
         insert_batches: Vec::new(),
     });
 
@@ -251,11 +254,26 @@ fn merge_add_delete_rowids_inner(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_merge_add_insert_batch(
+pub unsafe extern "C" fn lance_merge_add_update_batch(
     merge_handle: *mut c_void,
+    schema: *mut c_void,
     array: *mut c_void,
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
 ) -> i32 {
-    match merge_add_insert_batch_inner(merge_handle, array) {
+    match merge_add_update_batch_inner(
+        merge_handle,
+        schema,
+        array,
+        source_uris,
+        source_uri_keys,
+        source_uri_values,
+        source_uri_counts,
+        source_uri_count,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -267,41 +285,100 @@ pub unsafe extern "C" fn lance_merge_add_insert_batch(
     }
 }
 
-fn merge_add_insert_batch_inner(merge_handle: *mut c_void, array: *mut c_void) -> FfiResult<()> {
+#[allow(clippy::too_many_arguments)]
+fn merge_add_update_batch_inner(
+    merge_handle: *mut c_void,
+    schema: *mut c_void,
+    array: *mut c_void,
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
+) -> FfiResult<()> {
     if merge_handle.is_null() {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
             "merge_handle is null",
         ));
     }
-    if array.is_null() {
-        return Err(FfiError::new(ErrorCode::InvalidArgument, "array is null"));
-    }
-
     let handle = unsafe { &mut *(merge_handle as *mut MergeHandle) };
+    let batch = super::update::import_struct_batch(array, schema)?;
+    let columns = super::update::take_update_batch_fields(&batch)?;
+    let source_options = super::write::parse_batch_source_options(
+        source_uris,
+        source_uri_keys,
+        source_uri_values,
+        source_uri_counts,
+        source_uri_count,
+    )?;
+    handle.update_batches.push(UpdateValueBatch {
+        columns,
+        batch,
+        source_options,
+    });
+    Ok(())
+}
 
-    let raw_array = unsafe { ptr::read(array as *mut RawArrowArray) };
-    unsafe {
-        (*(array as *mut RawArrowArray)).release = None;
+#[no_mangle]
+pub unsafe extern "C" fn lance_merge_add_insert_batch(
+    merge_handle: *mut c_void,
+    schema: *mut c_void,
+    array: *mut c_void,
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
+) -> i32 {
+    match merge_add_insert_batch_inner(
+        merge_handle,
+        schema,
+        array,
+        source_uris,
+        source_uri_keys,
+        source_uri_values,
+        source_uri_counts,
+        source_uri_count,
+    ) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
     }
-    let ffi_array: arrow::ffi::FFI_ArrowArray = unsafe { std::mem::transmute(raw_array) };
+}
 
-    let array_data =
-        unsafe { arrow_array::ffi::from_ffi_and_data_type(ffi_array, handle.data_type.clone()) }
-            .map_err(|err| {
-                FfiError::new(ErrorCode::DatasetMerge, format!("array import: {err}"))
-            })?;
-
-    let array = make_array(array_data);
-    let struct_array = array
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| FfiError::new(ErrorCode::DatasetMerge, "array is not a struct"))?;
-
-    let batch = RecordBatch::try_new(handle.input_schema.clone(), struct_array.columns().to_vec())
-        .map_err(|err| FfiError::new(ErrorCode::DatasetMerge, format!("record batch: {err}")))?;
-
-    handle.insert_batches.push(batch);
+#[allow(clippy::too_many_arguments)]
+fn merge_add_insert_batch_inner(
+    merge_handle: *mut c_void,
+    schema: *mut c_void,
+    array: *mut c_void,
+    source_uris: *const *const c_char,
+    source_uri_keys: *const *const *const c_char,
+    source_uri_values: *const *const *const c_char,
+    source_uri_counts: *const usize,
+    source_uri_count: usize,
+) -> FfiResult<()> {
+    if merge_handle.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "merge_handle is null",
+        ));
+    }
+    let handle = unsafe { &mut *(merge_handle as *mut MergeHandle) };
+    let batch = super::update::import_struct_batch(array, schema)?;
+    let source_options = super::write::parse_batch_source_options(
+        source_uris,
+        source_uri_keys,
+        source_uri_values,
+        source_uri_counts,
+        source_uri_count,
+    )?;
+    handle.insert_batches.push((batch, source_options));
     Ok(())
 }
 
@@ -350,8 +427,28 @@ fn merge_finish_uncommitted_inner(
         let dataset = builder.load().await.map_err(|e| e.to_string())?;
         let dataset = Arc::new(dataset);
 
+        let existing_schema: arrow_schema::Schema = dataset.schema().into();
+        let blob_context = BlobWriteContext {
+            registry: handle
+                .session
+                .as_ref()
+                .map(|session| session.store_registry())
+                .unwrap_or_default(),
+            ingest_batch_budget: handle.ingest_batch_budget,
+        };
+
         let mut new_fragments = Vec::new();
         if !handle.insert_batches.is_empty() {
+            let mut insert_batches = Vec::with_capacity(handle.insert_batches.len());
+            for (batch, source_options) in handle.insert_batches.iter() {
+                insert_batches.push(convert_blob_batch(
+                    batch,
+                    &existing_schema,
+                    &blob_context,
+                    source_options,
+                )?);
+            }
+
             let mut store_params = ObjectStoreParams::default();
             if !handle.storage_options.is_empty() {
                 store_params.storage_options_accessor = Some(Arc::new(
@@ -366,14 +463,21 @@ fn merge_finish_uncommitted_inner(
                 max_bytes_per_file: handle.max_bytes_per_file,
                 session: handle.session.clone(),
                 store_params: Some(store_params),
+                // SQL reference values keep Lance ownership semantics: matching
+                // registered bases reuse them, other absolute URIs are stored
+                // as-is. Ingest values were materialized above.
+                allow_external_blob_outside_bases: true,
+                external_blob_mode: ExternalBlobMode::Reference,
                 ..Default::default()
             };
 
-            let stream = futures::stream::iter(handle.insert_batches.into_iter().map(Ok)).boxed();
-            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                handle.input_schema.clone(),
-                stream,
-            ));
+            let insert_schema = insert_batches
+                .first()
+                .map(|batch| batch.schema())
+                .unwrap_or_else(|| handle.input_schema.clone());
+            let stream = futures::stream::iter(insert_batches.into_iter().map(Ok)).boxed();
+            let stream: SendableRecordBatchStream =
+                Box::pin(RecordBatchStreamAdapter::new(insert_schema, stream));
 
             let append_txn = InsertBuilder::new(dataset.clone())
                 .with_params(&write_params)
@@ -401,13 +505,42 @@ fn merge_finish_uncommitted_inner(
             }
         }
 
-        let (updated_fragments, removed_fragment_ids) = if row_addrs.is_empty() {
+        let mut update_batches = Vec::with_capacity(handle.update_batches.len());
+        for mut item in handle.update_batches {
+            item.batch = convert_blob_batch(
+                &item.batch,
+                &existing_schema,
+                &blob_context,
+                &item.source_options,
+            )?;
+            update_batches.push(item);
+        }
+
+        let compose_result = compose_column_updates(
+            &dataset,
+            &update_batches,
+            &row_addrs,
+            handle.ingest_batch_budget,
+        )
+        .await?;
+        let mut updated_fragments = compose_result.0;
+        let fields_modified = compose_result.1;
+        let fragment_offsets = compose_result.2;
+
+        let (deleted_fragments, removed_fragment_ids) = if row_addrs.is_empty() {
             (Vec::new(), Vec::new())
         } else {
             apply_deletions(dataset.as_ref(), &row_addrs)
                 .await
                 .map_err(|e| e.to_string())?
         };
+        for deleted in deleted_fragments {
+            if let Some(existing) = updated_fragments.iter_mut().find(|f| f.id == deleted.id) {
+                existing.deletion_file = deleted.deletion_file.clone();
+            } else {
+                updated_fragments.push(deleted);
+            }
+        }
 
         if new_fragments.is_empty()
             && updated_fragments.is_empty()
@@ -416,16 +549,21 @@ fn merge_finish_uncommitted_inner(
             return Ok::<_, String>(None);
         }
 
+        let updated_fragment_offsets = if fragment_offsets.is_empty() {
+            None
+        } else {
+            Some(UpdatedFragmentOffsets(fragment_offsets))
+        };
         let operation = Operation::Update {
             removed_fragment_ids,
             updated_fragments,
             new_fragments,
-            fields_modified: vec![],
+            fields_modified,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: Vec::new(),
-            update_mode: Some(UpdateMode::RewriteRows),
+            update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
-            updated_fragment_offsets: None,
+            updated_fragment_offsets,
         };
         let txn = Transaction::new(dataset.manifest.version, operation, None);
 

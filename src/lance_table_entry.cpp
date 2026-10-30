@@ -1,5 +1,6 @@
 #include "lance_table_entry.hpp"
 #include "lance_arrow_compat.hpp"
+#include "lance_blob.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -7,6 +8,7 @@
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -15,6 +17,9 @@
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <algorithm>
@@ -22,6 +27,17 @@
 #include <memory>
 
 namespace duckdb {
+
+static string LanceHexEncode(const string &bytes) {
+  static constexpr char kHexDigits[] = "0123456789ABCDEF";
+  string result;
+  result.reserve(bytes.size() * 2);
+  for (auto byte : bytes) {
+    result.push_back(kHexDigits[(static_cast<uint8_t>(byte) >> 4) & 0x0F]);
+    result.push_back(kHexDigits[static_cast<uint8_t>(byte) & 0x0F]);
+  }
+  return result;
+}
 
 static void RestoreColumnDefault(ClientContext &context,
                                  const ArrowSchema &field,
@@ -56,6 +72,17 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
     ColumnDefinition column(Identifier(names[i]), types[i]);
     RestoreColumnDefault(context, field, column);
     result.columns.AddColumn(std::move(column));
+    result.blob_columns.push_back(LanceArrowFieldContainsBlob(field));
+    // Only genuinely Blob v2 fields accept the LANCE_BLOB_INPUT write type.
+    // Plain binary, legacy Blob, and Arrow extension-typed BLOB columns keep
+    // DuckDB's ordinary BLOB cast path.
+    if (types[i].id() == LogicalTypeId::BLOB) {
+      ArrowSchemaMetadata metadata(field.metadata);
+      auto extension = metadata.GetOption("ARROW:extension:name");
+      if (StringUtil::CIEquals(extension, "lance.blob.v2")) {
+        result.writable_blob_v2_columns.push_back(names[i]);
+      }
+    }
     if ((field.flags & ARROW_FLAG_NULLABLE) == 0) {
       result.constraints.push_back(
           make_uniq<NotNullConstraint>(LogicalIndex(i)));
@@ -169,11 +196,15 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
   vector<string> coerced;
+  vector<bool> blob_columns;
+  vector<string> writable_blob_v2_columns;
   try {
     auto live = LanceTableSchema::FromDataset(context, dataset);
     create_info.columns = std::move(live.columns);
     create_info.constraints = std::move(live.constraints);
     coerced = std::move(live.coerced_columns);
+    blob_columns = std::move(live.blob_columns);
+    writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
     LoadLanceColumnComments(dataset, create_info.columns);
   } catch (...) {
     lance_close_dataset(dataset);
@@ -189,6 +220,8 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
                                        base.DatasetUri());
   }
   entry->SetCoercedColumnNames(std::move(coerced));
+  entry->SetBlobColumns(std::move(blob_columns));
+  entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
 
   auto *table_md = lance_dataset_list_table_metadata(dataset);
   if (!table_md) {
@@ -306,17 +339,58 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
 
       vector<string> expressions;
       if (add.new_column.HasDefaultValue()) {
-        expressions.push_back(add.new_column.DefaultValue().ToString());
+        if (types[0].id() == LogicalTypeId::BLOB) {
+          // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
+          // default with the native binder/evaluator, then hand the exact
+          // bytes to the existing expression path as a hex literal. Only
+          // constant-foldable BLOB defaults are supported: URI ingestion is a
+          // DML value contract, not a stored default.
+          try {
+            auto default_binder = Binder::CreateBinder(context);
+            vector<unique_ptr<Expression>> bound_defaults;
+            default_binder->BindDefaultValue(
+                add.new_column, bound_defaults,
+                catalog.GetName().GetIdentifierName(),
+                schema.name.GetIdentifierName());
+            auto &bound_default = *bound_defaults[0];
+            if (!bound_default.IsFoldable() || bound_default.IsVolatile()) {
+              throw NotImplementedException(
+                  "ALTER TABLE ADD COLUMN BLOB DEFAULT only supports "
+                  "constant-foldable values, not columns or volatile "
+                  "functions");
+            }
+            Value default_value;
+            if (!ExpressionExecutor::TryEvaluateScalar(context, bound_default,
+                                                       default_value)) {
+              throw NotImplementedException(
+                  "ALTER TABLE ADD COLUMN BLOB DEFAULT could not be folded to "
+                  "a constant value");
+            }
+            if (default_value.IsNull()) {
+              expressions.push_back("NULL");
+            } else {
+              auto bytes = default_value.GetValueUnsafe<string_t>().GetString();
+              expressions.push_back("X'" + LanceHexEncode(bytes) + "'");
+            }
+          } catch (...) {
+            lance_close_dataset(dataset);
+            throw;
+          }
+        } else {
+          expressions.push_back(add.new_column.DefaultValue().ToString());
+        }
       }
       vector<const char *> expr_ptrs;
       expr_ptrs.reserve(expressions.size());
       for (auto &e : expressions) {
         expr_ptrs.push_back(e.c_str());
       }
+      auto blob_flags = LanceBlobFlagsForTypes(types);
 
       auto rc = lance_dataset_add_columns(
           dataset, &new_schema_root.arrow_schema,
-          expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(), 0);
+          expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(), 0,
+          blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size());
       if (rc != 0) {
         lance_close_dataset(dataset);
         throw IOException("Failed to add column to Lance dataset: " +
@@ -515,7 +589,42 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
         make_uniq<LanceTableEntry>(catalog, schema, *create_info, dataset_uri);
   }
   copy->SetCoercedColumnNames(coerced_column_names);
+  copy->SetBlobColumns(blob_column_flags);
+  copy->SetWritableBlobV2Columns(writable_blob_v2_columns);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
+}
+
+bool LanceTableEntry::IsWritableBlobV2Column(
+    const ColumnDefinition &column) const {
+  if (column.Type().id() != LogicalTypeId::BLOB) {
+    return false;
+  }
+  auto name = column.Name().GetIdentifierName();
+  return std::find(writable_blob_v2_columns.begin(),
+                   writable_blob_v2_columns.end(),
+                   name) != writable_blob_v2_columns.end();
+}
+
+LogicalType LanceTableEntry::GetExpectedTypeForInsert(
+    const ColumnDefinition &column) const {
+  if (IsWritableBlobV2Column(column)) {
+    return LanceBlobInputType();
+  }
+  return TableCatalogEntry::GetExpectedTypeForInsert(column);
+}
+
+unique_ptr<Expression> LanceTableEntry::GetDefaultExpressionForColumn(
+    ClientContext &context, const LogicalType &input_type,
+    const LogicalType &result_type, ColumnBinding binding,
+    const Expression &constant_value) const {
+  if (result_type.id() == LogicalTypeId::BLOB && LanceIsBlobInput(input_type)) {
+    // The value is already the Blob write input; casting it back to the
+    // declared BLOB read type would lose bytes/reference/ingest intent on
+    // DEFAULT and omitted-column paths.
+    return make_uniq<BoundColumnRefExpression>(input_type, binding);
+  }
+  return TableCatalogEntry::GetDefaultExpressionForColumn(
+      context, input_type, result_type, binding, constant_value);
 }
 
 // Collect the logical column indexes carrying NOT NULL constraints. Both the
@@ -559,6 +668,7 @@ bool LanceTableEntry::MatchesLiveSchemaState(
     const LanceTableSchema &live) const {
   if (columns.LogicalColumnCount() != live.columns.LogicalColumnCount() ||
       CoercedColumnNames() != live.coerced_columns ||
+      writable_blob_v2_columns != live.writable_blob_v2_columns ||
       NotNullIndexesFromConstraints(constraints) !=
           NotNullIndexesFromConstraints(live.constraints)) {
     return false;

@@ -1,13 +1,15 @@
 mod arrow_export;
+mod blob;
 mod blob_range;
 mod dataset;
+mod delete;
 mod dir_namespace;
 mod exec;
 mod index;
 mod knn;
 mod merge;
 mod namespace;
-mod projection;
+pub(crate) mod projection;
 mod query_table;
 mod scan;
 mod schema_evolution;
