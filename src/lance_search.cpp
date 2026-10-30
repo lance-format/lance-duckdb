@@ -802,6 +802,7 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
     }
 
     if (output.size() == 0) {
+      output.Reset();
       continue;
     }
     output.Verify();
@@ -1559,6 +1560,7 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
     }
 
     if (output.size() == 0) {
+      output.Reset();
       continue;
     }
     output.Verify();
