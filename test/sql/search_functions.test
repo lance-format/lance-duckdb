@@ -72,6 +72,13 @@ SELECT count(*) FROM lance_fts('test/data/search_test_data.lance', 'text', 'pupp
 ----
 2
 
+# FTS results expose _rowid so hits can be joined back to the dataset
+query I
+SELECT count(*) FROM lance_fts('test/data/search_test_data.lance', 'text', 'puppy', k = 10)
+WHERE _rowid IS NOT NULL
+----
+2
+
 # FTS + prefilter: ensure filters are applied before top-k
 query I
 SELECT id
@@ -151,17 +158,17 @@ ORDER BY _distance
 # Vector search (indexed): nprobs and refine_factor are reflected in EXPLAIN
 statement ok
 COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
-TO 'test/.tmp/search_knn_indexed.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/search_knn_indexed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-CREATE INDEX vec_idx ON 'test/.tmp/search_knn_indexed.lance' (vec)
+CREATE INDEX vec_idx ON '{TEST_DIR}/search_knn_indexed.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
 
 query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/search_knn_indexed.lance',
+  '{TEST_DIR}/search_knn_indexed.lance',
   'vec',
   [
     0.32245764,
@@ -193,7 +200,7 @@ physical_plan	<REGEX>:[\s\S]*ANNSubIndex: name=vec_idx, k=2[\s\S]*minimum_nprobe
 query I
 SELECT count(*)
 FROM lance_vector_search(
-  'test/.tmp/search_knn_indexed.lance',
+  '{TEST_DIR}/search_knn_indexed.lance',
   'vec',
   [
     0.32245764,
@@ -231,12 +238,12 @@ COPY (
       (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::FLOAT[3]),
       (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::FLOAT[3])
   ) AS t(id, animal, vec)
-) TO 'test/.tmp/knn_array_f32.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/knn_array_f32.lance' (FORMAT lance, mode 'overwrite');
 
 query I
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/knn_array_f32.lance',
+  '{TEST_DIR}/knn_array_f32.lance',
   'vec',
   [0.8, 0.7, 0.2]::FLOAT[3],
   k = 1,
@@ -255,12 +262,12 @@ COPY (
       (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::DOUBLE[3]),
       (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::DOUBLE[3])
   ) AS t(id, animal, vec)
-) TO 'test/.tmp/knn_array_f64.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/knn_array_f64.lance' (FORMAT lance, mode 'overwrite');
 
 query I
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/knn_array_f64.lance',
+  '{TEST_DIR}/knn_array_f64.lance',
   'vec',
   [0.8, 0.7, 0.2]::DOUBLE[3],
   k = 1,
@@ -280,12 +287,12 @@ COPY (
       (2::BIGINT, 'horse'::VARCHAR, [0.3, 0.1, 0.5]::FLOAT[]),
       (3::BIGINT, 'dragon'::VARCHAR, [0.5, 0.2, 0.7]::FLOAT[])
   ) AS t(id, animal, vec)
-) TO 'test/.tmp/knn_list_f32.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/knn_list_f32.lance' (FORMAT lance, mode 'overwrite');
 
 query I
 SELECT id
 FROM lance_vector_search(
-  'test/.tmp/knn_list_f32.lance',
+  '{TEST_DIR}/knn_list_f32.lance',
   'vec',
   [0.8, 0.7, 0.2]::FLOAT[3],
   k = 1,
@@ -314,6 +321,24 @@ ORDER BY _hybrid_score DESC
 1
 3
 2
+
+# Hybrid results expose _rowid alongside the score columns
+query I
+SELECT count(*)
+FROM lance_hybrid_search(
+  'test/data/search_test_data.lance',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  'text',
+  'puppy',
+  k = 3,
+  prefilter = false,
+  alpha = 0.5,
+  oversample_factor = 4
+)
+WHERE _rowid IS NOT NULL
+----
+3
 
 # Hybrid search with oversample_factor default alpha
 query I
@@ -358,14 +383,14 @@ ORDER BY _hybrid_score DESC
 
 statement ok
 COPY (SELECT * FROM 'test/data/search_test_data.lance')
-TO 'test/.tmp/search_hybrid_indexed.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/search_hybrid_indexed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-CREATE INDEX vec_idx ON 'test/.tmp/search_hybrid_indexed.lance' (vec)
+CREATE INDEX vec_idx ON '{TEST_DIR}/search_hybrid_indexed.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
 
 statement ok
-CREATE INDEX text_idx ON 'test/.tmp/search_hybrid_indexed.lance' (text)
+CREATE INDEX text_idx ON '{TEST_DIR}/search_hybrid_indexed.lance' (text)
 USING INVERTED;
 
 # Hybrid search exposes vector search controls in EXPLAIN when using an index
@@ -373,7 +398,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_hybrid_search(
-  'test/.tmp/search_hybrid_indexed.lance',
+  '{TEST_DIR}/search_hybrid_indexed.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   'text',
@@ -392,7 +417,7 @@ query II
 EXPLAIN (FORMAT JSON)
 SELECT id
 FROM lance_hybrid_search(
-  'test/.tmp/search_hybrid_indexed.lance',
+  '{TEST_DIR}/search_hybrid_indexed.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   'text',
@@ -410,7 +435,7 @@ physical_plan	<REGEX>:[\s\S]*"Lance Search Mode": "hybrid"[\s\S]*"Lance Use Inde
 query I
 SELECT id
 FROM lance_hybrid_search(
-  'test/.tmp/search_hybrid_indexed.lance',
+  '{TEST_DIR}/search_hybrid_indexed.lance',
   'vec',
   [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
   'text',
@@ -467,8 +492,8 @@ ORDER BY id
 ----
 3
 
-# FTS namespace query_table prefilter requires explicit namespace filter
-statement error
+# FTS namespace query_table prefilter with a pushed WHERE clause
+query I
 SELECT id
 FROM lance_fts(
   'search_ns.main.search_test_data',
@@ -478,8 +503,9 @@ FROM lance_fts(
   prefilter = true
 )
 WHERE label >= 3
+ORDER BY id
 ----
-Invalid Input Error: lance_fts requires explicit filter when prefilter=true on namespace-backed tables
+3
 
 # FTS namespace query_table prefilter with explicit filter
 query I
@@ -528,8 +554,8 @@ ORDER BY _distance
 4
 5
 
-# Vector namespace query_table prefilter requires explicit namespace filter
-statement error
+# Vector namespace query_table prefilter with a pushed WHERE clause
+query I
 SELECT id
 FROM lance_vector_search(
   'search_ns.main.search_test_data',
@@ -540,8 +566,10 @@ FROM lance_vector_search(
   use_index = false
 )
 WHERE label >= 4
+ORDER BY id
 ----
-Invalid Input Error: lance_vector_search requires explicit filter when prefilter=true on namespace-backed tables
+4
+5
 
 # Vector namespace query_table prefilter with explicit filter
 query I

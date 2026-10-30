@@ -1,20 +1,21 @@
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "lance_common.hpp"
 
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
+#include "lance_source_resolver.hpp"
 #include "lance_table_entry.hpp"
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
-#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <cstring>
+#include <memory>
 
 namespace duckdb {
 
@@ -44,6 +45,17 @@ string LanceFormatErrorSuffix() {
     return "";
   }
   return " (Lance error: " + err + ")";
+}
+
+vector<string> LanceConsumeStringList(LanceStringList &list) {
+  std::unique_ptr<LanceStringList, decltype(&lance_free_string_list)> owner(
+      &list, lance_free_string_list);
+  vector<string> result;
+  result.reserve(list.count);
+  for (idx_t i = 0; i < list.count; i++) {
+    result.emplace_back(list.items[i]);
+  }
+  return result;
 }
 
 bool IsComputedSearchColumn(const string &name) {
@@ -172,7 +184,7 @@ void LanceFillStorageOptionsFromSecrets(ClientContext &context,
     if (kv.second.IsNull()) {
       continue;
     }
-    out_keys.push_back(kv.first);
+    out_keys.push_back(kv.first.GetIdentifierName());
     out_values.push_back(kv.second.ToString());
   }
 }
@@ -226,7 +238,7 @@ void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
 }
 
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
-                               const named_parameter_map_t &options,
+                               const named_argument_map_t &options,
                                string &out_bearer_token, string &out_api_key) {
   FillLanceNamespaceAuthFromSecrets(context, endpoint, out_bearer_token,
                                     out_api_key);
@@ -293,24 +305,6 @@ void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
   }
 }
 
-vector<string> LanceConsumeStringList(LanceStringList &list) {
-  vector<string> values;
-  try {
-    values.reserve(list.count);
-    for (idx_t i = 0; i < list.count; i++) {
-      if (!list.items || !list.items[i]) {
-        throw IOException("Invalid Lance string list");
-      }
-      values.emplace_back(list.items[i]);
-    }
-  } catch (...) {
-    lance_free_string_list(&list);
-    throw;
-  }
-  lance_free_string_list(&list);
-  return values;
-}
-
 bool TryLanceNamespaceListTables(
     ClientContext &context, const string &endpoint, const string &namespace_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
@@ -324,10 +318,10 @@ bool TryLanceNamespaceListTables(
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  LanceStringList list{nullptr, 0};
+  LanceStringList tables = {};
   auto rc = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
                                         bearer_ptr, api_key_ptr, delimiter_ptr,
-                                        headers_ptr, &list);
+                                        headers_ptr, &tables);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -335,75 +329,7 @@ bool TryLanceNamespaceListTables(
     }
     return false;
   }
-  out_tables = LanceConsumeStringList(list);
-  return true;
-}
-
-bool TryLanceNamespaceListNamespaces(
-    ClientContext &context, const string &endpoint, const string &namespace_id,
-    const string &bearer_token, const string &api_key, const string &delimiter,
-    const string &headers_tsv, vector<string> &out_namespaces,
-    string &out_error) {
-  (void)context;
-  out_namespaces.clear();
-  out_error.clear();
-  LanceStringList list{nullptr, 0};
-  auto rc = lance_namespace_list_namespaces(
-      endpoint.c_str(), namespace_id.c_str(),
-      bearer_token.empty() ? nullptr : bearer_token.c_str(),
-      api_key.empty() ? nullptr : api_key.c_str(),
-      delimiter.empty() ? nullptr : delimiter.c_str(),
-      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), &list);
-  if (rc != 0) {
-    out_error = LanceConsumeLastError();
-    return false;
-  }
-  auto effective_delimiter = delimiter.empty() ? "$" : delimiter;
-  for (auto &namespace_name : LanceConsumeStringList(list)) {
-    if (!namespace_name.empty() &&
-        namespace_name.find(effective_delimiter) == string::npos) {
-      out_namespaces.push_back(std::move(namespace_name));
-    }
-  }
-  return true;
-}
-
-bool TryLanceNamespaceCreateNamespace(
-    ClientContext &context, const string &endpoint, const string &namespace_id,
-    const string &bearer_token, const string &api_key, const string &delimiter,
-    const string &headers_tsv, const string &mode, string &out_error) {
-  (void)context;
-  out_error.clear();
-  auto rc = lance_namespace_create_namespace(
-      endpoint.c_str(), namespace_id.c_str(),
-      bearer_token.empty() ? nullptr : bearer_token.c_str(),
-      api_key.empty() ? nullptr : api_key.c_str(),
-      delimiter.empty() ? nullptr : delimiter.c_str(),
-      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), mode.c_str());
-  if (rc != 0) {
-    out_error = LanceConsumeLastError();
-    return false;
-  }
-  return true;
-}
-
-bool TryLanceNamespaceDropNamespace(
-    ClientContext &context, const string &endpoint, const string &namespace_id,
-    const string &bearer_token, const string &api_key, const string &delimiter,
-    const string &headers_tsv, bool cascade, string &out_error) {
-  (void)context;
-  out_error.clear();
-  auto behavior = cascade ? "Cascade" : "Restrict";
-  auto rc = lance_namespace_drop_namespace(
-      endpoint.c_str(), namespace_id.c_str(),
-      bearer_token.empty() ? nullptr : bearer_token.c_str(),
-      api_key.empty() ? nullptr : api_key.c_str(),
-      delimiter.empty() ? nullptr : delimiter.c_str(),
-      headers_tsv.empty() ? nullptr : headers_tsv.c_str(), behavior);
-  if (rc != 0) {
-    out_error = LanceConsumeLastError();
-    return false;
-  }
+  out_tables = LanceConsumeStringList(tables);
   return true;
 }
 
@@ -550,11 +476,11 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
 
-  LanceStringList list{nullptr, 0};
+  LanceStringList tables = {};
   auto rc = lance_dir_namespace_list_tables(
       open_root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      &list);
+      &tables);
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -563,11 +489,7 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
     return false;
   }
 
-  for (auto &p : LanceConsumeStringList(list)) {
-    if (!p.empty()) {
-      out_tables.push_back(std::move(p));
-    }
-  }
+  out_tables = LanceConsumeStringList(tables);
   return true;
 }
 
@@ -577,7 +499,6 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &api_key, const string &delimiter,
                             const string &headers_tsv, string &out_table_uri) {
   out_table_uri.clear();
-  auto *session = LanceGetSessionHandle(context);
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
@@ -585,9 +506,13 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
   const char *uri_ptr = nullptr;
-  auto *dataset = lance_open_dataset_in_namespace_with_session(
-      endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr, session, &uri_ptr);
+  auto source_resolver = LanceCreateSourceResolver(context);
+  auto *dataset = LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        return lance_open_dataset_in_namespace_with_session(
+            endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
+            delimiter_ptr, headers_ptr, session, &uri_ptr);
+      });
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -601,19 +526,45 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
   vector<string> option_values;
   ResolveLanceStorageOptions(context, path, open_path, option_keys,
                              option_values);
-  auto *session = LanceGetSessionHandle(context);
+  auto source_resolver = LanceCreateSourceResolver(context);
+  return LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        if (option_keys.empty()) {
+          return lance_open_dataset_with_session(open_path.c_str(), session);
+        }
 
-  if (option_keys.empty()) {
-    return lance_open_dataset_with_session(open_path.c_str(), session);
-  }
+        vector<const char *> key_ptrs;
+        vector<const char *> value_ptrs;
+        BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                        value_ptrs);
+        return lance_open_dataset_with_storage_options_and_session(
+            open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
+            option_keys.size(), session);
+      });
+}
 
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-  return lance_open_dataset_with_storage_options_and_session(
-      open_path.c_str(), key_ptrs.data(), value_ptrs.data(), option_keys.size(),
-      session);
+void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
+                                const optional_idx &version) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
+  const uint8_t has_version = version.IsValid() ? 1 : 0;
+  const uint64_t version_value =
+      version.IsValid() ? NumericCast<uint64_t>(version.GetIndex()) : 0;
+  auto source_resolver = LanceCreateSourceResolver(context);
+  return LanceOpenDatasetWithSourceSession(
+      context, source_resolver, [&](void *session) {
+        vector<const char *> key_ptrs;
+        vector<const char *> value_ptrs;
+        BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                        value_ptrs);
+        return lance_open_dataset_with_storage_options_and_version(
+            open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
+            value_ptrs.empty() ? nullptr : value_ptrs.data(),
+            option_keys.size(), session, has_version, version_value);
+      });
 }
 
 static unordered_map<string, Value>
@@ -627,36 +578,6 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
     options["api_key"] = Value(api_key_override);
   }
   return options;
-}
-
-LanceTableEntry *TryResolveLanceTableEntry(ClientContext &context,
-                                           const string &input) {
-  // Fast-path bail-out: obvious filesystem / URL literals can never match a
-  // qualified catalog identifier.  Avoids parsing attempts and potential
-  // secondary lookups that would just end up throwing ParserException.
-  if (input.empty() || input.find('/') != string::npos ||
-      input.find('\\') != string::npos || input.find("://") != string::npos) {
-    return nullptr;
-  }
-
-  QualifiedName qname;
-  try {
-    qname = QualifiedName::Parse(input);
-  } catch (ParserException &) {
-    return nullptr;
-  }
-
-  EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
-  auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema,
-                                 lookup_info, OnEntryNotFound::RETURN_NULL);
-  if (!entry) {
-    return nullptr;
-  }
-  auto *table_entry = dynamic_cast<TableCatalogEntry *>(entry.get());
-  if (!table_entry) {
-    return nullptr;
-  }
-  return dynamic_cast<LanceTableEntry *>(table_entry);
 }
 
 void *LanceOpenDatasetForTable(ClientContext &context,
@@ -675,11 +596,15 @@ void *LanceOpenDatasetForTable(ClientContext &context,
                                     key_ptrs, value_ptrs);
 
     const char *uri_ptr = nullptr;
-    auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
-        cfg.root.c_str(), cfg.table_id.c_str(),
-        key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(),
-        cfg.option_keys.size(), LanceGetSessionHandle(context), &uri_ptr);
+    auto source_resolver = LanceCreateSourceResolver(context);
+    auto *dataset = LanceOpenDatasetWithSourceSession(
+        context, source_resolver, [&](void *session) {
+          return lance_open_dataset_in_dir_namespace_with_session(
+              cfg.root.c_str(), cfg.table_id.c_str(),
+              key_ptrs.empty() ? nullptr : key_ptrs.data(),
+              value_ptrs.empty() ? nullptr : value_ptrs.data(),
+              cfg.option_keys.size(), session, &uri_ptr);
+        });
     if (uri_ptr) {
       out_display_uri = uri_ptr;
       lance_free_string(uri_ptr);
@@ -765,109 +690,61 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                              out_option_values);
 }
 
-int64_t LanceTruncateDatasetWithStorageOptions(
-    ClientContext &context, const string &open_path,
-    const vector<string> &option_keys, const vector<string> &option_values,
-    const string &display_uri) {
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-
-  void *dataset = nullptr;
-  if (option_keys.empty()) {
-    dataset = lance_open_dataset(open_path.c_str());
-  } else {
-    dataset = lance_open_dataset_with_storage_options(
-        open_path.c_str(), key_ptrs.data(), value_ptrs.data(),
-        option_keys.size());
-  }
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + display_uri +
-                      LanceFormatErrorSuffix());
-  }
-
-  auto row_count = lance_dataset_count_rows(dataset);
-  if (row_count < 0) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to count rows from Lance dataset: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  auto *schema_handle = lance_get_schema(dataset);
-  if (!schema_handle) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to get schema from Lance dataset: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
-
-  ArrowSchemaWrapper schema_root;
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  if (lance_schema_to_arrow(schema_handle, &schema_root.arrow_schema) != 0) {
-    lance_free_schema(schema_handle);
-    lance_close_dataset(dataset);
-    throw IOException(
-        "Failed to export Lance schema to Arrow C Data Interface" +
-        LanceFormatErrorSuffix());
-  }
-
-  lance_free_schema(schema_handle);
-  lance_close_dataset(dataset);
-
-  auto *writer = lance_open_writer_with_storage_options(
-      open_path.c_str(), "overwrite",
-      key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE, nullptr, LanceGetSessionHandle(context),
-      &schema_root.arrow_schema);
-  if (!writer) {
-    throw IOException("Failed to open Lance writer: " + open_path +
-                      LanceFormatErrorSuffix());
-  }
-  auto rc = lance_writer_finish(writer);
-  lance_close_writer(writer);
-  if (rc != 0) {
-    throw IOException("Failed to finalize Lance dataset write" +
-                      LanceFormatErrorSuffix());
-  }
-
-  return row_count;
-}
-
-int64_t LanceTruncateDataset(ClientContext &context,
-                             const string &dataset_uri) {
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-  ResolveLanceStorageOptions(context, dataset_uri, open_path, option_keys,
-                             option_values);
-  return LanceTruncateDatasetWithStorageOptions(context, open_path, option_keys,
-                                                option_values, dataset_uri);
-}
-
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
                         DataChunk &chunk, SelectionVector &sel) {
   if (chunk.size() == 0) {
     return;
   }
   unique_ptr<Expression> combined;
-  for (auto &it : filters.filters) {
-    auto scan_col_idx = it.first;
+  for (auto &it : filters) {
+    auto scan_col_idx = it.GetIndex();
     if (scan_col_idx >= chunk.ColumnCount()) {
-      continue;
+      throw InternalException("Lance filter refers to a missing scan column");
     }
-    BoundReferenceExpression col_expr(chunk.data[scan_col_idx].GetType(),
-                                      NumericCast<storage_t>(scan_col_idx));
-    auto expr = it.second->ToExpression(col_expr);
+    BoundReferenceExpression col_expr(
+        chunk.data[scan_col_idx].GetType(),
+        NumericCast<storage_t>(scan_col_idx.GetIndex()));
+    auto expr = it.Filter().ToExpression(col_expr);
     if (!combined) {
       combined = std::move(expr);
     } else {
       auto conj = make_uniq<BoundConjunctionExpression>(
           ExpressionType::CONJUNCTION_AND);
-      conj->children.push_back(std::move(combined));
-      conj->children.push_back(std::move(expr));
+      conj->GetChildrenMutable().push_back(std::move(combined));
+      conj->GetChildrenMutable().push_back(std::move(expr));
       combined = std::move(conj);
+    }
+  }
+  for (const auto &filter : filters.GetMultiColumnFilters()) {
+    const auto &expression_filter =
+        ExpressionFilter::GetExpressionFilter(*filter, "Lance residual filter");
+    auto expr = expression_filter.expr->Copy();
+    std::function<void(Expression &)> remap = [&](Expression &node) {
+      if (node.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+        auto &ref = node.Cast<BoundReferenceExpression>();
+        if (ref.Index() >= expression_filter.column_indexes.size()) {
+          throw InternalException(
+              "Lance multi-column filter reference is out of bounds");
+        }
+        auto projection = expression_filter.column_indexes[ref.Index()];
+        if (projection >= chunk.ColumnCount()) {
+          throw InternalException(
+              "Lance multi-column filter refers to a missing scan column");
+        }
+        ref.IndexMutable() = projection.GetIndex();
+      }
+      ExpressionIterator::EnumerateChildren(
+          node, [&](Expression &child) { remap(child); });
+    };
+    remap(*expr);
+    if (!combined) {
+      combined = std::move(expr);
+    } else {
+      auto conjunction = make_uniq<BoundConjunctionExpression>(
+          ExpressionType::CONJUNCTION_AND);
+      conjunction->GetChildrenMutable().push_back(std::move(combined));
+      conjunction->GetChildrenMutable().push_back(std::move(expr));
+      combined = std::move(conjunction);
     }
   }
   if (!combined) {

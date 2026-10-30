@@ -16,55 +16,55 @@ COPY (
     ('prefixxx'),
     ('xxsuffix')
   ) t(s)
-) TO 'test/.tmp/like_pushdown.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/like_pushdown.lance' (FORMAT lance, mode 'overwrite');
 
 # Case-sensitive LIKE
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'Al%';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE 'Al%';
 ----
 1
 
 # Case-insensitive ILIKE
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s ILIKE 'al%';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s ILIKE 'al%';
 ----
 2
 
 # Prefix wildcard
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'pre%';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE 'pre%';
 ----
 2
 
 # Suffix wildcard
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE '%suffix';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE '%suffix';
 ----
 2
 
 # Escape percent and underscore using ESCAPE '\'
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE E'a\\%c' ESCAPE E'\\';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE E'a\\%c' ESCAPE E'\\';
 ----
 1
 
 query I
-SELECT count(*) FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE E'a\\_c' ESCAPE E'\\';
+SELECT count(*) FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE E'a\\_c' ESCAPE E'\\';
 ----
 1
 
 # Explain diagnostics indicate LIKE/ILIKE are pushed to Lance
 query II
-EXPLAIN (FORMAT JSON) SELECT s FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'a%c' LIMIT 1;
+EXPLAIN (FORMAT JSON) SELECT s FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE 'a%c' LIMIT 1;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*full_filter=s LIKE[\s\S]*a%c[\s\S]*
 
 query II
-EXPLAIN (FORMAT JSON) SELECT s FROM 'test/.tmp/like_pushdown.lance' WHERE s ILIKE 'a%c' LIMIT 1;
+EXPLAIN (FORMAT JSON) SELECT s FROM '{TEST_DIR}/like_pushdown.lance' WHERE s ILIKE 'a%c' LIMIT 1;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Filter IR Bytes \(Bind\)": "[1-9][0-9]*"[\s\S]*full_filter=s ILIKE[\s\S]*a%c[\s\S]*
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT s FROM 'test/.tmp/like_pushdown.lance' WHERE s LIKE 'a%c' LIMIT 1;
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT s FROM '{TEST_DIR}/like_pushdown.lance' WHERE s LIKE 'a%c' LIMIT 1;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*

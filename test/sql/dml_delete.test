@@ -16,7 +16,7 @@ COPY (
   SELECT 3::BIGINT AS id, 'c'::VARCHAR AS s
   UNION ALL
   SELECT 4::BIGINT AS id, 'd'::VARCHAR AS s
-) TO 'test/.tmp/lance_delete_basic.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_delete_basic.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 COPY (
@@ -31,20 +31,20 @@ COPY (
   SELECT 5::BIGINT AS id, 'e'::VARCHAR AS s
   UNION ALL
   SELECT 6::BIGINT AS id, 'f'::VARCHAR AS s
-) TO 'test/.tmp/lance_delete_predicate.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/lance_delete_predicate.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 CREATE OR REPLACE TEMP TABLE v_basic AS
   SELECT count(*)::BIGINT AS c
-  FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*');
+  FROM glob('{TEST_DIR}/lance_delete_basic.lance/_versions/*');
 
 statement ok
 CREATE OR REPLACE TEMP TABLE v_pred AS
   SELECT count(*)::BIGINT AS c
-  FROM glob('test/.tmp/lance_delete_predicate.lance/_versions/*');
+  FROM glob('{TEST_DIR}/lance_delete_predicate.lance/_versions/*');
 
 statement ok
-ATTACH 'test/.tmp' AS del_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS del_ns (TYPE LANCE);
 
 query I
 SELECT count(*) FROM del_ns.main.lance_delete_basic;
@@ -67,7 +67,7 @@ SELECT sum(id) FROM del_ns.main.lance_delete_basic;
 7
 
 query T
-SELECT ((SELECT c FROM v_basic) + 1) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*'));
+SELECT ((SELECT c FROM v_basic) + 1) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_delete_basic.lance/_versions/*'));
 ----
 true
 
@@ -92,7 +92,7 @@ SELECT sum(id) FROM del_ns.main.lance_delete_predicate;
 6
 
 query T
-SELECT ((SELECT c FROM v_pred) + 1) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_predicate.lance/_versions/*'));
+SELECT ((SELECT c FROM v_pred) + 1) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_delete_predicate.lance/_versions/*'));
 ----
 true
 
@@ -139,9 +139,29 @@ SELECT count(*) FROM del_ns.main.lance_delete_basic;
 0
 
 query T
-SELECT ((SELECT c FROM v_basic) + 2) = (SELECT count(*)::BIGINT FROM glob('test/.tmp/lance_delete_basic.lance/_versions/*'));
+SELECT ((SELECT c FROM v_basic) + 2) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/lance_delete_basic.lance/_versions/*'));
 ----
 true
 
 statement ok
 DETACH del_ns;
+
+# DELETE predicates on quoted, keyword, and mixed-case column names.
+statement ok
+ATTACH '{TEST_DIR}/delete_quoted_namespace' AS quoted_delete (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE quoted_delete.items AS SELECT 1::BIGINT AS "a b", 2::BIGINT AS "select", 3::BIGINT AS "CamelCase";
+
+query I
+DELETE FROM quoted_delete.items WHERE "a b"=1 AND "select"=2 AND "CamelCase"=3;
+----
+1
+
+query I
+SELECT count(*) FROM quoted_delete.items;
+----
+0
+
+statement ok
+DETACH quoted_delete;

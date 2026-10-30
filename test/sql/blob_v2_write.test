@@ -1,0 +1,447 @@
+# name: test/sql/blob_v2_write.test
+# description: Blob v2 write contract: default encoding, URI constructors, COPY/CTAS
+# group: [sql]
+
+require lance
+
+# Deterministic chunk boundaries keep the failing row in a later batch.
+statement ok
+PRAGMA threads=1;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 's'::VARCHAR AS s
+) TO '{TEST_DIR}/blob_v2_root_ns.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT 'hello source'::VARCHAR AS s)
+TO '{TEST_DIR}/blob_v2_src.bin' (FORMAT csv);
+
+# 6C616E63652E626C6F622E7632 is the hexadecimal representation of
+# "lance.blob.v2" (the Blob v2 extension marker) and 322E32 is "2.2".
+
+# --- constructor semantics ---
+
+query I
+SELECT lance_blob_ref(NULL) IS NULL
+----
+true
+
+statement error
+SELECT lance_blob_ref('')
+----
+URI must not be empty
+
+statement error
+SELECT lance_blob_ref('relative/path.bin')
+----
+requires an absolute URI
+
+statement error
+SELECT lance_blob_ref('file:///x', NULL, 10)
+----
+range arguments must both be non-NULL
+
+statement error
+SELECT lance_blob_ref('file:///x', 0, NULL)
+----
+range arguments must both be non-NULL
+
+statement error
+SELECT lance_blob_ref('file:///x', -1, 10)
+----
+offset must be >= 0
+
+statement error
+SELECT lance_blob_ref('file:///x', 1, 0)
+----
+length must be > 0
+
+statement error
+SELECT lance_blob_ingest('file:///x', NULL, 1)
+----
+range arguments must both be non-NULL
+
+# --- new BLOB fields default to Blob v2 at file version >= 2.2 ---
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'abc'::BLOB AS payload
+  UNION ALL
+  SELECT 2::BIGINT AS id, NULL::BLOB AS payload
+) TO '{TEST_DIR}/blob_v2_bytes.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/blob_v2_bytes.lance'
+----
+2
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_bytes.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+1
+
+# empty writes still create the Blob v2 schema
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::BLOB AS payload
+  LIMIT 0
+) TO '{TEST_DIR}/blob_v2_bytes_empty.lance' (FORMAT lance, mode 'overwrite', write_empty_file true);
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/blob_v2_bytes_empty.lance'
+----
+0
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_bytes_empty.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+1
+
+# --- mixed bytes / reference / ingest in one statement ---
+
+statement ok
+COPY (
+  SELECT 3::BIGINT AS id, 'abc'::BLOB AS payload
+  UNION ALL
+  SELECT 4::BIGINT AS id, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload
+  UNION ALL
+  SELECT 5::BIGINT AS id, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload
+) TO '{TEST_DIR}/blob_v2_mixed.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/blob_v2_mixed.lance'
+----
+3
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_mixed.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+1
+
+# --- ingest reads at write time; missing sources fail without publication ---
+
+statement error
+COPY (
+  SELECT 1::BIGINT AS id, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_missing.bin') AS payload
+) TO '{TEST_DIR}/blob_v2_missing_ingest.lance' (FORMAT lance)
+----
+ingest source
+
+statement error
+SELECT count(*) FROM '{TEST_DIR}/blob_v2_missing_ingest.lance'
+----
+<REGEX>:.*
+
+# a failure in a later batch must not publish earlier batches
+
+statement error
+COPY (
+  SELECT i::BIGINT AS id,
+         CASE WHEN i = 2048 THEN lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_missing.bin')
+              ELSE 'a'::BLOB END AS payload
+  FROM range(0, 4096) t(i)
+) TO '{TEST_DIR}/blob_v2_partial.lance' (FORMAT lance)
+----
+ingest source
+
+statement error
+SELECT count(*) FROM '{TEST_DIR}/blob_v2_partial.lance'
+----
+<REGEX>:.*
+
+# overwrite failure keeps the previous version intact
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'x'::BLOB AS payload
+) TO '{TEST_DIR}/blob_v2_overwrite.lance' (FORMAT lance, mode 'overwrite');
+
+statement error
+COPY (
+  SELECT i::BIGINT AS id,
+         CASE WHEN i = 2048 THEN lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_missing.bin')
+              ELSE 'a'::BLOB END AS payload
+  FROM range(0, 4096) t(i)
+) TO '{TEST_DIR}/blob_v2_overwrite.lance' (FORMAT lance, mode 'overwrite')
+----
+ingest source
+
+query I
+SELECT sum(id) FROM '{TEST_DIR}/blob_v2_overwrite.lance'
+----
+1
+
+query I
+SELECT count(*) FROM read_blob('{TEST_DIR}/blob_v2_overwrite.lance/_versions/*.manifest')
+----
+1
+
+# --- version < 2.2 keeps binary encoding and rejects URI inputs ---
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'abc'::BLOB AS payload
+) TO '{TEST_DIR}/blob_v2_legacy_21.lance' (FORMAT lance, mode 'overwrite', data_storage_version '2.1');
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_legacy_21.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+0
+
+statement error
+COPY (
+  SELECT 1::BIGINT AS id, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload
+) TO '{TEST_DIR}/blob_v2_legacy_21_uri.lance' (FORMAT lance, mode 'overwrite', data_storage_version '2.1')
+----
+blob input column
+
+# Existing binary/legacy columns keep DuckDB's BLOB cast path: only real Blob
+# v2 columns accept the write input type, so a URI assignment fails at bind.
+
+statement ok
+INSERT INTO ns.main.blob_v2_legacy_21 VALUES (2, 'zzz'::BLOB);
+
+query I
+SELECT count(*) FROM ns.main.blob_v2_legacy_21
+----
+2
+
+statement error
+INSERT INTO ns.main.blob_v2_legacy_21 VALUES (3, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'))
+----
+<REGEX>:.*LANCE_BLOB_INPUT.*BLOB.*
+
+# --- nested URI input is rejected explicitly ---
+
+statement error
+COPY (
+  SELECT [lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin')] AS payload
+) TO '{TEST_DIR}/blob_v2_nested.lance' (FORMAT lance)
+----
+nested LANCE_BLOB_INPUT
+
+# --- CTAS ---
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.blob_v2_ctas AS
+  SELECT 1::BIGINT AS id, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload;
+
+query I
+SELECT count(*) FROM ns.main.blob_v2_ctas
+----
+1
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_ctas.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE ns.main.blob_v2_ctas_empty AS
+  SELECT 1::BIGINT AS id, 'x'::BLOB AS payload
+  WHERE false;
+
+query I
+SELECT count(*) FROM ns.main.blob_v2_ctas_empty
+----
+0
+
+# --- ALTER TABLE ADD COLUMN keeps the Blob v2 write contract ---
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter ADD COLUMN payload BLOB;
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter
+VALUES (2, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'));
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter
+VALUES (3, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'));
+
+query II
+SELECT id, hex(payload) FROM ns.main.blob_v2_alter ORDER BY id
+----
+1	NULL
+2	730A68656C6C6F20736F757263650A
+3	730A68656C6C6F20736F757263650A
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_alter.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+1
+
+# DEFAULT values are ordinary bytes, including non-UTF8 bytes and NULs.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter_default.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter_default
+ADD COLUMN payload BLOB DEFAULT 'abc'::BLOB;
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter_default
+ADD COLUMN raw BLOB DEFAULT '\x00\xFF'::BLOB;
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter_default (id) VALUES (2);
+
+query III
+SELECT id, hex(payload), hex(raw) FROM ns.main.blob_v2_alter_default ORDER BY id
+----
+1	616263	00FF
+2	616263	00FF
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter_default ADD COLUMN absent BLOB DEFAULT NULL;
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter_default (id) VALUES (3);
+
+query II
+SELECT id, absent FROM ns.main.blob_v2_alter_default
+----
+1	NULL
+2	NULL
+3	NULL
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter_default
+VALUES (4, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'), 'z'::BLOB, NULL);
+
+query II
+SELECT id, hex(payload) FROM ns.main.blob_v2_alter_default WHERE id = 4
+----
+4	730A68656C6C6F20736F757263650A
+
+# A dataset whose file version predates Blob v2 keeps binary encoding.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter_21.lance'
+(FORMAT lance, mode 'overwrite', data_storage_version '2.1');
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter_21 ADD COLUMN payload BLOB;
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter_21 VALUES (2, 'abc'::BLOB);
+
+statement error
+INSERT INTO ns.main.blob_v2_alter_21
+VALUES (3, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'))
+----
+<REGEX>:.*LANCE_BLOB_INPUT.*BLOB.*
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_alter_21.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+0
+
+# A BIT column is not a SQL BLOB and must not be converted to Blob v2.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter_bit.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ALTER TABLE ns.main.blob_v2_alter_bit ADD COLUMN b BIT;
+
+statement ok
+INSERT INTO ns.main.blob_v2_alter_bit VALUES (2, '10'::BIT);
+
+query II
+SELECT id, b FROM ns.main.blob_v2_alter_bit ORDER BY id
+----
+1	NULL
+2	\x02
+
+query I
+SELECT contains(hex(content), '6C616E63652E626C6F622E7632')::INTEGER
+FROM read_blob('{TEST_DIR}/blob_v2_alter_bit.lance/_versions/*.manifest')
+ORDER BY last_modified DESC, filename
+LIMIT 1
+----
+0
+
+# Nested LANCE_BLOB_INPUT is rejected by ALTER and leaves the schema untouched.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter_nested.lance' (FORMAT lance, mode 'overwrite');
+
+statement error
+ALTER TABLE ns.main.blob_v2_alter_nested
+ADD COLUMN payload STRUCT(x LANCE_BLOB_INPUT)
+----
+nested LANCE_BLOB_INPUT
+
+statement error
+ALTER TABLE ns.main.blob_v2_alter_nested ADD COLUMN p LANCE_BLOB_INPUT
+----
+top-level LANCE_BLOB_INPUT
+
+query I
+SELECT count(*) FROM (DESCRIBE ns.main.blob_v2_alter_nested)
+----
+1
+
+query I
+SELECT count(*) FROM read_blob('{TEST_DIR}/blob_v2_alter_nested.lance/_versions/*.manifest')
+----
+1
+
+# The same rejection applies below the Blob v2 file version.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id)
+TO '{TEST_DIR}/blob_v2_alter_nested_21.lance'
+(FORMAT lance, mode 'overwrite', data_storage_version '2.1');
+
+statement error
+ALTER TABLE ns.main.blob_v2_alter_nested_21
+ADD COLUMN payload STRUCT(x LANCE_BLOB_INPUT)
+----
+nested LANCE_BLOB_INPUT
+
+query I
+SELECT count(*) FROM (DESCRIBE ns.main.blob_v2_alter_nested_21)
+----
+1
+
+query I
+SELECT count(*) FROM read_blob('{TEST_DIR}/blob_v2_alter_nested_21.lance/_versions/*.manifest')
+----
+1

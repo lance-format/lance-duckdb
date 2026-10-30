@@ -1,0 +1,117 @@
+# name: test/sql/copy_dataset_lifecycle.test
+# description: COPY publishes one Lance dataset only after its input succeeds
+# group: [sql]
+
+require lance
+
+statement ok
+SET threads=1;
+
+query I
+COPY (SELECT 42::BIGINT AS id) TO '{TEST_DIR}/copy_lifecycle.lance' (FORMAT lance);
+----
+1
+
+# Fail after multiple batches have reached the writer. Neither append nor
+# overwrite may publish a partial manifest or delete the existing dataset.
+foreach mode append overwrite
+
+statement error
+COPY (SELECT CASE WHEN i=8192 THEN error('copy input failed') ELSE i END AS id FROM range(10000) t(i))
+TO '{TEST_DIR}/copy_lifecycle.lance' (FORMAT lance, mode '{mode}');
+----
+copy input failed
+
+query I
+SELECT id FROM '{TEST_DIR}/copy_lifecycle.lance';
+----
+42
+
+endloop
+
+statement error
+COPY (SELECT 99::BIGINT AS id) TO '{TEST_DIR}/copy_lifecycle.lance' (FORMAT lance);
+----
+<REGEX>:.*(already exists|AlreadyExists|already exist).*
+
+query I
+SELECT id FROM '{TEST_DIR}/copy_lifecycle.lance';
+----
+42
+
+query I
+COPY (SELECT 7::BIGINT AS id) TO '{TEST_DIR}/copy_lifecycle.lance' (FORMAT lance, mode 'append');
+----
+1
+
+query I
+SELECT sum(id) FROM '{TEST_DIR}/copy_lifecycle.lance';
+----
+49
+
+query I
+COPY (SELECT 8::BIGINT AS id WHERE false) TO '{TEST_DIR}/copy_lifecycle_empty.lance' (FORMAT lance);
+----
+0
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/copy_lifecycle_empty.lance';
+----
+0
+
+statement error
+COPY (SELECT 1 AS id) TO '{TEST_DIR}/copy_partition.lance' (FORMAT lance, PARTITION_BY (id));
+----
+Unsupported option for COPY FORMAT lance
+
+# No manifest is published when a new dataset's input fails.
+statement error
+COPY (SELECT CASE WHEN i=8192 THEN error('copy input failed') ELSE i END AS id FROM range(10000) t(i))
+TO '{TEST_DIR}/copy_lifecycle_failed.lance' (FORMAT lance);
+----
+copy input failed
+
+statement error
+SELECT * FROM '{TEST_DIR}/copy_lifecycle_failed.lance';
+----
+Failed to open Lance dataset
+
+# CTAS uses the same execution path and must not publish partial input.
+statement ok
+ATTACH '{TEST_DIR}/copy_ctas_namespace' AS copy_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE copy_ns.items AS SELECT 42::BIGINT AS id;
+
+statement error
+CREATE OR REPLACE TABLE copy_ns.items AS SELECT CASE WHEN i=8192 THEN error('ctas input failed') ELSE i END AS id FROM range(10000) t(i);
+----
+ctas input failed
+
+query I
+SELECT id FROM copy_ns.items;
+----
+42
+
+statement ok
+DETACH copy_ns;
+
+query I
+COPY (SELECT 0::BIGINT AS id WHERE false) TO '{TEST_DIR}/copy_lifecycle.lance' (FORMAT lance, mode 'overwrite', write_empty_file false);
+----
+0
+
+query I
+SELECT sum(id) FROM '{TEST_DIR}/copy_lifecycle.lance';
+----
+49
+
+query I
+COPY (SELECT 0::BIGINT AS id WHERE false) TO '{TEST_DIR}/copy_no_empty.lance' (FORMAT lance, write_empty_file false);
+----
+0
+
+statement error
+SELECT * FROM '{TEST_DIR}/copy_no_empty.lance';
+----
+Failed to open Lance dataset

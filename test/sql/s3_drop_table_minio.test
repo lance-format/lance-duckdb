@@ -28,11 +28,11 @@ statement ok
 CREATE SECRET (
   TYPE LANCE,
   PROVIDER config,
-  SCOPE 's3://${LANCE_S3_BUCKET}/',
-  ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
-  SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}',
-  REGION '${LANCE_S3_REGION}',
-  ENDPOINT '${LANCE_S3_ENDPOINT}',
+  SCOPE 's3://{LANCE_S3_BUCKET}/',
+  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
   ALLOW_HTTP true
 );
@@ -42,10 +42,10 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_DROP_DATASET_PREFIX}' (FORMAT lance, mode 'overwrite');
+) TO 's3://{LANCE_S3_BUCKET}/{LANCE_S3_DROP_DATASET_PREFIX}' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 's3://${LANCE_S3_BUCKET}/' AS ns (TYPE LANCE, READ_WRITE true);
+ATTACH 's3://{LANCE_S3_BUCKET}/' AS ns (TYPE LANCE, READ_WRITE true);
 
 query I
 SELECT count(*) FROM ns.main.drop_table_test_data;
@@ -56,9 +56,9 @@ statement ok
 DROP TABLE ns.main.drop_table_test_data;
 
 statement error
-SELECT count(*) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_DROP_DATASET_PREFIX}';
+SELECT count(*) FROM 's3://{LANCE_S3_BUCKET}/{LANCE_S3_DROP_DATASET_PREFIX}';
 ----
-IO Error: Failed to open Lance dataset: s3://${LANCE_S3_BUCKET}/${LANCE_S3_DROP_DATASET_PREFIX} (Lance error: dataset open 's3://${LANCE_S3_BUCKET}/${LANCE_S3_DROP_DATASET_PREFIX}':
+IO Error: Failed to open Lance dataset: s3://{LANCE_S3_BUCKET}/{LANCE_S3_DROP_DATASET_PREFIX} (Lance error: dataset open 's3://{LANCE_S3_BUCKET}/{LANCE_S3_DROP_DATASET_PREFIX}':
 
 statement ok
 DROP TABLE IF EXISTS ns.main.drop_table_test_data;

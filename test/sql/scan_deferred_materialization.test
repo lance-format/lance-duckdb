@@ -16,7 +16,7 @@ COPY (
   UNION ALL SELECT 6, 40, 'fff', repeat('y', 2000)::BLOB
   UNION ALL SELECT 7, 10, 'ggg', repeat('z', 2000)::BLOB
   UNION ALL SELECT 8, 50, 'hhh', repeat('w', 2000)::BLOB
-) TO 'test/.tmp/deferred_mat.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/deferred_mat.lance' (FORMAT lance, mode 'overwrite');
 
 # -----------------------------------------------------------------------
 # Plan: pushable filter -> deferred NOT activated
@@ -24,7 +24,7 @@ COPY (
 # -----------------------------------------------------------------------
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE category = 10;
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_mat.lance' WHERE category = 10;
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 
@@ -34,7 +34,7 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 # -----------------------------------------------------------------------
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*"Lance Deferred Columns": "blob_data"[\s\S]*
 
@@ -43,7 +43,7 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*"Lan
 # -----------------------------------------------------------------------
 
 query II
-SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
+SELECT id, octet_length(blob_data) FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
 ----
 3	2000
 
@@ -52,7 +52,7 @@ SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE id:
 # -----------------------------------------------------------------------
 
 query II
-SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE category = 10 ORDER BY id;
+SELECT id, octet_length(blob_data) FROM '{TEST_DIR}/deferred_mat.lance' WHERE category = 10 ORDER BY id;
 ----
 1	2000
 3	2000
@@ -67,13 +67,13 @@ statement ok
 SET lance_deferred_materialization = false;
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 
 # Correctness still holds when disabled
 query II
-SELECT id, octet_length(blob_data) FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
+SELECT id, octet_length(blob_data) FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY id;
 ----
 3	2000
 
@@ -85,7 +85,7 @@ statement ok
 SET lance_deferred_materialization = true;
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
 
@@ -94,7 +94,7 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
 # -----------------------------------------------------------------------
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_mat.lance';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_mat.lance';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 
@@ -103,7 +103,7 @@ analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 # -----------------------------------------------------------------------
 
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, category FROM 'test/.tmp/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, category FROM '{TEST_DIR}/deferred_mat.lance' WHERE id::VARCHAR LIKE '%3%';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "false"[\s\S]*
 
@@ -117,7 +117,7 @@ COPY (
   UNION ALL SELECT 2, 20, repeat('b', 2000)::BLOB
   UNION ALL SELECT 3, 10, repeat('c', 2000)::BLOB
   UNION ALL SELECT 4, 30, repeat('d', 2000)::BLOB
-) TO 'test/.tmp/deferred_multi.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/deferred_multi.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
 COPY (
@@ -125,23 +125,23 @@ COPY (
   UNION ALL SELECT 6, 40, repeat('f', 2000)::BLOB
   UNION ALL SELECT 7, 10, repeat('g', 2000)::BLOB
   UNION ALL SELECT 8, 50, repeat('h', 2000)::BLOB
-) TO 'test/.tmp/deferred_multi.lance' (FORMAT lance, mode 'append');
+) TO '{TEST_DIR}/deferred_multi.lance' (FORMAT lance, mode 'append');
 
 # Multi-fragment with non-pushable filter: plan shows deferred
 query II
-EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
 ----
 analyzed_plan	<REGEX>:[\s\S]*"Lance Deferred Materialization": "true"[\s\S]*
 
 # Multi-fragment correctness: correct row + data
 query II
-SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
+SELECT id, octet_length(heavy) FROM '{TEST_DIR}/deferred_multi.lance' WHERE id::VARCHAR LIKE '%1%';
 ----
 1	2000
 
 # Multi-fragment: all matching rows across fragments
 query II
-SELECT id, octet_length(heavy) FROM 'test/.tmp/deferred_multi.lance' WHERE id::VARCHAR LIKE '%5%' OR id::VARCHAR LIKE '%7%' ORDER BY id;
+SELECT id, octet_length(heavy) FROM '{TEST_DIR}/deferred_multi.lance' WHERE id::VARCHAR LIKE '%5%' OR id::VARCHAR LIKE '%7%' ORDER BY id;
 ----
 5	2000
 7	2000

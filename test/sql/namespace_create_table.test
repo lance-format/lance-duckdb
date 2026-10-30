@@ -5,10 +5,10 @@
 require lance
 
 statement ok
-COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/nsroot_create_table_125/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
+COPY (SELECT 1::BIGINT AS id) TO '{TEST_DIR}/nsroot_create_table_125/attach_create_table_seed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp/nsroot_create_table_125' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}/nsroot_create_table_125' AS ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.attach_create_table_empty (id BIGINT, s VARCHAR);
@@ -21,7 +21,7 @@ SELECT count(*) FROM ns.main.attach_create_table_empty
 # 322E32 is the hexadecimal representation of "2.2" in the manifest.
 query I
 SELECT contains(hex(content), '322E32')::INTEGER
-FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_empty.lance/_versions/*.manifest')
+FROM read_blob('{TEST_DIR}/nsroot_create_table_125/attach_create_table_empty.lance/_versions/*.manifest')
 ORDER BY last_modified DESC, filename
 LIMIT 1;
 ----
@@ -49,13 +49,13 @@ SELECT count(*) FROM ns.main.attach_create_table_ctas
 2
 
 query I
-SELECT count(*) FROM 'test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance'
+SELECT count(*) FROM '{TEST_DIR}/nsroot_create_table_125/attach_create_table_ctas.lance'
 ----
 2
 
 query I
 SELECT contains(hex(content), '322E32')::INTEGER
-FROM read_blob('test/.tmp/nsroot_create_table_125/attach_create_table_ctas.lance/_versions/*.manifest')
+FROM read_blob('{TEST_DIR}/nsroot_create_table_125/attach_create_table_ctas.lance/_versions/*.manifest')
 ORDER BY last_modified DESC, filename
 LIMIT 1;
 ----

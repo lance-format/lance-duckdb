@@ -8,7 +8,7 @@ statement ok
 PRAGMA threads=4;
 
 statement ok
-ATTACH 'test/.tmp' AS merge_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS merge_ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE merge_ns.main.lance_merge_upsert AS
@@ -141,7 +141,7 @@ WHEN MATCHED THEN ERROR 'boom';
 ----
 Constraint Error: Merge error condition WHEN MATCHED: boom
 
-query I
+statement error
 MERGE INTO merge_ns.main.lance_merge_error_case AS t
 USING (
   SELECT 1::BIGINT AS id, 'u1'::VARCHAR AS s
@@ -151,7 +151,7 @@ USING (
 ON t.id = src.id
 WHEN MATCHED THEN UPDATE SET s = src.s;
 ----
-2
+Invalid Input Error: MERGE INTO command cannot affect the same target row more than once. A target row matched more than one source row; ensure the source rows are deduplicated or the ON condition is unique.
 
 query I
 SELECT count(*) FROM merge_ns.main.lance_merge_error_case;
@@ -159,15 +159,15 @@ SELECT count(*) FROM merge_ns.main.lance_merge_error_case;
 1
 
 query I
-SELECT s IN ('u1', 'u2') FROM merge_ns.main.lance_merge_error_case WHERE id = 1;
+SELECT s = 'a' FROM merge_ns.main.lance_merge_error_case WHERE id = 1;
 ----
-1
+true
 
 statement ok
 CREATE OR REPLACE TABLE merge_ns.main.lance_merge_duplicate_delete AS
 SELECT 1::BIGINT AS id, 'x'::VARCHAR AS s;
 
-query I
+statement error
 MERGE INTO merge_ns.main.lance_merge_duplicate_delete AS t
 USING (
   SELECT 1::BIGINT AS id
@@ -177,12 +177,12 @@ USING (
 ON t.id = src.id
 WHEN MATCHED THEN DELETE;
 ----
-2
+Invalid Input Error: MERGE INTO command cannot affect the same target row more than once. A target row matched more than one source row; ensure the source rows are deduplicated or the ON condition is unique.
 
 query I
 SELECT count(*) FROM merge_ns.main.lance_merge_duplicate_delete;
 ----
-0
+1
 
 statement ok
 DETACH merge_ns;

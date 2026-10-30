@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::ffi::{c_char, CString};
 use std::ptr;
 
+use lance_core::Error as LanceError;
+
 #[repr(i32)]
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorCode {
@@ -67,9 +69,26 @@ pub enum ErrorCode {
     Exec = 52,
     DatasetMerge = 53,
     NamespaceQueryTable = 54,
-    NamespaceListNamespaces = 55,
-    NamespaceCreateNamespace = 56,
-    NamespaceDropNamespace = 57,
+    DatasetCheckoutLatest = 55,
+
+    BlobRangeRead = 56,
+    NamespaceTableNotFound = 57,
+}
+
+pub(crate) fn namespace_error_code(err: &LanceError, fallback: ErrorCode) -> ErrorCode {
+    let is_table_not_found = match err {
+        LanceError::Namespace { source, .. } => source
+            .downcast_ref::<lance_namespace::NamespaceError>()
+            .is_some_and(|err| {
+                matches!(err, lance_namespace::NamespaceError::TableNotFound { .. })
+            }),
+        _ => false,
+    };
+    if is_table_not_found {
+        ErrorCode::NamespaceTableNotFound
+    } else {
+        fallback
+    }
 }
 
 struct LastError {

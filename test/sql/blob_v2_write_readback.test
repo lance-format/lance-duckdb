@@ -1,0 +1,162 @@
+# name: test/sql/blob_v2_write_readback.test
+# description: INSERT into Blob v2 datasets with real-byte read-back
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 's'::VARCHAR AS s
+) TO '{TEST_DIR}/blob_v2_root_ns.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT 'abcdef'::VARCHAR AS s)
+TO '{TEST_DIR}/blob_v2_src.bin' (FORMAT csv);
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'abc'::BLOB AS payload
+  UNION ALL
+  SELECT 2::BIGINT AS id, NULL::BLOB AS payload
+) TO '{TEST_DIR}/blob_v2_insert_target.lance' (FORMAT lance, mode 'overwrite');
+
+# bytes insert
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target VALUES (3, 'def'::BLOB);
+
+# external reference: no I/O at INSERT time
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target VALUES (4, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'));
+
+# ingest reads the source and stores managed bytes
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target VALUES (5, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'));
+
+# default and omitted columns
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target(id) VALUES (6);
+
+# NULL insert
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target VALUES (7, NULL);
+
+# explicit DEFAULT keeps the bytes/NULL default behavior
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target VALUES (8, DEFAULT);
+
+# CASE selecting reference and bytes branches
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target
+SELECT 9, CASE WHEN 1=1 THEN lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') ELSE 'fallback'::BLOB END;
+
+# COALESCE over the input type and a bytes fallback
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target
+SELECT 10, COALESCE(lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'), 'fallback'::BLOB);
+
+# materialized CTE
+statement ok
+WITH staged AS MATERIALIZED (
+  SELECT 11::BIGINT AS id, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload
+)
+INSERT INTO ns.main.blob_v2_insert_target SELECT * FROM staged;
+
+# ordinary DuckDB staging of the input type
+statement ok
+CREATE TEMP TABLE blob_input_stage AS
+  SELECT 12::BIGINT AS id, lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') AS payload;
+
+query I
+SELECT typeof(payload) = 'LANCE_BLOB_INPUT' FROM blob_input_stage
+----
+true
+
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target SELECT * FROM blob_input_stage;
+
+# prepared INSERT with parameterized URIs
+statement ok
+PREPARE blob_insert AS
+  INSERT INTO ns.main.blob_v2_insert_target VALUES ($1, lance_blob_ingest($2));
+
+statement ok
+EXECUTE blob_insert(13, 'file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin');
+
+# optimizer disabled keeps the same input semantics
+statement ok
+SET enable_optimizer = false;
+
+statement ok
+INSERT INTO ns.main.blob_v2_insert_target
+SELECT 14, CASE WHEN true THEN lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin') ELSE 'fallback'::BLOB END;
+
+statement ok
+SET enable_optimizer = true;
+
+# generic prepared parameters accept either bytes or the input type
+statement ok
+PREPARE blob_generic AS INSERT INTO ns.main.blob_v2_insert_target VALUES ($1, $2);
+
+statement ok
+EXECUTE blob_generic(15, 'blob'::BLOB);
+
+statement ok
+EXECUTE blob_generic(16, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'));
+
+query II
+SELECT id, hex(payload) FROM ns.main.blob_v2_insert_target ORDER BY id
+----
+1	616263
+2	NULL
+3	646566
+4	730A6162636465660A
+5	730A6162636465660A
+6	NULL
+7	NULL
+8	NULL
+9	730A6162636465660A
+10	730A6162636465660A
+11	730A6162636465660A
+12	730A6162636465660A
+13	730A6162636465660A
+14	730A6162636465660A
+15	626C6F62
+16	730A6162636465660A
+
+# CTAS keeps the same per-value modes across CASE/COALESCE
+statement ok
+CREATE OR REPLACE TABLE ns.main.blob_v2_ctas_combo AS
+  SELECT 1::BIGINT AS id,
+         CASE WHEN true THEN lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin')
+              ELSE 'fallback'::BLOB END AS payload
+  UNION ALL
+  SELECT 2,
+         COALESCE(lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'), 'fallback'::BLOB);
+
+query II
+SELECT id, hex(payload) FROM ns.main.blob_v2_ctas_combo ORDER BY id
+----
+1	730A6162636465660A
+2	730A6162636465660A
+
+# COPY keeps COALESCE and optimizer-off semantics
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id,
+         COALESCE(lance_blob_ingest('file://{TEMP_DIR_ABSOLUTE}/blob_v2_src.bin'), 'fallback'::BLOB) AS payload
+) TO '{TEST_DIR}/blob_v2_copy_coalesce.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+SELECT id, hex(payload) FROM '{TEST_DIR}/blob_v2_copy_coalesce.lance'
+----
+1	730A6162636465660A
+
+# Managed-ingest survival after source deletion and reference failure semantics
+# are covered by the Rust FFI lifecycle tests until a SQL delete-source fixture
+# is available.

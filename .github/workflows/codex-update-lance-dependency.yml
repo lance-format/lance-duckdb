@@ -31,17 +31,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Show inputs
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          echo "tag = ${{ inputs.tag || 'latest' }}"
+          echo "tag = ${TAG:-latest}"
 
       - name: Checkout Repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
 
@@ -49,7 +51,7 @@ jobs:
         run: npm install -g @openai/codex
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 

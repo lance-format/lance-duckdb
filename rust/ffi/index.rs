@@ -20,8 +20,7 @@ use crate::runtime;
 
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    canonicalize_lance_field_path, cstr_to_str, dataset_handle, export_string_list, to_c_string,
-    FfiError, FfiResult, LanceStringList,
+    canonicalize_lance_field_path, cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,15 +156,50 @@ fn create_index_list_stream_inner(dataset: *mut c_void) -> FfiResult<StreamHandl
     Ok(StreamHandle::Batches(vec![batch].into_iter()))
 }
 
-/// Returns column names that have scalar indices.
-/// The caller must free the result with `lance_free_string_list`.
+/// Returns an array of column names that have scalar indices.
+/// The caller must free the returned array with `lance_free_scalar_indexed_columns`.
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_scalar_indexed_columns(
     dataset: *mut c_void,
-    out: *mut LanceStringList,
-) -> i32 {
-    let result = list_scalar_indexed_columns_inner(dataset);
-    unsafe { export_string_list(result, out) }
+    out_len: *mut usize,
+) -> *mut *mut c_char {
+    match list_scalar_indexed_columns_inner(dataset) {
+        Ok(cols) => {
+            clear_last_error();
+            unsafe { *out_len = cols.len() };
+            if cols.is_empty() {
+                return std::ptr::null_mut();
+            }
+            let ptrs: Vec<*mut c_char> = cols
+                .into_iter()
+                .map(|s| to_c_string(s).into_raw())
+                .collect();
+            let mut boxed = ptrs.into_boxed_slice();
+            let ptr = boxed.as_mut_ptr();
+            std::mem::forget(boxed);
+            ptr
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            unsafe { *out_len = 0 };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_scalar_indexed_columns(ptr: *mut *mut c_char, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let slice = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
+        for &p in slice.iter() {
+            if !p.is_null() {
+                drop(std::ffi::CString::from_raw(p));
+            }
+        }
+    }
 }
 
 fn list_scalar_indexed_columns_inner(dataset: *mut c_void) -> FfiResult<Vec<String>> {

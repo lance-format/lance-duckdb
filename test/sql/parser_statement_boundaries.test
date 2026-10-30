@@ -1,0 +1,30 @@
+# name: test/sql/parser_statement_boundaries.test
+# description: Extension grammar preserves quoted semicolons and consumes only its statement
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1 AS id, 10 AS value UNION ALL SELECT 2, 20)
+TO '{TEST_DIR}/parser;quoted.lance' (FORMAT lance, mode 'overwrite');
+
+# Exercise native and extension statements in one parser invocation.
+statement ok
+SELECT 42;
+CREATE INDEX parser_id_index ON '{TEST_DIR}/parser;quoted.lance' (id) USING BTREE;
+SELECT 43;
+OPTIMIZE '{TEST_DIR}/parser;quoted.lance' WITH (target_rows_per_fragment = 1024);
+SELECT 44;
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/parser;quoted.lance'
+----
+2
+
+statement ok
+DROP INDEX parser_id_index ON '{TEST_DIR}/parser;quoted.lance'; SELECT 45;
+
+statement error
+VACUUM LANCE '{TEST_DIR}/parser;quoted.lance' WITH (older_than_seconds = -1);
+----
+older_than_seconds must be >= 0

@@ -7,10 +7,10 @@ require lance
 # Setup: copy test data and create a scalar index on the 'name' column
 statement ok
 COPY (SELECT * FROM 'test/data/test_data.lance')
-TO 'test/.tmp/scan_index_limit.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/scan_index_limit.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 statement ok
 CREATE INDEX name_idx ON ns.main.scan_index_limit (name) USING BTREE;
@@ -29,7 +29,7 @@ SELECT count(*) FROM (SELECT * FROM ns.main.scan_index_limit WHERE name = 'Alice
 
 # WHERE + LIMIT + OFFSET correctness on non-indexed column
 query I
-SELECT count(*) FROM (SELECT * FROM 'test/.tmp/scan_index_limit.lance' WHERE age > 30 LIMIT 2 OFFSET 1);
+SELECT count(*) FROM (SELECT * FROM '{TEST_DIR}/scan_index_limit.lance' WHERE age > 30 LIMIT 2 OFFSET 1);
 ----
 2
 

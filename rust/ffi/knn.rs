@@ -10,8 +10,9 @@ use crate::scanner::LanceStream;
 use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
-    cstr_to_str, nonzero_u64_to_usize, parse_optional_filter_ir, slice_from_ptr, to_c_string,
-    FfiError, FfiResult,
+    apply_scanner_filter, cstr_to_str, nonzero_u64_to_usize, optional_cstr_array,
+    optional_cstr_to_str, parse_optional_filter_ir, slice_from_ptr, to_c_string, FfiError,
+    FfiResult,
 };
 
 #[no_mangle]
@@ -75,6 +76,7 @@ fn get_knn_schema_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     scan.nearest(vector_column, &query, k_usize)
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema nearest: {err}")))?;
@@ -94,9 +96,9 @@ fn get_knn_schema_inner(
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema project: {err}")))?;
     scan.scan_in_order(false);
 
-    let schema = LanceStream::from_scanner(scan)
-        .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema: {err}")))?
-        .schema();
+    let schema = runtime::block_on(scan.schema())
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("knn schema runtime: {err}")))?
+        .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema: {err}")))?;
     Ok(schema)
 }
 
@@ -109,8 +111,11 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -122,8 +127,11 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         k,
         nprobes,
         refine_factor,
+        columns,
+        columns_len,
         filter_ir,
         filter_ir_len,
+        filter_sql,
         prefilter,
         use_index,
     ) {
@@ -147,8 +155,11 @@ fn create_knn_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
     filter_ir: *const u8,
     filter_ir_len: usize,
+    filter_sql: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<StreamHandle> {
@@ -160,6 +171,7 @@ fn create_knn_stream_ir_inner(
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
@@ -171,13 +183,13 @@ fn create_knn_stream_ir_inner(
     let k_usize = nonzero_u64_to_usize(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let projection = projection::build_knn_projection(&handle.base_projection);
+    let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
+    projection_columns.push(vector_column.to_string());
+    projection_columns.push(crate::constants::DISTANCE_COLUMN.to_string());
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
-    if let Some(filter) = filter {
-        scan.filter_expr(filter);
-    }
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     let query = Float32Array::from_iter_values(query_values.iter().copied());
     scan.nearest(vector_column, &query, k_usize)
         .map_err(|err| {
@@ -197,8 +209,20 @@ fn create_knn_stream_ir_inner(
         scan.refine(refine_factor_u32);
     }
     scan.use_index(use_index != 0);
+    let filter = apply_scanner_filter(
+        &mut scan,
+        filter,
+        filter_sql,
+        ErrorCode::KnnStreamCreate,
+        "knn filter_sql",
+    )?;
+    if let Some(filter) = &filter {
+        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
+    }
+    projection_columns.sort();
+    projection_columns.dedup();
     scan.disable_scoring_autoprojection();
-    scan.project(projection.as_ref()).map_err(|err| {
+    scan.project(&projection_columns).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
             format!("knn scan project: {err}"),
@@ -206,7 +230,8 @@ fn create_knn_stream_ir_inner(
     })?;
     scan.scan_in_order(false);
 
-    let stream = LanceStream::from_scanner(scan).map_err(|err| {
+    let full_schema = projection::build_knn_schema(&handle.read_schema);
+    let stream = LanceStream::from_scanner_with_schema(scan, full_schema).map_err(|err| {
         FfiError::new(
             ErrorCode::KnnStreamCreate,
             format!("knn stream create: {err}"),
@@ -293,6 +318,7 @@ fn explain_knn_scan_ir_inner(
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
     if let Some(filter) = filter {
         scan.filter_expr(filter);
     }

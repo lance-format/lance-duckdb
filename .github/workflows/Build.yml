@@ -25,7 +25,7 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       EXT_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore ccache
         id: cache-ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             .ccache
@@ -66,7 +66,7 @@ jobs:
           GEN=ninja make release -j 4
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-release-${{ github.sha }}
           path: |
@@ -76,7 +76,7 @@ jobs:
 
       - name: Save ccache
         if: github.ref == 'refs/heads/main' && success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             .ccache
@@ -87,10 +87,10 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-release-${{ github.sha }}
           path: build/release
@@ -101,17 +101,27 @@ jobs:
 
       - name: Run tests
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
+            exit 1
+          fi
 
   test_s3:
     name: Test S3 (MinIO)
     runs-on: ubuntu-24.04
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build-release-${{ github.sha }}
           path: build/release
@@ -127,7 +137,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-01-20T14-49-07Z \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z \
             server /data
 
       - name: Wait for MinIO
@@ -143,18 +153,41 @@ jobs:
 
       - name: Upload test dataset to MinIO
         run: |
-          curl -fsSL "https://dl.min.io/client/mc/release/linux-amd64/mc" -o mc
+          curl -fsSL "https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z" -o mc
           chmod +x mc
           ./mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
           ./mc mb -p local/lance-test || true
+          ./mc admin user add local blob-reader-a blob-reader-a-secret
+          ./mc admin user add local blob-reader-b blob-reader-b-secret
+          ./mc admin user add local blob-target-reader blob-target-reader-secret
+          ./mc admin policy create local blob-reader-a test/scripts/blob_v2_external_reader_a_policy.json
+          ./mc admin policy create local blob-reader-b test/scripts/blob_v2_external_reader_policy.json
+          ./mc admin policy create local blob-target-reader test/scripts/blob_v2_nested_target_policy.json
+          ./mc admin policy attach local blob-reader-a --user blob-reader-a
+          ./mc admin policy attach local blob-reader-b --user blob-reader-b
+          ./mc admin policy attach local blob-target-reader --user blob-target-reader
           ./mc mirror --overwrite test/data/test_data.lance local/lance-test/test_data.lance
           ./mc mirror --overwrite test/data/search_test_data.lance local/lance-test/search_test_data.lance
+          ./mc mirror --overwrite test/data/s3_nested_source_target.lance local/lance-test/nested_target.lance
+          ./mc cp test/data/blob_v2_external_a.bin local/lance-test/blob_v2_external/a/object.bin
+          ./mc cp test/data/blob_v2_external_b.bin local/lance-test/blob_v2_external/b/object.bin
+          ./mc cp test/data/blob_v2_external_nested.bin local/lance-test/nested_target.lance/source/object.bin
 
       - name: Run S3 tests
         env:
           LANCE_TEST_S3: "1"
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
+            exit 1
+          fi
 
       - name: Cleanup MinIO
         if: always()

@@ -1,11 +1,14 @@
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 
+#include "lance_arrow_compat.hpp"
+#include "lance_blob.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
@@ -89,12 +92,15 @@ public:
     lock_guard<mutex> guard(gstate.lock);
 
     if (!gstate.writer) {
+      // The chunk carries each column's evaluated type (BLOB or the
+      // LANCE_BLOB_INPUT union); the writer's import schema must match.
+      auto chunk_types = chunk.GetTypes();
       auto props = context.client.GetClientProperties();
       memset(&gstate.schema_root.arrow_schema, 0,
              sizeof(gstate.schema_root.arrow_schema));
       ArrowConverter::ToArrowSchema(&gstate.schema_root.arrow_schema,
-                                    gstate.column_types, gstate.column_names,
-                                    props);
+                                    chunk_types, gstate.column_names, props);
+      LanceNormalizeArrowListFieldNames(&gstate.schema_root.arrow_schema);
 
       if (!gstate.table) {
         throw InternalException("Lance INSERT missing table reference");
@@ -107,6 +113,7 @@ public:
       vector<const char *> value_ptrs;
       BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
                                       key_ptrs, value_ptrs);
+      auto blob_flags = LanceBlobFlagsForTypes(chunk_types);
 
       gstate.writer = lance_open_uncommitted_writer_with_storage_options(
           gstate.open_path.c_str(), "append",
@@ -115,7 +122,9 @@ public:
           gstate.option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
           LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
           nullptr, LanceGetSessionHandle(context.client),
-          &gstate.schema_root.arrow_schema);
+          &gstate.schema_root.arrow_schema,
+          blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
+          LanceBlobIngestBatchBudget(context.client));
       if (!gstate.writer) {
         throw IOException("Failed to open Lance writer: " + gstate.open_path +
                           LanceFormatErrorSuffix());
@@ -126,11 +135,16 @@ public:
         extension_type_cast;
     auto props = context.client.GetClientProperties();
 
+    // Resolve and validate source access before exporting the Arrow array: a
+    // policy or secret lookup failure must not leak an unreleased array.
+    LanceBatchSourceOptions source_options;
+    LanceCollectIngestSourceOptions(context.client, chunk, source_options);
+
     ArrowArray array;
     memset(&array, 0, sizeof(array));
     ArrowConverter::ToArrowArray(chunk, &array, props, extension_type_cast);
 
-    auto rc = lance_writer_write_batch(gstate.writer, &array);
+    auto rc = LanceWriteBlobBatch(gstate.writer, &array, source_options);
     if (array.release) {
       array.release(&array);
     }
@@ -192,9 +206,8 @@ public:
     state.emitted = true;
 
     auto &gstate = sink_state->Cast<LanceInsertGlobalState>();
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0,
-                   Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
+    chunk.data[0].Append(
+        Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
     return SourceResultType::FINISHED;
   }
 
@@ -229,6 +242,15 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceInsertAppend called for non-Lance table");
   }
+  // Plain INSERT does not bind a scan of the target, so the scan-bind
+  // freshness check never runs for it; validate here so a stale entry (e.g.
+  // a coerced-column list outdated by an external type evolution) fails
+  // closed instead of gating the write on stale state. Throws and replaces
+  // the entry on mismatch. This is defense-in-depth rather than the only
+  // guard for prepared INSERT: LanceDuckCatalog::GetCatalogVersion opts the
+  // catalog out of prepared-plan reuse, so every EXECUTE rebinds and reaches
+  // this check with a freshly resolved entry instead of a cached plan.
+  lance_table->VerifySchemaFreshness(context);
   if (lance_table->HasCoercedColumns()) {
     throw NotImplementedException(
         "INSERT into Lance table '" + lance_table->name +
@@ -238,11 +260,17 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
         "catalog exposes a coerced type. Writing in the coerced type would "
         "silently change the on-disk storage.");
   }
+  if (lance_table->HasJsonColumns()) {
+    throw NotImplementedException(
+        "INSERT into Lance table '" + lance_table->name +
+        "' is not supported because it writes JSON column(s) [" +
+        StringUtil::Join(lance_table->JsonColumnNames(), ", ") + "]");
+  }
 
   vector<string> column_names;
   vector<LogicalType> column_types;
   for (auto &col : op.table.GetColumns().Physical()) {
-    column_names.push_back(col.Name());
+    column_names.push_back(col.Name().GetIdentifierName());
     column_types.push_back(col.Type());
   }
 

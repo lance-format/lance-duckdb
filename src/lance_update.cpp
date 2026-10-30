@@ -1,28 +1,21 @@
 #include "duckdb.hpp"
 
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/exception_format_value.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression_binder/constant_binder.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
+#include "lance_blob.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
-#include "lance_expr_ir.hpp"
 #include "lance_ffi.hpp"
-#include "lance_filter_ir.hpp"
 #include "lance_insert.hpp"
-#include "lance_scan_bind_data.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
@@ -31,264 +24,265 @@
 
 namespace duckdb {
 
-static vector<pair<string, string>> ParseLanceMetadataRows(const char *ptr) {
-  if (!ptr) {
-    throw IOException("Failed to read Lance field metadata" +
-                      LanceFormatErrorSuffix());
-  }
+namespace {
 
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<pair<string, string>> out;
-  for (auto &line : StringUtil::Split(joined, '\n')) {
-    if (line.empty()) {
-      continue;
+idx_t ResolveUpdateSetChunkIndex(LogicalUpdate &op,
+                                 const LogicalProjection *projection,
+                                 idx_t expression_idx) {
+  auto &expr = *op.expressions[expression_idx];
+  switch (expr.GetExpressionClass()) {
+  case ExpressionClass::BOUND_REF:
+    return expr.Cast<BoundReferenceExpression>().Index();
+  case ExpressionClass::BOUND_COLUMN_REF: {
+    auto &ref = expr.Cast<BoundColumnRefExpression>();
+    if (!projection || ref.Binding().table_index != projection->table_index) {
+      throw NotImplementedException(
+          "Lance UPDATE does not support UPDATE with joins or FROM");
     }
-    auto parts = StringUtil::Split(line, '\t');
-    if (parts.size() != 2) {
-      continue;
-    }
-    out.emplace_back(std::move(parts[0]), std::move(parts[1]));
+    return ref.Binding().column_index;
   }
-  return out;
+  default:
+    throw NotImplementedException(
+        "Lance UPDATE does not support SET expression of class %s",
+        ExpressionClassToString(expr.GetExpressionClass()));
+  }
 }
 
-static bool TryGetLanceFieldDefaultExpr(ClientContext &context,
-                                        LanceTableEntry &table,
-                                        const string &field_name,
-                                        string &out_default_expr) {
-  out_default_expr.clear();
+class LanceUpdateValueGlobalState : public GlobalSinkState {
+public:
+  explicit LanceUpdateValueGlobalState(const LanceTableEntry &table_p)
+      : table(&table_p) {}
 
+  const LanceTableEntry *table = nullptr;
   string display_uri;
-  auto *dataset = LanceOpenDatasetForTable(context, table, display_uri);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset for UPDATE planning: " +
-                      display_uri + LanceFormatErrorSuffix());
-  }
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  void *update_handle = nullptr;
+  idx_t rows_updated = 0;
+  mutex lock;
 
-  auto rows = ParseLanceMetadataRows(
-      lance_dataset_list_field_metadata(dataset, field_name.c_str()));
-  lance_close_dataset(dataset);
-
-  for (auto &entry : rows) {
-    if (entry.first == "duckdb_default_expr") {
-      out_default_expr = std::move(entry.second);
-      return true;
+  ~LanceUpdateValueGlobalState() override {
+    if (update_handle) {
+      lance_update_abort(update_handle);
+      update_handle = nullptr;
     }
   }
-  return false;
-}
-
-static unique_ptr<Expression>
-BindStoredDefaultExpr(ClientContext &context, const string &catalog_name,
-                      const string &schema_name, const string &default_expr_sql,
-                      const LogicalType &target_type) {
-  auto expr_list =
-      Parser::ParseExpressionList(default_expr_sql, context.GetParserOptions());
-  if (expr_list.size() != 1 || !expr_list[0]) {
-    throw InternalException(
-        "Lance UPDATE stored default expression is invalid");
-  }
-
-  (void)catalog_name;
-  (void)schema_name;
-  auto binder = Binder::CreateBinder(context);
-  ConstantBinder default_binder(*binder, context, "DEFAULT value");
-  default_binder.target_type = target_type;
-  return default_binder.Bind(expr_list[0]);
-}
-
-struct LanceUpdatePlanParts {
-  LogicalProjection *projection = nullptr;
-  LogicalGet *get = nullptr;
-  vector<LogicalFilter *> filters;
 };
 
-static LanceUpdatePlanParts ExtractUpdatePlanParts(LogicalUpdate &op) {
-  LanceUpdatePlanParts parts;
-  if (op.children.empty() || !op.children[0]) {
-    throw InternalException("Lance UPDATE expects a child plan");
-  }
+class LanceUpdateValueLocalState : public LocalSinkState {};
 
-  parts.projection = dynamic_cast<LogicalProjection *>(op.children[0].get());
-  if (!parts.projection) {
-    throw NotImplementedException(
-        "Lance UPDATE only supports the standard UPDATE planning path");
-  }
-
-  LogicalOperator *node = parts.projection->children.empty()
-                              ? nullptr
-                              : parts.projection->children[0].get();
-  if (!node) {
-    throw InternalException("Lance UPDATE projection has no child");
-  }
-
-  // Optimizer passes can introduce extra projections between UPDATE's
-  // projection and the base scan/filter nodes (e.g. pruning, projection
-  // pushdown). Walk down projection/filter layers until we reach the base scan.
-  while (true) {
-    if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-      auto &proj = node->Cast<LogicalProjection>();
-      if (proj.children.empty() || !proj.children[0]) {
-        throw InternalException("Lance UPDATE projection has no child");
-      }
-      node = proj.children[0].get();
-      continue;
-    }
-    if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
-      auto &filter = node->Cast<LogicalFilter>();
-      parts.filters.push_back(&filter);
-      if (filter.children.empty() || !filter.children[0]) {
-        throw InternalException("Lance UPDATE filter has no child");
-      }
-      node = filter.children[0].get();
-      continue;
-    }
-    break;
-  }
-
-  parts.get = dynamic_cast<LogicalGet *>(node);
-  if (!parts.get) {
-    throw NotImplementedException(
-        "Lance UPDATE does not support UPDATE with joins or FROM");
-  }
-
-  return parts;
-}
-
-class PhysicalLanceUpdateOverwrite final : public PhysicalOperator {
+class PhysicalLanceUpdateValue final : public PhysicalOperator {
 public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
-  PhysicalLanceUpdateOverwrite(PhysicalPlan &physical_plan,
-                               vector<LogicalType> types_p,
-                               LanceTableEntry &table_p, string predicate_ir_p,
-                               vector<string> set_columns_p,
-                               vector<string> set_expr_irs_p,
-                               idx_t estimated_cardinality)
+  PhysicalLanceUpdateValue(PhysicalPlan &physical_plan,
+                           vector<LogicalType> types_p,
+                           LanceTableEntry &table_p,
+                           vector<string> set_columns_p,
+                           vector<LogicalType> set_types_p,
+                           vector<idx_t> set_chunk_indices_p,
+                           idx_t rowid_chunk_index_p, LogicalType rowid_type_p,
+                           idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), predicate_ir(std::move(predicate_ir_p)),
-        set_columns(std::move(set_columns_p)),
-        set_expr_irs(std::move(set_expr_irs_p)) {}
+        table(table_p), set_columns(std::move(set_columns_p)),
+        set_types(std::move(set_types_p)),
+        set_chunk_indices(std::move(set_chunk_indices_p)),
+        rowid_chunk_index(rowid_chunk_index_p) {
+    if (set_columns.size() != set_types.size() ||
+        set_columns.size() != set_chunk_indices.size()) {
+      throw InternalException(
+          "Lance UPDATE value plan has mismatched SET columns");
+    }
+    value_chunk_types = set_types;
+    value_chunk_types.push_back(std::move(rowid_type_p));
+  }
 
+  bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
+  bool ParallelSink() const override { return false; }
+  bool SinkOrderDependent() const override { return false; }
 
-  class UpdateSourceState : public GlobalSourceState {
+  unique_ptr<GlobalSinkState>
+  GetGlobalSinkState(ClientContext &) const override {
+    return make_uniq<LanceUpdateValueGlobalState>(table);
+  }
+
+  unique_ptr<LocalSinkState>
+  GetLocalSinkState(ExecutionContext &) const override {
+    return make_uniq<LanceUpdateValueLocalState>();
+  }
+
+  SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
+                      OperatorSinkInput &input) const override {
+    if (chunk.size() == 0) {
+      return SinkResultType::NEED_MORE_INPUT;
+    }
+
+    auto &gstate = input.global_state.Cast<LanceUpdateValueGlobalState>();
+    lock_guard<mutex> guard(gstate.lock);
+
+    if (!gstate.update_handle) {
+      ResolveLanceStorageOptionsForTable(
+          context.client, table, gstate.open_path, gstate.option_keys,
+          gstate.option_values, gstate.display_uri);
+
+      vector<const char *> key_ptrs;
+      vector<const char *> value_ptrs;
+      BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
+                                      key_ptrs, value_ptrs);
+
+      auto rc = lance_update_begin_with_storage_options(
+          gstate.open_path.c_str(),
+          key_ptrs.empty() ? nullptr : key_ptrs.data(),
+          value_ptrs.empty() ? nullptr : value_ptrs.data(),
+          gstate.option_keys.size(),
+          NumericCast<uint64_t>(LanceBlobIngestBatchBudget(context.client)),
+          LanceGetSessionHandle(context.client), &gstate.update_handle);
+      if (rc != 0 || !gstate.update_handle) {
+        throw IOException("Failed to start Lance UPDATE transaction for '" +
+                          gstate.open_path + "'" + LanceFormatErrorSuffix());
+      }
+    }
+
+    chunk.Flatten();
+
+    DataChunk value_chunk;
+    value_chunk.Initialize(context.client, value_chunk_types);
+    value_chunk.SetChildCardinality(chunk.size());
+    for (idx_t i = 0; i < set_chunk_indices.size(); i++) {
+      value_chunk.data[i].Reference(chunk.data[set_chunk_indices[i]]);
+    }
+    value_chunk.data[set_chunk_indices.size()].Reference(
+        chunk.data[rowid_chunk_index]);
+    // Materialize ingest rows exactly once; the same values feed the writer.
+    NormalizeIngestRowsInChunk(context.client, value_chunk);
+
+    auto props = context.client.GetClientProperties();
+    unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
+        extension_type_cast;
+
+    ArrowArray array;
+    memset(&array, 0, sizeof(array));
+    ArrowConverter::ToArrowArray(value_chunk, &array, props,
+                                 extension_type_cast);
+
+    vector<string> value_names = set_columns;
+    value_names.push_back("_rowid");
+    ArrowSchemaWrapper schema;
+    schema.arrow_schema = {};
+    ArrowConverter::ToArrowSchema(&schema.arrow_schema, value_chunk.GetTypes(),
+                                  value_names, props);
+
+    // Resolve ingest source credentials before exporting the Arrow array; a
+    // secret/policy failure must not leak an unreleased array.
+    LanceBatchSourceOptions source_options;
+    LanceCollectIngestSourceOptions(context.client, value_chunk,
+                                    source_options);
+    LanceBlobSourceOptionArrays option_arrays;
+    BuildLanceBlobSourceOptionArrays(source_options, option_arrays);
+
+    auto rc = lance_update_add_value_batch(
+        gstate.update_handle, &schema.arrow_schema, &array,
+        option_arrays.Uris(), option_arrays.KeyOffsets(),
+        option_arrays.ValueOffsets(), option_arrays.Counts(),
+        option_arrays.counts.size());
+    if (array.release) {
+      array.release(&array);
+    }
+    if (rc != 0) {
+      throw IOException("Failed to add Lance UPDATE value batch" +
+                        LanceFormatErrorSuffix());
+    }
+    gstate.rows_updated += chunk.size();
+    return SinkResultType::NEED_MORE_INPUT;
+  }
+
+  SinkCombineResultType Combine(ExecutionContext &,
+                                OperatorSinkCombineInput &) const override {
+    return SinkCombineResultType::FINISHED;
+  }
+
+  SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
+                            OperatorSinkFinalizeInput &input) const override {
+    auto &gstate = input.global_state.Cast<LanceUpdateValueGlobalState>();
+    lock_guard<mutex> guard(gstate.lock);
+    if (!gstate.update_handle) {
+      return SinkFinalizeType::READY;
+    }
+
+    void *txn = nullptr;
+    auto rc = lance_update_finish_uncommitted(gstate.update_handle, &txn);
+    // finish takes ownership of the handle and releases it either way.
+    gstate.update_handle = nullptr;
+    if (rc != 0) {
+      throw IOException("Failed to finish Lance UPDATE transaction for '" +
+                        gstate.open_path + "'" + LanceFormatErrorSuffix());
+    }
+    if (!txn) {
+      return SinkFinalizeType::READY;
+    }
+
+    RegisterLancePendingAppend(
+        context, table.catalog, std::move(gstate.open_path),
+        std::move(gstate.option_keys), std::move(gstate.option_values),
+        LanceBuildDatasetCacheKeyForTable(context, table), txn);
+    return SinkFinalizeType::READY;
+  }
+
+  class LanceUpdateValueSourceState : public GlobalSourceState {
   public:
     bool emitted = false;
-    uint64_t rows_updated = 0;
   };
 
   unique_ptr<GlobalSourceState>
   GetGlobalSourceState(ClientContext &) const override {
-    return make_uniq<UpdateSourceState>();
+    return make_uniq<LanceUpdateValueSourceState>();
   }
 
-  SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+  SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
                                    OperatorSourceInput &input) const override {
-    auto &state = input.global_state.Cast<UpdateSourceState>();
+    auto &state = input.global_state.Cast<LanceUpdateValueSourceState>();
     if (state.emitted) {
       return SourceResultType::FINISHED;
     }
     state.emitted = true;
 
-    if (set_columns.size() != set_expr_irs.size()) {
-      throw InternalException("Lance UPDATE has mismatched SET columns/values");
-    }
-
-    string open_path;
-    vector<string> option_keys;
-    vector<string> option_values;
-    string display_uri;
-    ResolveLanceStorageOptionsForTable(context.client, table, open_path,
-                                       option_keys, option_values, display_uri);
-
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                    value_ptrs);
-
-    vector<const char *> set_col_ptrs;
-    vector<const uint8_t *> set_expr_ir_ptrs;
-    vector<size_t> set_expr_ir_lens;
-    set_col_ptrs.reserve(set_columns.size());
-    set_expr_ir_ptrs.reserve(set_expr_irs.size());
-    set_expr_ir_lens.reserve(set_expr_irs.size());
-    for (idx_t i = 0; i < set_columns.size(); i++) {
-      set_col_ptrs.push_back(set_columns[i].c_str());
-      set_expr_ir_ptrs.push_back(
-          reinterpret_cast<const uint8_t *>(set_expr_irs[i].data()));
-      set_expr_ir_lens.push_back(set_expr_irs[i].size());
-    }
-
-    void *txn = nullptr;
-    uint64_t rows_updated = 0;
-    auto predicate_ptr =
-        predicate_ir.empty()
-            ? nullptr
-            : reinterpret_cast<const uint8_t *>(predicate_ir.data());
-    auto rc = lance_overwrite_update_transaction_with_irs_and_storage_options(
-        open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-        predicate_ptr, predicate_ir.size(), set_col_ptrs.data(),
-        set_expr_ir_ptrs.data(), set_expr_ir_lens.data(), set_columns.size(),
-        LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-        LANCE_DEFAULT_MAX_BYTES_PER_FILE, LanceGetSessionHandle(context.client),
-        &txn, &rows_updated);
-    if (rc != 0) {
-      throw IOException("Failed to create Lance UPDATE transaction for '" +
-                        open_path + "'" + LanceFormatErrorSuffix());
-    }
-    if (!txn) {
-      if (rows_updated != 0) {
-        throw IOException(
-            "Failed to create Lance UPDATE transaction for '" + open_path +
-            "': null transaction returned for non-zero updated rows");
-      }
-      state.rows_updated = 0;
-      chunk.SetCardinality(1);
-      chunk.SetValue(0, 0,
-                     Value::BIGINT(NumericCast<int64_t>(state.rows_updated)));
-      return SourceResultType::FINISHED;
-    }
-
-    RegisterLancePendingAppend(
-        context.client, table.catalog, std::move(open_path),
-        std::move(option_keys), std::move(option_values),
-        LanceBuildDatasetCacheKeyForTable(context.client, table), txn);
-
-    state.rows_updated = rows_updated;
-
-    chunk.SetCardinality(1);
-    chunk.SetValue(0, 0,
-                   Value::BIGINT(NumericCast<int64_t>(state.rows_updated)));
+    auto &gstate = sink_state->Cast<LanceUpdateValueGlobalState>();
+    chunk.data[0].Append(
+        Value::BIGINT(NumericCast<int64_t>(gstate.rows_updated)));
     return SourceResultType::FINISHED;
   }
 
-  string GetName() const override { return "LanceUpdateOverwrite"; }
+  string GetName() const override { return "LanceUpdateValue"; }
 
   InsertionOrderPreservingMap<string> ParamsToString() const override {
     InsertionOrderPreservingMap<string> result;
-    result["Predicate IR Bytes"] =
-        predicate_ir.empty() ? "0" : to_string(predicate_ir.size());
     result["SET Columns"] = StringUtil::Join(set_columns, "\n");
-    result["SET Expr IR Count"] = to_string(set_expr_irs.size());
+    result["SET Chunk Indices"] =
+        StringUtil::Join(set_chunk_indices, "\n",
+                         [](const idx_t &index) { return to_string(index); });
+    result["Row ID Chunk Index"] = to_string(rowid_chunk_index);
     return result;
   }
 
 private:
   LanceTableEntry &table;
-  string predicate_ir;
   vector<string> set_columns;
-  vector<string> set_expr_irs;
+  vector<LogicalType> set_types;
+  vector<idx_t> set_chunk_indices;
+  idx_t rowid_chunk_index;
+  vector<LogicalType> value_chunk_types;
 };
+
+} // namespace
 
 PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
                                            PhysicalPlanGenerator &planner,
-                                           LogicalUpdate &op) {
+                                           LogicalUpdate &op,
+                                           PhysicalOperator &plan) {
   if (op.return_chunk) {
     throw NotImplementedException("Lance UPDATE does not support RETURNING");
   }
@@ -308,150 +302,58 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
         "silently change the on-disk storage.");
   }
 
-  auto parts = ExtractUpdatePlanParts(op);
-  auto *scan_bind =
-      parts.get && parts.get->bind_data
-          ? dynamic_cast<LanceScanBindData *>(parts.get->bind_data.get())
-          : nullptr;
-  if (!scan_bind) {
-    throw InternalException("Lance UPDATE is missing Lance scan bind data");
+  if (op.expressions.size() != op.columns.size()) {
+    throw InternalException(
+        "Lance UPDATE has mismatched SET columns/expressions");
   }
-
-  vector<string> predicate_ir_parts;
-  if (!parts.get->table_filters.filters.empty() &&
-      !TryBuildLanceTableFilterIRParts(scan_bind->names, scan_bind->types,
-                                       parts.get->table_filters,
-                                       predicate_ir_parts)) {
+  if (op.children.empty() || !op.children[0]) {
+    throw InternalException("Lance UPDATE expects a child plan");
+  }
+  auto *projection = dynamic_cast<LogicalProjection *>(op.children[0].get());
+  if (!projection) {
     throw NotImplementedException(
-        "Lance UPDATE does not support one or more pushed table filters");
+        "Lance UPDATE only supports the standard UPDATE planning path");
   }
-
-  for (auto &part : scan_bind->lance_pushed_filter_ir_parts) {
-    if (!part.empty()) {
-      predicate_ir_parts.push_back(part);
-    }
+  if (plan.types.empty()) {
+    throw InternalException("Lance UPDATE child plan has no output columns");
   }
-
-  for (auto *filter : parts.filters) {
-    if (!filter) {
-      continue;
-    }
-    if (filter->children.empty() || !filter->children[0]) {
-      throw InternalException("Lance UPDATE filter has no child");
-    }
-    for (auto &expr : filter->expressions) {
-      if (!expr) {
-        continue;
-      }
-      if (expr->IsFoldable()) {
-        Value folded;
-        if (ExpressionExecutor::TryEvaluateScalar(context, *expr, folded) &&
-            folded.type() == LogicalTypeId::BOOLEAN && !folded.IsNull() &&
-            folded.GetValue<bool>()) {
-          continue;
-        }
-      }
-      string expr_ir;
-      if (!TryBuildLanceExprFilterIR(*parts.get, scan_bind->names,
-                                     scan_bind->types, false, *expr, expr_ir)) {
-        throw NotImplementedException(
-            "Lance UPDATE does not support WHERE expression: %s",
-            expr->ToString());
-      }
-      predicate_ir_parts.push_back(std::move(expr_ir));
-    }
-  }
-
-  string predicate_ir;
-  if (!TryEncodeLanceFilterIRMessage(predicate_ir_parts, predicate_ir)) {
-    throw InternalException("Failed to encode Lance UPDATE predicate IR");
-  }
+  idx_t rowid_chunk_index = plan.types.size() - 1;
 
   vector<string> set_columns;
-  vector<string> set_expr_irs;
+  vector<LogicalType> set_types;
+  vector<idx_t> set_chunk_indices;
   set_columns.reserve(op.columns.size());
-  set_expr_irs.reserve(op.columns.size());
-
-  if (!parts.projection) {
-    throw InternalException("Lance UPDATE is missing projection");
-  }
-
-  if (parts.projection->children.empty() || !parts.projection->children[0]) {
-    throw InternalException("Lance UPDATE projection has no child");
-  }
-  auto &set_expr_scope = *parts.projection->children[0];
+  set_types.reserve(op.columns.size());
+  set_chunk_indices.reserve(op.columns.size());
 
   for (idx_t i = 0; i < op.columns.size(); i++) {
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
-    set_columns.push_back(target_col.Name());
-
+    if (lance_table->IsJsonColumn(target_col.Name().GetIdentifierName())) {
+      throw NotImplementedException(
+          "UPDATE on Lance table '" + lance_table->name +
+          "' is not supported because it writes JSON column(s) [" +
+          target_col.Name().GetIdentifierName() + "]");
+    }
+    set_columns.push_back(target_col.Name().GetIdentifierName());
     if (!op.expressions[i]) {
       throw InternalException("Lance UPDATE has null SET expression");
     }
-
-    if (op.expressions[i]->GetExpressionType() ==
-        ExpressionType::VALUE_DEFAULT) {
-      unique_ptr<Expression> target_default;
-      string stored_default_expr;
-      if (TryGetLanceFieldDefaultExpr(context, *lance_table, target_col.Name(),
-                                      stored_default_expr)) {
-        target_default = BindStoredDefaultExpr(
-            context, op.table.catalog.GetName(), op.table.ParentSchema().name,
-            stored_default_expr, target_col.Type());
-      } else {
-        auto storage_idx = target_col.StorageOid();
-        if (storage_idx >= op.bound_defaults.size()) {
-          throw InternalException(
-              "Lance UPDATE default expression is missing for target column");
-        }
-        auto &bound_default = op.bound_defaults[storage_idx];
-        if (!bound_default) {
-          throw InternalException(
-              "Lance UPDATE default expression is missing for target column");
-        }
-        target_default = bound_default->Copy();
-      }
-      string expr_ir;
-      EncodeLanceExprIR(*parts.get, *scan_bind, set_expr_scope, *target_default,
-                        expr_ir);
-      set_expr_irs.push_back(std::move(expr_ir));
-      continue;
+    auto chunk_index = ResolveUpdateSetChunkIndex(op, projection, i);
+    if (chunk_index >= plan.types.size() - 1) {
+      throw InternalException(
+          "Lance UPDATE SET expression resolved past the row-id column");
     }
-
-    unique_ptr<Expression> set_expr;
-    if (op.expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_REF) {
-      auto &ref = op.expressions[i]->Cast<BoundReferenceExpression>();
-      auto idx = NumericCast<idx_t>(ref.index);
-      if (idx >= parts.projection->expressions.size()) {
-        throw InternalException(
-            "Lance UPDATE SET expression has invalid projection index");
-      }
-      set_expr = parts.projection->expressions[idx]->Copy();
-    } else if (op.expressions[i]->GetExpressionClass() ==
-               ExpressionClass::BOUND_COLUMN_REF) {
-      auto &ref = op.expressions[i]->Cast<BoundColumnRefExpression>();
-      if (ref.binding.table_index != parts.projection->table_index) {
-        throw NotImplementedException(
-            "Lance UPDATE does not support UPDATE with joins or FROM");
-      }
-      if (ref.binding.column_index >= parts.projection->expressions.size()) {
-        throw InternalException(
-            "Lance UPDATE SET expression has invalid projection index");
-      }
-      set_expr =
-          parts.projection->expressions[ref.binding.column_index]->Copy();
-    } else {
-      set_expr = op.expressions[i]->Copy();
-    }
-    string expr_ir;
-    EncodeLanceExprIR(*parts.get, *scan_bind, set_expr_scope, *set_expr,
-                      expr_ir);
-    set_expr_irs.push_back(std::move(expr_ir));
+    set_types.push_back(op.expressions[i]->GetReturnType());
+    set_chunk_indices.push_back(chunk_index);
   }
 
-  return planner.Make<PhysicalLanceUpdateOverwrite>(
-      op.types, *lance_table, std::move(predicate_ir), std::move(set_columns),
-      std::move(set_expr_irs), op.estimated_cardinality);
+  auto &update = planner.Make<PhysicalLanceUpdateValue>(
+      op.types, *lance_table, std::move(set_columns), std::move(set_types),
+      std::move(set_chunk_indices), rowid_chunk_index,
+      plan.types[rowid_chunk_index], op.estimated_cardinality);
+  update.children.push_back(plan);
+  (void)context;
+  return update;
 }
 
 } // namespace duckdb

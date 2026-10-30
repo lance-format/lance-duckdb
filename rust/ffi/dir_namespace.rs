@@ -9,10 +9,11 @@ use lance_namespace::models::{DropTableRequest, ListTablesRequest};
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 
-use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::error::{clear_last_error, namespace_error_code, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::record_dataset_open;
+use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, export_string_list, optional_session_handle, slice_from_ptr, to_c_string,
@@ -105,8 +106,12 @@ pub unsafe extern "C" fn lance_dir_namespace_list_tables(
     options_len: usize,
     out: *mut LanceStringList,
 ) -> i32 {
-    let result = dir_namespace_list_tables_inner(root, option_keys, option_values, options_len);
-    unsafe { export_string_list(result, out) }
+    unsafe {
+        export_string_list(
+            dir_namespace_list_tables_inner(root, option_keys, option_values, options_len),
+            out,
+        )
+    }
 }
 
 fn open_dataset_in_dir_namespace_inner(
@@ -117,6 +122,7 @@ fn open_dataset_in_dir_namespace_inner(
     options_len: usize,
     session: *mut c_void,
 ) -> FfiResult<(DatasetHandle, String)> {
+    let session_ptr = session;
     let root = unsafe { cstr_to_str(root, "root")? }
         .trim_end_matches('/')
         .to_string();
@@ -140,7 +146,7 @@ fn open_dataset_in_dir_namespace_inner(
                 .await
                 .map_err(|err| {
                     FfiError::new(
-                        ErrorCode::DatasetOpen,
+                        namespace_error_code(&err, ErrorCode::DatasetOpen),
                         format!("dir namespace describe '{root}/{table_name}': {err}"),
                     )
                 })?;
@@ -167,7 +173,7 @@ fn open_dataset_in_dir_namespace_inner(
         }
         builder.load().await.map_err(|err| {
             FfiError::new(
-                ErrorCode::DatasetOpen,
+                namespace_error_code(&err, ErrorCode::DatasetOpen),
                 format!("dir namespace dataset open: {err}"),
             )
         })
@@ -175,6 +181,9 @@ fn open_dataset_in_dir_namespace_inner(
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
     let table_uri = dataset.uri().to_string();
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
     record_dataset_open();
     Ok((DatasetHandle::new(Arc::new(dataset)), table_uri))
 }

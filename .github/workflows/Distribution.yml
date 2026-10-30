@@ -1,15 +1,9 @@
+# Validate main commits and manually selected refs; DuckDB owns official publication.
 name: Main Extension Distribution Pipeline
 on:
   push:
-    tags:
-      - "*"
-  pull_request:
-    paths:
-      - "CMakeLists.txt"
-      - "Makefile"
-      - "extension_config.cmake"
-      - "vcpkg.json"
-      - ".github/workflows/Distribution.yml"
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
@@ -19,10 +13,9 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
     with:
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v2.0-cyanoptera
       extension_name: lance
       extra_toolchains: "rust"
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;osx_amd64"

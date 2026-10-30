@@ -15,8 +15,26 @@ concurrency:
 jobs:
   code-quality:
     name: Code Quality
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
       extension_name: lance
-      duckdb_version: v1.5-variegata
-      ci_tools_version: v1.5-variegata
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: v2.0-cyanoptera
+
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check Rust formatting
+        run: cargo fmt -- --check
+      - name: Install Rust build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev
+      - name: Test Rust FFI and namespace behavior
+        run: cargo test --locked --lib
