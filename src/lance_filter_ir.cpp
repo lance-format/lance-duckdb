@@ -134,34 +134,34 @@ static bool TryEncodeLanceFilterIRScalarFunction(const string &name,
 
 static bool TryGetNonNullVarcharConstant(const Expression &expr,
                                          string &out_value) {
-  if (expr.expression_class == ExpressionClass::BOUND_CONSTANT) {
+  if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
     auto &c = expr.Cast<BoundConstantExpression>();
-    if (c.value.IsNull()) {
+    if (c.GetValue().IsNull()) {
       return false;
     }
     try {
       out_value =
-          c.value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
+          c.GetValue().DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
       return true;
     } catch (...) {
       return false;
     }
   }
-  if (expr.expression_class == ExpressionClass::BOUND_CAST) {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (cast.try_cast) {
+  if (BoundCastExpression::IsCast(expr)) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (BoundCastExpression::IsTryCast(cast)) {
       return false;
     }
-    if (!cast.child ||
-        cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
+    if (!cast.GetChildren()[0] || cast.GetChildren()[0]->GetExpressionClass() !=
+                                      ExpressionClass::BOUND_CONSTANT) {
       return false;
     }
-    auto &c = cast.child->Cast<BoundConstantExpression>();
-    if (c.value.IsNull()) {
+    auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+    if (c.GetValue().IsNull()) {
       return false;
     }
     try {
-      auto casted = c.value.DefaultCastAs(cast.return_type);
+      auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
       out_value = casted.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
       return true;
     } catch (...) {
@@ -173,29 +173,30 @@ static bool TryGetNonNullVarcharConstant(const Expression &expr,
 
 static bool TryGetNonNullListConstant(const Expression &expr,
                                       Value &out_value) {
-  if (expr.expression_class == ExpressionClass::BOUND_CONSTANT) {
+  if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
     auto &c = expr.Cast<BoundConstantExpression>();
-    if (c.value.IsNull() || c.value.type().id() != LogicalTypeId::LIST) {
+    if (c.GetValue().IsNull() ||
+        c.GetValue().type().id() != LogicalTypeId::LIST) {
       return false;
     }
-    out_value = c.value;
+    out_value = c.GetValue();
     return true;
   }
-  if (expr.expression_class == ExpressionClass::BOUND_CAST) {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (cast.try_cast) {
+  if (BoundCastExpression::IsCast(expr)) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (BoundCastExpression::IsTryCast(cast)) {
       return false;
     }
-    if (!cast.child ||
-        cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
+    if (!cast.GetChildren()[0] || cast.GetChildren()[0]->GetExpressionClass() !=
+                                      ExpressionClass::BOUND_CONSTANT) {
       return false;
     }
-    auto &c = cast.child->Cast<BoundConstantExpression>();
-    if (c.value.IsNull()) {
+    auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+    if (c.GetValue().IsNull()) {
       return false;
     }
     try {
-      auto casted = c.value.DefaultCastAs(cast.return_type);
+      auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
       if (casted.IsNull() || casted.type().id() != LogicalTypeId::LIST) {
         return false;
       }
@@ -225,53 +226,93 @@ static bool TryGetLanceContainmentFunctionName(const string &duckdb_name,
   return false;
 }
 
-static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
+static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
                                            const TableFilter &filter,
                                            string &out_ir) {
   std::function<bool(const Expression &, string &)> build_from_expr;
 
   build_from_expr = [&](const Expression &expr, string &out_expr_ir) -> bool {
-    switch (expr.expression_class) {
+    if (BoundCastExpression::IsCast(expr)) {
+      auto &cast = expr.Cast<BoundFunctionExpression>();
+      if (BoundCastExpression::IsTryCast(cast)) {
+        return false;
+      }
+      if (!cast.GetChildren()[0] ||
+          cast.GetChildren()[0]->GetExpressionClass() !=
+              ExpressionClass::BOUND_CONSTANT) {
+        return false;
+      }
+      auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+      try {
+        auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
+        return TryEncodeLanceFilterIRLiteral(casted, out_expr_ir);
+      } catch (...) {
+        return false;
+      }
+    }
+    if (BoundComparisonExpression::IsComparison(expr)) {
+      auto &cmp = expr.Cast<BoundFunctionExpression>();
+      uint8_t op = 0;
+      if (!TryEncodeLanceFilterIRComparisonOp(cmp.GetExpressionType(), op)) {
+        return false;
+      }
+      string lhs_ir, rhs_ir;
+      if (!cmp.GetChildren()[0] || !cmp.GetChildren()[1]) {
+        return false;
+      }
+      if (!build_from_expr(*cmp.GetChildren()[0], lhs_ir) ||
+          !build_from_expr(*cmp.GetChildren()[1], rhs_ir)) {
+        return false;
+      }
+      return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_expr_ir);
+    }
+    switch (expr.GetExpressionClass()) {
     case ExpressionClass::BOUND_REF: {
-      out_expr_ir = col_ref_ir;
+      auto index = expr.Cast<BoundReferenceExpression>().Index();
+      if (index >= column_refs.size()) {
+        return false;
+      }
+      out_expr_ir = column_refs[index];
       return true;
     }
     case ExpressionClass::BOUND_FUNCTION: {
       auto &func = expr.Cast<BoundFunctionExpression>();
-      for (auto &child : func.children) {
+      for (auto &child : func.GetChildren()) {
         if (!child) {
           return false;
         }
       }
 
-      if (func.function.name == "lower" || func.function.name == "upper") {
-        if (func.children.size() != 1) {
+      if (func.Function().GetName().GetIdentifierName() == "lower" ||
+          func.Function().GetName().GetIdentifierName() == "upper") {
+        if (func.GetChildren().size() != 1) {
           return false;
         }
         string input_ir;
-        if (!build_from_expr(*func.children[0], input_ir)) {
+        if (!build_from_expr(*func.GetChildren()[0], input_ir)) {
           return false;
         }
         vector<string> args;
         args.push_back(std::move(input_ir));
-        return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
-                                                    out_expr_ir);
+        return TryEncodeLanceFilterIRScalarFunction(
+            func.Function().GetName().GetIdentifierName(), args, out_expr_ir);
       }
 
-      if (func.function.name == "starts_with" ||
-          func.function.name == "ends_with" ||
-          func.function.name == "contains") {
-        if (func.children.size() != 2) {
+      if (func.Function().GetName().GetIdentifierName() == "starts_with" ||
+          func.Function().GetName().GetIdentifierName() == "ends_with" ||
+          func.Function().GetName().GetIdentifierName() == "contains") {
+        if (func.GetChildren().size() != 2) {
           return false;
         }
 
         string input_ir;
-        if (!build_from_expr(*func.children[0], input_ir)) {
+        if (!build_from_expr(*func.GetChildren()[0], input_ir)) {
           return false;
         }
 
         string needle_value;
-        if (!TryGetNonNullVarcharConstant(*func.children[1], needle_value)) {
+        if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1],
+                                          needle_value)) {
           return false;
         }
         string needle_ir;
@@ -282,24 +323,25 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
         vector<string> args;
         args.push_back(std::move(input_ir));
         args.push_back(std::move(needle_ir));
-        return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
-                                                    out_expr_ir);
+        return TryEncodeLanceFilterIRScalarFunction(
+            func.Function().GetName().GetIdentifierName(), args, out_expr_ir);
       }
 
       string containment_name;
-      if (TryGetLanceContainmentFunctionName(func.function.name,
-                                             containment_name)) {
-        if (func.children.size() != 2) {
+      if (TryGetLanceContainmentFunctionName(
+              func.Function().GetName().GetIdentifierName(),
+              containment_name)) {
+        if (func.GetChildren().size() != 2) {
           return false;
         }
 
         string input_ir;
-        if (!build_from_expr(*func.children[0], input_ir)) {
+        if (!build_from_expr(*func.GetChildren()[0], input_ir)) {
           return false;
         }
 
         Value needle_value;
-        if (!TryGetNonNullListConstant(*func.children[1], needle_value)) {
+        if (!TryGetNonNullListConstant(*func.GetChildren()[1], needle_value)) {
           return false;
         }
         string needle_ir;
@@ -318,54 +360,22 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
     }
     case ExpressionClass::BOUND_CONSTANT: {
       auto &c = expr.Cast<BoundConstantExpression>();
-      return TryEncodeLanceFilterIRLiteral(c.value, out_expr_ir);
+      return TryEncodeLanceFilterIRLiteral(c.GetValue(), out_expr_ir);
     }
-    case ExpressionClass::BOUND_CAST: {
-      auto &cast = expr.Cast<BoundCastExpression>();
-      if (cast.try_cast) {
-        return false;
-      }
-      if (!cast.child ||
-          cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
-        return false;
-      }
-      auto &c = cast.child->Cast<BoundConstantExpression>();
-      try {
-        auto casted = c.value.DefaultCastAs(cast.return_type);
-        return TryEncodeLanceFilterIRLiteral(casted, out_expr_ir);
-      } catch (...) {
-        return false;
-      }
-    }
-    case ExpressionClass::BOUND_COMPARISON: {
-      auto &cmp = expr.Cast<BoundComparisonExpression>();
-      uint8_t op = 0;
-      if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
-        return false;
-      }
-      string lhs_ir, rhs_ir;
-      if (!cmp.left || !cmp.right) {
-        return false;
-      }
-      if (!build_from_expr(*cmp.left, lhs_ir) ||
-          !build_from_expr(*cmp.right, rhs_ir)) {
-        return false;
-      }
-      return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_expr_ir);
-    }
+
     case ExpressionClass::BOUND_CONJUNCTION: {
       auto &conj = expr.Cast<BoundConjunctionExpression>();
       LanceFilterIRTag tag;
-      if (conj.type == ExpressionType::CONJUNCTION_AND) {
+      if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
         tag = LanceFilterIRTag::AND;
-      } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
+      } else if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
         tag = LanceFilterIRTag::OR;
       } else {
         return false;
       }
       vector<string> children;
-      children.reserve(conj.children.size());
-      for (auto &child : conj.children) {
+      children.reserve(conj.GetChildren().size());
+      for (auto &child : conj.GetChildren()) {
         if (!child) {
           return false;
         }
@@ -379,56 +389,57 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
     }
     case ExpressionClass::BOUND_OPERATOR: {
       auto &op = expr.Cast<BoundOperatorExpression>();
-      if (op.type == ExpressionType::OPERATOR_NOT) {
-        if (op.children.size() != 1 || !op.children[0]) {
+      if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+        if (op.GetChildren().size() != 1 || !op.GetChildren()[0]) {
           return false;
         }
         string child_ir;
-        if (!build_from_expr(*op.children[0], child_ir)) {
+        if (!build_from_expr(*op.GetChildren()[0], child_ir)) {
           return false;
         }
         return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir,
                                            out_expr_ir);
       }
-      if (op.type == ExpressionType::OPERATOR_IS_NULL ||
-          op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-        if (op.children.size() != 1 || !op.children[0]) {
+      if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+          op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+        if (op.GetChildren().size() != 1 || !op.GetChildren()[0]) {
           return false;
         }
         string child_ir;
-        if (!build_from_expr(*op.children[0], child_ir)) {
+        if (!build_from_expr(*op.GetChildren()[0], child_ir)) {
           return false;
         }
         return TryEncodeLanceFilterIRUnary(
-            op.type == ExpressionType::OPERATOR_IS_NULL
+            op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL
                 ? LanceFilterIRTag::IS_NULL
                 : LanceFilterIRTag::IS_NOT_NULL,
             child_ir, out_expr_ir);
       }
-      if (op.type == ExpressionType::COMPARE_IN ||
-          op.type == ExpressionType::COMPARE_NOT_IN) {
-        if (op.children.size() < 2 || !op.children[0]) {
+      if (op.GetExpressionType() == ExpressionType::COMPARE_IN ||
+          op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+        if (op.GetChildren().size() < 2 || !op.GetChildren()[0]) {
           return false;
         }
         string lhs_ir;
-        if (!build_from_expr(*op.children[0], lhs_ir)) {
+        if (!build_from_expr(*op.GetChildren()[0], lhs_ir)) {
           return false;
         }
         vector<string> values;
-        values.reserve(op.children.size() - 1);
-        for (idx_t i = 1; i < op.children.size(); i++) {
-          if (!op.children[i] || op.children[i]->expression_class !=
-                                     ExpressionClass::BOUND_CONSTANT) {
+        values.reserve(op.GetChildren().size() - 1);
+        for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+          if (!op.GetChildren()[i] ||
+              op.GetChildren()[i]->GetExpressionClass() !=
+                  ExpressionClass::BOUND_CONSTANT) {
             return false;
           }
-          auto &c = op.children[i]->Cast<BoundConstantExpression>();
+          auto &c = op.GetChildren()[i]->Cast<BoundConstantExpression>();
           string lit_ir;
-          if (!TryEncodeLanceFilterIRLiteral(c.value, lit_ir)) {
+          if (!TryEncodeLanceFilterIRLiteral(c.GetValue(), lit_ir)) {
             return false;
           }
           values.push_back(std::move(lit_ir));
         }
-        return TryEncodeLanceFilterIRInList(op.type ==
+        return TryEncodeLanceFilterIRInList(op.GetExpressionType() ==
                                                 ExpressionType::COMPARE_NOT_IN,
                                             lhs_ir, values, out_expr_ir);
       }
@@ -439,103 +450,17 @@ static bool TryBuildLanceTableFilterIRExpr(const string &col_ref_ir,
     }
   };
 
-  switch (filter.filter_type) {
-  case TableFilterType::CONSTANT_COMPARISON: {
-    auto &f = filter.Cast<ConstantFilter>();
-    uint8_t op = 0;
-    if (!TryEncodeLanceFilterIRComparisonOp(f.comparison_type, op)) {
-      return false;
-    }
-    string lit_ir;
-    if (!TryEncodeLanceFilterIRLiteral(f.constant, lit_ir)) {
-      return false;
-    }
-    return TryEncodeLanceFilterIRComparison(op, col_ref_ir, lit_ir, out_ir);
-  }
-  case TableFilterType::IS_NULL:
-    return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::IS_NULL, col_ref_ir,
-                                       out_ir);
-  case TableFilterType::IS_NOT_NULL:
-    return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::IS_NOT_NULL,
-                                       col_ref_ir, out_ir);
-  case TableFilterType::IN_FILTER: {
-    auto &f = filter.Cast<InFilter>();
-    vector<string> items;
-    items.reserve(f.values.size());
-    for (auto &value : f.values) {
-      string lit_ir;
-      if (!TryEncodeLanceFilterIRLiteral(value, lit_ir)) {
-        return false;
-      }
-      items.push_back(std::move(lit_ir));
-    }
-    return TryEncodeLanceFilterIRInList(false, col_ref_ir, items, out_ir);
-  }
-  case TableFilterType::CONJUNCTION_AND: {
-    auto &f = filter.Cast<ConjunctionAndFilter>();
-    vector<string> children;
-    children.reserve(f.child_filters.size());
-    for (auto &child : f.child_filters) {
-      string child_ir;
-      if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *child, child_ir)) {
-        return false;
-      }
-      children.push_back(std::move(child_ir));
-    }
-    return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
-                                             out_ir);
-  }
-  case TableFilterType::CONJUNCTION_OR: {
-    auto &f = filter.Cast<ConjunctionOrFilter>();
-    vector<string> children;
-    children.reserve(f.child_filters.size());
-    for (auto &child : f.child_filters) {
-      string child_ir;
-      if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *child, child_ir)) {
-        return false;
-      }
-      children.push_back(std::move(child_ir));
-    }
-    return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::OR, children,
-                                             out_ir);
-  }
-  case TableFilterType::EXPRESSION_FILTER: {
-    auto &f = filter.Cast<ExpressionFilter>();
-    if (!f.expr) {
-      return false;
-    }
-    return build_from_expr(*f.expr, out_ir);
-  }
-  default:
-    return false;
-  }
+  const auto &expression_filter =
+      ExpressionFilter::GetExpressionFilter(filter, "Lance filter pushdown");
+  return expression_filter.expr &&
+         build_from_expr(*expression_filter.expr, out_ir);
 }
 
 LanceFilterIRBuildResult
 ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
                         const vector<LogicalType> &types) {
-  LanceFilterIRBuildResult empty_result;
-  if (get.table_filters.filters.empty()) {
-    return empty_result;
-  }
-  idx_t max_col_id = 0;
-  for (auto &it : get.table_filters.filters) {
-    auto col_id = NumericCast<idx_t>(it.first);
-    if (col_id >= names.size() || col_id >= types.size()) {
-      LanceFilterIRBuildResult oob_result;
-      oob_result.all_filters_pushed = false;
-      oob_result.all_prefilterable_filters_pushed = false;
-      return oob_result;
-    }
-    max_col_id = MaxValue(max_col_id, col_id);
-  }
-  vector<column_t> column_ids;
-  column_ids.reserve(max_col_id + 1);
-  for (idx_t i = 0; i <= max_col_id; i++) {
-    column_ids.push_back(NumericCast<column_t>(i));
-  }
   vector<idx_t> projection_ids;
-  TableFunctionInitInput probe_input(get.bind_data.get(), std::move(column_ids),
+  TableFunctionInitInput probe_input(get.bind_data.get(), get.GetColumnIds(),
                                      projection_ids, &get.table_filters);
   return BuildLanceTableFilterIRParts(names, types, probe_input, false);
 }
@@ -544,20 +469,15 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const TableFunctionInitInput &input, bool exclude_computed_columns) {
   LanceFilterIRBuildResult result;
-  if (!input.filters || input.filters->filters.empty()) {
+  if (!input.filters) {
     return result;
   }
 
-  result.parts.reserve(input.filters->filters.size());
+  result.parts.reserve(input.filters->FilterCount());
 
-  for (auto &it : input.filters->filters) {
-    auto scan_col_idx = it.first;
-    if (!it.second) {
-      result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
-      continue;
-    }
-    auto &filter = *it.second;
+  for (auto &it : *input.filters) {
+    auto scan_col_idx = it.GetIndex();
+    auto &filter = it.Filter();
 
     if (scan_col_idx >= input.column_ids.size()) {
       result.all_filters_pushed = false;
@@ -587,12 +507,54 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
       continue;
     }
     string filter_ir;
-    if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, filter, filter_ir)) {
+    if (!TryBuildLanceTableFilterIRExpr({col_ref_ir}, filter, filter_ir)) {
       result.all_filters_pushed = false;
       result.all_prefilterable_filters_pushed = false;
       continue;
     }
 
+    result.parts.push_back(std::move(filter_ir));
+  }
+
+  for (const auto &filter : input.filters->GetMultiColumnFilters()) {
+    const auto &expression_filter = ExpressionFilter::GetExpressionFilter(
+        *filter, "Lance multi-column pushdown");
+    vector<string> column_refs;
+    bool supported = true;
+    bool computed = false;
+    for (auto projection : expression_filter.column_indexes) {
+      if (projection >= input.column_ids.size()) {
+        supported = false;
+        break;
+      }
+      auto column_id = input.column_ids[projection];
+      if (column_id >= names.size() || column_id >= types.size()) {
+        supported = false;
+        break;
+      }
+      if (exclude_computed_columns &&
+          IsComputedSearchColumn(names[column_id])) {
+        computed = true;
+        supported = false;
+        break;
+      }
+      string column_ref;
+      if (!LanceFilterIRSupportsLogicalType(types[column_id]) ||
+          !TryEncodeLanceFilterIRColumnRef(names[column_id], column_ref)) {
+        supported = false;
+        break;
+      }
+      column_refs.push_back(std::move(column_ref));
+    }
+    string filter_ir;
+    if (!supported ||
+        !TryBuildLanceTableFilterIRExpr(column_refs, *filter, filter_ir)) {
+      result.all_filters_pushed = false;
+      if (!computed) {
+        result.all_prefilterable_filters_pushed = false;
+      }
+      continue;
+    }
     result.parts.push_back(std::move(filter_ir));
   }
 
@@ -613,19 +575,19 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
 
   build_segments = [&](const Expression &node, vector<string> &out_segments,
                        LogicalType &out_leaf_type) -> bool {
-    if (node.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+    if (node.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
       auto &colref = node.Cast<BoundColumnRefExpression>();
-      if (colref.depth != 0) {
+      if (colref.Depth() != 0) {
         return false;
       }
-      if (colref.binding.table_index != get.table_index) {
+      if (colref.Binding().table_index != get.table_index) {
         return false;
       }
       auto &column_ids = get.GetColumnIds();
-      if (colref.binding.column_index >= column_ids.size()) {
+      if (colref.Binding().column_index >= column_ids.size()) {
         return false;
       }
-      auto &col_index = column_ids[colref.binding.column_index];
+      auto &col_index = column_ids[colref.Binding().column_index];
       if (col_index.IsVirtualColumn()) {
         return false;
       }
@@ -673,19 +635,20 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
           return false;
         }
         out_segments.push_back(
-            StructType::GetChildName(out_leaf_type, child_idx));
+            StructType::GetChildName(out_leaf_type, child_idx)
+                .GetIdentifierName());
         out_leaf_type = StructType::GetChildType(out_leaf_type, child_idx);
       }
       return true;
     }
 
-    if (node.expression_class == ExpressionClass::BOUND_REF) {
+    if (node.GetExpressionClass() == ExpressionClass::BOUND_REF) {
       auto &ref = node.Cast<BoundReferenceExpression>();
       auto &column_ids = get.GetColumnIds();
-      if (ref.index >= column_ids.size()) {
+      if (ref.Index() >= column_ids.size()) {
         return false;
       }
-      auto &col_index = column_ids[ref.index];
+      auto &col_index = column_ids[ref.Index()];
       if (col_index.IsVirtualColumn()) {
         return false;
       }
@@ -733,50 +696,54 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
           return false;
         }
         out_segments.push_back(
-            StructType::GetChildName(out_leaf_type, child_idx));
+            StructType::GetChildName(out_leaf_type, child_idx)
+                .GetIdentifierName());
         out_leaf_type = StructType::GetChildType(out_leaf_type, child_idx);
       }
       return true;
     }
 
-    if (node.expression_class == ExpressionClass::BOUND_FUNCTION) {
+    if (node.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
       auto &func = node.Cast<BoundFunctionExpression>();
-      if (func.function.name != "struct_extract" &&
-          func.function.name != "struct_extract_at") {
+      if (func.Function().GetName().GetIdentifierName() != "struct_extract" &&
+          func.Function().GetName().GetIdentifierName() !=
+              "struct_extract_at") {
         return false;
       }
-      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
+      if (func.GetChildren().size() != 2 || !func.GetChildren()[0] ||
+          !func.GetChildren()[1]) {
         return false;
       }
 
       vector<string> base_segments;
       LogicalType base_type;
-      if (!build_segments(*func.children[0], base_segments, base_type)) {
+      if (!build_segments(*func.GetChildren()[0], base_segments, base_type)) {
         return false;
       }
       if (base_type.id() != LogicalTypeId::STRUCT) {
         return false;
       }
 
-      if (func.children[1]->expression_class !=
+      if (func.GetChildren()[1]->GetExpressionClass() !=
           ExpressionClass::BOUND_CONSTANT) {
         return false;
       }
-      auto &c = func.children[1]->Cast<BoundConstantExpression>();
-      if (c.value.IsNull()) {
+      auto &c = func.GetChildren()[1]->Cast<BoundConstantExpression>();
+      if (c.GetValue().IsNull()) {
         return false;
       }
 
       idx_t child_idx = 0;
       string child_name;
-      if (func.function.name == "struct_extract") {
-        if (c.value.type().id() != LogicalTypeId::VARCHAR) {
+      if (func.Function().GetName().GetIdentifierName() == "struct_extract") {
+        if (c.GetValue().type().id() != LogicalTypeId::VARCHAR) {
           return false;
         }
-        child_name = c.value.GetValue<string>();
+        child_name = c.GetValue().GetValue<string>();
         bool found = false;
         for (idx_t i = 0; i < StructType::GetChildCount(base_type); i++) {
-          if (StructType::GetChildName(base_type, i) == child_name) {
+          if (StructType::GetChildName(base_type, i).GetIdentifierName() ==
+              child_name) {
             child_idx = i;
             found = true;
             break;
@@ -787,8 +754,9 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
         }
       } else {
         try {
-          auto one_based =
-              c.value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+          auto one_based = c.GetValue()
+                               .DefaultCastAs(LogicalType::BIGINT)
+                               .GetValue<int64_t>();
           if (one_based <= 0) {
             return false;
           }
@@ -799,7 +767,8 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
         if (child_idx >= StructType::GetChildCount(base_type)) {
           return false;
         }
-        child_name = StructType::GetChildName(base_type, child_idx);
+        child_name =
+            StructType::GetChildName(base_type, child_idx).GetIdentifierName();
         if (child_name.empty()) {
           // Fallback: for unnamed structs, the name can be empty; encode a
           // stable segment anyway by using the 1-based index.
@@ -836,335 +805,55 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const vector<LogicalType> &types,
                                bool exclude_computed_columns,
                                const Expression &expr, string &out_ir) {
-  switch (expr.expression_class) {
-  case ExpressionClass::BOUND_COLUMN_REF:
-  case ExpressionClass::BOUND_REF:
-    return TryBuildLanceExprColumnRefIR(get, names, types,
-                                        exclude_computed_columns, expr, out_ir);
-  case ExpressionClass::BOUND_FUNCTION: {
-    auto &func = expr.Cast<BoundFunctionExpression>();
-    if (func.function.name == "struct_extract" ||
-        func.function.name == "struct_extract_at") {
-      return TryBuildLanceExprColumnRefIR(
-          get, names, types, exclude_computed_columns, expr, out_ir);
-    }
-
-    if (func.function.name == "lower" || func.function.name == "upper") {
-      if (func.children.size() != 1 || !func.children[0]) {
-        return false;
-      }
-      string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
-                                     *func.children[0], input_ir)) {
-        return false;
-      }
-      vector<string> args;
-      args.push_back(std::move(input_ir));
-      return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
-                                                  out_ir);
-    }
-
-    if (func.function.name == "starts_with" ||
-        func.function.name == "ends_with" || func.function.name == "contains") {
-      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
-        return false;
-      }
-      string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
-                                     *func.children[0], input_ir)) {
-        return false;
-      }
-
-      string needle_value;
-      if (!TryGetNonNullVarcharConstant(*func.children[1], needle_value)) {
-        return false;
-      }
-      string needle_ir;
-      if (!TryEncodeLanceFilterIRLiteral(Value(needle_value), needle_ir)) {
-        return false;
-      }
-
-      vector<string> args;
-      args.push_back(std::move(input_ir));
-      args.push_back(std::move(needle_ir));
-      return TryEncodeLanceFilterIRScalarFunction(func.function.name, args,
-                                                  out_ir);
-    }
-
-    string containment_name;
-    if (TryGetLanceContainmentFunctionName(func.function.name,
-                                           containment_name)) {
-      if (func.children.size() != 2 || !func.children[0] || !func.children[1]) {
-        return false;
-      }
-      string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
-                                     *func.children[0], input_ir)) {
-        return false;
-      }
-
-      Value needle_value;
-      if (!TryGetNonNullListConstant(*func.children[1], needle_value)) {
-        return false;
-      }
-      string needle_ir;
-      if (!TryEncodeLanceFilterIRListLiteral(needle_value, needle_ir)) {
-        return false;
-      }
-
-      vector<string> args;
-      args.push_back(std::move(input_ir));
-      args.push_back(std::move(needle_ir));
-      return TryEncodeLanceFilterIRScalarFunction(containment_name, args,
-                                                  out_ir);
-    }
-
-    if (func.function.name == "regexp_matches" ||
-        func.function.name == "regexp_full_match") {
-      if (func.children.size() != 2 && func.children.size() != 3) {
-        return false;
-      }
-      for (auto &child : func.children) {
-        if (!child) {
-          return false;
-        }
-      }
-
-      string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns,
-                                     *func.children[0], input_ir)) {
-        return false;
-      }
-
-      string pattern_value;
-      if (!TryGetNonNullVarcharConstant(*func.children[1], pattern_value)) {
-        return false;
-      }
-      string pattern_ir;
-      if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
-        return false;
-      }
-
-      bool has_flags = func.children.size() == 3;
-      string flags_ir;
-      if (has_flags) {
-        string flags_value;
-        if (!TryGetNonNullVarcharConstant(*func.children[2], flags_value)) {
-          return false;
-        }
-        if (!TryEncodeLanceFilterIRLiteral(Value(flags_value), flags_ir)) {
-          return false;
-        }
-      }
-
-      uint8_t mode = func.function.name == "regexp_full_match"
-                         ? LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH
-                         : LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH;
-      return TryEncodeLanceFilterIRRegexp(mode, has_flags, input_ir, pattern_ir,
-                                          flags_ir, out_ir);
-    }
-
-    bool case_insensitive = false;
-    bool has_escape = false;
-    if (func.function.name == "~~") {
-      case_insensitive = false;
-      has_escape = false;
-    } else if (func.function.name == "~~*") {
-      case_insensitive = true;
-      has_escape = false;
-    } else if (func.function.name == "like_escape") {
-      case_insensitive = false;
-      has_escape = true;
-    } else if (func.function.name == "ilike_escape") {
-      case_insensitive = true;
-      has_escape = true;
-    } else {
+  if (BoundCastExpression::IsCast(expr)) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (BoundCastExpression::IsTryCast(cast)) {
       return false;
     }
-
-    if ((has_escape && func.children.size() != 3) ||
-        (!has_escape && func.children.size() != 2)) {
+    if (cast.GetChildren()[0]->GetExpressionClass() !=
+        ExpressionClass::BOUND_CONSTANT) {
       return false;
     }
-    for (auto &child : func.children) {
-      if (!child) {
-        return false;
-      }
-    }
-
-    string input_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *func.children[0], input_ir)) {
-      return false;
-    }
-
-    string pattern_value;
-    if (!TryGetNonNullVarcharConstant(*func.children[1], pattern_value)) {
-      return false;
-    }
-    string pattern_ir;
-    if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
-      return false;
-    }
-
-    uint8_t escape_char = 0;
-    if (has_escape) {
-      string escape_value;
-      if (!TryGetNonNullVarcharConstant(*func.children[2], escape_value)) {
-        return false;
-      }
-      if (escape_value.size() != 1) {
-        return false;
-      }
-      escape_char = static_cast<uint8_t>(escape_value[0]);
-      if (escape_char != static_cast<uint8_t>('\\')) {
-        return false;
-      }
-    }
-
-    return TryEncodeLanceFilterIRLike(case_insensitive, has_escape, escape_char,
-                                      input_ir, pattern_ir, out_ir);
-  }
-  case ExpressionClass::BOUND_CONSTANT: {
-    auto &c = expr.Cast<BoundConstantExpression>();
-    return TryEncodeLanceFilterIRLiteral(c.value, out_ir);
-  }
-  case ExpressionClass::BOUND_CAST: {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (cast.try_cast) {
-      return false;
-    }
-    if (cast.child->expression_class != ExpressionClass::BOUND_CONSTANT) {
-      return false;
-    }
-    auto &c = cast.child->Cast<BoundConstantExpression>();
+    auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
     try {
-      auto casted = c.value.DefaultCastAs(cast.return_type);
+      auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
       return TryEncodeLanceFilterIRLiteral(casted, out_ir);
     } catch (...) {
       return false;
     }
   }
-  case ExpressionClass::BOUND_COMPARISON: {
-    auto &cmp = expr.Cast<BoundComparisonExpression>();
+  if (BoundComparisonExpression::IsComparison(expr)) {
+    auto &cmp = expr.Cast<BoundFunctionExpression>();
     uint8_t op = 0;
-    if (!TryEncodeLanceFilterIRComparisonOp(cmp.type, op)) {
+    if (!TryEncodeLanceFilterIRComparisonOp(cmp.GetExpressionType(), op)) {
       return false;
     }
     string lhs_ir, rhs_ir;
     if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *cmp.left, lhs_ir) ||
+                                   *cmp.GetChildren()[0], lhs_ir) ||
         !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *cmp.right, rhs_ir)) {
+                                   *cmp.GetChildren()[1], rhs_ir)) {
       return false;
     }
     return TryEncodeLanceFilterIRComparison(op, lhs_ir, rhs_ir, out_ir);
   }
-  case ExpressionClass::BOUND_CONJUNCTION: {
-    auto &conj = expr.Cast<BoundConjunctionExpression>();
-    LanceFilterIRTag tag;
-    if (conj.type == ExpressionType::CONJUNCTION_AND) {
-      tag = LanceFilterIRTag::AND;
-    } else if (conj.type == ExpressionType::CONJUNCTION_OR) {
-      tag = LanceFilterIRTag::OR;
-    } else {
-      return false;
-    }
-    vector<string> children;
-    children.reserve(conj.children.size());
-    for (auto &child : conj.children) {
-      string child_ir;
-      if (!TryBuildLanceExprFilterIR(
-              get, names, types, exclude_computed_columns, *child, child_ir)) {
-        return false;
-      }
-      children.push_back(std::move(child_ir));
-    }
-    return TryEncodeLanceFilterIRConjunction(tag, children, out_ir);
-  }
-  case ExpressionClass::BOUND_OPERATOR: {
-    auto &op = expr.Cast<BoundOperatorExpression>();
-    if (op.type == ExpressionType::OPERATOR_NOT) {
-      if (op.children.size() != 1) {
-        return false;
-      }
-      string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     child_ir)) {
-        return false;
-      }
-      return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir,
-                                         out_ir);
-    }
-    if (op.type == ExpressionType::OPERATOR_IS_NULL ||
-        op.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-      if (op.children.size() != 1) {
-        return false;
-      }
-      string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     child_ir)) {
-        return false;
-      }
-      return TryEncodeLanceFilterIRUnary(
-          op.type == ExpressionType::OPERATOR_IS_NULL
-              ? LanceFilterIRTag::IS_NULL
-              : LanceFilterIRTag::IS_NOT_NULL,
-          child_ir, out_ir);
-    }
-    if (op.type == ExpressionType::COMPARE_IN ||
-        op.type == ExpressionType::COMPARE_NOT_IN) {
-      if (op.children.size() < 2) {
-        return false;
-      }
-      string lhs_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
-                                     exclude_computed_columns, *op.children[0],
-                                     lhs_ir)) {
-        return false;
-      }
-      vector<string> values;
-      values.reserve(op.children.size() - 1);
-      for (idx_t i = 1; i < op.children.size(); i++) {
-        if (op.children[i]->expression_class !=
-            ExpressionClass::BOUND_CONSTANT) {
-          return false;
-        }
-        auto &c = op.children[i]->Cast<BoundConstantExpression>();
-        string lit_ir;
-        if (!TryEncodeLanceFilterIRLiteral(c.value, lit_ir)) {
-          return false;
-        }
-        values.push_back(std::move(lit_ir));
-      }
-      return TryEncodeLanceFilterIRInList(
-          op.type == ExpressionType::COMPARE_NOT_IN, lhs_ir, values, out_ir);
-    }
-    return false;
-  }
-  case ExpressionClass::BOUND_BETWEEN: {
-    auto &between = expr.Cast<BoundBetweenExpression>();
+  if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+    auto &between = expr.Cast<BoundFunctionExpression>();
     uint8_t lower_op = 0;
     uint8_t upper_op = 0;
-    if (!TryEncodeLanceFilterIRComparisonOp(between.LowerComparisonType(),
-                                            lower_op) ||
-        !TryEncodeLanceFilterIRComparisonOp(between.UpperComparisonType(),
-                                            upper_op)) {
+    if (!TryEncodeLanceFilterIRComparisonOp(
+            BoundBetweenExpression::LowerComparisonType(between), lower_op) ||
+        !TryEncodeLanceFilterIRComparisonOp(
+            BoundBetweenExpression::UpperComparisonType(between), upper_op)) {
       return false;
     }
     string input_ir, lower_ir, upper_ir;
     if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *between.input, input_ir) ||
+                                   *between.GetChildren()[0], input_ir) ||
         !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *between.lower, lower_ir) ||
+                                   *between.GetChildren()[1], lower_ir) ||
         !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
-                                   *between.upper, upper_ir)) {
+                                   *between.GetChildren()[2], upper_ir)) {
       return false;
     }
     string lower_cmp_ir;
@@ -1183,55 +872,301 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     return TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
                                              out_ir);
   }
+  switch (expr.GetExpressionClass()) {
+  case ExpressionClass::BOUND_COLUMN_REF:
+  case ExpressionClass::BOUND_REF:
+    return TryBuildLanceExprColumnRefIR(get, names, types,
+                                        exclude_computed_columns, expr, out_ir);
+  case ExpressionClass::BOUND_FUNCTION: {
+    auto &func = expr.Cast<BoundFunctionExpression>();
+    if (func.Function().GetName().GetIdentifierName() == "struct_extract" ||
+        func.Function().GetName().GetIdentifierName() == "struct_extract_at") {
+      return TryBuildLanceExprColumnRefIR(
+          get, names, types, exclude_computed_columns, expr, out_ir);
+    }
+
+    if (func.Function().GetName().GetIdentifierName() == "lower" ||
+        func.Function().GetName().GetIdentifierName() == "upper") {
+      if (func.GetChildren().size() != 1 || !func.GetChildren()[0]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.GetChildren()[0], input_ir)) {
+        return false;
+      }
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      return TryEncodeLanceFilterIRScalarFunction(
+          func.Function().GetName().GetIdentifierName(), args, out_ir);
+    }
+
+    if (func.Function().GetName().GetIdentifierName() == "starts_with" ||
+        func.Function().GetName().GetIdentifierName() == "ends_with" ||
+        func.Function().GetName().GetIdentifierName() == "contains") {
+      if (func.GetChildren().size() != 2 || !func.GetChildren()[0] ||
+          !func.GetChildren()[1]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.GetChildren()[0], input_ir)) {
+        return false;
+      }
+
+      string needle_value;
+      if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1], needle_value)) {
+        return false;
+      }
+      string needle_ir;
+      if (!TryEncodeLanceFilterIRLiteral(Value(needle_value), needle_ir)) {
+        return false;
+      }
+
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      args.push_back(std::move(needle_ir));
+      return TryEncodeLanceFilterIRScalarFunction(
+          func.Function().GetName().GetIdentifierName(), args, out_ir);
+    }
+
+    string containment_name;
+    if (TryGetLanceContainmentFunctionName(
+            func.Function().GetName().GetIdentifierName(), containment_name)) {
+      if (func.GetChildren().size() != 2 || !func.GetChildren()[0] ||
+          !func.GetChildren()[1]) {
+        return false;
+      }
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.GetChildren()[0], input_ir)) {
+        return false;
+      }
+
+      Value needle_value;
+      if (!TryGetNonNullListConstant(*func.GetChildren()[1], needle_value)) {
+        return false;
+      }
+      string needle_ir;
+      if (!TryEncodeLanceFilterIRListLiteral(needle_value, needle_ir)) {
+        return false;
+      }
+
+      vector<string> args;
+      args.push_back(std::move(input_ir));
+      args.push_back(std::move(needle_ir));
+      return TryEncodeLanceFilterIRScalarFunction(containment_name, args,
+                                                  out_ir);
+    }
+
+    if (func.Function().GetName().GetIdentifierName() == "regexp_matches" ||
+        func.Function().GetName().GetIdentifierName() == "regexp_full_match") {
+      if (func.GetChildren().size() != 2 && func.GetChildren().size() != 3) {
+        return false;
+      }
+      for (auto &child : func.GetChildren()) {
+        if (!child) {
+          return false;
+        }
+      }
+
+      string input_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *func.GetChildren()[0], input_ir)) {
+        return false;
+      }
+
+      string pattern_value;
+      if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1],
+                                        pattern_value)) {
+        return false;
+      }
+      string pattern_ir;
+      if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
+        return false;
+      }
+
+      bool has_flags = func.GetChildren().size() == 3;
+      string flags_ir;
+      if (has_flags) {
+        string flags_value;
+        if (!TryGetNonNullVarcharConstant(*func.GetChildren()[2],
+                                          flags_value)) {
+          return false;
+        }
+        if (!TryEncodeLanceFilterIRLiteral(Value(flags_value), flags_ir)) {
+          return false;
+        }
+      }
+
+      uint8_t mode =
+          func.Function().GetName().GetIdentifierName() == "regexp_full_match"
+              ? LANCE_FILTER_IR_REGEXP_MODE_FULL_MATCH
+              : LANCE_FILTER_IR_REGEXP_MODE_PARTIAL_MATCH;
+      return TryEncodeLanceFilterIRRegexp(mode, has_flags, input_ir, pattern_ir,
+                                          flags_ir, out_ir);
+    }
+
+    bool case_insensitive = false;
+    bool has_escape = false;
+    if (func.Function().GetName().GetIdentifierName() == "~~") {
+      case_insensitive = false;
+      has_escape = false;
+    } else if (func.Function().GetName().GetIdentifierName() == "~~*") {
+      case_insensitive = true;
+      has_escape = false;
+    } else if (func.Function().GetName().GetIdentifierName() == "like_escape") {
+      case_insensitive = false;
+      has_escape = true;
+    } else if (func.Function().GetName().GetIdentifierName() ==
+               "ilike_escape") {
+      case_insensitive = true;
+      has_escape = true;
+    } else {
+      return false;
+    }
+
+    if ((has_escape && func.GetChildren().size() != 3) ||
+        (!has_escape && func.GetChildren().size() != 2)) {
+      return false;
+    }
+    for (auto &child : func.GetChildren()) {
+      if (!child) {
+        return false;
+      }
+    }
+
+    string input_ir;
+    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+                                   *func.GetChildren()[0], input_ir)) {
+      return false;
+    }
+
+    string pattern_value;
+    if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1], pattern_value)) {
+      return false;
+    }
+    string pattern_ir;
+    if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {
+      return false;
+    }
+
+    uint8_t escape_char = 0;
+    if (has_escape) {
+      string escape_value;
+      if (!TryGetNonNullVarcharConstant(*func.GetChildren()[2], escape_value)) {
+        return false;
+      }
+      if (escape_value.size() != 1) {
+        return false;
+      }
+      escape_char = static_cast<uint8_t>(escape_value[0]);
+      if (escape_char != static_cast<uint8_t>('\\')) {
+        return false;
+      }
+    }
+
+    return TryEncodeLanceFilterIRLike(case_insensitive, has_escape, escape_char,
+                                      input_ir, pattern_ir, out_ir);
+  }
+  case ExpressionClass::BOUND_CONSTANT: {
+    auto &c = expr.Cast<BoundConstantExpression>();
+    return TryEncodeLanceFilterIRLiteral(c.GetValue(), out_ir);
+  }
+
+  case ExpressionClass::BOUND_CONJUNCTION: {
+    auto &conj = expr.Cast<BoundConjunctionExpression>();
+    LanceFilterIRTag tag;
+    if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+      tag = LanceFilterIRTag::AND;
+    } else if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_OR) {
+      tag = LanceFilterIRTag::OR;
+    } else {
+      return false;
+    }
+    vector<string> children;
+    children.reserve(conj.GetChildren().size());
+    for (auto &child : conj.GetChildren()) {
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(
+              get, names, types, exclude_computed_columns, *child, child_ir)) {
+        return false;
+      }
+      children.push_back(std::move(child_ir));
+    }
+    return TryEncodeLanceFilterIRConjunction(tag, children, out_ir);
+  }
+  case ExpressionClass::BOUND_OPERATOR: {
+    auto &op = expr.Cast<BoundOperatorExpression>();
+    if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
+      if (op.GetChildren().size() != 1) {
+        return false;
+      }
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *op.GetChildren()[0], child_ir)) {
+        return false;
+      }
+      return TryEncodeLanceFilterIRUnary(LanceFilterIRTag::NOT, child_ir,
+                                         out_ir);
+    }
+    if (op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+        op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+      if (op.GetChildren().size() != 1) {
+        return false;
+      }
+      string child_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *op.GetChildren()[0], child_ir)) {
+        return false;
+      }
+      return TryEncodeLanceFilterIRUnary(
+          op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL
+              ? LanceFilterIRTag::IS_NULL
+              : LanceFilterIRTag::IS_NOT_NULL,
+          child_ir, out_ir);
+    }
+    if (op.GetExpressionType() == ExpressionType::COMPARE_IN ||
+        op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) {
+      if (op.GetChildren().size() < 2) {
+        return false;
+      }
+      string lhs_ir;
+      if (!TryBuildLanceExprFilterIR(get, names, types,
+                                     exclude_computed_columns,
+                                     *op.GetChildren()[0], lhs_ir)) {
+        return false;
+      }
+      vector<string> values;
+      values.reserve(op.GetChildren().size() - 1);
+      for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+        if (op.GetChildren()[i]->GetExpressionClass() !=
+            ExpressionClass::BOUND_CONSTANT) {
+          return false;
+        }
+        auto &c = op.GetChildren()[i]->Cast<BoundConstantExpression>();
+        string lit_ir;
+        if (!TryEncodeLanceFilterIRLiteral(c.GetValue(), lit_ir)) {
+          return false;
+        }
+        values.push_back(std::move(lit_ir));
+      }
+      return TryEncodeLanceFilterIRInList(op.GetExpressionType() ==
+                                              ExpressionType::COMPARE_NOT_IN,
+                                          lhs_ir, values, out_ir);
+    }
+    return false;
+  }
+
   default:
     return false;
   }
-}
-
-bool TryBuildLanceTableFilterIRParts(const vector<string> &names,
-                                     const vector<LogicalType> &types,
-                                     const TableFilterSet &filters,
-                                     vector<string> &out_parts) {
-  out_parts.clear();
-  out_parts.reserve(filters.filters.size());
-  for (auto &entry : filters.filters) {
-    auto col_id = entry.first;
-    auto *filter = entry.second.get();
-    if (!filter) {
-      continue;
-    }
-    if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-        col_id == COLUMN_IDENTIFIER_EMPTY) {
-      return false;
-    }
-    if (col_id >= names.size() || col_id >= types.size()) {
-      return false;
-    }
-    if (!LanceFilterIRSupportsLogicalType(types[col_id])) {
-      return false;
-    }
-    string col_ref_ir;
-    if (!TryEncodeLanceFilterIRColumnRef(names[col_id], col_ref_ir)) {
-      return false;
-    }
-    string part_ir;
-    if (!TryBuildLanceTableFilterIRExpr(col_ref_ir, *filter, part_ir)) {
-      return false;
-    }
-    out_parts.push_back(std::move(part_ir));
-  }
-  return true;
-}
-
-bool TryBuildLanceTableFilterIRMessage(const vector<string> &names,
-                                       const vector<LogicalType> &types,
-                                       const TableFilterSet &filters,
-                                       string &out_msg) {
-  vector<string> parts;
-  if (!TryBuildLanceTableFilterIRParts(names, types, filters, parts)) {
-    return false;
-  }
-  return TryEncodeLanceFilterIRMessage(parts, out_msg);
 }
 
 bool TryEncodeLanceFilterIRMessage(const vector<string> &parts,

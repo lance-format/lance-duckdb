@@ -1,6 +1,6 @@
 #pragma once
 
-#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 
 #include <string>
 #include <vector>
@@ -16,10 +16,10 @@ namespace duckdb {
 // shape at the reader boundary:
 //
 //   * `LanceCoerceArrowSchemaForDuckDB` — in-place rewrite of the Arrow schema
-//     so DuckDB's type mapper accepts it. Returns top-level columns whose
-//     storage type was coerced (empty if none). Metadata-only JSON
-//     normalization is excluded so write paths can validate the columns they
-//     actually modify.
+//     so DuckDB's type mapper accepts it. Returns the top-level column names
+//     whose declared type had to be coerced (empty if none). Callers should
+//     store this list on the catalog entry so write paths can refuse to
+//     silently re-encode.
 //
 //   * `LanceCoerceArrowArrayForDuckDB` — per-batch mirror: rewrite buffers of
 //     the same coerced fields so values DuckDB reads match the coerced schema.
@@ -36,12 +36,29 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema);
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
                                     ArrowArray *array);
 
-std::vector<std::string>
-LanceGetJsonExtensionColumnNames(const ArrowSchema *schema);
+// Consumes the opaque Rust batch, including when export or coercion throws.
+// The schema retains its original formats for column mapping. Arrays have
+// already been widened for DuckDB; callers that consume the schema must coerce
+// it separately. Keep array alive while DuckDB vectors reference its buffers.
+struct LanceArrowBatch {
+  explicit LanceArrowBatch(
+      void *batch,
+      const char *export_error =
+          "Failed to export Lance RecordBatch to Arrow C Data Interface");
+  LanceArrowBatch(const LanceArrowBatch &) = delete;
+  LanceArrowBatch &operator=(const LanceArrowBatch &) = delete;
+
+  ArrowSchemaWrapper schema;
+  shared_ptr<ArrowArrayWrapper> array;
+};
 
 // Quick predicate — true when the schema contains any type that the coercion
 // helpers above would rewrite.
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema);
+
+// True when this field, or any nested child, carries a Lance blob marker
+// (Blob v1 or Blob v2). Ordinary Arrow binary fields do not match.
+bool LanceArrowFieldContainsBlob(const ArrowSchema &field);
 
 // DuckDB's Arrow exporter names list child fields `l`; Arrow (and therefore
 // Lance, pyarrow and DataFusion) call them `item`. Lance persists the name, and

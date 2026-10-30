@@ -8,6 +8,7 @@
 #include "duckdb/function/table_function.hpp"
 
 #include <cstdint>
+#include <unordered_set>
 
 namespace duckdb {
 class TableCatalogEntry;
@@ -25,6 +26,10 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema scan_arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<bool> blob_columns;
+  // Internal scan columns whose values are known to be irrelevant to the
+  // consumer. Emit typed NULLs without adding them to the Lance read.
+  unordered_set<column_t> forced_null_columns;
   vector<string> lance_pushed_filter_ir_parts;
   vector<string> duckdb_pushed_filter_sql_parts;
   optional_ptr<TableCatalogEntry> table_entry = nullptr;

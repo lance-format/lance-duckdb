@@ -1,6 +1,6 @@
 ---
 name: lance-duckdb-update-lance-dependency
-description: Update lance-duckdb to a specific Lance release or tag. Use when bumping Lance Rust dependencies in the lance-duckdb repository, including Cargo.toml, Cargo.lock, validation, branch creation, commit, push, and PR creation when requested.
+description: Update the upstream Lance Rust dependency to a specific release or tag. Use when bumping Lance Rust dependencies in the lance-duckdb repository, including Cargo.toml, Cargo.lock, validation, branch creation, commit, push, and PR creation when requested.
 ---
 
 # lance-duckdb Update Lance Dependency
@@ -8,6 +8,9 @@ description: Update lance-duckdb to a specific Lance release or tag. Use when bu
 ## Scope
 
 Use this skill in the `lance-format/lance-duckdb` repository when updating Lance Rust dependencies to a specific Lance version or tag.
+
+This updates an upstream dependency. lance-duckdb has no independent release
+version; do not bump its internal Cargo package version or create release tags.
 
 Inputs can be a version (`7.2.0-beta.1`), a tag (`v7.2.0-beta.1`), a tag ref (`refs/tags/v7.2.0-beta.1`), or `latest`.
 
@@ -81,7 +84,7 @@ Inputs can be a version (`7.2.0-beta.1`), a tag (`v7.2.0-beta.1`), a tag ref (`r
 This workflow is intentionally manual. When this skill is used from GitHub Actions, `TAG`, `GH_TOKEN`, and `GITHUB_TOKEN` may already be set. Resolve `latest` first when `TAG` is empty. Once an explicit tag or version is known, use:
 
 ```bash
-python3 ci/update_lance_dependency.py "$TAG" --github-output "$GITHUB_OUTPUT"
+python3 ci/update_lance_dependency.py "$TAG"
 ```
 
-Then use the emitted `branch_name`, `commit_message`, and `pr_title` values for branch, commit, and PR creation.
+Then read the JSON output and use its `branch_name`, `commit_message`, and `pr_title` values for branch, commit, and PR creation.

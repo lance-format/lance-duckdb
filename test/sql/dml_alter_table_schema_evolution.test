@@ -5,10 +5,10 @@
 require lance
 
 statement ok
-COPY (SELECT 1::BIGINT AS id) TO 'test/.tmp/alter_table_schema_evolution_seed.lance' (FORMAT lance, mode 'overwrite');
+COPY (SELECT 1::BIGINT AS id) TO '{TEST_DIR}/alter_table_schema_evolution_seed.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp' AS ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.alter_table_schema_evolution AS
@@ -66,10 +66,10 @@ WHERE database_name = 'ns'
 col comment
 
 statement ok
-CREATE INDEX age_idx ON 'test/.tmp/alter_table_schema_evolution.lance' (age) USING BTREE;
+CREATE INDEX age_idx ON '{TEST_DIR}/alter_table_schema_evolution.lance' (age) USING BTREE;
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
+SHOW INDEXES ON '{TEST_DIR}/alter_table_schema_evolution.lance';
 ----
 age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
 
@@ -77,7 +77,7 @@ statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution RENAME COLUMN score TO score2;
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
+SHOW INDEXES ON '{TEST_DIR}/alter_table_schema_evolution.lance';
 ----
 age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
 
@@ -117,7 +117,7 @@ ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
 IO Error: Failed to change column type in Lance dataset
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
+SHOW INDEXES ON '{TEST_DIR}/alter_table_schema_evolution.lance';
 ----
 age_idx	<REGEX>:.*	age	<REGEX>:[0-9]+	<REGEX>:.*
 
@@ -128,7 +128,7 @@ statement ok
 ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN age TYPE BIGINT;
 
 query TTTIT
-SHOW INDEXES ON 'test/.tmp/alter_table_schema_evolution.lance';
+SHOW INDEXES ON '{TEST_DIR}/alter_table_schema_evolution.lance';
 ----
 
 query I
@@ -148,6 +148,44 @@ statement error
 SELECT score2 FROM ns.main.alter_table_schema_evolution LIMIT 1;
 ----
 Binder Error:
+
+# Re-discovery and ALTER rebuild must expose the same binding schema.
+statement ok
+ALTER TABLE ns.main.alter_table_schema_evolution ALTER COLUMN const_col SET NOT NULL;
+
+statement ok
+CREATE TEMP TABLE expected_catalog_schema AS
+SELECT column_name, data_type, column_default, is_nullable
+FROM duckdb_columns()
+WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution';
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM expected_catalog_schema
+  EXCEPT ALL
+  SELECT column_name, data_type, column_default, is_nullable
+  FROM duckdb_columns()
+  WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution'
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT column_name, data_type, column_default, is_nullable
+  FROM duckdb_columns()
+  WHERE database_name = 'ns' AND table_name = 'alter_table_schema_evolution'
+  EXCEPT ALL
+  SELECT * FROM expected_catalog_schema
+);
+----
+0
 
 statement ok
 DETACH ns;

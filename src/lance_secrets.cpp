@@ -23,7 +23,7 @@ CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
     if (kv.second.IsNull()) {
       continue;
     }
-    secret->secret_map[kv.first] = Value(kv.second.ToString());
+    secret->secret_map[Identifier(kv.first)] = Value(kv.second.ToString());
   }
 
   auto it = input.options.find("storage_options");
@@ -39,12 +39,12 @@ CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
       if (key.empty()) {
         continue;
       }
-      secret->secret_map[key] = Value(std::move(value));
+      secret->secret_map[Identifier(key)] = Value(std::move(value));
     }
   }
 
   for (auto &kv : secret->secret_map) {
-    if (ShouldRedactLanceStorageOption(kv.first)) {
+    if (ShouldRedactLanceStorageOption(kv.first.GetIdentifierName())) {
       secret->redact_keys.insert(kv.first);
     }
   }
@@ -54,7 +54,7 @@ CreateLanceSecretFromConfig(ClientContext &, CreateSecretInput &input) {
 
 static bool HasSecretType(SecretManager &secret_manager, const string &name) {
   for (auto &t : secret_manager.AllSecretTypes()) {
-    if (StringUtil::CIEquals(t.name, name)) {
+    if (t.name == name) {
       return true;
     }
   }
@@ -150,11 +150,11 @@ void RegisterLanceSecrets(DatabaseInstance &instance) {
   auto register_provider = [&](const string &provider) {
     CreateSecretFunction fun;
     fun.secret_type = "lance";
-    fun.provider = provider;
+    fun.provider = Identifier(provider);
     fun.function = CreateLanceSecretFromConfig;
 
     for (auto &key : storage_option_keys) {
-      fun.named_parameters[key] = LogicalType::VARCHAR;
+      fun.named_parameters[Identifier(key)] = LogicalType::VARCHAR;
     }
 
     // Fallback: accept a MAP for bulk configuration.

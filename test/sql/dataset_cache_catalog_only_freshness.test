@@ -8,20 +8,20 @@ require lance
 # ever binding a scan or planning DML, so entry resolution itself must run
 # the freshness check: when the first access after an external schema or
 # nullability change is catalog-only, the stale entry is replaced through
-# the catalog version chain and the fresh one returned transparently.
+# the metadata cache and the fresh one returned transparently.
 
 statement ok con1
 COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 'test/.tmp/cache_catalog_only.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/cache_catalog_only.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-ATTACH 'test/.tmp' AS cat_reader_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS cat_reader_ns (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/.tmp' AS cat_writer_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS cat_writer_ns (TYPE LANCE);
 
 # The reader discovers the table with s nullable.
 query TTTTTT con1

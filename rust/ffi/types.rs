@@ -10,6 +10,7 @@ use crate::datafusion_stream::DataFusionStream;
 use crate::scanner::{LanceStream, LanceTakeStream};
 
 use super::projection;
+use super::source_resolver::SourceResolutionState;
 
 pub(crate) type SchemaHandle = Arc<Schema>;
 
@@ -17,24 +18,28 @@ pub(crate) struct SessionHandle {
     pub(crate) session: Arc<Session>,
     // Lance does not expose clearing its index cache through Session.
     pub(crate) index_cache: Arc<dyn CacheBackend>,
+    // Derived source sessions share these backends but clear neither on close.
+    pub(crate) metadata_cache: Arc<dyn CacheBackend>,
+    pub(crate) source_resolution: Option<Arc<SourceResolutionState>>,
+    pub(crate) clear_caches_on_close: bool,
 }
 
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,
-    pub(crate) arrow_schema: SchemaHandle,
+    pub(crate) read_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
 }
 
 impl DatasetHandle {
     pub(crate) fn new(dataset: Arc<Dataset>) -> Self {
-        let arrow_schema: Schema = dataset.schema().into();
-        let arrow_schema = Arc::new(arrow_schema);
-        let base_projection = projection::build_base_projection(&arrow_schema);
+        let read_schema: Schema = (&projection::materialized_schema(dataset.schema())).into();
+        let read_schema = Arc::new(read_schema);
+        let base_projection = projection::build_base_projection(&read_schema);
         let fts_projection = projection::build_fts_projection(&base_projection);
         Self {
             dataset,
-            arrow_schema,
+            read_schema,
             base_projection,
             fts_projection,
         }

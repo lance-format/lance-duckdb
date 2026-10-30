@@ -3,6 +3,7 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
+#include "lance_source_resolver.hpp"
 #include "lance_table_entry.hpp"
 
 #include "duckdb/common/types/hash.hpp"
@@ -82,6 +83,26 @@ public:
     revalidated_keys.insert(key);
   }
 
+  void PinForWrite(idx_t query_id, const string &key,
+                   shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      write_datasets.clear();
+      write_query_id = query_id;
+    }
+    write_datasets[key] = std::move(entry);
+  }
+
+  shared_ptr<LanceDatasetCacheEntry> GetPinnedForWrite(idx_t query_id,
+                                                       const string &key) {
+    lock_guard<mutex> guard(lock);
+    if (write_query_id != query_id) {
+      return nullptr;
+    }
+    auto entry = write_datasets.find(key);
+    return entry == write_datasets.end() ? nullptr : entry->second;
+  }
+
   void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
     entries.erase(key);
@@ -96,6 +117,12 @@ public:
     query_misses = 0;
     query_revalidations = 0;
     revalidated_keys.clear();
+    write_datasets.clear();
+  }
+
+  void QueryEnd() override {
+    lock_guard<mutex> guard(lock);
+    write_datasets.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
@@ -111,6 +138,12 @@ private:
   // Keys whose entry has already been revalidated (or freshly opened) during
   // the current statement; cleared in QueryBegin.
   unordered_set<string> revalidated_keys;
+  // Retained independently of the cache map so invalidation cannot change a
+  // write's target generation while other pipelines in the statement read it.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> write_datasets;
+  // QueryBegin/QueryEnd may span a submission expanded into several statements.
+  // DuckDB's active query number distinguishes those statement boundaries.
+  idx_t write_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
   idx_t query_revalidations = 0;
@@ -131,6 +164,22 @@ static shared_ptr<LanceDatasetCacheState>
 GetOrCreateLanceDatasetCacheState(ClientContext &context) {
   return context.registered_state->GetOrCreate<LanceDatasetCacheState>(
       LANCE_DATASET_CACHE_STATE_KEY);
+}
+
+void LancePinDatasetForWrite(ClientContext &context,
+                             const LanceTableEntry &table,
+                             shared_ptr<LanceDatasetCacheEntry> dataset) {
+  GetOrCreateLanceDatasetCacheState(context)->PinForWrite(
+      context.transaction.GetActiveQuery(),
+      LanceBuildDatasetCacheKeyForTable(context, table), std::move(dataset));
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetDatasetPinnedForWrite(ClientContext &context,
+                              const LanceTableEntry &table) {
+  return GetOrCreateLanceDatasetCacheState(context)->GetPinnedForWrite(
+      context.transaction.GetActiveQuery(),
+      LanceBuildDatasetCacheKeyForTable(context, table));
 }
 
 static void AppendCacheKeyPart(string &key, const string &value) {
@@ -211,11 +260,9 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
   return options;
 }
 
-static void *OpenResolvedPathDataset(ClientContext &context,
-                                     const string &open_path,
+static void *OpenResolvedPathDataset(void *session, const string &open_path,
                                      const vector<string> &option_keys,
                                      const vector<string> &option_values) {
-  auto *session = LanceGetSessionHandle(context);
   if (option_keys.empty()) {
     return lance_open_dataset_with_session(open_path.c_str(), session);
   }
@@ -230,12 +277,11 @@ static void *OpenResolvedPathDataset(ClientContext &context,
 }
 
 static void *
-OpenNamespaceDataset(ClientContext &context, const string &endpoint,
+OpenNamespaceDataset(void *session, const string &endpoint,
                      const string &table_id, const string &bearer_token,
                      const string &api_key, const string &delimiter,
                      const string &headers_tsv, string &out_table_uri) {
   out_table_uri.clear();
-  auto *session = LanceGetSessionHandle(context);
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
   const char *api_key_ptr = api_key.empty() ? nullptr : api_key.c_str();
@@ -253,13 +299,12 @@ OpenNamespaceDataset(ClientContext &context, const string &endpoint,
   return dataset;
 }
 
-static void *OpenDirNamespaceDataset(ClientContext &context, const string &root,
+static void *OpenDirNamespaceDataset(void *session, const string &root,
                                      const string &table_id,
                                      const vector<string> &option_keys,
                                      const vector<string> &option_values,
                                      string &out_table_uri) {
   out_table_uri.clear();
-  auto *session = LanceGetSessionHandle(context);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;
@@ -416,8 +461,12 @@ LanceGetOrOpenDatasetEntry(ClientContext &context, const string &path,
   return GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
-        auto *dataset = OpenResolvedPathDataset(context, open_path, option_keys,
-                                                option_values);
+        auto source_resolver = LanceCreateSourceResolver(context);
+        auto *dataset = LanceOpenDatasetWithSourceSession(
+            context, source_resolver, [&](void *session) {
+              return OpenResolvedPathDataset(session, open_path, option_keys,
+                                             option_values);
+            });
         if (!dataset) {
           return shared_ptr<LanceDatasetCacheEntry>();
         }
@@ -448,10 +497,19 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     const char *headers_ptr =
         headers_tsv.empty() ? nullptr : headers_tsv.c_str();
     const char *uri_ptr = nullptr;
-    auto rc = lance_dataset_namespace_checkout_latest_if_stale(
-        dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-        delimiter_ptr, headers_ptr, LanceGetSessionHandle(context),
-        out_new_dataset, &uri_ptr);
+    int32_t rc = 0;
+    // A moved namespace table needs a fresh source registry. Reusing the
+    // cached dataset's registry would mutate state retained by old handles.
+    auto source_resolver = LanceCreateSourceResolver(context);
+    auto *reopened = LanceOpenDatasetWithSourceSession(
+        context, source_resolver, [&](void *session) {
+          rc = lance_dataset_namespace_checkout_latest_if_stale(
+              dataset, endpoint.c_str(), table_id.c_str(), bearer_ptr,
+              api_key_ptr, delimiter_ptr, headers_ptr, session, out_new_dataset,
+              &uri_ptr);
+          return rc == 0 ? *out_new_dataset : nullptr;
+        });
+    *out_new_dataset = reopened;
     if (uri_ptr) {
       out_new_display_uri = uri_ptr;
       lance_free_string(uri_ptr);
@@ -461,10 +519,14 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
   auto entry = GetOrOpenDatasetCacheEntry(
       context, cache_key,
       [&]() {
+        auto source_resolver = LanceCreateSourceResolver(context);
         string table_uri;
-        auto *dataset =
-            OpenNamespaceDataset(context, endpoint, table_id, bearer_token,
-                                 api_key, delimiter, headers_tsv, table_uri);
+        auto *dataset = LanceOpenDatasetWithSourceSession(
+            context, source_resolver, [&](void *session) {
+              return OpenNamespaceDataset(session, endpoint, table_id,
+                                          bearer_token, api_key, delimiter,
+                                          headers_tsv, table_uri);
+            });
         if (!dataset) {
           return shared_ptr<LanceDatasetCacheEntry>();
         }
@@ -503,10 +565,14 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
     auto entry = GetOrOpenDatasetCacheEntry(
         context, cache_key,
         [&]() {
+          auto source_resolver = LanceCreateSourceResolver(context);
           string table_uri;
-          auto *dataset = OpenDirNamespaceDataset(context, cfg.root,
-                                                  cfg.table_id, cfg.option_keys,
-                                                  cfg.option_values, table_uri);
+          auto *dataset = LanceOpenDatasetWithSourceSession(
+              context, source_resolver, [&](void *session) {
+                return OpenDirNamespaceDataset(session, cfg.root, cfg.table_id,
+                                               cfg.option_keys,
+                                               cfg.option_values, table_uri);
+              });
           if (!dataset) {
             return shared_ptr<LanceDatasetCacheEntry>();
           }

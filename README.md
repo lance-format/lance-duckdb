@@ -2,6 +2,11 @@
 
 [Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
 
+Lance is a **DuckDB core extension**. lance-duckdb has no independent version
+number or release cycle: it ships with DuckDB's core extensions and follows the
+target DuckDB release and commit. This repository's commits identify extension
+source revisions. See the [version and release policy](docs/duckdb-compatibility.md).
+
 ## Install
 
 ### Install from DuckDB (recommended)
@@ -17,7 +22,7 @@ SELECT *
   LIMIT 1;
 ```
 
-See DuckDB's extension page for `lance` for the latest release details: https://duckdb.org/docs/stable/core_extensions/lance
+See DuckDB's extension page for `lance` for official availability and installation details: https://duckdb.org/docs/stable/core_extensions/lance
 
 ### Build from source (development)
 
@@ -35,15 +40,17 @@ git submodule update --init --recursive
 GEN=ninja make release
 ```
 
-3. Load the extension from a standalone DuckDB binary (local builds typically require unsigned extensions):
+3. Use the matching DuckDB binary from the same build. A standalone DuckDB must
+match the DuckDB build and platform used to compile the extension; local builds require unsigned extensions:
 
 ```bash
-duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
+./build/release/duckdb -unsigned -c "LOAD 'build/release/extension/lance/lance.duckdb_extension'; SELECT 1;"
 ```
 
 ## Usage
 
 - Full SQL reference: [`docs/sql.md`](./docs/sql.md)
+- Blob columns and write inputs: [`docs/sql.md#blob-columns-and-write-inputs`](./docs/sql.md#blob-columns-and-write-inputs)
 - Cloud storage reference: [`docs/cloud.md`](./docs/cloud.md)
 
 ### Query a Lance dataset
@@ -170,13 +177,22 @@ ORDER BY _hybrid_score DESC;
 
 See the SQL reference for full parameter documentation: [docs/sql.md#search](docs/sql.md#search).
 
+## DuckDB compatibility
+
+Main targets DuckDB's `v2.0-cyanoptera` branch. The
+`v1.5-variegata` branch preserves DuckDB 1.5 support. See
+[compatibility and release branches](docs/duckdb-compatibility.md) for cutover,
+backport, and official publication requirements.
+
 ## Contributing
 
 Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.
 
 ### Manual Lance dependency bumps
 
-This repository includes a manual GitHub Actions workflow for preparing Lance dependency bump PRs:
+This repository includes a manual GitHub Actions workflow for preparing upstream
+Lance Rust dependency bump PRs. These update an internal dependency, not a
+lance-duckdb release number:
 
 - `.github/workflows/codex-update-lance-dependency.yml`: manually runs Codex CLI with the repo-scoped `$lance-duckdb-update-lance-dependency` skill.
 - `.agents/skills/lance-duckdb-update-lance-dependency/SKILL.md`: defines the shared workflow for latest-release resolution, duplicate PR handling, dependency updates, validation, and PR creation.

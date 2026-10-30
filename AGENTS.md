@@ -4,6 +4,15 @@
 
 This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
+## Version and Release Policy
+
+- Lance is a DuckDB core extension. lance-duckdb has no independent product version or release cadence; delivery follows DuckDB releases and the target DuckDB commit.
+- Do not propose or create lance-duckdb version bumps, release tags, or GitHub releases. DuckDB owns official core-extension publication and selects this repository's latest `main` for the active target.
+- Identify compatibility by DuckDB release/commit and platform. Identify extension source by its lance-duckdb commit. Record both commits when reporting validation; repository CI success is distinct from official artifact availability.
+- The `duckdb` gitlink pins the tested upstream commit. DuckDB-named maintenance branches are compatibility lines, not independent extension versions. Keep gitlinks, branch annotations, and CI targets aligned when changing the DuckDB target.
+- Cargo package versions are internal metadata; Lance dependency versions and dataset/storage/IR versions are separate concepts. Preserve DuckDB's generated build metadata without treating it as an independent product version.
+- Follow [DuckDB compatibility and release policy](docs/duckdb-compatibility.md) for branch and publication details.
+
 ## Documentation Language
 
 All documentation in this repository (including `README.md` and files under `docs/`) must be written in English.
@@ -70,10 +79,12 @@ cargo clippy --manifest-path Cargo.toml --all-targets
 This repository is configured with `uv`, so you can run formatting via:
 
 ```bash
+uv run make format-fix
 uv run make format
+cargo fmt -- --check
 ```
 
-PR requirement: Before submitting a PR, run `uv run make format` and commit any resulting formatting changes (as a separate commit if it helps review).
+PR requirement: Before submitting a PR, run `uv run make format` (check only). Use `uv run make format-fix` to apply C++/SQL formatting, and `cargo fmt` for Rust. Commit any resulting changes.
 
 ### Commit & PR Conventions
 
@@ -93,12 +104,13 @@ type[(scope)]: short description
 The `release` build can be slow. For fast iteration, prefer `test_debug` when available.
 
 ```bash
-# Run all tests (builds and runs sqllogictest)
-GEN=ninja make test
+# Build first, then run all SQLLogicTests
+GEN=ninja make release
+make test
 
-# Run with specific build
-GEN=ninja make test_debug     # Test with debug build
-GEN=ninja make test_release   # Test with release build
+# Run with a previously built configuration
+make test_debug     # Test with debug build
+make test_release   # Test with release build
 
 # Run DuckDB with extension for manual testing
 ./build/release/duckdb -c "SELECT * FROM 'test/data/test_data.lance' LIMIT 1;"
@@ -120,11 +132,12 @@ DuckDB SQL → C++ Extension (src/) → FFI calls → Rust (rust/) → Lance cra
 
 See [docs/rust_guidelines.md](docs/rust_guidelines.md) for the FFI function patterns, error propagation, and memory ownership conventions.
 
-### Key Concepts: Filter IR & Exec IR
+### Key Concepts: Filter, Expression, and Exec IR
 
-The extension uses two custom binary wire formats to push work from C++ into Rust:
+The extension uses three custom binary wire formats to push work from C++ into Rust:
 
 - **Filter IR** (magic `LFT1`): Serializes DuckDB bound filter expressions into a compact binary format that Rust deserializes into DataFusion `Expr`. This avoids passing expression trees through C function signatures.
+- **Expression IR** (magic `LUE1`): Serializes expressions for updates and computed columns into DataFusion expressions.
 - **Exec IR** (magic `LEX1`): Encodes aggregate/projection plans so that Rust can execute them entirely inside Lance/DataFusion, returning only pre-aggregated results to C++.
 
 When modifying filter or aggregate pushdown, changes typically span both sides: C++ serialization (`lance_filter_ir.cpp` / `lance_exec_ir.cpp`) and Rust deserialization (`rust/filter_ir.rs` / `rust/exec_ir.rs`). The magic bytes and version numbers must stay in sync.
@@ -135,7 +148,7 @@ When modifying filter or aggregate pushdown, changes typically span both sides: 
 
 ## Testing Conventions
 
-Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
+Tests use DuckDB's `sqllogictest` format in `test/sql/`. S3/MinIO tests (`s3_*.test` and `namespace_attach_s3_minio.test`) are gated by `LANCE_TEST_S3=1` and require a running MinIO instance.
 
 ## Common Gotchas
 

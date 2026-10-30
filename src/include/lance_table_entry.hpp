@@ -9,9 +9,35 @@ struct ArrowSchema;
 namespace duckdb {
 
 struct AlterInfo;
+struct Binder;
 struct CatalogTransaction;
+class LogicalGet;
+class LogicalProjection;
+class LogicalUpdate;
 class CatalogEntry;
 class ClientContext;
+struct ArrowTableSchema;
+
+// A transient interpretation shared by catalog discovery, rebuild, and
+// freshness checks. Comments are loaded separately and never affect binding.
+struct LanceTableSchema {
+  // Read original Arrow formats, coerce the schema in place, and populate
+  // the same Arrow mapping that scan binding uses.
+  static LanceTableSchema FromArrow(ClientContext &context, ArrowSchema &schema,
+                                    ArrowTableSchema &arrow_table);
+  static LanceTableSchema FromDataset(ClientContext &context, void *dataset);
+
+  ColumnList columns;
+  vector<unique_ptr<Constraint>> constraints;
+  vector<string> coerced_columns;
+  // Top-level columns whose source Arrow field contains an actual Lance blob.
+  vector<bool> blob_columns;
+  // Top-level columns whose Lance field is genuinely Blob v2. Only these
+  // accept the LANCE_BLOB_INPUT write type; plain binary/legacy Blob columns
+  // keep the ordinary BLOB cast path and reject URI values at the write
+  // boundary. Kept distinct from the read-side per-column encoding markers.
+  vector<string> writable_blob_v2_columns;
+};
 
 enum class LanceNamespaceKind { Directory, Rest };
 
@@ -34,35 +60,6 @@ struct LanceNamespaceTableConfig {
   bool IsRest() const { return kind == LanceNamespaceKind::Rest; }
 };
 
-// C++-only ALTER marker (never produced by SQL) that asks a LanceTableEntry
-// to rebuild itself from the current dataset state; used to replace a stale
-// entry through DuckDB's transactional catalog version chain (see
-// LanceTableEntry::AlterEntry and LanceSchemaEntry::ReplaceStaleTableEntry).
-// It must derive from a stock AlterTableInfo subclass because
-// CatalogSet::AlterEntry serializes the info into the undo buffer and the
-// commit path deserializes it through the stock registry; the payload must
-// also report an empty GetColumnName(), since the commit path casts the old
-// entry to DuckTableEntry only for column-affecting alters (see
-// CommitState::CommitEntryDrop). SET_PARTITIONED_BY with no keys satisfies
-// both: the inherited Serialize() emits a valid stock encoding and the base
-// GetColumnName() stays empty; the deserialized stock object is discarded at
-// commit. Detected via dynamic_cast in LanceTableEntry::AlterEntry.
-// (SET_COMMENT is unsuitable: CatalogSet::AlterEntry special-cases it with
-// entry->Copy instead of calling the entry's AlterEntry.)
-struct LanceRefreshTableAlterInfo final : SetPartitionedByInfo {
-  explicit LanceRefreshTableAlterInfo(AlterEntryData data)
-      : SetPartitionedByInfo(std::move(data),
-                             vector<unique_ptr<ParsedExpression>>()) {}
-
-  // Preserve the marker type across Copy() so a copied info still triggers
-  // the refresh path instead of a stock (rejected) SET_PARTITIONED_BY.
-  unique_ptr<AlterInfo> Copy() const override {
-    auto result = make_uniq<LanceRefreshTableAlterInfo>(GetAlterEntryData());
-    result->allow_internal = allow_internal;
-    return std::move(result);
-  }
-};
-
 // LanceTableEntry represents a Lance dataset as a DuckDB base table entry.
 // It supports scanning via a Lance-backed table scan function and appending via
 // DuckDB's INSERT planning path (implemented at the catalog level).
@@ -75,21 +72,36 @@ public:
 
   unique_ptr<CatalogEntry> AlterEntry(ClientContext &context,
                                       AlterInfo &info) override;
-  unique_ptr<CatalogEntry> AlterEntry(CatalogTransaction transaction,
-                                      AlterInfo &info) override;
+  // Rebuild metadata without changing storage. Executing queries retain their
+  // previous generation until QueryEnd; prepared statements rebind on EXECUTE.
+  unique_ptr<CatalogEntry> Rebuild(ClientContext &context) const;
 
   unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
 
   TableFunction GetScanFunction(ClientContext &context,
                                 unique_ptr<FunctionData> &bind_data) override;
 
+  // BLOB columns read as BLOB bytes but accept the shared Blob write input so
+  // SQL can express bytes, external references, and managed ingest through the
+  // same INSERT/UPDATE/MERGE value contract. Whether a URI value is legal
+  // depends on the destination field's encoding and is enforced at the write
+  // boundary.
+  LogicalType
+  GetExpectedTypeForInsert(const ColumnDefinition &column) const override;
+
+  // Preserve an already-input-typed value on DEFAULT/omitted-column binding
+  // instead of casting it back to the declared BLOB read type.
+  unique_ptr<Expression> GetDefaultExpressionForColumn(
+      ClientContext &context, const LogicalType &input_type,
+      const LogicalType &result_type, ColumnBinding binding,
+      const Expression &constant_value) const override;
+
   // Validate that this entry's declared schema state (columns, coerced
   // columns, NOT NULL constraints) still matches the dataset on storage.
   // Statements that bind a scan get this implicitly via GetScanFunction;
   // write-only statements (e.g. plain INSERT) must call it before planning.
-  // On mismatch the stale entry is replaced through the catalog version
-  // chain (this object stays alive until undo-buffer cleanup, so existing
-  // references remain valid) and a "changed externally" error is thrown; the
+  // On mismatch the cache entry is replaced (executing queries retain the old
+  // generation) and a "changed externally" error is thrown; the
   // next access serves the entry rebuilt from the current schema.
   void VerifySchemaFreshness(ClientContext &context);
 
@@ -104,7 +116,17 @@ public:
     return nullptr;
   }
 
+  const ColumnList &GetColumns() const override { return columns; }
+
   TableStorageInfo GetStorageInfo(ClientContext &) override { return {}; }
+
+  // Lance tables have no local CHECK constraints or secondary-index
+  // maintenance for UPDATE. DuckDB's default also binds every physical column
+  // whenever RETURNING is present; the Lance MERGE sink builds the returned row
+  // image itself from the columns the RETURNING projection references.
+  void BindUpdateConstraints(Binder &binder, LogicalGet &get,
+                             LogicalProjection &proj, LogicalUpdate &update,
+                             ClientContext &context) override {}
 
   const string &DatasetUri() const { return dataset_uri; }
   bool IsNamespaceBacked() const { return namespace_config != nullptr; }
@@ -127,66 +149,51 @@ public:
   void SetCoercedColumnNames(vector<string> names) {
     coerced_column_names = std::move(names);
   }
-
-  bool HasJsonExtensionColumns() const {
-    return !json_extension_column_names.empty();
+  void SetWritableBlobV2Columns(vector<string> names) {
+    writable_blob_v2_columns = std::move(names);
   }
-  bool IsJsonExtensionColumn(const string &name) const {
-    for (const auto &json_name : json_extension_column_names) {
-      if (json_name == name) {
+
+  bool IsWritableBlobV2Column(const ColumnDefinition &column) const;
+
+  const vector<bool> &GetBlobColumns() const { return blob_column_flags; }
+  bool HasBlobColumns() const {
+    for (auto is_blob : blob_column_flags) {
+      if (is_blob) {
         return true;
       }
     }
     return false;
   }
-  const vector<string> &GetJsonExtensionColumnNames() const {
-    return json_extension_column_names;
-  }
-  void SetJsonExtensionColumnNames(vector<string> names) {
-    json_extension_column_names = std::move(names);
+  void SetBlobColumns(vector<bool> columns) {
+    blob_column_flags = std::move(columns);
   }
 
 private:
-  // Pure comparison of this entry's declared schema state against a live
-  // dataset schema produced by the shared population pipeline.
-  bool
-  MatchesLiveSchemaState(const vector<string> &live_names,
-                         const vector<LogicalType> &live_types,
-                         const std::vector<std::string> &live_coerced_columns,
-                         const ArrowSchema &live_schema_root) const;
+  bool MatchesLiveSchemaState(const LanceTableSchema &live) const;
 
-  // Fetch the (revalidated) dataset handle and compare; shared by
-  // IsSchemaStale and VerifySchemaFreshness.
-  bool FetchLiveSchemaMatches(ClientContext &context, string &out_display_uri);
+  // Uses the revalidated dataset handle; infrastructure errors propagate.
+  LanceTableSchema FetchLiveSchema(ClientContext &context,
+                                   string &out_display_uri);
 
-  // Shared freshness comparator for the scan bind path and
-  // VerifySchemaFreshness; replaces this entry through the catalog version
-  // chain and throws on mismatch.
-  void ValidateLiveSchemaOrReplace(
-      ClientContext &context, const vector<string> &live_names,
-      const vector<LogicalType> &live_types,
-      const std::vector<std::string> &live_coerced_columns,
-      const ArrowSchema &live_schema_root, const string &display_uri);
+  // Best-effort cache replacement followed by a fail-closed error on mismatch.
+  // The current query keeps this entry's generation pinned.
+  void ValidateLiveSchemaOrReplace(ClientContext &context,
+                                   const LanceTableSchema &live,
+                                   const string &display_uri);
 
 private:
+  ColumnList columns;
   string dataset_uri;
   unique_ptr<LanceNamespaceTableConfig> namespace_config;
   vector<string> coerced_column_names;
-  vector<string> json_extension_column_names;
+  vector<bool> blob_column_flags;
+  vector<string> writable_blob_v2_columns;
 };
 
-// Replace a catalog table entry whose declared schema state no longer
-// matches the dataset on storage (external schema evolution) with an entry
-// rebuilt from the current dataset state. The replacement goes through
-// DuckDB's transactional catalog version chain (CatalogSet::AlterEntry with
-// the caller's real transaction), so the old generation - `table` itself -
-// stays alive, and raw references held by active scans, DML operators, or
-// prepared plans stay valid, until normal undo-buffer cleanup reclaims it
-// once no active transaction can reference it. Returns false (serving the
-// existing entry unchanged) when the entry is not part of a Lance-attached
-// schema, was already replaced or dropped, the caller has no real
-// transaction to own the undo entry, or the replace lost a write-write
-// conflict; the replacement is best-effort and always fail-open.
+// Rebuild a stale cache entry without changing storage. Executing queries pin
+// their bound generations until QueryEnd; prepared statements rebind before
+// execution. Return false if the entry was superseded, is not Lance-owned,
+// or cannot be rebuilt because storage is unavailable.
 bool LanceTryReplaceStaleTableEntry(ClientContext &context,
                                     LanceTableEntry &table);
 

@@ -62,6 +62,7 @@ impl PartitionStream for LanceExecPartition {
         builder.spawn_on(
             async move {
                 let mut scan = dataset.scan();
+                scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
                 scan.project(projection.as_ref())
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 if let Some(filter) = &filter {
@@ -179,7 +180,7 @@ fn split_fragments(
 }
 
 fn projected_schema(handle: &DatasetHandle, projection: &[String]) -> Result<Arc<Schema>, String> {
-    let base_schema = handle.arrow_schema.as_ref();
+    let base_schema = handle.read_schema.as_ref();
     let mut fields = Vec::with_capacity(projection.len());
     for name in projection.iter() {
         let idx = base_schema
@@ -370,7 +371,9 @@ fn create_dataset_exec_stream_ir_inner(
 ) -> FfiResult<StreamHandle> {
     let handle = unsafe { dataset_handle(dataset)? };
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
-    let threads = unsafe { exec_ctx.as_ref() }.map(|c| c.threads as usize).unwrap_or(0);
+    let threads = unsafe { exec_ctx.as_ref() }
+        .map(|c| c.threads as usize)
+        .unwrap_or(0);
 
     let stream_res = runtime::block_on(async {
         let df = build_exec_df(handle, bytes, threads).await?;

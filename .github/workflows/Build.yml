@@ -101,7 +101,17 @@ jobs:
 
       - name: Run tests
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
+            exit 1
+          fi
 
   test_s3:
     name: Test S3 (MinIO)
@@ -147,14 +157,37 @@ jobs:
           chmod +x mc
           ./mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
           ./mc mb -p local/lance-test || true
+          ./mc admin user add local blob-reader-a blob-reader-a-secret
+          ./mc admin user add local blob-reader-b blob-reader-b-secret
+          ./mc admin user add local blob-target-reader blob-target-reader-secret
+          ./mc admin policy create local blob-reader-a test/scripts/blob_v2_external_reader_a_policy.json
+          ./mc admin policy create local blob-reader-b test/scripts/blob_v2_external_reader_policy.json
+          ./mc admin policy create local blob-target-reader test/scripts/blob_v2_nested_target_policy.json
+          ./mc admin policy attach local blob-reader-a --user blob-reader-a
+          ./mc admin policy attach local blob-reader-b --user blob-reader-b
+          ./mc admin policy attach local blob-target-reader --user blob-target-reader
           ./mc mirror --overwrite test/data/test_data.lance local/lance-test/test_data.lance
           ./mc mirror --overwrite test/data/search_test_data.lance local/lance-test/search_test_data.lance
+          ./mc mirror --overwrite test/data/s3_nested_source_target.lance local/lance-test/nested_target.lance
+          ./mc cp test/data/blob_v2_external_a.bin local/lance-test/blob_v2_external/a/object.bin
+          ./mc cp test/data/blob_v2_external_b.bin local/lance-test/blob_v2_external/b/object.bin
+          ./mc cp test/data/blob_v2_external_nested.bin local/lance-test/nested_target.lance/source/object.bin
 
       - name: Run S3 tests
         env:
           LANCE_TEST_S3: "1"
         run: |
-          ./build/release/test/unittest "test/*"
+          set -o pipefail
+          ./build/release/test/unittest "test/*" 2>&1 | tee test-results.log
+          if grep -Eq '^require lance: [0-9]+' test-results.log; then
+            echo "Lance did not load; extension tests were skipped" >&2
+            exit 1
+          fi
+          git diff --exit-code -- test/data
+          if [ -n "$(git ls-files --others --exclude-standard -- test/data)" ]; then
+            echo "Tests created files in read-only test/data fixtures" >&2
+            exit 1
+          fi
 
       - name: Cleanup MinIO
         if: always()

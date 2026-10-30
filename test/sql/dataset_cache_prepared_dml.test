@@ -15,31 +15,31 @@ require lance
 
 statement ok con1
 COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
-TO 'test/.tmp/prep_dml_ins.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/prep_dml_ins.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (
   SELECT 1::BIGINT AS id, 10::BIGINT AS v
   UNION ALL
   SELECT 2::BIGINT AS id, 20::BIGINT AS v
-) TO 'test/.tmp/prep_dml_upd.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/prep_dml_upd.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (
   SELECT 1::BIGINT AS id, 10::BIGINT AS v
   UNION ALL
   SELECT 2::BIGINT AS id, 20::BIGINT AS v
-) TO 'test/.tmp/prep_dml_del.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/prep_dml_del.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
 COPY (SELECT 1::BIGINT AS id, 10::BIGINT AS v)
-TO 'test/.tmp/prep_dml_mrg.lance' (FORMAT lance, mode 'overwrite');
+TO '{TEST_DIR}/prep_dml_mrg.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-ATTACH 'test/.tmp' AS prep_dml_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_dml_reader (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/.tmp' AS prep_dml_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS prep_dml_writer (TYPE LANCE);
 
 # ---------------------------------------------------------------------------
 # INSERT: target-only, external schema evolution
@@ -60,12 +60,10 @@ SELECT count(*) FROM prep_dml_reader.main.prep_dml_ins;
 statement ok con2
 ALTER TABLE prep_dml_writer.main.prep_dml_ins ADD COLUMN extra BIGINT;
 
-# An ad-hoc read on con1 heals the reader's stale entry. The prepared plan
-# still references the superseded entry generation: before the version-chain
-# replace, healing destroyed that catalog object outright and the next
-# EXECUTE dereferenced freed memory; now the old generation stays alive until
-# undo-buffer cleanup, and the EXECUTE below never touches it anyway because
-# it is forced to rebind.
+# An ad-hoc read heals the reader's cache entry. The prepared plan may still
+# refer to the previous generation, but EXECUTE must rebind before accessing
+# it. Only executing queries pin old generations; preparing a statement must
+# not retain obsolete catalog metadata indefinitely.
 query I con1
 SELECT count(*) FROM prep_dml_reader.main.prep_dml_ins;
 ----

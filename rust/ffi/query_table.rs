@@ -373,10 +373,7 @@ fn filter_expr_to_sql(expr: &Expr) -> FfiResult<String> {
 // A pushed filter arrives as a DataFusion `Expr`, but namespace query_table only accepts a
 // filter string, so it is unparsed here and ANDed with whatever the caller passed as the
 // explicit `filter :=` argument.
-fn apply_filter_expr(
-    request: &mut QueryTableRequest,
-    filter_expr: Option<&Expr>,
-) -> FfiResult<()> {
+fn apply_filter_expr(request: &mut QueryTableRequest, filter_expr: Option<&Expr>) -> FfiResult<()> {
     let Some(filter_expr) = filter_expr else {
         return Ok(());
     };

@@ -22,11 +22,11 @@ statement ok
 CREATE SECRET (
   TYPE LANCE,
   PROVIDER config,
-  SCOPE 's3://${LANCE_S3_BUCKET}/',
-  ACCESS_KEY_ID '${LANCE_S3_ACCESS_KEY_ID}',
-  SECRET_ACCESS_KEY '${LANCE_S3_SECRET_ACCESS_KEY}',
-  REGION '${LANCE_S3_REGION}',
-  ENDPOINT '${LANCE_S3_ENDPOINT}',
+  SCOPE 's3://{LANCE_S3_BUCKET}/',
+  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
   VIRTUAL_HOSTED_STYLE_REQUEST false,
   ALLOW_HTTP true
 );
@@ -36,14 +36,48 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s
-) TO 's3://${LANCE_S3_BUCKET}/${LANCE_S3_WRITE_DATASET_PREFIX}' (FORMAT lance, mode 'overwrite');
+) TO 's3://{LANCE_S3_BUCKET}/{LANCE_S3_WRITE_DATASET_PREFIX}' (FORMAT lance, mode 'overwrite');
 
 query I
-SELECT count(*) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_WRITE_DATASET_PREFIX}';
+SELECT count(*) FROM 's3://{LANCE_S3_BUCKET}/{LANCE_S3_WRITE_DATASET_PREFIX}';
 ----
 2
 
 query I
-SELECT sum(id) FROM 's3://${LANCE_S3_BUCKET}/${LANCE_S3_WRITE_DATASET_PREFIX}';
+SELECT sum(id) FROM 's3://{LANCE_S3_BUCKET}/{LANCE_S3_WRITE_DATASET_PREFIX}';
 ----
 3
+
+# Core-extension writes use TYPE LANCE credentials without loading httpfs.
+statement ok
+ATTACH 's3://{LANCE_S3_BUCKET}/copy_ctas_namespace' AS s3_copy_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE s3_copy_ns.items AS SELECT 42::BIGINT AS id;
+
+query I
+SELECT id FROM s3_copy_ns.items;
+----
+42
+
+statement ok
+SET threads=1;
+
+statement error
+COPY (SELECT CASE WHEN i=8192 THEN error('s3 input failed') ELSE i END AS id FROM range(10000) t(i))
+TO 's3://{LANCE_S3_BUCKET}/copy_ctas_namespace/items.lance' (FORMAT lance, mode 'overwrite');
+----
+s3 input failed
+
+query I
+SELECT id FROM s3_copy_ns.items;
+----
+42
+
+query I
+SELECT count(*) FROM duckdb_extensions() WHERE extension_name='httpfs' AND loaded;
+----
+0
+
+statement ok
+DETACH s3_copy_ns;

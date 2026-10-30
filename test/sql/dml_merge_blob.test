@@ -1,0 +1,271 @@
+# name: test/sql/dml_merge_blob.test
+# description: MERGE replacement updates BLOB values, preserves unassigned columns, and commits actions atomically
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 'old-a'::BLOB AS payload
+  UNION ALL SELECT 2, 'b', repeat('b', 5000)::BLOB
+  UNION ALL SELECT 3, 'c', NULL::BLOB
+  UNION ALL SELECT 4, 'd', 'old-d'::BLOB
+) TO '{TEST_DIR}/lance_merge_blob.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TEMP TABLE merge_source(id BIGINT, new_s VARCHAR, new_payload BLOB, action_tag BIGINT);
+
+statement ok
+INSERT INTO merge_source VALUES
+  (1, 'merged-a', 'merged-a'::BLOB, 1),
+  (2, 'deleted-b', NULL::BLOB, -1),
+  (5, 'inserted-e', 'inserted-e'::BLOB, 1);
+
+# One statement: BLOB replacement, DELETE, and INSERT.
+statement ok
+MERGE INTO ns.main.lance_merge_blob AS t
+USING merge_source AS s ON t.id = s.id
+WHEN MATCHED AND s.action_tag < 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET payload = s.new_payload, s = s.new_s
+WHEN NOT MATCHED THEN INSERT (id, s, payload) VALUES (s.id, s.new_s, s.new_payload);
+
+query III
+SELECT id, s, payload = 'merged-a'::BLOB FROM ns.main.lance_merge_blob WHERE id = 1;
+----
+1	merged-a	true
+
+query I
+SELECT count(*) FROM ns.main.lance_merge_blob WHERE id = 2;
+----
+0
+
+query II
+SELECT s = 'c', payload IS NULL FROM ns.main.lance_merge_blob WHERE id = 3;
+----
+true	true
+
+query II
+SELECT s = 'd', payload = 'old-d'::BLOB FROM ns.main.lance_merge_blob WHERE id = 4;
+----
+true	true
+
+query III
+SELECT id, s, payload = 'inserted-e'::BLOB FROM ns.main.lance_merge_blob WHERE id = 5;
+----
+5	inserted-e	true
+
+# Different UPDATE actions assign different column sets on the same fragment.
+statement ok
+CREATE TEMP TABLE merge_actions(id BIGINT, new_payload BLOB, new_s VARCHAR, kind VARCHAR);
+
+statement ok
+INSERT INTO merge_actions VALUES
+  (3, 'only-payload'::BLOB, 'ignored', 'payload'),
+  (4, NULL::BLOB, 'only-s', 'scalar');
+
+statement ok
+MERGE INTO ns.main.lance_merge_blob AS t
+USING merge_actions AS s ON t.id = s.id
+WHEN MATCHED AND s.kind = 'payload' THEN UPDATE SET payload = s.new_payload
+WHEN MATCHED AND s.kind = 'scalar' THEN UPDATE SET s = s.new_s;
+
+query II
+SELECT payload = 'only-payload'::BLOB, s = 'c' FROM ns.main.lance_merge_blob WHERE id = 3;
+----
+true	true
+
+query II
+SELECT payload = 'old-d'::BLOB, s = 'only-s' FROM ns.main.lance_merge_blob WHERE id = 4;
+----
+true	true
+
+# MERGE RETURNING reports the real BLOB bytes of the new row image.
+query TI
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 6::BIGINT AS id, 'returning'::BLOB AS payload) AS s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, s, payload) VALUES (s.id, 'f', s.payload)
+RETURNING id, payload = 'returning'::BLOB;
+----
+6	true
+
+query TI
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 6::BIGINT AS id, 'updated-via-returning'::BLOB AS payload) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET payload = s.payload
+RETURNING id, payload = 'updated-via-returning'::BLOB;
+----
+6	true
+
+# Rolled-back MERGE does not publish any action.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 1::BIGINT AS id, 'rolled-back'::BLOB AS payload) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET payload = s.payload;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT payload = 'merged-a'::BLOB FROM ns.main.lance_merge_blob WHERE id = 1;
+----
+true
+
+# A failing action expression publishes no partial state.
+statement error
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 1::BIGINT AS id, 'boom'::BLOB AS payload) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET id = CAST('bad' AS BIGINT), payload = s.payload;
+----
+Conversion Error
+
+query II
+SELECT id = 1, payload = 'merged-a'::BLOB FROM ns.main.lance_merge_blob WHERE id = 1;
+----
+true	true
+
+# DELETE RETURNING only reads referenced columns. A missing external payload is
+# irrelevant for `RETURNING id` or `RETURNING merge_action`.
+query I
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 7::BIGINT AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, s, payload)
+VALUES (s.id, 'missing-external', lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_merge_missing_external.bin'))
+RETURNING id;
+----
+7
+
+query I
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 8::BIGINT AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, s, payload)
+VALUES (s.id, 'missing-external-2', lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_merge_missing_external.bin'))
+RETURNING id;
+----
+8
+
+statement error
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 7::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN DELETE
+RETURNING id, payload;
+----
+IO Error
+
+query I
+SELECT count(*) FROM ns.main.lance_merge_blob WHERE id = 7;
+----
+1
+
+query I
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 7::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN DELETE
+RETURNING id;
+----
+7
+
+query I
+SELECT count(*) FROM ns.main.lance_merge_blob WHERE id = 7;
+----
+0
+
+query T
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 8::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN DELETE
+RETURNING merge_action;
+----
+DELETE
+
+query I
+SELECT count(*) FROM ns.main.lance_merge_blob WHERE id = 8;
+----
+0
+
+# A readable payload is fetched for RETURNING even though the target scan masks
+# its unused copy.
+query I
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 9::BIGINT AS id) AS s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, s, payload)
+VALUES (s.id, 'delete-readable', 'delete-readable-payload'::BLOB)
+RETURNING id;
+----
+9
+
+query TI
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 9::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED THEN DELETE
+RETURNING id, hex(payload);
+----
+9	64656C6574652D7265616461626C652D7061796C6F6164
+
+# A payload referenced by a merge action condition remains available even when
+# RETURNING does not project it.
+query I
+MERGE INTO ns.main.lance_merge_blob AS t
+USING (SELECT 1::BIGINT AS id) AS s ON t.id = s.id
+WHEN MATCHED AND t.payload = 'merged-a'::BLOB THEN UPDATE SET s = 'condition-hit'
+RETURNING id;
+----
+1
+
+query T
+SELECT s FROM ns.main.lance_merge_blob WHERE id = 1;
+----
+condition-hit
+
+# Self-merge: source and target scan the same catalog table. SET expressions
+# depend on target values through a derived source projection.
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS label, 'aaa'::BLOB AS payload
+  UNION ALL SELECT 2, 'b', 'bbb'::BLOB
+) TO '{TEST_DIR}/lance_self_merge.lance' (FORMAT lance, mode 'overwrite');
+
+query TIT
+MERGE INTO ns.main.lance_self_merge AS t
+USING (
+  SELECT id, label || '-src' AS label
+  FROM ns.main.lance_self_merge WHERE id = 2
+) AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET label = t.label || '-self', payload = t.payload || '!'::BLOB
+RETURNING id, label, hex(payload);
+----
+2	b-self	62626221
+
+query TIT
+SELECT id, label, hex(payload) FROM ns.main.lance_self_merge ORDER BY id;
+----
+1	a	616161
+2	b-self	62626221
+
+# Self-delete derives its source from the same catalog table. The source scan
+# must not be mistaken for the target, and RETURNING id must not read payload.
+statement ok
+COPY (
+  SELECT 1::BIGINT AS id,
+         lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/lance_duckdb_self_delete_missing.bin') AS payload
+) TO '{TEST_DIR}/lance_self_delete_missing.lance'
+  (FORMAT lance, mode 'overwrite');
+
+query I
+MERGE INTO ns.main.lance_self_delete_missing AS t
+USING (SELECT id FROM ns.main.lance_self_delete_missing WHERE id = 1) AS s
+ON t.id = s.id
+WHEN MATCHED THEN DELETE
+RETURNING id;
+----
+1
+
+query I
+SELECT count(*) FROM ns.main.lance_self_delete_missing;
+----
+0

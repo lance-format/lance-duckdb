@@ -8,7 +8,7 @@ statement ok
 PRAGMA threads=4;
 
 statement ok
-ATTACH 'test/.tmp' AS merge_ret_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS merge_ret_ns (TYPE LANCE);
 
 statement ok
 CREATE OR REPLACE TABLE merge_ret_ns.main.lance_merge_returning AS
@@ -58,6 +58,23 @@ SELECT id, s FROM merge_ret_ns.main.lance_merge_returning ORDER BY id;
 2	bb
 3	c
 10	x
+
+# The global post-bind hook must leave non-Lance MERGE RETURNING statements to
+# DuckDB's native planner.
+statement ok
+CREATE TEMP TABLE plain_merge_target(id BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO plain_merge_target VALUES (1, 'plain');
+
+query TIT
+MERGE INTO plain_merge_target AS t
+USING (SELECT 1::BIGINT AS id, 'changed'::VARCHAR AS s) AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s
+RETURNING merge_action, id, s;
+----
+UPDATE	1	changed
 
 statement ok
 DETACH merge_ret_ns;

@@ -32,12 +32,12 @@ statement ok
 COPY (
   SELECT range::BIGINT AS id
   FROM range(6)
-) TO 'test/.tmp/scan_rowid_in_fragments.lance'
+) TO '{TEST_DIR}/scan_rowid_in_fragments.lance'
   (FORMAT lance, mode 'overwrite', max_rows_per_file 2);
 
 query I
 SELECT id
-FROM 'test/.tmp/scan_rowid_in_fragments.lance'
+FROM '{TEST_DIR}/scan_rowid_in_fragments.lance'
 WHERE _rowid IN (4294967296, 8589934592)
 ORDER BY id
 ----

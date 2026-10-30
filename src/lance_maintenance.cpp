@@ -1,3 +1,4 @@
+#include "lance_parser.hpp"
 #include "duckdb.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -12,6 +13,7 @@
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
+#include "lance_insert.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
@@ -20,31 +22,6 @@
 #include <unordered_map>
 
 namespace duckdb {
-
-// When the user passes a qualified table name (e.g.
-// "catalog.schema.table") to the maintenance table functions, the
-// registered dataset resolvers may produce a "virtual" URI that
-// lance-io cannot open directly -- namespace-backed Lance tables
-// expose themselves through an "http://<endpoint>/<table-id>" handle
-// whose real location (cos:// / file://) is only reachable through
-// the namespace REST API.
-//
-// To stay correct in that case we keep the original first-argument
-// literal in the bind data, and at execution time re-resolve it via
-// TryResolveLanceTableEntry() so we can take the namespace-aware
-// LanceOpenDatasetForTable() path.  If the input does not name a
-// Lance table (plain file path, or table not yet in the catalog for
-// any reason), we transparently fall back to LanceOpenDataset() on
-// the resolved URI -- preserving the original "open by path" contract.
-static void *TryOpenDatasetForMaintenanceInput(ClientContext &context,
-                                               const string &input_str,
-                                               string &out_display_uri) {
-  auto *lance_entry = TryResolveLanceTableEntry(context, input_str);
-  if (!lance_entry) {
-    return nullptr;
-  }
-  return LanceOpenDatasetForTable(context, *lance_entry, out_display_uri);
-}
 
 static constexpr const char *LANCE_AUTO_CLEANUP_INTERVAL_KEY =
     "lance.auto_cleanup.interval";
@@ -84,34 +61,27 @@ enum class LanceMaintenanceOp : uint8_t {
 };
 
 struct LanceMaintenanceBindData final : public FunctionData {
-  LanceMaintenanceBindData(string dataset_uri_p, string input_str_p,
+  LanceMaintenanceBindData(LanceDatasetReference dataset_ref_p,
                            LanceMaintenanceOp op_p, string options_json_p,
                            string index_name_p)
-      : dataset_uri(std::move(dataset_uri_p)),
-        input_str(std::move(input_str_p)), op(op_p),
+      : dataset_ref(std::move(dataset_ref_p)), op(op_p),
         options_json(std::move(options_json_p)),
         index_name(std::move(index_name_p)) {}
 
-  string dataset_uri;
-  // Original first-argument literal preserved so the executor can re-resolve
-  // it as a Lance catalog table entry when the registered resolver produced
-  // a virtual URI (e.g. namespace-backed tables).  See
-  // TryOpenDatasetForMaintenanceInput().
-  string input_str;
+  LanceDatasetReference dataset_ref;
   LanceMaintenanceOp op;
   string options_json;
   string index_name;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceMaintenanceBindData>(dataset_uri, input_str, op,
-                                               options_json, index_name);
+    return make_uniq<LanceMaintenanceBindData>(dataset_ref, op, options_json,
+                                               index_name);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceMaintenanceBindData>();
-    return dataset_uri == other.dataset_uri && input_str == other.input_str &&
-           op == other.op && options_json == other.options_json &&
-           index_name == other.index_name;
+    return dataset_ref == other.dataset_ref && op == other.op &&
+           options_json == other.options_json && index_name == other.index_name;
   }
 };
 
@@ -126,17 +96,17 @@ LanceMaintenanceInitGlobal(ClientContext &, TableFunctionInitInput &) {
 
 static unique_ptr<FunctionData>
 LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
-                     vector<LogicalType> &return_types, vector<string> &names,
-                     LanceMaintenanceOp op, idx_t expected_inputs) {
+                     vector<LogicalType> &return_types,
+                     vector<Identifier> &names, LanceMaintenanceOp op,
+                     idx_t expected_inputs) {
   if (input.inputs.size() != expected_inputs) {
     throw BinderException("invalid argument count");
   }
 
-  auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
-      "__lance_maintenance");
-  string input_str =
-      input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  auto dataset_ref = ResolveLanceDataset(context, input.inputs[0],
+                                         LanceResolvePolicy::FALLBACK_TO_PATH,
+                                         "__lance_maintenance")
+                         .Reference();
 
   string options_json;
   string index_name;
@@ -164,21 +134,21 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
   return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,
                   LogicalType::VARCHAR};
   names = {"Operation", "Target", "MetricsJSON"};
-  return make_uniq<LanceMaintenanceBindData>(
-      std::move(dataset_uri), std::move(input_str), op, std::move(options_json),
-      std::move(index_name));
+  return make_uniq<LanceMaintenanceBindData>(std::move(dataset_ref), op,
+                                             std::move(options_json),
+                                             std::move(index_name));
 }
 
 static unique_ptr<FunctionData>
 LanceCompactBind(ClientContext &context, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
+                 vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::COMPACT, 2);
 }
 
 static unique_ptr<FunctionData>
 LanceCleanupBind(ClientContext &context, TableFunctionBindInput &input,
-                 vector<LogicalType> &return_types, vector<string> &names) {
+                 vector<LogicalType> &return_types, vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::CLEANUP, 2);
 }
@@ -186,7 +156,7 @@ LanceCleanupBind(ClientContext &context, TableFunctionBindInput &input,
 static unique_ptr<FunctionData>
 LanceOptimizeIndexBind(ClientContext &context, TableFunctionBindInput &input,
                        vector<LogicalType> &return_types,
-                       vector<string> &names) {
+                       vector<Identifier> &names) {
   return LanceMaintenanceBind(context, input, return_types, names,
                               LanceMaintenanceOp::OPTIMIZE_INDEX, 3);
 }
@@ -218,7 +188,6 @@ static void LanceMaintenanceFunc(ClientContext &context,
                                  TableFunctionInput &data, DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceMaintenanceGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
@@ -227,13 +196,9 @@ static void LanceMaintenanceFunc(ClientContext &context,
   const char *options_ptr =
       bind_data.options_json.empty() ? nullptr : bind_data.options_json.c_str();
 
-  string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
-  if (!dataset) {
-    display_uri = bind_data.dataset_uri;
-    dataset = LanceOpenDataset(context, bind_data.dataset_uri);
-  }
+  string display_uri;
+  auto target = bind_data.dataset_ref.Resolve(context);
+  void *dataset = target.Open(context, display_uri);
   if (!dataset) {
     throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
@@ -249,8 +214,9 @@ static void LanceMaintenanceFunc(ClientContext &context,
     op_name = "compact";
     break;
   case LanceMaintenanceOp::CLEANUP:
-    rc = lance_dataset_cleanup_old_versions_with_options(dataset, options_ptr,
-                                                         &metrics_ptr);
+    rc = lance_dataset_cleanup_old_versions_with_options(
+        dataset, options_ptr, LanceHasUncommittedWrites(context) ? 1 : 0,
+        &metrics_ptr);
     op_name = "cleanup";
     break;
   case LanceMaintenanceOp::OPTIMIZE_INDEX:
@@ -276,25 +242,22 @@ static void LanceMaintenanceFunc(ClientContext &context,
     lance_free_string(metrics_ptr);
   }
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  output.data[0].Append(Value(op_name));
+  output.data[1].Append(Value(display_uri));
+  output.data[2].Append(Value(metrics_json));
 }
 
 struct LanceAutoCleanupSetBindData final : public FunctionData {
-  LanceAutoCleanupSetBindData(string dataset_uri_p, string input_str_p,
-                              bool unset_p, int64_t interval_p,
-                              string older_than_p, bool has_retain_versions_p,
+  LanceAutoCleanupSetBindData(LanceDatasetReference dataset_ref_p, bool unset_p,
+                              int64_t interval_p, string older_than_p,
+                              bool has_retain_versions_p,
                               int64_t retain_versions_p)
-      : dataset_uri(std::move(dataset_uri_p)),
-        input_str(std::move(input_str_p)), unset(unset_p), interval(interval_p),
-        older_than(std::move(older_than_p)),
+      : dataset_ref(std::move(dataset_ref_p)), unset(unset_p),
+        interval(interval_p), older_than(std::move(older_than_p)),
         has_retain_versions(has_retain_versions_p),
         retain_versions(retain_versions_p) {}
 
-  string dataset_uri;
-  string input_str;
+  LanceDatasetReference dataset_ref;
   bool unset = false;
   int64_t interval = 0;
   string older_than;
@@ -303,35 +266,32 @@ struct LanceAutoCleanupSetBindData final : public FunctionData {
 
   unique_ptr<FunctionData> Copy() const override {
     return make_uniq<LanceAutoCleanupSetBindData>(
-        dataset_uri, input_str, unset, interval, older_than,
-        has_retain_versions, retain_versions);
+        dataset_ref, unset, interval, older_than, has_retain_versions,
+        retain_versions);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceAutoCleanupSetBindData>();
-    return dataset_uri == other.dataset_uri && input_str == other.input_str &&
-           unset == other.unset && interval == other.interval &&
-           older_than == other.older_than &&
+    return dataset_ref == other.dataset_ref && unset == other.unset &&
+           interval == other.interval && older_than == other.older_than &&
            has_retain_versions == other.has_retain_versions &&
            retain_versions == other.retain_versions;
   }
 };
 
 struct LanceAutoCleanupShowBindData final : public FunctionData {
-  LanceAutoCleanupShowBindData(string dataset_uri_p, string input_str_p)
-      : dataset_uri(std::move(dataset_uri_p)),
-        input_str(std::move(input_str_p)) {}
+  LanceAutoCleanupShowBindData(LanceDatasetReference dataset_ref_p)
+      : dataset_ref(std::move(dataset_ref_p)) {}
 
-  string dataset_uri;
-  string input_str;
+  LanceDatasetReference dataset_ref;
 
   unique_ptr<FunctionData> Copy() const override {
-    return make_uniq<LanceAutoCleanupShowBindData>(dataset_uri, input_str);
+    return make_uniq<LanceAutoCleanupShowBindData>(dataset_ref);
   }
 
   bool Equals(const FunctionData &other_p) const override {
     auto &other = other_p.Cast<LanceAutoCleanupShowBindData>();
-    return dataset_uri == other.dataset_uri && input_str == other.input_str;
+    return dataset_ref == other.dataset_ref;
   }
 };
 
@@ -346,18 +306,17 @@ struct LanceAutoCleanupShowGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<FunctionData>
 LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                         vector<LogicalType> &return_types,
-                        vector<string> &names) {
+                        vector<Identifier> &names) {
   if (input.inputs.size() != 5) {
     throw BinderException(
         "__lance_set_auto_cleanup requires (dataset, interval, older_than, "
         "retain_versions, unset)");
   }
 
-  auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
-      "__lance_set_auto_cleanup");
-  string input_str =
-      input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  auto dataset_ref = ResolveLanceDataset(context, input.inputs[0],
+                                         LanceResolvePolicy::FALLBACK_TO_PATH,
+                                         "__lance_set_auto_cleanup")
+                         .Reference();
 
   bool unset = false;
   if (!input.inputs[4].IsNull()) {
@@ -402,26 +361,24 @@ LanceSetAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                   LogicalType::VARCHAR};
   names = {"Operation", "Target", "MetricsJSON"};
   return make_uniq<LanceAutoCleanupSetBindData>(
-      std::move(dataset_uri), std::move(input_str), unset, interval,
-      std::move(older_than), has_retain_versions, retain_versions);
+      std::move(dataset_ref), unset, interval, std::move(older_than),
+      has_retain_versions, retain_versions);
 }
 
 static unique_ptr<FunctionData>
 LanceShowAutoCleanupBind(ClientContext &context, TableFunctionBindInput &input,
                          vector<LogicalType> &return_types,
-                         vector<string> &names) {
+                         vector<Identifier> &names) {
   if (input.inputs.size() != 1) {
     throw BinderException("__lance_show_auto_cleanup requires 1 argument");
   }
-  auto dataset_uri = ResolveLanceDatasetUri(
-      context, input.inputs[0], LanceResolvePolicy::FALLBACK_TO_PATH,
-      "__lance_show_auto_cleanup");
-  string input_str =
-      input.inputs[0].IsNull() ? string() : input.inputs[0].GetValue<string>();
+  auto dataset_ref = ResolveLanceDataset(context, input.inputs[0],
+                                         LanceResolvePolicy::FALLBACK_TO_PATH,
+                                         "__lance_show_auto_cleanup")
+                         .Reference();
   return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
   names = {"Key", "Value"};
-  return make_uniq<LanceAutoCleanupShowBindData>(std::move(dataset_uri),
-                                                 std::move(input_str));
+  return make_uniq<LanceAutoCleanupShowBindData>(std::move(dataset_ref));
 }
 
 static void UpdateDatasetConfigOrThrow(void *dataset, const string &dataset_uri,
@@ -438,19 +395,14 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
                                     DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceMaintenanceGlobalState>();
   if (gstate.finished) {
-    output.SetCardinality(0);
     return;
   }
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceAutoCleanupSetBindData>();
-  string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
-  if (!dataset) {
-    display_uri = bind_data.dataset_uri;
-    dataset = LanceOpenDataset(context, bind_data.dataset_uri);
-  }
+  string display_uri;
+  auto target = bind_data.dataset_ref.Resolve(context);
+  void *dataset = target.Open(context, display_uri);
   if (!dataset) {
     throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
@@ -505,23 +457,18 @@ static void LanceSetAutoCleanupFunc(ClientContext &context,
   }
   lance_close_dataset(dataset);
 
-  output.SetCardinality(1);
-  output.SetValue(0, 0, Value(op_name));
-  output.SetValue(1, 0, Value(display_uri));
-  output.SetValue(2, 0, Value(metrics_json));
+  output.data[0].Append(Value(op_name));
+  output.data[1].Append(Value(display_uri));
+  output.data[2].Append(Value(metrics_json));
 }
 
 static unique_ptr<GlobalTableFunctionState>
 LanceShowAutoCleanupInitGlobal(ClientContext &context,
                                TableFunctionInitInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceAutoCleanupShowBindData>();
-  string display_uri = bind_data.dataset_uri;
-  void *dataset = TryOpenDatasetForMaintenanceInput(
-      context, bind_data.input_str, display_uri);
-  if (!dataset) {
-    display_uri = bind_data.dataset_uri;
-    dataset = LanceOpenDataset(context, bind_data.dataset_uri);
-  }
+  string display_uri;
+  auto target = bind_data.dataset_ref.Resolve(context);
+  void *dataset = target.Open(context, display_uri);
   if (!dataset) {
     throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
@@ -567,18 +514,16 @@ static void LanceShowAutoCleanupFunc(ClientContext &, TableFunctionInput &data,
                                      DataChunk &output) {
   auto &gstate = data.global_state->Cast<LanceAutoCleanupShowGlobalState>();
   if (gstate.offset >= gstate.rows.size()) {
-    output.SetCardinality(0);
     return;
   }
 
   auto remaining = gstate.rows.size() - gstate.offset;
   auto count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-  output.SetCardinality(count);
 
   for (idx_t i = 0; i < count; i++) {
     auto &kv = gstate.rows[gstate.offset + i];
-    output.SetValue(0, i, Value(kv.first));
-    output.SetValue(1, i, Value(kv.second));
+    output.data[0].Append(Value(kv.first));
+    output.data[1].Append(Value(kv.second));
   }
   gstate.offset += count;
 }
@@ -1320,13 +1265,10 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     target = parse_data->dataset_uri;
   } else {
     auto qname = QualifiedName::Parse(parse_data->target_sql);
-    if (qname.catalog.empty()) {
-      qname.catalog = DatabaseManager::GetDefaultDatabase(context);
-    }
-    if (qname.schema.empty()) {
-      qname.schema = DEFAULT_SCHEMA;
-    }
-    target = qname.catalog + "." + qname.schema + "." + qname.name;
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname)
+                      .Cast<TableCatalogEntry>();
+    qname = entry.schema.GetQualifiedName(entry.name);
+    target = qname.ToString();
   }
 
   ParserExtensionPlanResult result;
@@ -1385,7 +1327,10 @@ void RegisterLanceMaintenance(ExtensionLoader &loader) {
 
 void RegisterLanceMaintenanceParser(DBConfig &config) {
   ParserExtension extension;
-  extension.parse_function = LanceMaintenanceParse;
+  extension.parse_function = [](ParserExtensionInfo *info,
+                                const vector<SimpleToken> &tokens) {
+    return ParseLanceStatement(info, tokens, LanceMaintenanceParse);
+  };
   extension.plan_function = LanceMaintenancePlan;
   extension.parser_info = make_shared_ptr<ParserExtensionInfo>();
   ParserExtension::Register(config, std::move(extension));

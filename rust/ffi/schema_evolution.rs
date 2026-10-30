@@ -18,6 +18,10 @@ use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
 
+use super::blob::{
+    apply_blob_output_fields, blob_v2_array_from_bytes, is_blob_v2_field, plan_blob_conversions,
+    version_supports_blob_v2,
+};
 use super::util::{
     canonicalize_lance_field_path, cstr_to_str, optional_cstr_array, to_c_string, FfiError,
     FfiResult,
@@ -29,6 +33,54 @@ fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
         .get("lance.add_columns.batch_size")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| *v > 0)
+}
+
+/// Apply the SQL BLOB contract to columns introduced by ALTER ADD COLUMN.
+///
+/// DuckDB exports BLOB as a plain binary Arrow field. At file version >= 2.2
+/// the flagged top-level fields must instead carry the logical Blob v2 shape,
+/// matching what COPY/CTAS writes. The planner rejects nested
+/// `LANCE_BLOB_INPUT` values in non-BLOB containers and a top-level
+/// `LANCE_BLOB_INPUT` column, which ALTER has no stored-default contract for.
+/// Older datasets keep the binary encoding and existing fields are never
+/// rewritten by this path.
+fn add_blob_v2_schema_fields(
+    dataset: &Dataset,
+    schema: Arc<ArrowSchema>,
+    blob_flags: &[bool],
+) -> FfiResult<Arc<ArrowSchema>> {
+    if !blob_flags.iter().any(|flag| *flag) {
+        return Ok(schema);
+    }
+    for (idx, flag) in blob_flags.iter().enumerate() {
+        if *flag && matches!(schema.fields()[idx].data_type(), DataType::Union(_, _)) {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "top-level LANCE_BLOB_INPUT columns are not supported in ALTER TABLE ADD COLUMN",
+            ));
+        }
+    }
+    let version = dataset
+        .manifest
+        .data_storage_format
+        .lance_file_format()
+        .to_manifest_string();
+    let flag_bytes: Vec<u8> = blob_flags.iter().map(|flag| u8::from(*flag)).collect();
+    let conversions = plan_blob_conversions(
+        schema.as_ref(),
+        None,
+        version_supports_blob_v2(version),
+        &flag_bytes,
+    )
+    .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err))?;
+    if conversions.is_empty() {
+        return Ok(schema);
+    }
+    let output_schema = apply_blob_output_fields(schema.as_ref(), &conversions);
+    Ok(Arc::new(ArrowSchema::new_with_metadata(
+        output_schema.fields().to_vec(),
+        schema.metadata().clone(),
+    )))
 }
 
 /// Treat a zero size/count option as unset so Lance applies its own default.
@@ -68,6 +120,7 @@ struct CleanupOldVersionsOptionsInput {
 struct CleanupOldVersionsMetricsOutput {
     bytes_removed: u64,
     old_versions: u64,
+    failed_deletes: u64,
 }
 
 impl Default for CleanupOldVersionsOptionsInput {
@@ -201,6 +254,8 @@ pub unsafe extern "C" fn lance_dataset_add_columns(
     expressions: *const *const c_char,
     expressions_len: usize,
     batch_size: u32,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
 ) -> i32 {
     match dataset_add_columns_inner(
         dataset,
@@ -208,6 +263,8 @@ pub unsafe extern "C" fn lance_dataset_add_columns(
         expressions,
         expressions_len,
         batch_size,
+        blob_columns,
+        blob_columns_len,
     ) {
         Ok(()) => {
             clear_last_error();
@@ -226,6 +283,8 @@ fn dataset_add_columns_inner(
     expressions: *const *const c_char,
     expressions_len: usize,
     batch_size: u32,
+    blob_columns: *const u8,
+    blob_columns_len: usize,
 ) -> FfiResult<()> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let mut ds = (*handle.dataset).clone();
@@ -237,6 +296,27 @@ fn dataset_add_columns_inner(
             "new_columns_schema must have at least one field",
         ));
     }
+    if blob_columns_len != 0 && blob_columns_len != output_schema.fields().len() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "blob_columns_len must be zero or match new_columns_schema field count",
+        ));
+    }
+    let blob_flags = if blob_columns_len == 0 {
+        vec![false; output_schema.fields().len()]
+    } else {
+        if blob_columns.is_null() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "blob_columns must not be null when blob_columns_len is non-zero",
+            ));
+        }
+        unsafe { std::slice::from_raw_parts(blob_columns, blob_columns_len) }
+            .iter()
+            .map(|flag| *flag != 0)
+            .collect()
+    };
+    let output_schema = add_blob_v2_schema_fields(&ds, output_schema, &blob_flags)?;
 
     let batch_size = if batch_size == 0 {
         parse_batch_size_from_config(&ds)
@@ -330,7 +410,22 @@ fn dataset_add_columns_inner(
                     .map_err(|err| {
                         lance::Error::invalid_input(format!("expression[{idx}] into_array: {err}"))
                     })?;
-                let arr = if arr.data_type() != field.data_type() {
+                let arr = if is_blob_v2_field(field) {
+                    let arr = if matches!(
+                        arr.data_type(),
+                        DataType::Binary | DataType::LargeBinary | DataType::Null
+                    ) {
+                        arr
+                    } else {
+                        compute::cast(&arr, &DataType::LargeBinary).map_err(|err| {
+                            lance::Error::invalid_input(format!(
+                                "expression[{idx}] blob cast: {err}"
+                            ))
+                        })?
+                    };
+                    blob_v2_array_from_bytes(field.name(), arr.as_ref())
+                        .map_err(lance::Error::invalid_input)?
+                } else if arr.data_type() != field.data_type() {
                     compute::cast(&arr, field.data_type()).map_err(|err| {
                         lance::Error::invalid_input(format!("expression[{idx}] cast: {err}"))
                     })?
@@ -823,6 +918,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
 pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
     dataset: *mut c_void,
     options_json: *const c_char,
+    has_uncommitted_writes: u8,
     out_metrics_json: *mut *const c_char,
 ) -> i32 {
     if !out_metrics_json.is_null() {
@@ -830,9 +926,20 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions_with_options(
             ptr::write_unaligned(out_metrics_json, ptr::null());
         }
     }
-    match parse_cleanup_options_json(options_json).and_then(|options| {
+    let result = parse_cleanup_options_json(options_json).and_then(|options| {
+        // delete_unverified lists data files with no age cutoff
+        // (lance-format/lance#8944), so it would delete the files of writes still
+        // pending in an open transaction, whose commit then publishes a table
+        // that cannot be read.
+        if options.delete_unverified && has_uncommitted_writes != 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "delete_unverified cannot run while a transaction has uncommitted Lance writes",
+            ));
+        }
         dataset_cleanup_old_versions_with_options_struct(dataset, options, out_metrics_json)
-    }) {
+    });
+    match result {
         Ok(()) => {
             clear_last_error();
             0
@@ -894,6 +1001,9 @@ fn dataset_cleanup_old_versions_with_options_struct(
             let metrics = CleanupOldVersionsMetricsOutput {
                 bytes_removed: stats.bytes_removed,
                 old_versions: stats.old_versions,
+                // Lance keeps going past files it cannot delete; report them so
+                // a partial cleanup is not mistaken for a complete one.
+                failed_deletes: stats.failed_deletes,
             };
             write_metrics_json(
                 &metrics,

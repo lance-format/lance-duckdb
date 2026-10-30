@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.14...3.29)
 
 # Set extension name here
 set(TARGET_NAME lance)
@@ -9,48 +9,59 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/lance_extension.cpp src/lance_scan.cpp
-                      src/lance_search.cpp src/lance_common.cpp
-                      src/lance_dataset_cache.cpp
-                      src/lance_session_state.cpp
-                      src/lance_secrets.cpp
-                      src/lance_filter_ir.cpp
-                      src/lance_exec_ir.cpp
-                      src/lance_logical_exec.cpp
-                      src/lance_storage.cpp
-                      src/lance_metadata.cpp
-                      src/lance_maintenance.cpp
-                      src/lance_replacement.cpp
-                      src/lance_insert.cpp
-                      src/lance_merge.cpp
-                      src/lance_delete.cpp
-                      src/lance_update.cpp
-                      src/lance_expr_ir.cpp
-                      src/lance_write.cpp
-                      src/lance_truncate.cpp
-                      src/lance_index.cpp
-                      src/lance_arrow_compat.cpp
-                      src/lance_resolver.cpp)
+set(EXTENSION_SOURCES
+    src/lance_extension.cpp
+    src/lance_blob.cpp
+    src/lance_scan.cpp
+    src/lance_search.cpp
+    src/lance_common.cpp
+    src/lance_dataset_cache.cpp
+    src/lance_session_state.cpp
+    src/lance_source_resolver.cpp
+    src/lance_secrets.cpp
+    src/lance_filter_ir.cpp
+    src/lance_exec_ir.cpp
+    src/lance_logical_exec.cpp
+    src/lance_storage.cpp
+    src/lance_table_entry.cpp
+    src/lance_maintenance.cpp
+    src/lance_replacement.cpp
+    src/lance_insert.cpp
+    src/lance_merge.cpp
+    src/lance_delete.cpp
+    src/lance_update.cpp
+    src/lance_expr_ir.cpp
+    src/lance_write.cpp
+    src/lance_index.cpp
+    src/lance_range_read.cpp
+    src/lance_arrow_compat.cpp
+    src/lance_resolver.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Platform libs required by Rust deps (e.g., TLS, timezone)
 if(APPLE)
-  if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+  if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET
+                                                STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET
         13.3
         CACHE STRING "Minimum OS X deployment version" FORCE)
   endif()
-  set(PLATFORM_LIBS
-      "-framework CoreFoundation"
-      "-framework IOKit"
-      "-framework SystemConfiguration"
-      "-framework Security")
+  set(PLATFORM_LIBS "-framework CoreFoundation" "-framework IOKit"
+                    "-framework SystemConfiguration" "-framework Security")
 elseif(UNIX)
   set(PLATFORM_LIBS m c)
 elseif(WIN32)
-  set(PLATFORM_LIBS ws2_32 userenv advapi32 crypt32 ntdll bcrypt ncrypt secur32)
+  set(PLATFORM_LIBS
+      ws2_32
+      userenv
+      advapi32
+      crypt32
+      ntdll
+      bcrypt
+      ncrypt
+      secur32)
 endif()
 
 # Build and link Rust staticlib (lance_duckdb_ffi)
@@ -120,41 +131,20 @@ else()
 endif()
 
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/cargo")
-set(RUST_DEBUG_LIB "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/debug/${RUST_STATICLIB_NAME}")
-set(RUST_RELEASE_LIB "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/release/${RUST_STATICLIB_NAME}")
+set(RUST_DEBUG_LIB
+    "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/debug/${RUST_STATICLIB_NAME}")
+set(RUST_RELEASE_LIB
+    "${RUST_TARGET_DIR}/${RUST_PLATFORM_TARGET}/release/${RUST_STATICLIB_NAME}")
 
-set(RUST_FFI_DEPENDS
-    ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
-    ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock
-    ${CMAKE_CURRENT_LIST_DIR}/rust/constants.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/datafusion_stream.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/error.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/exec_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/filter_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/arrow_export.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/dataset.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/exec.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/index.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/knn.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/mod.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/projection.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/query_table.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/scan.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/search.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/stream.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/take.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/types.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/update.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/util.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/ffi/write.rs
-	    ${CMAKE_CURRENT_LIST_DIR}/rust/lib.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/runtime.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/expr_ir.rs
-    ${CMAKE_CURRENT_LIST_DIR}/rust/scanner.rs)
+# Cargo discovers Rust modules; CMake must notice changes to every module before
+# deciding whether to invoke Cargo, including newly added FFI modules.
+file(GLOB_RECURSE RUST_SOURCES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_LIST_DIR}/rust/*.rs")
+set(RUST_FFI_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
+                     ${CMAKE_CURRENT_LIST_DIR}/Cargo.lock ${RUST_SOURCES})
 
-set(RUST_CARGO_ENV
-    CARGO_TARGET_DIR=${RUST_TARGET_DIR}
-    MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+set(RUST_CARGO_ENV CARGO_TARGET_DIR=${RUST_TARGET_DIR}
+                   MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
 if(DEFINED VCPKG_ROOT)
   list(APPEND RUST_CARGO_ENV VCPKG_ROOT=${VCPKG_ROOT})
 endif()
@@ -187,30 +177,33 @@ elseif(DEFINED VCPKG_TARGET_TRIPLET)
   endif()
 
   set(RUST_PROTOC_PATH
-      "${RUST_PROTOC_ROOT}/${VCPKG_TARGET_TRIPLET}/tools/protobuf/${RUST_PROTOC_NAME}")
+      "${RUST_PROTOC_ROOT}/${VCPKG_TARGET_TRIPLET}/tools/protobuf/${RUST_PROTOC_NAME}"
+  )
   if(EXISTS "${RUST_PROTOC_PATH}")
     list(APPEND RUST_CARGO_ENV "PROTOC=${RUST_PROTOC_PATH}")
   endif()
 endif()
 
-# Building both debug and release Rust artifacts is expensive and can trigger OOMs in CI.
-# For single-config generators (Ninja/Makefiles), only build the active configuration's artifact.
+# Building both debug and release Rust artifacts is expensive and can trigger
+# OOMs in CI. For single-config generators (Ninja/Makefiles), only build the
+# active configuration's artifact.
 if(CMAKE_CONFIGURATION_TYPES)
   add_custom_command(
     OUTPUT "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}"
     COMMAND
-      ${CMAKE_COMMAND} -E env
-      ${RUST_CARGO_ENV}
-      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
+      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
+      --target=${RUST_PLATFORM_TARGET}
     COMMAND
-      ${CMAKE_COMMAND} -E env
-      ${RUST_CARGO_ENV}
-      cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+      ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
+      --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
+      --target=${RUST_PLATFORM_TARGET}
     WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
     DEPENDS ${RUST_FFI_DEPENDS}
     VERBATIM)
 
-  add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}" "${RUST_RELEASE_LIB}")
+  add_custom_target(lance_duckdb_ffi_build DEPENDS "${RUST_DEBUG_LIB}"
+                                                   "${RUST_RELEASE_LIB}")
 else()
   if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
     set(CMAKE_BUILD_TYPE Release)
@@ -220,9 +213,9 @@ else()
     add_custom_command(
       OUTPUT "${RUST_DEBUG_LIB}"
       COMMAND
-        ${CMAKE_COMMAND} -E env
-        ${RUST_CARGO_ENV}
-        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --target=${RUST_PLATFORM_TARGET}
+        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
+        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml
+        --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}
       VERBATIM)
@@ -232,9 +225,9 @@ else()
     add_custom_command(
       OUTPUT "${RUST_RELEASE_LIB}"
       COMMAND
-        ${CMAKE_COMMAND} -E env
-        ${RUST_CARGO_ENV}
-        cargo build --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release --target=${RUST_PLATFORM_TARGET}
+        ${CMAKE_COMMAND} -E env ${RUST_CARGO_ENV} cargo build
+        --manifest-path=${CMAKE_CURRENT_LIST_DIR}/Cargo.toml --release
+        --target=${RUST_PLATFORM_TARGET}
       WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
       DEPENDS ${RUST_FFI_DEPENDS}
       VERBATIM)
@@ -243,22 +236,12 @@ else()
   endif()
 endif()
 
-target_link_libraries(
-  ${EXTENSION_NAME}
-  debug
-  "${RUST_DEBUG_LIB}"
-  optimized
-  "${RUST_RELEASE_LIB}"
-  ${PLATFORM_LIBS})
+target_link_libraries(${EXTENSION_NAME} debug "${RUST_DEBUG_LIB}" optimized
+                      "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
 add_dependencies(${EXTENSION_NAME} lance_duckdb_ffi_build)
 
-target_link_libraries(
-  ${LOADABLE_EXTENSION_NAME}
-  debug
-  "${RUST_DEBUG_LIB}"
-  optimized
-  "${RUST_RELEASE_LIB}"
-  ${PLATFORM_LIBS})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} debug "${RUST_DEBUG_LIB}"
+                      optimized "${RUST_RELEASE_LIB}" ${PLATFORM_LIBS})
 add_dependencies(${LOADABLE_EXTENSION_NAME} lance_duckdb_ffi_build)
 
 install(

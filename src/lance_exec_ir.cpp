@@ -170,7 +170,7 @@ static bool TryEncodeOutputTypeHint(const LogicalType &type, string &out) {
 
 static bool TryMapAggFunc(const BoundAggregateExpression &agg,
                           ExecIrAggFunc &out) {
-  auto name = StringUtil::Lower(agg.function.name);
+  auto name = StringUtil::Lower(agg.Function().GetName().GetIdentifierName());
   if (name == "sum") {
     out = ExecIrAggFunc::SUM;
     return true;
@@ -180,11 +180,11 @@ static bool TryMapAggFunc(const BoundAggregateExpression &agg,
     return true;
   }
   if (name == "count") {
-    if (agg.children.empty()) {
+    if (agg.GetChildren().empty()) {
       out = ExecIrAggFunc::COUNT_STAR;
       return true;
     }
-    if (agg.children.size() == 1) {
+    if (agg.GetChildren().size() == 1) {
       out = ExecIrAggFunc::COUNT;
       return true;
     }
@@ -207,10 +207,10 @@ static bool TryMapAggFunc(const BoundAggregateExpression &agg,
 
 static bool TryMapBinaryOp(const BoundFunctionExpression &fn,
                            ExecIrBinaryOp &out) {
-  if (fn.children.size() != 2) {
+  if (fn.GetChildren().size() != 2) {
     return false;
   }
-  auto name = StringUtil::Lower(fn.function.name);
+  auto name = StringUtil::Lower(fn.Function().GetName().GetIdentifierName());
   if (name == "+" || name == "add") {
     out = ExecIrBinaryOp::ADD;
     return true;
@@ -367,17 +367,18 @@ static bool IsExecIrPushdownableExpr(const Expression &expr) {
   if (!expr.CanThrow()) {
     return true;
   }
-  if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+  if (!BoundCastExpression::IsCast(expr)) {
     return false;
   }
-  auto &cast = expr.Cast<BoundCastExpression>();
-  if (!cast.child) {
+  auto &cast = expr.Cast<BoundFunctionExpression>();
+  if (!cast.GetChildren()[0]) {
     return false;
   }
-  if (!IsExecIrSafeCast(cast.child->return_type, cast.return_type)) {
+  if (!IsExecIrSafeCast(cast.GetChildren()[0]->GetReturnType(),
+                        cast.GetReturnType())) {
     return false;
   }
-  return IsExecIrPushdownableExpr(*cast.child);
+  return IsExecIrPushdownableExpr(*cast.GetChildren()[0]);
 }
 
 static bool TryEncodeExecExpr(
@@ -388,24 +389,52 @@ static bool TryEncodeExecExpr(
   auto projection_exprs = projection_stack_offset < projection_stack.size()
                               ? projection_stack[projection_stack_offset]
                               : nullptr;
+  if (BoundCastExpression::IsCast(expr)) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (!cast.GetChildren()[0]) {
+      return false;
+    }
+    if (cast.GetChildren()[0]->GetExpressionClass() ==
+        ExpressionClass::BOUND_CONSTANT) {
+      auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+      Value v;
+      try {
+        v = c.GetValue().DefaultCastAs(cast.GetReturnType());
+      } catch (...) {
+        return false;
+      }
+      return TryEncodeLiteral(v, out);
+    }
+    string type_hint;
+    if (!TryEncodeOutputTypeHint(cast.GetReturnType(), type_hint)) {
+      return false;
+    }
+    WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::CAST));
+    WriteBytes(out, reinterpret_cast<const_data_ptr_t>(type_hint.data()),
+               type_hint.size());
+    return TryEncodeExecExpr(scan_get, scan_bind, projection_stack,
+                             projection_stack_offset, *cast.GetChildren()[0],
+                             out, out_col_idxs);
+  }
   switch (expr.GetExpressionClass()) {
   case ExpressionClass::BOUND_COLUMN_REF: {
     auto &colref = expr.Cast<BoundColumnRefExpression>();
-    if (colref.binding.table_index != scan_get.table_index) {
+    if (colref.Binding().table_index != scan_get.table_index) {
       if (!projection_exprs ||
-          colref.binding.column_index >= projection_exprs->size() ||
-          !(*projection_exprs)[colref.binding.column_index]) {
+          colref.Binding().column_index >= projection_exprs->size() ||
+          !(*projection_exprs)[colref.Binding().column_index]) {
         return false;
       }
       return TryEncodeExecExpr(
           scan_get, scan_bind, projection_stack, projection_stack_offset + 1,
-          *(*projection_exprs)[colref.binding.column_index], out, out_col_idxs);
+          *(*projection_exprs)[colref.Binding().column_index], out,
+          out_col_idxs);
     }
     auto &column_ids = scan_get.GetColumnIds();
-    if (colref.binding.column_index >= column_ids.size()) {
+    if (colref.Binding().column_index >= column_ids.size()) {
       return false;
     }
-    auto &col_index = column_ids[colref.binding.column_index];
+    auto &col_index = column_ids[colref.Binding().column_index];
     if (col_index.IsVirtualColumn()) {
       return false;
     }
@@ -424,49 +453,24 @@ static bool TryEncodeExecExpr(
   }
   case ExpressionClass::BOUND_CONSTANT: {
     auto &c = expr.Cast<BoundConstantExpression>();
-    return TryEncodeLiteral(c.value, out);
+    return TryEncodeLiteral(c.GetValue(), out);
   }
-  case ExpressionClass::BOUND_CAST: {
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (!cast.child) {
-      return false;
-    }
-    if (cast.child->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      auto &c = cast.child->Cast<BoundConstantExpression>();
-      Value v;
-      try {
-        v = c.value.DefaultCastAs(cast.return_type);
-      } catch (...) {
-        return false;
-      }
-      return TryEncodeLiteral(v, out);
-    }
-    string type_hint;
-    if (!TryEncodeOutputTypeHint(cast.return_type, type_hint)) {
-      return false;
-    }
-    WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::CAST));
-    WriteBytes(out, reinterpret_cast<const_data_ptr_t>(type_hint.data()),
-               type_hint.size());
-    return TryEncodeExecExpr(scan_get, scan_bind, projection_stack,
-                             projection_stack_offset, *cast.child, out,
-                             out_col_idxs);
-  }
+
   case ExpressionClass::BOUND_REF: {
     auto &ref = expr.Cast<BoundReferenceExpression>();
-    if (projection_exprs && ref.index < projection_exprs->size() &&
-        (*projection_exprs)[ref.index] &&
-        (*projection_exprs)[ref.index].get() != &expr) {
+    if (projection_exprs && ref.Index() < projection_exprs->size() &&
+        (*projection_exprs)[ref.Index()] &&
+        (*projection_exprs)[ref.Index()].get() != &expr) {
       return TryEncodeExecExpr(
           scan_get, scan_bind, projection_stack, projection_stack_offset + 1,
-          *(*projection_exprs)[ref.index], out, out_col_idxs);
+          *(*projection_exprs)[ref.Index()], out, out_col_idxs);
     }
 
     auto &column_ids = scan_get.GetColumnIds();
-    if (ref.index >= column_ids.size()) {
+    if (ref.Index() >= column_ids.size()) {
       return false;
     }
-    auto &col_index = column_ids[ref.index];
+    auto &col_index = column_ids[ref.Index()];
     if (col_index.IsVirtualColumn()) {
       return false;
     }
@@ -493,14 +497,15 @@ static bool TryEncodeExecExpr(
     WriteU8(out, static_cast<uint8_t>(bop));
 
     const LogicalType *decimal_type = nullptr;
-    if (fn.children.size() == 2 && fn.children[0] &&
-        fn.children[0]->return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &fn.children[0]->return_type;
-    } else if (fn.children.size() == 2 && fn.children[1] &&
-               fn.children[1]->return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &fn.children[1]->return_type;
-    } else if (expr.return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &expr.return_type;
+    if (fn.GetChildren().size() == 2 && fn.GetChildren()[0] &&
+        fn.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::DECIMAL) {
+      decimal_type = &fn.GetChildren()[0]->GetReturnType();
+    } else if (fn.GetChildren().size() == 2 && fn.GetChildren()[1] &&
+               fn.GetChildren()[1]->GetReturnType().id() ==
+                   LogicalTypeId::DECIMAL) {
+      decimal_type = &fn.GetChildren()[1]->GetReturnType();
+    } else if (expr.GetReturnType().id() == LogicalTypeId::DECIMAL) {
+      decimal_type = &expr.GetReturnType();
     }
 
     auto encode_child = [&](const unique_ptr<Expression> &child_expr) -> bool {
@@ -512,7 +517,7 @@ static bool TryEncodeExecExpr(
         auto &c = child_expr->Cast<BoundConstantExpression>();
         Value v;
         try {
-          v = c.value.DefaultCastAs(*decimal_type);
+          v = c.GetValue().DefaultCastAs(*decimal_type);
         } catch (...) {
           return false;
         }
@@ -523,17 +528,18 @@ static bool TryEncodeExecExpr(
                                out_col_idxs);
     };
 
-    if (!encode_child(fn.children[0])) {
+    if (!encode_child(fn.GetChildren()[0])) {
       return false;
     }
-    if (!encode_child(fn.children[1])) {
+    if (!encode_child(fn.GetChildren()[1])) {
       return false;
     }
     return true;
   }
   case ExpressionClass::BOUND_OPERATOR: {
     auto &op = expr.Cast<BoundOperatorExpression>();
-    if (op.children.size() != 2 || !op.children[0] || !op.children[1]) {
+    if (op.GetChildren().size() != 2 || !op.GetChildren()[0] ||
+        !op.GetChildren()[1]) {
       return false;
     }
     auto op_str = ExpressionTypeToOperator(expr.GetExpressionType());
@@ -553,14 +559,15 @@ static bool TryEncodeExecExpr(
     WriteU8(out, static_cast<uint8_t>(bop));
 
     const LogicalType *decimal_type = nullptr;
-    if (op.children[0] &&
-        op.children[0]->return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &op.children[0]->return_type;
-    } else if (op.children[1] &&
-               op.children[1]->return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &op.children[1]->return_type;
-    } else if (expr.return_type.id() == LogicalTypeId::DECIMAL) {
-      decimal_type = &expr.return_type;
+    if (op.GetChildren()[0] &&
+        op.GetChildren()[0]->GetReturnType().id() == LogicalTypeId::DECIMAL) {
+      decimal_type = &op.GetChildren()[0]->GetReturnType();
+    } else if (op.GetChildren()[1] &&
+               op.GetChildren()[1]->GetReturnType().id() ==
+                   LogicalTypeId::DECIMAL) {
+      decimal_type = &op.GetChildren()[1]->GetReturnType();
+    } else if (expr.GetReturnType().id() == LogicalTypeId::DECIMAL) {
+      decimal_type = &expr.GetReturnType();
     }
 
     auto encode_child = [&](const unique_ptr<Expression> &child_expr) -> bool {
@@ -572,7 +579,7 @@ static bool TryEncodeExecExpr(
         auto &c = child_expr->Cast<BoundConstantExpression>();
         Value v;
         try {
-          v = c.value.DefaultCastAs(*decimal_type);
+          v = c.GetValue().DefaultCastAs(*decimal_type);
         } catch (...) {
           return false;
         }
@@ -583,10 +590,10 @@ static bool TryEncodeExecExpr(
                                out_col_idxs);
     };
 
-    if (!encode_child(op.children[0])) {
+    if (!encode_child(op.GetChildren()[0])) {
       return false;
     }
-    if (!encode_child(op.children[1])) {
+    if (!encode_child(op.GetChildren()[1])) {
       return false;
     }
     return true;
@@ -623,7 +630,7 @@ bool TryEncodeLanceExecIRv1(
       return false;
     }
     for (idx_t i = 0; i < aggregate.groups.size(); i++) {
-      if (set.count(i) == 0) {
+      if (set.count(ProjectionIndex(i)) == 0) {
         if (ExecIrFailfast()) {
           throw IOException("ExecIR reordered grouping set not supported");
         }
@@ -664,15 +671,15 @@ bool TryEncodeLanceExecIRv1(
         expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
       return true;
     }
-    if (expr.GetExpressionClass() != ExpressionClass::BOUND_CAST) {
+    if (!BoundCastExpression::IsCast(expr)) {
       return false;
     }
-    auto &cast = expr.Cast<BoundCastExpression>();
-    if (!cast.child) {
+    auto &cast = expr.Cast<BoundFunctionExpression>();
+    if (!cast.GetChildren()[0]) {
       return false;
     }
     // Allow nested CASTs but require the leaf to be a direct column reference.
-    return is_supported_group_expr(*cast.child);
+    return is_supported_group_expr(*cast.GetChildren()[0]);
   };
 
   vector<EncodedGroup> groups;
@@ -704,12 +711,12 @@ bool TryEncodeLanceExecIRv1(
     }
 
     EncodedGroup g;
-    g.output_name = expr->GetName();
+    g.output_name = expr->GetName().GetIdentifierName();
     g.encoded_expr = std::move(expr_buf);
-    if (!TryEncodeOutputTypeHint(expr->return_type, g.output_type_hint)) {
+    if (!TryEncodeOutputTypeHint(expr->GetReturnType(), g.output_type_hint)) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR group output type unsupported: " +
-                          expr->return_type.ToString());
+                          expr->GetReturnType().ToString());
       }
       return false;
     }
@@ -735,7 +742,7 @@ bool TryEncodeLanceExecIRv1(
 
     if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
       auto &agg = expr->Cast<BoundAggregateExpression>();
-      if (agg.IsDistinct() || agg.filter || agg.order_bys) {
+      if (agg.IsDistinct() || agg.GetFilter() || agg.GetOrderBys()) {
         if (ExecIrFailfast()) {
           throw IOException("ExecIR aggregate has DISTINCT/FILTER/ORDER BY");
         }
@@ -744,12 +751,12 @@ bool TryEncodeLanceExecIRv1(
       if (!TryMapAggFunc(agg, func)) {
         if (ExecIrFailfast()) {
           throw IOException("ExecIR unsupported aggregate: " +
-                            agg.function.name);
+                            agg.Function().GetName().GetIdentifierName());
         }
         return false;
       }
       if (func == ExecIrAggFunc::COUNT_STAR) {
-        if (!agg.children.empty()) {
+        if (!agg.GetChildren().empty()) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR count_star has args");
           }
@@ -757,22 +764,23 @@ bool TryEncodeLanceExecIRv1(
         }
         count_star = true;
       } else {
-        if (agg.children.size() != 1) {
+        if (agg.GetChildren().size() != 1) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR aggregate arg count != 1");
           }
           return false;
         }
-        arg_expr = agg.children[0].get();
+        arg_expr = agg.GetChildren()[0].get();
       }
     } else if (expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
       auto &fn = expr->Cast<BoundFunctionExpression>();
-      auto name = StringUtil::Lower(fn.function.name);
+      auto name =
+          StringUtil::Lower(fn.Function().GetName().GetIdentifierName());
       if (name == "sum") {
         func = ExecIrAggFunc::SUM;
       } else if (name == "count") {
-        func = fn.children.empty() ? ExecIrAggFunc::COUNT_STAR
-                                   : ExecIrAggFunc::COUNT;
+        func = fn.GetChildren().empty() ? ExecIrAggFunc::COUNT_STAR
+                                        : ExecIrAggFunc::COUNT;
       } else if (name == "min") {
         func = ExecIrAggFunc::MIN;
       } else if (name == "max") {
@@ -782,12 +790,12 @@ bool TryEncodeLanceExecIRv1(
       } else {
         if (ExecIrFailfast()) {
           throw IOException("ExecIR unsupported aggregate function: " +
-                            fn.function.name);
+                            fn.Function().GetName().GetIdentifierName());
         }
         return false;
       }
       if (func == ExecIrAggFunc::COUNT_STAR) {
-        if (!fn.children.empty()) {
+        if (!fn.GetChildren().empty()) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR count_star has args");
           }
@@ -795,13 +803,13 @@ bool TryEncodeLanceExecIRv1(
         }
         count_star = true;
       } else {
-        if (fn.children.size() != 1) {
+        if (fn.GetChildren().size() != 1) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR aggregate arg count != 1");
           }
           return false;
         }
-        arg_expr = fn.children[0].get();
+        arg_expr = fn.GetChildren()[0].get();
       }
     } else {
       if (ExecIrFailfast()) {
@@ -813,11 +821,11 @@ bool TryEncodeLanceExecIRv1(
 
     EncodedAgg enc;
     enc.func = func;
-    enc.output_name = expr->GetName();
-    if (!TryEncodeOutputTypeHint(expr->return_type, enc.output_type_hint)) {
+    enc.output_name = expr->GetName().GetIdentifierName();
+    if (!TryEncodeOutputTypeHint(expr->GetReturnType(), enc.output_type_hint)) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR aggregate output type unsupported: " +
-                          expr->return_type.ToString());
+                          expr->GetReturnType().ToString());
       }
       return false;
     }
@@ -982,29 +990,28 @@ bool TryEncodeLanceExecIRv1(
       }
 
       const Expression *base = expr_ptr.get();
-      while (base->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-        auto &cast = base->Cast<BoundCastExpression>();
-        if (!cast.child) {
+      while (BoundCastExpression::IsCast(*base)) {
+        auto &cast = base->Cast<BoundFunctionExpression>();
+        if (!cast.GetChildren()[0]) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR post projection cast child is null");
           }
           return false;
         }
-        base = cast.child.get();
+        base = cast.GetChildren()[0].get();
       }
 
       idx_t out_idx = DConstants::INVALID_INDEX;
       if (base->GetExpressionClass() == ExpressionClass::BOUND_REF) {
         auto &ref = base->Cast<BoundReferenceExpression>();
-        out_idx = NumericCast<idx_t>(ref.index);
+        out_idx = NumericCast<idx_t>(ref.Index());
       } else if (base->GetExpressionClass() ==
                  ExpressionClass::BOUND_COLUMN_REF) {
         auto &colref = base->Cast<BoundColumnRefExpression>();
-        if (colref.binding.table_index == aggregate.group_index) {
-          out_idx = NumericCast<idx_t>(colref.binding.column_index);
-        } else if (colref.binding.table_index == aggregate.aggregate_index) {
-          out_idx =
-              groups.size() + NumericCast<idx_t>(colref.binding.column_index);
+        if (colref.Binding().table_index == aggregate.group_index) {
+          out_idx = colref.Binding().column_index.GetIndex();
+        } else if (colref.Binding().table_index == aggregate.aggregate_index) {
+          out_idx = groups.size() + colref.Binding().column_index.GetIndex();
         }
       }
       if (out_idx == DConstants::INVALID_INDEX || out_idx != i ||
@@ -1016,7 +1023,7 @@ bool TryEncodeLanceExecIRv1(
         return false;
       }
 
-      auto name = expr_ptr->GetName();
+      auto name = expr_ptr->GetName().GetIdentifierName();
       if (name.empty()) {
         if (ExecIrFailfast()) {
           throw IOException("ExecIR post projection output name is empty");
@@ -1047,7 +1054,7 @@ bool TryEncodeLanceExecIRv1(
       string name;
       if (node.expression->GetExpressionClass() == ExpressionClass::BOUND_REF) {
         auto &ref = node.expression->Cast<BoundReferenceExpression>();
-        auto idx = NumericCast<idx_t>(ref.index);
+        auto idx = NumericCast<idx_t>(ref.Index());
         if (idx >= output_names.size()) {
           if (ExecIrFailfast()) {
             throw IOException("ExecIR order by bound ref out of bounds");
@@ -1058,26 +1065,26 @@ bool TryEncodeLanceExecIRv1(
       } else if (node.expression->GetExpressionClass() ==
                  ExpressionClass::BOUND_COLUMN_REF) {
         auto &colref = node.expression->Cast<BoundColumnRefExpression>();
-        if (colref.binding.table_index == aggregate.group_index) {
-          if (colref.binding.column_index >= groups.size()) {
+        if (colref.Binding().table_index == aggregate.group_index) {
+          if (colref.Binding().column_index >= groups.size()) {
             if (ExecIrFailfast()) {
               throw IOException("ExecIR order by group column out of bounds");
             }
             return false;
           }
-          name = groups[colref.binding.column_index].output_name;
-        } else if (colref.binding.table_index == aggregate.aggregate_index) {
-          if (colref.binding.column_index >= aggs.size()) {
+          name = groups[colref.Binding().column_index].output_name;
+        } else if (colref.Binding().table_index == aggregate.aggregate_index) {
+          if (colref.Binding().column_index >= aggs.size()) {
             if (ExecIrFailfast()) {
               throw IOException(
                   "ExecIR order by aggregate column out of bounds");
             }
             return false;
           }
-          name = aggs[colref.binding.column_index].output_name;
-        } else if (post_projection &&
-                   colref.binding.table_index == post_projection->table_index) {
-          auto idx = NumericCast<idx_t>(colref.binding.column_index);
+          name = aggs[colref.Binding().column_index].output_name;
+        } else if (post_projection && colref.Binding().table_index ==
+                                          post_projection->table_index) {
+          auto idx = colref.Binding().column_index.GetIndex();
           if (idx >= output_names.size()) {
             if (ExecIrFailfast()) {
               throw IOException(

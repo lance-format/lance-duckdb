@@ -23,10 +23,10 @@ COPY (
          (i != 10)                                                    AS active,
          (i = 11)                                                     AS archived
   FROM range(1, 13) t(i)
-) TO 'test/.tmp/containment_ns/items.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/containment_ns/items.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok
-ATTACH 'test/.tmp/containment_ns' AS containment_ns (TYPE LANCE);
+ATTACH '{TEST_DIR}/containment_ns' AS containment_ns (TYPE LANCE);
 
 statement ok
 CREATE INDEX tags_idx ON containment_ns.main.items (tags) USING LABEL_LIST;

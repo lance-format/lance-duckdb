@@ -17,13 +17,13 @@ COPY (
   SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s, 10::BIGINT AS extra
   UNION ALL
   SELECT 2::BIGINT AS id, 'b'::VARCHAR AS s, 20::BIGINT AS extra
-) TO 'test/.tmp/cache_schema_evo.lance' (FORMAT lance, mode 'overwrite');
+) TO '{TEST_DIR}/cache_schema_evo.lance' (FORMAT lance, mode 'overwrite');
 
 statement ok con1
-ATTACH 'test/.tmp' AS evo_reader (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS evo_reader (TYPE LANCE);
 
 statement ok con2
-ATTACH 'test/.tmp' AS evo_writer (TYPE LANCE);
+ATTACH '{TEST_DIR}' AS evo_writer (TYPE LANCE);
 
 # con1 discovers the table with the original three-column schema.
 query ITI con1
@@ -58,7 +58,7 @@ SELECT * FROM evo_reader.main.cache_schema_evo ORDER BY id;
 1	10
 2	20
 
-# External rename: same fail-closed + self-heal cycle.
+# External rename: entry resolution refreshes the schema before binding.
 statement ok con2
 ALTER TABLE evo_writer.main.cache_schema_evo RENAME extra TO score;
 
@@ -73,26 +73,22 @@ SELECT score FROM evo_reader.main.cache_schema_evo ORDER BY id;
 10
 20
 
-# DROP TABLE as the very first statement after an external change: the DROP's
-# own bind refreshes the stale entry inside the DROP's transaction, and the
-# non-transactional catalog part of DROP cannot run on top of that
-# uncommitted refresh. It must fail closed BEFORE deleting the dataset
-# (proceeding would delete the data and then abort on the catalog conflict).
+# Refreshing metadata no longer creates an uncommitted native catalog entry.
+# ALTER and DROP can be the first reader statements after an external change.
 statement ok con2
 ALTER TABLE evo_writer.main.cache_schema_evo ADD COLUMN flag BIGINT;
 
-statement error con1
-DROP TABLE evo_reader.main.cache_schema_evo;
-----
-<REGEX>:.*refreshed in the current transaction.*
+statement ok con1
+ALTER TABLE evo_reader.main.cache_schema_evo RENAME flag TO refreshed_flag;
 
-# The dataset is intact; a successful statement commits the refreshed entry.
 query I con1
 SELECT count(*) FROM evo_reader.main.cache_schema_evo;
 ----
 2
 
-# With the refresh committed, the DROP goes through.
+statement ok con2
+ALTER TABLE evo_writer.main.cache_schema_evo ADD COLUMN another_flag BIGINT;
+
 statement ok con1
 DROP TABLE evo_reader.main.cache_schema_evo;
 

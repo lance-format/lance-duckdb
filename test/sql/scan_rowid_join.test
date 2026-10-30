@@ -1,0 +1,28 @@
+# name: test/sql/scan_rowid_join.test
+# description: Native rowid vectors retain their size when a Lance scan probes a right join
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/rowid_join' AS rowid_ns (TYPE LANCE);
+
+statement ok
+CREATE OR REPLACE TABLE rowid_ns.main.items AS
+SELECT 1::BIGINT AS id UNION ALL SELECT 2::BIGINT;
+
+# A raw rowid buffer with a zero vector size can be read by a projection but
+# loses the matching row when used as a join payload.
+query II
+SELECT t.rowid IS NOT NULL, s.id
+FROM rowid_ns.main.items t RIGHT JOIN (SELECT 2::BIGINT AS id) s ON t.id = s.id;
+----
+true	2
+
+query I
+SELECT count(*) FROM rowid_ns.main.items CROSS JOIN (VALUES (1), (2)) s(n);
+----
+4
+
+statement ok
+DETACH rowid_ns;

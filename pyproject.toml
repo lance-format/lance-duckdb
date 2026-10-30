@@ -1,5 +1,6 @@
 [project]
 name = "lance-duckdb-devtools"
+# Local development-environment metadata, not a lance-duckdb release number.
 version = "0.1.0"
 description = "Developer tooling for DuckDB format.py"
 requires-python = ">=3.11"

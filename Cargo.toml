@@ -1,6 +1,8 @@
 [package]
 name = "lance_duckdb_ffi"
+# Internal Cargo metadata; lance-duckdb releases follow DuckDB.
 version = "0.1.0"
+publish = false
 edition = "2021"
 
 [lib]
@@ -19,18 +21,22 @@ panic = "abort"
 [dependencies]
 
 # Lance and Arrow dependencies - using compatible versions
-lance = { version = "12.0.0", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
-lance-arrow = "12.0.0"
-lance-core = "12.0.0"
-lance-index = "12.0.0"
-lance-linalg = "12.0.0"
-lance-namespace = "12.0.0"
-lance-namespace-impls = { version = "12.0.0", features = ["rest"] }
-lance-table = "12.0.0"
+lance = { version = "14.0.1", default-features = false, features = ["aws", "azure", "gcp", "oss", "huggingface"] }
+lance-arrow = "14.0.1"
+lance-core = "14.0.1"
+lance-datafusion = "14.0.1"
+lance-index = "14.0.1"
+lance-io = "14.0.1"
+lance-linalg = "14.0.1"
+lance-namespace = "14.0.1"
+lance-namespace-impls = { version = "14.0.1", features = ["rest"] }
+lance-table = "14.0.1"
+object_store = "0.14.2"
 
-arrow = { version = "58.0.0", features = ["ffi"] }
-arrow-array = "58.0.0"
-arrow-schema = "58.0.0"
+arrow = { version = "58.4.1", features = ["ffi"] }
+arrow-array = "58.4.1"
+arrow-buffer = "58.4.1"
+arrow-schema = "58.4.1"
 
 datafusion = "54.0.0"
 datafusion-common = "54.0.0"
@@ -41,6 +47,7 @@ datafusion-sql = "54.0.0"
 
 anyhow = "1.0"
 async-trait = "0.1"
+blake3 = "1"
 bzip2-sys = { version = "0.1.13", features = ["static"] }
 chrono = "0.4"
 futures = "0.3"
@@ -50,3 +57,8 @@ serde = { version = "1.0", features = ["derive"] }
 snafu = "0.9.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rand = "0.8"
+url = "2"
+
+[dev-dependencies]
+lance-file = "14.0.1"
+lance-io = { version = "14.0.1", features = ["test-util"] }

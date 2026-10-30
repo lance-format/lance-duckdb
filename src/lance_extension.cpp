@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "lance_extension.hpp"
+#include "lance_blob.hpp"
 #include "lance_secrets.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -16,17 +17,19 @@ void RegisterLanceMaintenance(ExtensionLoader &loader);
 void RegisterLanceMaintenanceParser(DBConfig &config);
 void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
+void RegisterLanceRangeRead(ExtensionLoader &loader);
 void RegisterLanceReplacement(DBConfig &config);
 void RegisterLanceWrite(ExtensionLoader &loader);
 void RegisterLanceStorage(DBConfig &config);
-void RegisterLanceTruncate(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceIndex(DBConfig &config, ExtensionLoader &loader);
 void RegisterLanceScanOptimizer(DBConfig &config);
 
 static void LoadInternal(ExtensionLoader &loader) {
+  RegisterLanceBlobInput(loader);
   // Register internal scan table functions.
   RegisterLanceScan(loader);
   RegisterLanceSearch(loader);
+  RegisterLanceRangeRead(loader);
   RegisterLanceWrite(loader);
   RegisterLanceMaintenance(loader);
 }
@@ -38,6 +41,7 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   auto &instance = loader.GetDatabaseInstance();
   RegisterLanceSecrets(instance);
   auto &config = DBConfig::GetConfig(instance);
+  RegisterLanceBlobPlannerExtension(config);
   config.AddExtensionOption("lance_deferred_materialization",
                             "Enable deferred materialization for heavy columns "
                             "when filter pushdown fails",
@@ -51,7 +55,6 @@ void LanceExtension::Load(ExtensionLoader &loader) {
   RegisterLanceScanOptimizer(config);
   RegisterLanceStorage(config);
   RegisterLanceReplacement(config);
-  RegisterLanceTruncate(config, loader);
   RegisterLanceIndex(config, loader);
   RegisterLanceMaintenanceParser(config);
 }
