@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr};
 use std::ptr;
@@ -15,7 +14,7 @@ use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
 use lance::index::DatasetIndexExt;
 use lance::Dataset;
-use lance_arrow::json::{convert_lance_json_to_arrow, has_json_fields, lance_json_to_arrow_json};
+use lance_arrow::json::has_json_fields;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use serde::{Deserialize, Serialize};
@@ -35,19 +34,6 @@ fn parse_batch_size_from_config(dataset: &Dataset) -> Option<u32> {
         .get("lance.add_columns.batch_size")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|v| *v > 0)
-}
-
-/// Project physical Lance JSON fields to their logical text type for planning.
-fn logical_json_schema(schema: &ArrowSchema) -> Arc<ArrowSchema> {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(|field| Arc::new(lance_json_to_arrow_json(field)))
-        .collect::<Vec<_>>();
-    Arc::new(ArrowSchema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    ))
 }
 
 /// Apply the SQL BLOB contract to columns introduced by ALTER ADD COLUMN.
@@ -358,9 +344,8 @@ fn dataset_add_columns_inner(
             ));
         }
 
-        let full_physical_schema = Arc::new(ArrowSchema::from(ds.schema()));
-        let full_logical_schema = logical_json_schema(&full_physical_schema);
-        let planner = lance::io::exec::Planner::new(full_logical_schema);
+        let full_read_schema = Arc::new(ArrowSchema::from(ds.schema()));
+        let planner = lance::io::exec::Planner::new(full_read_schema);
 
         let parsed = exprs
             .iter()
@@ -389,20 +374,14 @@ fn dataset_add_columns_inner(
             }
         }
         let needed_columns = needed.into_iter().collect::<Vec<_>>();
-        let projected = ds.schema().project(&needed_columns).map_err(|err| {
+        let read_schema = ds.schema().project(&needed_columns).map_err(|err| {
             FfiError::new(
                 ErrorCode::DatasetAddColumns,
                 format!("read schema project: {err}"),
             )
         })?;
-        let read_physical_schema = Arc::new(ArrowSchema::from(&projected));
-        // The planner schema below no longer contains the physical JSON marker.
-        let needs_json_conversion = read_physical_schema
-            .fields()
-            .iter()
-            .any(|field| has_json_fields(field));
-        let read_logical_schema = logical_json_schema(&read_physical_schema);
-        let planner = lance::io::exec::Planner::new(read_logical_schema);
+        let read_schema = Arc::new(ArrowSchema::from(&read_schema));
+        let planner = lance::io::exec::Planner::new(read_schema.clone());
 
         let physical = parsed
             .into_iter()
@@ -420,19 +399,11 @@ fn dataset_add_columns_inner(
         let output_fields = output_schema.fields().to_vec();
         let schema_ref = output_schema.clone();
         let mapper = move |batch: &RecordBatch| {
-            let evaluation_batch = if needs_json_conversion {
-                Cow::Owned(
-                    convert_lance_json_to_arrow(batch)
-                        .map_err(|err| lance::Error::invalid_input(format!("JSON input: {err}")))?,
-                )
-            } else {
-                Cow::Borrowed(batch)
-            };
-            let num_rows = evaluation_batch.num_rows();
+            let num_rows = batch.num_rows();
             let mut arrays = Vec::with_capacity(physical.len());
             for (idx, (field, expr)) in output_fields.iter().zip(physical.iter()).enumerate() {
                 let arr = expr
-                    .evaluate(evaluation_batch.as_ref())
+                    .evaluate(batch)
                     .map_err(|err| {
                         lance::Error::invalid_input(format!("expression[{idx}] evaluate: {err}"))
                     })?
@@ -475,7 +446,7 @@ fn dataset_add_columns_inner(
         });
 
         let read_columns = Some(
-            read_physical_schema
+            read_schema
                 .fields()
                 .iter()
                 .map(|f| f.name().clone())

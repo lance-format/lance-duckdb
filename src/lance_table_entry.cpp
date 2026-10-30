@@ -343,20 +343,30 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       LanceNormalizeArrowListFieldNames(&new_schema_root.arrow_schema);
 
       vector<string> expressions;
-      if (add.new_column.HasDefaultValue()) {
-        if (types[0].id() == LogicalTypeId::BLOB) {
-          // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
-          // default with the native binder/evaluator, then hand the exact
-          // bytes to the existing expression path as a hex literal. Only
-          // constant-foldable BLOB defaults are supported: URI ingestion is a
-          // DML value contract, not a stored default.
-          try {
-            auto default_binder = Binder::CreateBinder(context);
-            vector<unique_ptr<Expression>> bound_defaults;
-            default_binder->BindDefaultValue(
-                add.new_column, bound_defaults,
-                catalog.GetName().GetIdentifierName(),
-                schema.name.GetIdentifierName());
+      const bool has_default = add.new_column.HasDefaultValue();
+      string default_sql;
+      if (has_default) {
+        try {
+          // DuckDB rebinds stored defaults for subsequent DML. Validate them
+          // before committing the external schema change.
+          auto default_binder = Binder::CreateBinder(context);
+          vector<unique_ptr<Expression>> bound_defaults;
+          default_binder->BindDefaultValue(
+              add.new_column, bound_defaults,
+              catalog.GetName().GetIdentifierName(),
+              schema.name.GetIdentifierName());
+          if (bound_defaults.size() != 1 || !bound_defaults[0]) {
+            throw InternalException(
+                "DuckDB default binder returned an unexpected result");
+          }
+          default_sql = add.new_column.DefaultValue().ToString();
+
+          if (types[0].id() == LogicalTypeId::BLOB) {
+            // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
+            // default with the native binder/evaluator, then hand the exact
+            // bytes to the existing expression path as a hex literal. Only
+            // constant-foldable BLOB defaults are supported: URI ingestion is
+            // a DML value contract, not a stored default.
             auto &bound_default = *bound_defaults[0];
             if (!bound_default.IsFoldable() || bound_default.IsVolatile()) {
               throw NotImplementedException(
@@ -377,12 +387,12 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
               auto bytes = default_value.GetValueUnsafe<string_t>().GetString();
               expressions.push_back("X'" + LanceHexEncode(bytes) + "'");
             }
-          } catch (...) {
-            lance_close_dataset(dataset);
-            throw;
+          } else {
+            expressions.push_back(default_sql);
           }
-        } else {
-          expressions.push_back(add.new_column.DefaultValue().ToString());
+        } catch (...) {
+          lance_close_dataset(dataset);
+          throw;
         }
       }
       vector<const char *> expr_ptrs;
@@ -407,14 +417,13 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       // is visible to the metadata updater.
       lance_close_dataset(dataset);
       dataset = nullptr;
-      if (add.new_column.HasDefaultValue()) {
+      if (has_default) {
         string reopen_uri;
         dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
         if (dataset) {
-          auto default_expr = add.new_column.DefaultValue().ToString();
           (void)lance_dataset_update_field_metadata(
               dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
-              default_expr.c_str());
+              default_sql.c_str());
           lance_close_dataset(dataset);
           dataset = nullptr;
         }
