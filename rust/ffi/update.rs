@@ -9,7 +9,6 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use datafusion_common::{DataFusionError, Result as DFResult};
 use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
@@ -17,7 +16,7 @@ use lance_core::datatypes::BLOB_V2_LOGICAL_TYPE;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::format::Fragment;
-use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence};
+use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex};
 use lance_table::transaction::UpdatedFragmentOffsets;
 use roaring::RoaringBitmap;
 use roaring::RoaringTreemap;
@@ -31,43 +30,6 @@ use super::blob::{
 };
 
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
-
-#[derive(Debug, Clone)]
-pub(super) enum CapturedRowIds {
-    AddressStyle(RoaringTreemap),
-    SequenceStyle(RowIdSequence),
-}
-
-impl CapturedRowIds {
-    pub(super) fn new(stable_row_ids: bool) -> Self {
-        if stable_row_ids {
-            Self::SequenceStyle(RowIdSequence::new())
-        } else {
-            Self::AddressStyle(RoaringTreemap::new())
-        }
-    }
-
-    pub(super) fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
-        match self {
-            Self::AddressStyle(addrs) => {
-                addrs
-                    .append(row_ids.iter().copied())
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-            }
-            Self::SequenceStyle(sequence) => {
-                sequence.extend(row_ids.into());
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn len(&self) -> u64 {
-        match self {
-            Self::AddressStyle(addrs) => addrs.len(),
-            Self::SequenceStyle(sequence) => sequence.len(),
-        }
-    }
-}
 
 pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
     if !dataset.manifest.uses_stable_row_ids() {

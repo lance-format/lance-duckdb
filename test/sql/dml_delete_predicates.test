@@ -1,0 +1,131 @@
+# name: test/sql/dml_delete_predicates.test
+# description: DELETE removes exactly the rows DuckDB's WHERE clause selects
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/delete_predicates' AS del_pred (TYPE LANCE);
+
+statement ok
+CREATE MACRO delete_rows(lo, hi) AS TABLE
+SELECT i::INTEGER AS id,
+       ('n' || i)::VARCHAR AS name,
+       (TIME '00:00:00' + to_seconds(i))::TIME AS ts,
+       ('\xAA'::BLOB || i::VARCHAR::BLOB) AS b,
+       ('00000000-0000-0000-0000-' || lpad(i::VARCHAR, 12, '0'))::UUID AS u
+FROM range(lo, hi) r(i);
+
+# Two fragments: ids 1..20 and 21..40.
+statement ok
+CREATE TABLE del_pred.main.t AS FROM delete_rows(1, 21);
+
+statement ok
+INSERT INTO del_pred.main.t FROM delete_rows(21, 41);
+
+# Predicates that Lance filter pushdown cannot express.
+query I
+DELETE FROM del_pred.main.t WHERE id % 10 = 3;
+----
+4
+
+query I
+DELETE FROM del_pred.main.t WHERE ts = TIME '00:00:05';
+----
+1
+
+query I
+DELETE FROM del_pred.main.t WHERE b = '\xAA27'::BLOB;
+----
+1
+
+query I
+DELETE FROM del_pred.main.t WHERE u = '00000000-0000-0000-0000-000000000011'::UUID;
+----
+1
+
+query I
+DELETE FROM del_pred.main.t
+WHERE id <= 10 AND u = '00000000-0000-0000-0000-000000000012'::UUID;
+----
+0
+
+query I
+DELETE FROM del_pred.main.t WHERE abs(id - 15) < 2;
+----
+3
+
+query I
+DELETE FROM del_pred.main.t WHERE name LIKE 'n1%' AND id % 2 = 0;
+----
+3
+
+query I
+SELECT list(id ORDER BY id) FROM del_pred.main.t WHERE id <= 20;
+----
+[1, 2, 4, 6, 7, 8, 9, 17, 19, 20]
+
+# Removes the rest of the second fragment.
+query I
+DELETE FROM del_pred.main.t WHERE id > 20;
+----
+17
+
+# Subqueries and joins.
+statement ok
+CREATE TABLE victims AS SELECT * FROM (VALUES (2), (4), (6), (6), (8), (9), (99)) v(id);
+
+query I
+DELETE FROM del_pred.main.t WHERE id IN (SELECT id FROM victims WHERE id < 5);
+----
+2
+
+# A target row matched twice is deleted (and counted) once.
+query I
+DELETE FROM del_pred.main.t USING victims v WHERE t.id = v.id AND v.id IN (6, 8);
+----
+2
+
+query I
+DELETE FROM del_pred.main.t WHERE id = (SELECT max(id) FROM del_pred.main.t);
+----
+1
+
+query I
+DELETE FROM del_pred.main.t WHERE EXISTS (SELECT 1 FROM victims v WHERE v.id = t.id);
+----
+1
+
+query I
+SELECT list(id ORDER BY id) FROM del_pred.main.t;
+----
+[1, 7, 17, 19]
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+DELETE FROM del_pred.main.t WHERE id % 2 = 1;
+----
+4
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT list(id ORDER BY id) FROM del_pred.main.t;
+----
+[1, 7, 17, 19]
+
+query I
+DELETE FROM del_pred.main.t;
+----
+4
+
+query I
+SELECT count(*) FROM del_pred.main.t;
+----
+0
+
+statement ok
+DETACH del_pred;
