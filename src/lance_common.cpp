@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <cstring>
+#include <memory>
 
 namespace duckdb {
 
@@ -44,6 +45,17 @@ string LanceFormatErrorSuffix() {
     return "";
   }
   return " (Lance error: " + err + ")";
+}
+
+vector<string> LanceConsumeStringList(LanceStringList &list) {
+  std::unique_ptr<LanceStringList, decltype(&lance_free_string_list)> owner(
+      &list, lance_free_string_list);
+  vector<string> result;
+  result.reserve(list.count);
+  for (idx_t i = 0; i < list.count; i++) {
+    result.emplace_back(list.items[i]);
+  }
+  return result;
 }
 
 bool IsComputedSearchColumn(const string &name) {
@@ -306,25 +318,18 @@ bool TryLanceNamespaceListTables(
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(
-      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr);
-  if (!ptr) {
+  LanceStringList tables = {};
+  auto rc = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                        bearer_ptr, api_key_ptr, delimiter_ptr,
+                                        headers_ptr, &tables);
+  if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
     }
     return false;
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> parts = StringUtil::Split(joined, '\n');
-  for (auto &p : parts) {
-    if (!p.empty()) {
-      out_tables.push_back(std::move(p));
-    }
-  }
+  out_tables = LanceConsumeStringList(tables);
   return true;
 }
 
@@ -471,10 +476,12 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
                                   value_ptrs);
 
-  auto *ptr = lance_dir_namespace_list_tables(
+  LanceStringList tables = {};
+  auto rc = lance_dir_namespace_list_tables(
       open_root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size());
-  if (!ptr) {
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      &tables);
+  if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
       out_error = "unknown error";
@@ -482,15 +489,7 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
     return false;
   }
 
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> parts = StringUtil::Split(joined, '\n');
-  for (auto &p : parts) {
-    if (!p.empty()) {
-      out_tables.push_back(std::move(p));
-    }
-  }
+  out_tables = LanceConsumeStringList(tables);
   return true;
 }
 

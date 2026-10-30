@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::Arc;
@@ -13,15 +14,15 @@ use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::RestNamespaceBuilder;
 
-use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::error::{clear_last_error, namespace_error_code, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
 use super::source_resolver::activate_source_resolution_for_session;
 use super::types::DatasetHandle;
 use super::util::{
-    cstr_to_str, optional_session_handle, schema_to_ffi_arrow_schema, to_c_string, FfiError,
-    FfiResult,
+    cstr_to_str, export_string_list, optional_session_handle, schema_to_ffi_arrow_schema,
+    to_c_string, FfiError, FfiResult, LanceStringList,
 };
 
 unsafe fn optional_cstr_to_string(
@@ -87,6 +88,48 @@ fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, Str
         .join("\n")
 }
 
+fn split_id(id: &str, delimiter: &str) -> Vec<String> {
+    if id.is_empty() || id == delimiter {
+        Vec::new()
+    } else {
+        id.split(delimiter).map(ToString::to_string).collect()
+    }
+}
+
+fn normalize_listed_tables(
+    tables: Vec<String>,
+    namespace_id: &str,
+    delimiter: &str,
+) -> Vec<String> {
+    let effective_namespace_id = if namespace_id == delimiter {
+        ""
+    } else {
+        namespace_id
+    };
+    let namespace_prefix = if effective_namespace_id.is_empty() {
+        None
+    } else {
+        Some(format!("{effective_namespace_id}{delimiter}"))
+    };
+    let mut seen = HashSet::new();
+    tables
+        .into_iter()
+        .filter_map(|table| {
+            let relative = match namespace_prefix.as_deref() {
+                Some(prefix) if table.starts_with(prefix) => table[prefix.len()..].to_string(),
+                _ if !table.contains(delimiter) => table,
+                _ => return None,
+            };
+            if relative.is_empty() || relative.contains(delimiter) {
+                None
+            } else {
+                Some(relative)
+            }
+        })
+        .filter(|relative| seen.insert(relative.clone()))
+        .collect()
+}
+
 fn list_tables_inner(
     endpoint: *const c_char,
     namespace_id: *const c_char,
@@ -96,20 +139,21 @@ fn list_tables_inner(
     headers_tsv: *const c_char,
 ) -> FfiResult<Vec<String>> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
-    let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")? };
+    let namespace_id = unsafe { cstr_to_str(namespace_id, "namespace_id")?.to_string() };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
     let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
     let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
     let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
 
     let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
+    let namespace_parts = split_id(&namespace_id, &delimiter);
     let namespace = build_config(
         endpoint,
         bearer_token.as_deref(),
         api_key.as_deref(),
         headers_tsv.as_deref(),
     )
-    .delimiter(delimiter)
+    .delimiter(delimiter.clone())
     .build();
 
     let tables = runtime::block_on(async move {
@@ -117,11 +161,7 @@ fn list_tables_inner(
         let mut page_token: Option<String> = None;
         loop {
             let mut req = ListTablesRequest::new();
-            req.id = Some(if namespace_id.is_empty() {
-                Vec::new()
-            } else {
-                vec![namespace_id.to_string()]
-            });
+            req.id = Some(namespace_parts.clone());
             req.page_token = page_token.clone();
             req.limit = Some(1000);
             let resp = namespace.list_tables(req).await.map_err(|err| {
@@ -140,7 +180,7 @@ fn list_tables_inner(
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
-    Ok(tables)
+    Ok(normalize_listed_tables(tables, &namespace_id, &delimiter))
 }
 
 #[no_mangle]
@@ -151,24 +191,20 @@ pub unsafe extern "C" fn lance_namespace_list_tables(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
-) -> *const c_char {
-    match list_tables_inner(
-        endpoint,
-        namespace_id,
-        bearer_token,
-        api_key,
-        delimiter,
-        headers_tsv,
-    ) {
-        Ok(tables) => {
-            clear_last_error();
-            let joined = tables.join("\n");
-            to_c_string(joined).into_raw() as *const c_char
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null()
-        }
+    out: *mut LanceStringList,
+) -> i32 {
+    unsafe {
+        export_string_list(
+            list_tables_inner(
+                endpoint,
+                namespace_id,
+                bearer_token,
+                api_key,
+                delimiter,
+                headers_tsv,
+            ),
+            out,
+        )
     }
 }
 
@@ -212,7 +248,7 @@ fn describe_table_info_inner(
         req.with_table_uri = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
-                ErrorCode::NamespaceDescribeTableInfo,
+                namespace_error_code(&err, ErrorCode::NamespaceDescribeTableInfo),
                 format!("namespace describe_table: {err}"),
             )
         })?;
@@ -477,7 +513,7 @@ fn describe_table_with_schema_inner(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
-) -> FfiResult<String> {
+) -> FfiResult<Option<String>> {
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
@@ -508,19 +544,16 @@ fn describe_table_with_schema_inner(
         req.load_detailed_metadata = Some(true);
         let resp = namespace.describe_table(req).await.map_err(|err| {
             FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
+                namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
                 format!("namespace describe_table: {err}"),
             )
         })?;
 
-        let schema = resp.schema.ok_or_else(|| {
-            FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
-                "namespace describe_table: missing schema in response",
-            )
-        })?;
+        let Some(schema) = resp.schema else {
+            return Ok(None);
+        };
 
-        serde_json::to_string(&schema).map_err(|err| {
+        serde_json::to_string(&schema).map(Some).map_err(|err| {
             FfiError::new(
                 ErrorCode::SchemaExport,
                 format!("failed to serialize schema: {err}"),
@@ -556,7 +589,7 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
         delimiter,
         headers_tsv,
     ) {
-        Ok(schema_json) => {
+        Ok(Some(schema_json)) => {
             clear_last_error();
             if !out_schema_json.is_null() {
                 let c = CString::new(schema_json)
@@ -565,6 +598,10 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
                     std::ptr::write_unaligned(out_schema_json, c.into_raw() as *const c_char);
                 }
             }
+            0
+        }
+        Ok(None) => {
+            clear_last_error();
             0
         }
         Err(err) => {
@@ -619,7 +656,7 @@ fn open_dataset_in_namespace_inner(
             .await
             .map_err(|err| {
                 FfiError::new(
-                    ErrorCode::NamespaceDescribeTable,
+                    namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
                     format!("namespace describe_table: {err}"),
                 )
             })?;
@@ -628,7 +665,7 @@ fn open_dataset_in_namespace_inner(
         }
         let dataset = builder.load().await.map_err(|err| {
             FfiError::new(
-                ErrorCode::DatasetOpen,
+                namespace_error_code(&err, ErrorCode::DatasetOpen),
                 format!("namespace dataset open: {err}"),
             )
         })?;
@@ -858,7 +895,7 @@ fn namespace_checkout_latest_if_stale_inner(
         };
         let response = namespace.describe_table(request).await.map_err(|err| {
             FfiError::new(
-                ErrorCode::NamespaceDescribeTable,
+                namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
                 format!("namespace describe_table: {err}"),
             )
         })?;
@@ -890,7 +927,7 @@ fn namespace_checkout_latest_if_stale_inner(
                     .await
                     .map_err(|err| {
                         FfiError::new(
-                            ErrorCode::NamespaceDescribeTable,
+                            namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
                             format!("namespace describe_table: {err}"),
                         )
                     })?;
@@ -899,7 +936,7 @@ fn namespace_checkout_latest_if_stale_inner(
             }
             let reopened = builder.load().await.map_err(|err| {
                 FfiError::new(
-                    ErrorCode::DatasetOpen,
+                    namespace_error_code(&err, ErrorCode::DatasetOpen),
                     format!("namespace dataset open: {err}"),
                 )
             })?;

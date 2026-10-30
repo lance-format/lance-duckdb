@@ -3,11 +3,13 @@
 #include "duckdb.hpp"
 
 struct LanceNamespaceQueryConfig;
+struct LanceStringList;
 
 namespace duckdb {
 
 string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
+vector<string> LanceConsumeStringList(LanceStringList &list);
 
 bool IsComputedSearchColumn(const string &name);
 

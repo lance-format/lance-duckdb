@@ -1,4 +1,5 @@
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::ptr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -10,7 +11,7 @@ use lance::session::Session;
 use lance_arrow::json::lance_json_to_arrow_json;
 use lance_core::datatypes::Schema as LanceSchema;
 
-use crate::error::ErrorCode;
+use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
 use super::types::{DatasetHandle, SchemaHandle, SessionHandle, StreamHandle};
 
@@ -30,6 +31,129 @@ impl FfiError {
 }
 
 pub(crate) type FfiResult<T> = Result<T, FfiError>;
+
+#[repr(C)]
+pub struct LanceStringList {
+    pub items: *mut *const c_char,
+    pub count: usize,
+}
+
+pub(crate) unsafe fn write_string_list(
+    values: Vec<String>,
+    out: *mut LanceStringList,
+) -> FfiResult<()> {
+    if out.is_null() {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "string list output is null",
+        ));
+    }
+
+    unsafe {
+        ptr::write_unaligned(
+            out,
+            LanceStringList {
+                items: ptr::null_mut(),
+                count: 0,
+            },
+        );
+    }
+
+    // Build all CString values before transferring ownership. If a value
+    // contains NUL, the ordinary Vec drop releases every string already built.
+    let strings = values
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            CString::new(value).map_err(|_| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("string list item {idx} contains NUL"),
+                )
+            })
+        })
+        .collect::<FfiResult<Vec<_>>>()?;
+
+    let count = strings.len();
+    if strings.is_empty() {
+        unsafe {
+            ptr::write_unaligned(
+                out,
+                LanceStringList {
+                    items: ptr::null_mut(),
+                    count: 0,
+                },
+            );
+        }
+        return Ok(());
+    }
+
+    let pointers = strings
+        .into_iter()
+        .map(|value| value.into_raw() as *const c_char)
+        .collect::<Vec<_>>();
+    let mut boxed = pointers.into_boxed_slice();
+    let items = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    unsafe {
+        ptr::write_unaligned(out, LanceStringList { items, count });
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn export_string_list(
+    result: FfiResult<Vec<String>>,
+    out: *mut LanceStringList,
+) -> i32 {
+    if out.is_null() {
+        let err = FfiError::new(ErrorCode::InvalidArgument, "string list output is null");
+        set_last_error(err.code, err.message);
+        return -1;
+    }
+
+    // Every call starts with a valid empty output, including all error paths.
+    unsafe {
+        ptr::write_unaligned(
+            out,
+            LanceStringList {
+                items: ptr::null_mut(),
+                count: 0,
+            },
+        );
+    }
+
+    match result.and_then(|values| unsafe { write_string_list(values, out) }) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_free_string_list(list: *mut LanceStringList) {
+    if list.is_null() {
+        return;
+    }
+
+    let list = unsafe { &mut *list };
+    if !list.items.is_null() {
+        let items = unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(list.items, list.count)) };
+        for item in items.iter().copied() {
+            if !item.is_null() {
+                unsafe {
+                    drop(CString::from_raw(item as *mut c_char));
+                }
+            }
+        }
+    }
+    list.items = ptr::null_mut();
+    list.count = 0;
+}
 
 pub(crate) fn to_c_string(s: impl AsRef<str>) -> CString {
     match CString::new(s.as_ref()) {

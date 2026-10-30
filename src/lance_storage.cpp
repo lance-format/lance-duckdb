@@ -50,6 +50,7 @@
 #include "lance_write.hpp"
 
 #include <cstring>
+#include <memory>
 
 #include <algorithm>
 
@@ -169,23 +170,16 @@ ListDirectoryNamespaceTables(const LanceDirectoryNamespaceConfig &ns) {
   BuildStorageOptionPointerArrays(ns.option_keys, ns.option_values, key_ptrs,
                                   value_ptrs);
 
-  auto *ptr = lance_dir_namespace_list_tables(
+  LanceStringList tables = {};
+  auto rc = lance_dir_namespace_list_tables(
       ns.root.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size());
-  if (!ptr) {
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), ns.option_keys.size(),
+      &tables);
+  if (rc != 0) {
     throw IOException("Failed to list tables from Lance directory namespace: " +
                       ns.root + LanceFormatErrorSuffix());
   }
-  string joined = ptr;
-  lance_free_string(ptr);
-
-  vector<string> out;
-  for (auto &p : StringUtil::Split(joined, '\n')) {
-    if (!p.empty()) {
-      out.push_back(std::move(p));
-    }
-  }
-  return out;
+  return LanceConsumeStringList(tables);
 }
 
 static vector<string>
@@ -198,23 +192,56 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
   const char *headers_ptr = headers_tsv.empty() ? nullptr : headers_tsv.c_str();
 
-  auto *ptr = lance_namespace_list_tables(
-      endpoint.c_str(), namespace_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr);
-  if (!ptr) {
+  LanceStringList tables = {};
+  auto rc = lance_namespace_list_tables(endpoint.c_str(), namespace_id.c_str(),
+                                        bearer_ptr, api_key_ptr, delimiter_ptr,
+                                        headers_ptr, &tables);
+  if (rc != 0) {
     throw IOException("Failed to list tables from Lance namespace: " +
                       endpoint + "/" + namespace_id + LanceFormatErrorSuffix());
   }
-  string joined = ptr;
-  lance_free_string(ptr);
+  return LanceConsumeStringList(tables);
+}
 
-  vector<string> out;
-  for (auto &p : StringUtil::Split(joined, '\n')) {
-    if (!p.empty()) {
-      out.push_back(std::move(p));
-    }
+static string GetRestNamespaceTableId(const string &namespace_id,
+                                      const string &table_name,
+                                      const string &delimiter) {
+  auto separator = delimiter.empty() ? "$" : delimiter;
+  if (table_name.empty() || table_name.find(separator) != string::npos) {
+    throw InvalidInputException(
+        "Lance namespace table names must be non-empty and cannot contain "
+        "the namespace delimiter '%s'",
+        separator);
   }
-  return out;
+  if (namespace_id.empty() || namespace_id == separator) {
+    return table_name;
+  }
+  return namespace_id + separator + table_name;
+}
+
+static bool FindRestNamespaceTableId(const string &namespace_id,
+                                     const string &table_name,
+                                     const string &delimiter,
+                                     const vector<string> &listed_names,
+                                     string &out_table_id) {
+  out_table_id = GetRestNamespaceTableId(namespace_id, table_name, delimiter);
+  const string *matched = nullptr;
+  for (const auto &name : listed_names) {
+    if (!StringUtil::CIEquals(name, table_name)) {
+      continue;
+    }
+    if (matched && *matched != name) {
+      throw CatalogException(
+          "Ambiguous Lance namespace table names '%s' and '%s'", *matched,
+          name);
+    }
+    matched = &name;
+  }
+  if (!matched) {
+    return false;
+  }
+  out_table_id = GetRestNamespaceTableId(namespace_id, *matched, delimiter);
+  return true;
 }
 
 static string
@@ -382,12 +409,10 @@ class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
 public:
   LanceRestNamespaceDefaultGenerator(
       Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
-      string namespace_id, string bearer_token, string api_key,
-      string delimiter, string bearer_token_override, string api_key_override,
-      string headers_tsv)
+      string namespace_id, string delimiter, string bearer_token_override,
+      string api_key_override, string headers_tsv)
       : DefaultGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
-        bearer_token(std::move(bearer_token)), api_key(std::move(api_key)),
         delimiter(std::move(delimiter)),
         bearer_token_override(std::move(bearer_token_override)),
         api_key_override(std::move(api_key_override)),
@@ -397,25 +422,8 @@ public:
   CreateDefaultEntry(ClientContext &context,
                      const Identifier &entry_name_p) override {
     const auto &entry_name = entry_name_p.GetIdentifierName();
-    // Only resolve names that are real tables in this namespace. DuckDB probes
-    // the active catalog for system names (e.g. duckdb_tables when SHOW TABLES
-    // runs under `USE <lance_catalog>`); without this guard we'd try to open
-    // those as Lance datasets and throw, aborting the statement. Returning
-    // nullptr (not found) lets resolution fall through to the system catalog.
-    {
-      auto known = GetDefaultEntries();
-      bool found = false;
-      for (auto &k : known) {
-        if (k == entry_name) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return nullptr;
-      }
-    }
-
+    auto table_id =
+        GetRestNamespaceTableId(namespace_id, entry_name, delimiter);
     unordered_map<string, Value> overrides;
     if (!bearer_token_override.empty()) {
       overrides["bearer_token"] = Value(bearer_token_override);
@@ -423,133 +431,69 @@ public:
     if (!api_key_override.empty()) {
       overrides["api_key"] = Value(api_key_override);
     }
+    string bearer_token;
+    string api_key;
+    ResolveLanceNamespaceAuth(context, endpoint, overrides, bearer_token,
+                              api_key);
 
-    string resolved_bearer;
-    string resolved_api_key;
-    ResolveLanceNamespaceAuth(context, endpoint, overrides, resolved_bearer,
-                              resolved_api_key);
-    // Backward-compatible fallback to credentials resolved during ATTACH.
-    if (resolved_bearer.empty() && resolved_api_key.empty() &&
-        (!bearer_token.empty() || !api_key.empty())) {
-      resolved_bearer = bearer_token;
-      resolved_api_key = api_key;
+    const char *schema_ptr = nullptr;
+    auto rc = lance_namespace_describe_table_with_schema(
+        endpoint.c_str(), table_id.c_str(),
+        bearer_token.empty() ? nullptr : bearer_token.c_str(),
+        api_key.empty() ? nullptr : api_key.c_str(),
+        delimiter.empty() ? nullptr : delimiter.c_str(),
+        headers_tsv.empty() ? nullptr : headers_tsv.c_str(), &schema_ptr);
+    std::unique_ptr<const char, decltype(&lance_free_string)> schema_owner(
+        schema_ptr, lance_free_string);
+    if (rc != 0) {
+      auto code = lance_last_error_code();
+      auto error = LanceFormatErrorSuffix();
+      if (code == LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND) {
+        return nullptr;
+      }
+      throw IOException(
+          "Failed to describe Lance namespace table: " + table_id + error);
+    }
+    if (schema_ptr) {
+      return MakeNamespaceEntry(entry_name, table_id,
+                                LanceTableSchemaFromJson(context, schema_ptr));
     }
 
-    // Build candidate table IDs (bare name + optional namespace-prefixed).
-    vector<string> candidates = {entry_name};
-    if (!namespace_id.empty()) {
-      auto delim = delimiter.empty() ? "$" : delimiter;
-      auto prefix = namespace_id + delim;
-      if (!StringUtil::StartsWith(entry_name, prefix)) {
-        candidates.push_back(prefix + entry_name);
+    string table_uri;
+    std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+        LanceOpenDatasetInNamespace(context, endpoint, table_id, bearer_token,
+                                    api_key, delimiter, headers_tsv, table_uri),
+        lance_close_dataset);
+    if (!dataset) {
+      auto code = lance_last_error_code();
+      auto error = LanceFormatErrorSuffix();
+      if (code == LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND) {
+        return nullptr;
       }
+      throw IOException("Failed to open Lance namespace table: " + table_id +
+                        error);
     }
-
-    // Fast path: describe_table with schema from REST API (skips S3 open).
-    for (auto &table_id : candidates) {
-      string schema_json;
-      if (!TryDescribeTableWithSchema(table_id, resolved_bearer,
-                                      resolved_api_key, schema_json)) {
-        continue;
-      }
-      CreateTableInfo info(schema, Identifier(entry_name));
-      info.internal = true;
-      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-      vector<string> coerced;
-      vector<string> json_columns;
-      vector<bool> blob_columns;
-      vector<string> writable_blob_v2_columns;
-      try {
-        auto live = LanceTableSchemaFromJson(context, schema_json);
-        info.columns = std::move(live.columns);
-        info.constraints = std::move(live.constraints);
-        coerced = std::move(live.coerced_columns);
-        json_columns = std::move(live.json_columns);
-        blob_columns = std::move(live.blob_columns);
-        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
-      } catch (...) {
-        continue; // Schema conversion failed, try next candidate.
-      }
-      return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(json_columns),
-                                std::move(blob_columns),
-                                std::move(writable_blob_v2_columns));
-    }
-
-    // Slow fallback: open dataset from S3.
-    for (auto &table_id : candidates) {
-      string table_uri;
-      void *dataset = nullptr;
-      try {
-        dataset = LanceOpenDatasetInNamespace(
-            context, endpoint, table_id, resolved_bearer, resolved_api_key,
-            delimiter, headers_tsv, table_uri);
-      } catch (...) {
-        // Unresolvable candidate (e.g. a DuckDB system name like
-        // duckdb_tables that SHOW TABLES resolves against the active catalog,
-        // or an invalid 1-segment id) — skip it instead of aborting the
-        // whole statement.
-        continue;
-      }
-      if (!dataset) {
-        continue;
-      }
-      CreateTableInfo info(schema, Identifier(entry_name));
-      info.internal = true;
-      info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-      vector<string> coerced;
-      vector<string> json_columns;
-      vector<bool> blob_columns;
-      vector<string> writable_blob_v2_columns;
-      try {
-        auto live = LanceTableSchema::FromDataset(context, dataset);
-        info.columns = std::move(live.columns);
-        info.constraints = std::move(live.constraints);
-        coerced = std::move(live.coerced_columns);
-        json_columns = std::move(live.json_columns);
-        blob_columns = std::move(live.blob_columns);
-        writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
-      } catch (...) {
-        lance_close_dataset(dataset);
-        continue;
-      }
-      lance_close_dataset(dataset);
-      return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(json_columns),
-                                std::move(blob_columns),
-                                std::move(writable_blob_v2_columns));
-    }
-
-    // All paths failed — return an empty entry to prevent DuckDB crash.
-    CreateTableInfo info(schema, Identifier(entry_name));
-    info.internal = true;
-    info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {}, {}, {}, {});
+    return MakeNamespaceEntry(
+        entry_name, table_id,
+        LanceTableSchema::FromDataset(context, dataset.get()));
   }
 
   vector<Identifier> GetDefaultEntries() override {
-    auto tables = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
-                                          api_key, delimiter, headers_tsv);
-    if (namespace_id.empty()) {
-      return vector<Identifier>(tables.begin(), tables.end());
-    }
-    auto delim = delimiter.empty() ? "$" : delimiter;
-    auto prefix = namespace_id + delim;
-    for (auto &t : tables) {
-      if (StringUtil::StartsWith(t, prefix)) {
-        t = t.substr(prefix.size());
-      }
-    }
-    return vector<Identifier>(tables.begin(), tables.end());
+    auto names =
+        ListRestNamespaceTables(endpoint, namespace_id, bearer_token_override,
+                                api_key_override, delimiter, headers_tsv);
+    return vector<Identifier>(names.begin(), names.end());
   }
 
 private:
-  unique_ptr<CatalogEntry>
-  MakeNamespaceEntry(const string &entry_name, const string &table_id,
-                     CreateTableInfo info, vector<string> coerced_columns,
-                     vector<string> json_columns, vector<bool> blob_columns,
-                     vector<string> writable_blob_v2_columns) {
+  unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
+                                              const string &table_id,
+                                              LanceTableSchema live) {
+    CreateTableInfo info(schema, Identifier(entry_name));
+    info.internal = true;
+    info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+    info.columns = std::move(live.columns);
+    info.constraints = std::move(live.constraints);
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;
@@ -560,42 +504,18 @@ private:
     cfg.headers_tsv = headers_tsv;
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
-    entry->SetCoercedColumnNames(std::move(coerced_columns));
-    entry->SetJsonColumnNames(std::move(json_columns));
-    entry->SetBlobColumns(std::move(blob_columns));
-    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
+    entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+    entry->SetJsonColumnNames(std::move(live.json_columns));
+    entry->SetBlobColumns(std::move(live.blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  bool TryDescribeTableWithSchema(const string &table_id,
-                                  const string &resolved_bearer,
-                                  const string &resolved_api_key,
-                                  string &out_schema_json) {
-    const char *bearer_ptr =
-        resolved_bearer.empty() ? nullptr : resolved_bearer.c_str();
-    const char *api_key_ptr =
-        resolved_api_key.empty() ? nullptr : resolved_api_key.c_str();
-    const char *delimiter_ptr = delimiter.empty() ? nullptr : delimiter.c_str();
-    const char *headers_ptr =
-        headers_tsv.empty() ? nullptr : headers_tsv.c_str();
-    const char *schema_ptr = nullptr;
-
-    auto rc = lance_namespace_describe_table_with_schema(
-        endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-        delimiter_ptr, headers_ptr, &schema_ptr);
-    if (rc != 0 || !schema_ptr) {
-      return false;
-    }
-    out_schema_json = schema_ptr;
-    lance_free_string(schema_ptr);
-    return !out_schema_json.empty();
-  }
-
+  // Mirrored by ErrorCode::NamespaceTableNotFound in rust/error.rs.
+  static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 57;
   SchemaCatalogEntry &schema;
   string endpoint;
   string namespace_id;
-  string bearer_token;
-  string api_key;
   string delimiter;
   string bearer_token_override;
   string api_key_override;
@@ -856,36 +776,7 @@ public:
       ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
-      auto leaf_id = info.GetQualifiedName().Name().GetIdentifierName();
-      string prefixed_id;
-      if (!rest_ns->namespace_id.empty()) {
-        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-        auto prefix = rest_ns->namespace_id + delim;
-        if (!StringUtil::StartsWith(leaf_id, prefix)) {
-          prefixed_id = prefix + leaf_id;
-        }
-      }
-
-      vector<string> discovered;
-      string list_error;
-      if (!TryLanceNamespaceListTables(
-              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
-              list_error)) {
-        throw IOException("Failed to list tables from Lance namespace: " +
-                          (list_error.empty() ? "unknown error" : list_error));
-      }
-      string table_id_for_ops = prefixed_id.empty() ? leaf_id : prefixed_id;
-      for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-          table_id_for_ops = prefixed_id;
-          break;
-        }
-        if (StringUtil::CIEquals(t, leaf_id)) {
-          table_id_for_ops = leaf_id;
-          break;
-        }
-      }
+      const auto &table_id_for_ops = lance_entry->NamespaceConfig().table_id;
 
       string drop_error;
       if (!TryLanceNamespaceDropTable(
@@ -965,16 +856,6 @@ public:
       ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
-      auto leaf_id = create_info.GetTableName().GetIdentifierName();
-      string prefixed_id;
-      if (!rest_ns->namespace_id.empty()) {
-        auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-        auto prefix = rest_ns->namespace_id + delim;
-        if (!StringUtil::StartsWith(leaf_id, prefix)) {
-          prefixed_id = prefix + leaf_id;
-        }
-      }
-
       vector<string> discovered;
       string list_error;
       if (!TryLanceNamespaceListTables(
@@ -984,22 +865,10 @@ public:
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
-      bool exists = false;
-      string existing_id;
-      for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-          exists = true;
-          existing_id = prefixed_id;
-          break;
-        }
-        if (StringUtil::CIEquals(t, leaf_id)) {
-          exists = true;
-          existing_id = leaf_id;
-          break;
-        }
-      }
-      auto table_id_for_ops =
-          exists ? existing_id : (prefixed_id.empty() ? leaf_id : prefixed_id);
+      string table_id_for_ops;
+      auto exists = FindRestNamespaceTableId(
+          rest_ns->namespace_id, create_info.GetTableName().GetIdentifierName(),
+          rest_ns->delimiter, discovered, table_id_for_ops);
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
         InvalidateTableEntry(create_info.GetTableName());
@@ -1007,7 +876,7 @@ public:
       }
       if (create_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT &&
           exists) {
-        throw IOException("Lance table already exists: " + existing_id);
+        throw IOException("Lance table already exists: " + table_id_for_ops);
       }
       if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT &&
           exists) {
@@ -1027,27 +896,9 @@ public:
               context, rest_ns->endpoint, table_id_for_ops, bearer_token,
               api_key, rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
               option_keys, option_values, create_error)) {
-        // Best-effort fallback for namespace implementations that do not use
-        // a qualified object identifier for tables in ListTables.
-        if (!prefixed_id.empty() && table_id_for_ops == prefixed_id) {
-          option_keys.clear();
-          option_values.clear();
-          dataset_path.clear();
-          create_error.clear();
-          if (!TryLanceNamespaceCreateEmptyTable(
-                  context, rest_ns->endpoint, leaf_id, bearer_token, api_key,
-                  rest_ns->delimiter, rest_ns->headers_tsv, dataset_path,
-                  option_keys, option_values, create_error)) {
-            throw IOException(
-                "Failed to create Lance table via namespace: " +
-                (create_error.empty() ? "unknown error" : create_error));
-          }
-          table_id_for_ops = leaf_id;
-        } else {
-          throw IOException(
-              "Failed to create Lance table via namespace: " +
-              (create_error.empty() ? "unknown error" : create_error));
-        }
+        throw IOException(
+            "Failed to create Lance table via namespace: " +
+            (create_error.empty() ? "unknown error" : create_error));
       }
       if (dataset_path.empty()) {
         throw IOException(
@@ -1463,16 +1314,6 @@ public:
           ResolveLanceNamespaceAuth(context, state->endpoint, overrides,
                                     bearer_token, api_key);
 
-          auto delim = state->delimiter.empty() ? "$" : state->delimiter;
-          auto prefix = state->namespace_id.empty()
-                            ? string()
-                            : (state->namespace_id + delim);
-          auto leaf_id = state->table_name;
-          string prefixed_id;
-          if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
-            prefixed_id = prefix + leaf_id;
-          }
-
           vector<string> discovered;
           string list_error;
           if (!TryLanceNamespaceListTables(
@@ -1483,18 +1324,9 @@ public:
                 "Failed to list tables from Lance namespace: " +
                 (list_error.empty() ? "unknown error" : list_error));
           }
-
-          state->table_id = prefixed_id.empty() ? leaf_id : prefixed_id;
-          for (auto &t : discovered) {
-            if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-              state->table_id = prefixed_id;
-              break;
-            }
-            if (StringUtil::CIEquals(t, leaf_id)) {
-              state->table_id = leaf_id;
-              break;
-            }
-          }
+          FindRestNamespaceTableId(state->namespace_id, state->table_name,
+                                   state->delimiter, discovered,
+                                   state->table_id);
 
           // REST namespace metadata changes (DROP + CREATE empty table) happen
           // before the writer starts and are not part of the Lance data
@@ -1520,26 +1352,9 @@ public:
                   api_key, state->delimiter, state->headers_tsv,
                   state->open_path, state->option_keys, state->option_values,
                   create_error)) {
-            if (!prefixed_id.empty() && state->table_id == prefixed_id) {
-              state->table_id = leaf_id;
-              state->open_path.clear();
-              state->option_keys.clear();
-              state->option_values.clear();
-              create_error.clear();
-              if (!TryLanceNamespaceCreateEmptyTable(
-                      context, state->endpoint, state->table_id, bearer_token,
-                      api_key, state->delimiter, state->headers_tsv,
-                      state->open_path, state->option_keys,
-                      state->option_values, create_error)) {
-                throw IOException(
-                    "Failed to create Lance table via namespace: " +
-                    (create_error.empty() ? "unknown error" : create_error));
-              }
-            } else {
-              throw IOException(
-                  "Failed to create Lance table via namespace: " +
-                  (create_error.empty() ? "unknown error" : create_error));
-            }
+            throw IOException(
+                "Failed to create Lance table via namespace: " +
+                (create_error.empty() ? "unknown error" : create_error));
           }
           if (state->open_path.empty()) {
             throw IOException(
@@ -1707,30 +1522,10 @@ public:
                           (list_error.empty() ? "unknown error" : list_error));
       }
 
-      auto delim = rest_ns->delimiter.empty() ? "$" : rest_ns->delimiter;
-      auto prefix = rest_ns->namespace_id.empty()
-                        ? string()
-                        : (rest_ns->namespace_id + delim);
-      auto leaf_id = create_info.GetTableName().GetIdentifierName();
-      string prefixed_id;
-      if (!prefix.empty() && !StringUtil::StartsWith(leaf_id, prefix)) {
-        prefixed_id = prefix + leaf_id;
-      }
-
-      bool exists = false;
       string existing_id;
-      for (auto &t : discovered) {
-        if (!prefixed_id.empty() && StringUtil::CIEquals(t, prefixed_id)) {
-          exists = true;
-          existing_id = prefixed_id;
-          break;
-        }
-        if (StringUtil::CIEquals(t, leaf_id)) {
-          exists = true;
-          existing_id = leaf_id;
-          break;
-        }
-      }
+      auto exists = FindRestNamespaceTableId(
+          rest_ns->namespace_id, create_info.GetTableName().GetIdentifierName(),
+          rest_ns->delimiter, discovered, existing_id);
 
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
@@ -1870,8 +1665,6 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
 
   auto is_rest_namespace = !endpoint.empty();
   string namespace_id;
-  string bearer_token;
-  string api_key;
   string bearer_token_override;
   string api_key_override;
 
@@ -1902,20 +1695,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
       throw InvalidInputException(
           "ATTACH TYPE LANCE with ENDPOINT requires a non-empty namespace id");
     }
-    ResolveLanceNamespaceAuth(context, endpoint, info.options, bearer_token,
-                              api_key);
     ResolveLanceNamespaceAuthOverrides(info.options, bearer_token_override,
                                        api_key_override);
-    string list_error;
-    vector<string> discovered_tables;
-    // Validate the namespace during ATTACH.
-    if (!TryLanceNamespaceListTables(
-            context, endpoint, namespace_id, bearer_token, api_key, delimiter,
-            headers_tsv, discovered_tables, list_error)) {
-      throw IOException("Failed to list tables from Lance namespace: " +
-                        list_error);
-    }
-
     rest_ns = make_shared_ptr<LanceRestNamespaceConfig>();
     rest_ns->endpoint = endpoint;
     rest_ns->namespace_id = namespace_id;
@@ -1944,9 +1725,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                                                           directory_ns);
   } else {
     generator = make_uniq<LanceRestNamespaceDefaultGenerator>(
-        *catalog, schema, endpoint, namespace_id, std::move(bearer_token),
-        std::move(api_key), delimiter, bearer_token_override, api_key_override,
-        headers_tsv);
+        *catalog, schema, endpoint, namespace_id, delimiter,
+        bearer_token_override, api_key_override, headers_tsv);
   }
   lance_schema.SetTableDefaultGenerator(std::move(generator));
 

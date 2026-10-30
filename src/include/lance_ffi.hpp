@@ -21,6 +21,11 @@ typedef struct LanceExecContext {
   uint32_t threads;
 } LanceExecContext;
 
+typedef struct LanceStringList {
+  const char **items;
+  size_t count;
+} LanceStringList;
+
 typedef struct LanceSourceResolverCallbacks {
   void *resolver;
   int32_t (*resolve_source)(void *resolver, const char *uri,
@@ -55,10 +60,11 @@ void *lance_open_dataset_with_storage_options_and_version(
 int32_t lance_dataset_version(void *dataset, uint64_t *out_version);
 int32_t lance_dataset_uses_stable_row_ids(void *dataset,
                                           uint8_t *out_uses_stable_row_ids);
-const char *lance_dir_namespace_list_tables(const char *root,
-                                            const char **option_keys,
-                                            const char **option_values,
-                                            size_t options_len);
+int32_t lance_dir_namespace_list_tables(const char *root,
+                                        const char **option_keys,
+                                        const char **option_values,
+                                        size_t options_len,
+                                        LanceStringList *out_tables);
 int32_t lance_dir_namespace_drop_table(const char *root, const char *table_name,
                                        const char **option_keys,
                                        const char **option_values,
@@ -70,10 +76,12 @@ void *lance_open_dataset_in_dir_namespace_with_session(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, void *session,
     const char **out_table_uri);
-const char *
-lance_namespace_list_tables(const char *endpoint, const char *namespace_id,
-                            const char *bearer_token, const char *api_key,
-                            const char *delimiter, const char *headers_tsv);
+int32_t lance_namespace_list_tables(const char *endpoint,
+                                    const char *namespace_id,
+                                    const char *bearer_token,
+                                    const char *api_key, const char *delimiter,
+                                    const char *headers_tsv,
+                                    LanceStringList *out_tables);
 int32_t lance_json_arrow_schema_to_c(const char *json_schema,
                                      ArrowSchema *out_schema);
 int32_t lance_namespace_describe_table_with_schema(
@@ -127,6 +135,7 @@ void *lance_create_dataset_exec_stream_ir(void *dataset, const uint8_t *exec_ir,
 int32_t lance_last_error_code();
 const char *lance_last_error_message();
 void lance_free_string(const char *s);
+void lance_free_string_list(LanceStringList *list);
 int32_t lance_normalize_source_uri(const char *uri, const char **out_uri);
 
 int64_t lance_dataset_count_rows(void *dataset);
