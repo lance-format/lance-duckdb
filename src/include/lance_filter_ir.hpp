@@ -16,9 +16,12 @@ struct LanceFilterIRBuildResult {
   bool all_prefilterable_filters_pushed = true;
 };
 
+// `json_columns` names top-level fields whose DuckDB VARCHAR view is logical
+// JSON text. Filters that touch one of these fields must remain in DuckDB.
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
-    const TableFunctionInitInput &input, bool exclude_computed_columns);
+    const vector<string> &json_columns, const TableFunctionInitInput &input,
+    bool exclude_computed_columns);
 
 // Probe whether every filter attached to `get.table_filters` can be encoded
 // into Lance filter IR. Owns the invariant "filters encodable → limit/offset
@@ -31,11 +34,13 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
 // IR message) can consume `parts` directly.
 LanceFilterIRBuildResult
 ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
-                        const vector<LogicalType> &types);
+                        const vector<LogicalType> &types,
+                        const vector<string> &json_columns);
 
 bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const vector<string> &names,
                                const vector<LogicalType> &types,
+                               const vector<string> &json_columns,
                                bool exclude_computed_columns,
                                const Expression &expr, string &out_ir);
 

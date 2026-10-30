@@ -271,6 +271,7 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     vector<string> coerced;
+    vector<string> json_columns;
     vector<bool> blob_columns;
     vector<string> writable_blob_v2_columns;
     try {
@@ -278,6 +279,7 @@ public:
       info.columns = std::move(live.columns);
       info.constraints = std::move(live.constraints);
       coerced = std::move(live.coerced_columns);
+      json_columns = std::move(live.json_columns);
       blob_columns = std::move(live.blob_columns);
       writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
     } catch (...) {
@@ -299,6 +301,7 @@ public:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced));
+    entry->SetJsonColumnNames(std::move(json_columns));
     entry->SetBlobColumns(std::move(blob_columns));
     entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
@@ -434,6 +437,7 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
       vector<bool> blob_columns;
       vector<string> writable_blob_v2_columns;
       try {
@@ -441,13 +445,15 @@ public:
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
+        json_columns = std::move(live.json_columns);
         blob_columns = std::move(live.blob_columns);
         writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
         continue; // Schema conversion failed, try next candidate.
       }
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(blob_columns),
+                                std::move(coerced), std::move(json_columns),
+                                std::move(blob_columns),
                                 std::move(writable_blob_v2_columns));
     }
 
@@ -473,6 +479,7 @@ public:
       info.internal = true;
       info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
       vector<string> coerced;
+      vector<string> json_columns;
       vector<bool> blob_columns;
       vector<string> writable_blob_v2_columns;
       try {
@@ -480,6 +487,7 @@ public:
         info.columns = std::move(live.columns);
         info.constraints = std::move(live.constraints);
         coerced = std::move(live.coerced_columns);
+        json_columns = std::move(live.json_columns);
         blob_columns = std::move(live.blob_columns);
         writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
       } catch (...) {
@@ -488,7 +496,8 @@ public:
       }
       lance_close_dataset(dataset);
       return MakeNamespaceEntry(entry_name, table_id, std::move(info),
-                                std::move(coerced), std::move(blob_columns),
+                                std::move(coerced), std::move(json_columns),
+                                std::move(blob_columns),
                                 std::move(writable_blob_v2_columns));
     }
 
@@ -497,7 +506,7 @@ public:
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     return MakeNamespaceEntry(entry_name, candidates.front(), std::move(info),
-                              {}, {}, {});
+                              {}, {}, {}, {});
   }
 
   vector<Identifier> GetDefaultEntries() override {
@@ -520,7 +529,7 @@ private:
   unique_ptr<CatalogEntry>
   MakeNamespaceEntry(const string &entry_name, const string &table_id,
                      CreateTableInfo info, vector<string> coerced_columns,
-                     vector<bool> blob_columns,
+                     vector<string> json_columns, vector<bool> blob_columns,
                      vector<string> writable_blob_v2_columns) {
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
@@ -533,6 +542,7 @@ private:
     auto entry =
         make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
     entry->SetCoercedColumnNames(std::move(coerced_columns));
+    entry->SetJsonColumnNames(std::move(json_columns));
     entry->SetBlobColumns(std::move(blob_columns));
     entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));

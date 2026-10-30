@@ -3,6 +3,7 @@
 #include "lance_common.hpp"
 #include "lance_expr_ir.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -27,6 +28,16 @@ namespace duckdb {
 
 bool LanceFilterIRSupportsLogicalType(const LogicalType &type) {
   return LanceExprIRSupportsLogicalType(type);
+}
+
+static bool IsJsonColumn(const vector<string> &json_columns,
+                         const string &name) {
+  for (const auto &json_column : json_columns) {
+    if (StringUtil::CIEquals(json_column, name)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static constexpr char LANCE_FILTER_IR_MAGIC[] = {'L', 'F', 'T', '1'};
@@ -458,16 +469,19 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
 
 LanceFilterIRBuildResult
 ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
-                        const vector<LogicalType> &types) {
+                        const vector<LogicalType> &types,
+                        const vector<string> &json_columns) {
   vector<idx_t> projection_ids;
   TableFunctionInitInput probe_input(get.bind_data.get(), get.GetColumnIds(),
                                      projection_ids, &get.table_filters);
-  return BuildLanceTableFilterIRParts(names, types, probe_input, false);
+  return BuildLanceTableFilterIRParts(names, types, json_columns, probe_input,
+                                      false);
 }
 
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
-    const TableFunctionInitInput &input, bool exclude_computed_columns) {
+    const vector<string> &json_columns, const TableFunctionInitInput &input,
+    bool exclude_computed_columns) {
   LanceFilterIRBuildResult result;
   if (!input.filters) {
     return result;
@@ -492,6 +506,11 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     }
     if (exclude_computed_columns && IsComputedSearchColumn(names[col_id])) {
       result.all_filters_pushed = false;
+      continue;
+    }
+    if (IsJsonColumn(json_columns, names[col_id])) {
+      result.all_filters_pushed = false;
+      result.all_prefilterable_filters_pushed = false;
       continue;
     }
     if (!LanceFilterIRSupportsLogicalType(types[col_id])) {
@@ -538,6 +557,10 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
         supported = false;
         break;
       }
+      if (IsJsonColumn(json_columns, names[column_id])) {
+        supported = false;
+        break;
+      }
       string column_ref;
       if (!LanceFilterIRSupportsLogicalType(types[column_id]) ||
           !TryEncodeLanceFilterIRColumnRef(names[column_id], column_ref)) {
@@ -561,12 +584,10 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
   return result;
 }
 
-static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
-                                         const vector<string> &names,
-                                         const vector<LogicalType> &types,
-                                         bool exclude_computed_columns,
-                                         const Expression &expr,
-                                         string &out_ir) {
+static bool TryBuildLanceExprColumnRefIR(
+    const LogicalGet &get, const vector<string> &names,
+    const vector<LogicalType> &types, const vector<string> &json_columns,
+    bool exclude_computed_columns, const Expression &expr, string &out_ir) {
   vector<string> segments;
   LogicalType leaf_type;
 
@@ -794,6 +815,9 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
   if (exclude_computed_columns && IsComputedSearchColumn(segments[0])) {
     return false;
   }
+  if (IsJsonColumn(json_columns, segments[0])) {
+    return false;
+  }
   if (!LanceFilterIRSupportsLogicalType(leaf_type)) {
     return false;
   }
@@ -803,6 +827,7 @@ static bool TryBuildLanceExprColumnRefIR(const LogicalGet &get,
 bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                const vector<string> &names,
                                const vector<LogicalType> &types,
+                               const vector<string> &json_columns,
                                bool exclude_computed_columns,
                                const Expression &expr, string &out_ir) {
   if (BoundCastExpression::IsCast(expr)) {
@@ -829,9 +854,11 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     string lhs_ir, rhs_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *cmp.GetChildren()[0], lhs_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *cmp.GetChildren()[1], rhs_ir)) {
       return false;
     }
@@ -848,11 +875,14 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     string input_ir, lower_ir, upper_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *between.GetChildren()[0], input_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *between.GetChildren()[1], lower_ir) ||
-        !TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+        !TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *between.GetChildren()[2], upper_ir)) {
       return false;
     }
@@ -875,14 +905,15 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
   switch (expr.GetExpressionClass()) {
   case ExpressionClass::BOUND_COLUMN_REF:
   case ExpressionClass::BOUND_REF:
-    return TryBuildLanceExprColumnRefIR(get, names, types,
+    return TryBuildLanceExprColumnRefIR(get, names, types, json_columns,
                                         exclude_computed_columns, expr, out_ir);
   case ExpressionClass::BOUND_FUNCTION: {
     auto &func = expr.Cast<BoundFunctionExpression>();
     if (func.Function().GetName().GetIdentifierName() == "struct_extract" ||
         func.Function().GetName().GetIdentifierName() == "struct_extract_at") {
-      return TryBuildLanceExprColumnRefIR(
-          get, names, types, exclude_computed_columns, expr, out_ir);
+      return TryBuildLanceExprColumnRefIR(get, names, types, json_columns,
+                                          exclude_computed_columns, expr,
+                                          out_ir);
     }
 
     if (func.Function().GetName().GetIdentifierName() == "lower" ||
@@ -891,7 +922,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *func.GetChildren()[0], input_ir)) {
         return false;
@@ -910,7 +941,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *func.GetChildren()[0], input_ir)) {
         return false;
@@ -940,7 +971,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *func.GetChildren()[0], input_ir)) {
         return false;
@@ -974,7 +1005,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       }
 
       string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *func.GetChildren()[0], input_ir)) {
         return false;
@@ -1041,7 +1072,8 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     }
 
     string input_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, exclude_computed_columns,
+    if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                   exclude_computed_columns,
                                    *func.GetChildren()[0], input_ir)) {
       return false;
     }
@@ -1092,8 +1124,9 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     children.reserve(conj.GetChildren().size());
     for (auto &child : conj.GetChildren()) {
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(
-              get, names, types, exclude_computed_columns, *child, child_ir)) {
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
+                                     exclude_computed_columns, *child,
+                                     child_ir)) {
         return false;
       }
       children.push_back(std::move(child_ir));
@@ -1107,7 +1140,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *op.GetChildren()[0], child_ir)) {
         return false;
@@ -1121,7 +1154,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string child_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *op.GetChildren()[0], child_ir)) {
         return false;
@@ -1138,7 +1171,7 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
         return false;
       }
       string lhs_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types,
+      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
                                      exclude_computed_columns,
                                      *op.GetChildren()[0], lhs_ir)) {
         return false;

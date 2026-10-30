@@ -3,6 +3,7 @@
 #include "lance_ffi.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/common/helper.hpp"
 
 #include <memory>
 
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace duckdb {
@@ -143,19 +145,61 @@ const CoercionRule *FindRule(const char *format) {
 // Generic recursion (unchanged by the set of coercion rules).
 // ---------------------------------------------------------------------------
 
-bool SchemaNeedsCoercion(const ArrowSchema *schema) {
+constexpr char kArrowJsonExtension[] = "arrow.json";
+
+bool HasArrowJsonExtension(const ArrowSchema *schema) {
+  if (!schema || !schema->metadata) {
+    return false;
+  }
+  ArrowSchemaMetadata metadata(schema->metadata);
+  return metadata.GetOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME) ==
+         kArrowJsonExtension;
+}
+
+bool ContainsArrowJsonField(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (HasArrowJsonExtension(schema)) {
+    return true;
+  }
+  for (int64_t child_idx = 0; child_idx < schema->n_children; child_idx++) {
+    if (schema->children &&
+        ContainsArrowJsonField(schema->children[child_idx])) {
+      return true;
+    }
+  }
+  return ContainsArrowJsonField(schema->dictionary);
+}
+
+bool SchemaNeedsStorageCoercion(const ArrowSchema *schema) {
   if (!schema) {
     return false;
   }
   if (FindRule(schema->format)) {
     return true;
   }
-  for (int64_t i = 0; i < schema->n_children; i++) {
-    if (SchemaNeedsCoercion(schema->children[i])) {
+  for (int64_t child_idx = 0; child_idx < schema->n_children; child_idx++) {
+    if (SchemaNeedsStorageCoercion(schema->children[child_idx])) {
       return true;
     }
   }
-  return SchemaNeedsCoercion(schema->dictionary);
+  return SchemaNeedsStorageCoercion(schema->dictionary);
+}
+
+bool SchemaNeedsRewrite(const ArrowSchema *schema) {
+  if (!schema) {
+    return false;
+  }
+  if (FindRule(schema->format) || HasArrowJsonExtension(schema)) {
+    return true;
+  }
+  for (int64_t child_idx = 0; child_idx < schema->n_children; child_idx++) {
+    if (SchemaNeedsRewrite(schema->children[child_idx])) {
+      return true;
+    }
+  }
+  return SchemaNeedsRewrite(schema->dictionary);
 }
 
 // --- Array buffer rewrite ---------------------------------------------------
@@ -225,12 +269,14 @@ void CoerceArrayRecursive(const ArrowSchema *schema, ArrowArray *array,
   }
 }
 
-// --- Schema format rewrite --------------------------------------------------
+// --- Schema format and metadata rewrite ------------------------------------
 
 struct SchemaOverride {
   struct Entry {
     ArrowSchema *schema;
     const char *original_format;
+    const char *original_metadata;
+    unsafe_unique_array<char> replacement_metadata;
   };
   std::vector<Entry> entries;
   void (*original_release)(ArrowSchema *) = nullptr;
@@ -244,6 +290,7 @@ void SchemaReleaseWrapper(ArrowSchema *schema) {
   auto *state = static_cast<SchemaOverride *>(schema->private_data);
   for (auto &e : state->entries) {
     e.schema->format = e.original_format;
+    e.schema->metadata = e.original_metadata;
   }
   auto *original_release = state->original_release;
   schema->release = original_release;
@@ -258,15 +305,32 @@ void CoerceSchemaRecursive(ArrowSchema *schema, SchemaOverride &state) {
   if (!schema) {
     return;
   }
-  if (const auto *rule = FindRule(schema->format)) {
+  const auto *rule = FindRule(schema->format);
+  const bool strip_json_extension = HasArrowJsonExtension(schema);
+  if (rule || strip_json_extension) {
+    unsafe_unique_array<char> replacement_metadata;
+    if (strip_json_extension) {
+      ArrowSchemaMetadata metadata(schema->metadata);
+      metadata.AddOption(ArrowSchemaMetadata::ARROW_EXTENSION_NAME, "");
+      metadata.AddOption(ArrowSchemaMetadata::ARROW_METADATA_KEY, "");
+      replacement_metadata = metadata.SerializeMetadata();
+    }
+    const char *replacement_ptr = replacement_metadata.get();
     SchemaOverride::Entry entry;
     entry.schema = schema;
     entry.original_format = schema->format;
-    state.entries.push_back(entry);
-    schema->format = rule->coerced_format;
+    entry.original_metadata = schema->metadata;
+    entry.replacement_metadata = std::move(replacement_metadata);
+    state.entries.push_back(std::move(entry));
+    if (rule) {
+      schema->format = rule->coerced_format;
+    }
+    if (strip_json_extension) {
+      schema->metadata = replacement_ptr;
+    }
   }
-  for (int64_t i = 0; i < schema->n_children; i++) {
-    CoerceSchemaRecursive(schema->children[i], state);
+  for (int64_t child_idx = 0; child_idx < schema->n_children; child_idx++) {
+    CoerceSchemaRecursive(schema->children[child_idx], state);
   }
   CoerceSchemaRecursive(schema->dictionary, state);
 }
@@ -274,26 +338,32 @@ void CoerceSchemaRecursive(ArrowSchema *schema, SchemaOverride &state) {
 } // namespace
 
 bool LanceArrowSchemaNeedsCoercion(const ArrowSchema *schema) {
-  return SchemaNeedsCoercion(schema);
+  return SchemaNeedsRewrite(schema);
 }
 
-std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
-  std::vector<std::string> coerced_top_level;
-  if (!schema || !SchemaNeedsCoercion(schema)) {
-    return coerced_top_level;
+LanceArrowSchemaCoercionResult
+LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
+  LanceArrowSchemaCoercionResult result;
+  if (!schema || !SchemaNeedsRewrite(schema)) {
+    return result;
   }
 
-  // Capture affected top-level column names BEFORE installing the release
-  // wrapper, so the list reflects user-facing catalog columns regardless of
-  // whether the coercion lives at the top or inside a nested type.
-  for (int64_t i = 0; i < schema->n_children; i++) {
-    auto *child = schema->children[i];
-    if (SchemaNeedsCoercion(child) && child && child->name) {
-      coerced_top_level.emplace_back(child->name);
+  // Capture affected top-level column names before installing the release
+  // wrapper. JSON remains a containment marker for the whole top-level field.
+  for (int64_t child_idx = 0; child_idx < schema->n_children; child_idx++) {
+    auto *child = schema->children[child_idx];
+    if (!child || !child->name) {
+      continue;
+    }
+    if (SchemaNeedsStorageCoercion(child)) {
+      result.storage_coerced_columns.emplace_back(child->name);
+    }
+    if (ContainsArrowJsonField(child)) {
+      result.json_columns.emplace_back(child->name);
     }
   }
 
-  auto *state = new SchemaOverride();
+  auto state = make_uniq<SchemaOverride>();
   state->original_release = schema->release;
   state->original_private_data = schema->private_data;
   try {
@@ -301,13 +371,13 @@ std::vector<std::string> LanceCoerceArrowSchemaForDuckDB(ArrowSchema *schema) {
   } catch (...) {
     for (auto &e : state->entries) {
       e.schema->format = e.original_format;
+      e.schema->metadata = e.original_metadata;
     }
-    delete state;
     throw;
   }
-  schema->private_data = state;
+  schema->private_data = state.release();
   schema->release = SchemaReleaseWrapper;
-  return coerced_top_level;
+  return result;
 }
 
 void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
@@ -315,7 +385,7 @@ void LanceCoerceArrowArrayForDuckDB(const ArrowSchema *schema,
   if (!schema || !array || array->release == nullptr) {
     return;
   }
-  if (!SchemaNeedsCoercion(schema)) {
+  if (!SchemaNeedsStorageCoercion(schema)) {
     return;
   }
   auto *state = new ArrayOverride();

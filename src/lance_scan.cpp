@@ -988,8 +988,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
       }
     }
     string filter_ir;
-    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, false,
-                                   *expr, filter_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types,
+                                   scan_bind.json_columns, false, *expr,
+                                   filter_ir)) {
       continue;
     }
     scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
@@ -1059,11 +1060,13 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto schema_coercion =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = std::move(schema_coercion.json_columns);
   result->blob_columns =
       LanceBlobColumnsFromSchema(result->schema_root.arrow_schema);
 
@@ -1160,11 +1163,13 @@ LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto schema_coercion =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = std::move(schema_coercion.json_columns);
   result->blob_columns =
       LanceBlobColumnsFromSchema(result->schema_root.arrow_schema);
 
@@ -1397,7 +1402,7 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     vector<string> filter_parts;
 
     auto table_filters = BuildLanceTableFilterIRParts(
-        bind_data.names, bind_data.types, input, false);
+        bind_data.names, bind_data.types, bind_data.json_columns, input, false);
     filter_parts = std::move(table_filters.parts);
 
     if (!bind_data.lance_pushed_filter_ir_parts.empty()) {
@@ -2753,7 +2758,8 @@ LanceRowIdInRewrite(unique_ptr<LogicalOperator> op) {
 static bool TryBuildLanceFilterIRThroughProjections(
     const LogicalFilter &filter, const LogicalGet &get,
     const vector<string> &names, const vector<LogicalType> &types,
-    const Expression &expression, string &out_ir) {
+    const vector<string> &json_columns, const Expression &expression,
+    string &out_ir) {
   auto rewritten = expression.Copy();
   auto *node = filter.children[0].get();
 
@@ -2793,8 +2799,9 @@ static bool TryBuildLanceFilterIRThroughProjections(
     node = node->children[0].get();
   }
 
-  return node == &get && TryBuildLanceExprFilterIR(get, names, types, false,
-                                                   *rewritten, out_ir);
+  return node == &get &&
+         TryBuildLanceExprFilterIR(get, names, types, json_columns, false,
+                                   *rewritten, out_ir);
 }
 
 static unique_ptr<LogicalOperator>
@@ -2883,7 +2890,7 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
         string discard_ir;
         if (!TryBuildLanceFilterIRThroughProjections(
                 *filter_node, get, scan_bind_check.names, scan_bind_check.types,
-                *expr, discard_ir)) {
+                scan_bind_check.json_columns, *expr, discard_ir)) {
           return op;
         }
       }
@@ -2927,7 +2934,8 @@ LanceLimitOffsetPushdown(unique_ptr<LogicalOperator> op) {
   // stream — slower than Lance-side pushdown, but correct and strictly
   // better than the previous "IO Error: Lance limit/offset pushdown
   // requires filter pushdown" failure.
-  auto probe = ProbeLanceTableFilterIR(get, scan_bind.names, scan_bind.types);
+  auto probe = ProbeLanceTableFilterIR(get, scan_bind.names, scan_bind.types,
+                                       scan_bind.json_columns);
   if (!probe.all_filters_pushed) {
     return op;
   }
@@ -3090,8 +3098,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
         }
       }
 
-      auto table_filters =
-          ProbeLanceTableFilterIR(scan_get, scan_bind.names, scan_bind.types);
+      auto table_filters = ProbeLanceTableFilterIR(
+          scan_get, scan_bind.names, scan_bind.types, scan_bind.json_columns);
       if (!table_filters.all_filters_pushed) {
         return bail("Lance exec pushdown: table_filters not fully pushable");
       }
@@ -3128,7 +3136,8 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
         }
         string part;
         if (!TryBuildLanceExprFilterIR(scan_get, scan_bind.names,
-                                       scan_bind.types, false, *expr, part)) {
+                                       scan_bind.types, scan_bind.json_columns,
+                                       false, *expr, part)) {
           return bail("Lance exec pushdown: filter IR encode failed");
         }
         filter_parts.push_back(std::move(part));
@@ -3347,8 +3356,9 @@ LanceLikePushdown(unique_ptr<LogicalOperator> op) {
     }
 
     string filter_ir;
-    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types, false,
-                                   *expr, filter_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, scan_bind.names, scan_bind.types,
+                                   scan_bind.json_columns, false, *expr,
+                                   filter_ir)) {
       continue;
     }
     scan_bind.lance_pushed_filter_ir_parts.push_back(std::move(filter_ir));
@@ -3717,6 +3727,7 @@ static void PopulateNamespaceQueryScanSchema(ClientContext &context,
                                                result.schema_root.arrow_schema);
   result.names = result.arrow_table.GetNames();
   result.types = result.arrow_table.GetTypes();
+  result.json_columns = table.JsonColumnNames();
   result.blob_columns = table.GetBlobColumns();
 
   field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
@@ -3779,6 +3790,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       context, result->schema_root.arrow_schema, result->arrow_table);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = live.json_columns;
   result->blob_columns = live.blob_columns;
 
   ValidateLiveSchemaOrReplace(context, live, result->file_path);

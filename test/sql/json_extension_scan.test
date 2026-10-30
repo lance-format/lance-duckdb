@@ -4,20 +4,34 @@
 
 require lance
 
+require json
+
+# Committed updates must use a temporary dataset rather than a tracked fixture.
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, '{"a":1}'::JSON AS payload
+      UNION ALL SELECT 2::BIGINT, '{"a":2}'::JSON)
+TO '__TEST_DIR__/json_extension_scan/json_data.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+RESET arrow_lossless_conversion;
+
 query TTTTTT
-DESCRIBE SELECT * FROM 'test/data/json_data.lance';
+DESCRIBE SELECT * FROM '__TEST_DIR__/json_extension_scan/json_data.lance';
 ----
 id	BIGINT	YES	NULL	NULL	NULL
 payload	VARCHAR	YES	NULL	NULL	NULL
 
 query TI
-SELECT payload, id FROM 'test/data/json_data.lance' ORDER BY id;
+SELECT payload, id FROM '__TEST_DIR__/json_extension_scan/json_data.lance' ORDER BY id;
 ----
 {"a":1}	1
 {"a":2}	2
 
 statement ok
-ATTACH 'test/data' AS json_ns (TYPE LANCE);
+ATTACH '__TEST_DIR__/json_extension_scan' AS json_ns (TYPE LANCE);
 
 statement ok
 BEGIN TRANSACTION;

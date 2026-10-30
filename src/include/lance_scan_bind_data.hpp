@@ -26,6 +26,7 @@ struct LanceScanBindData : public TableFunctionData {
   ArrowTableSchema scan_arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<string> json_columns;
   vector<bool> blob_columns;
   // Internal scan columns whose values are known to be irrelevant to the
   // consumer. Emit typed NULLs without adding them to the Lance read.

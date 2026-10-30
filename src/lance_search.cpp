@@ -232,6 +232,7 @@ struct LanceKnnBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<string> json_columns;
 
   vector<string> lance_pushed_filter_ir_parts;
 
@@ -316,12 +317,11 @@ static void *CreateLanceSearchStreamWithFallback(GLOBAL &global, LOCAL &local,
 // filter cannot restore rows lost to the truncation. Silent skipping is only
 // sound for prefilter=false, where filtering after top-k is the documented
 // semantics. `out_unencodable` receives the first predicate that failed.
-static bool
-CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
-                                const vector<LogicalType> &types,
-                                const vector<unique_ptr<Expression>> &filters,
-                                vector<string> &out_parts,
-                                string &out_unencodable) {
+static bool CollectLancePushedFilterIRParts(
+    LogicalGet &get, const vector<string> &names,
+    const vector<LogicalType> &types, const vector<string> &json_columns,
+    const vector<unique_ptr<Expression>> &filters, vector<string> &out_parts,
+    string &out_unencodable) {
   auto complete = true;
   auto mark_unencodable = [&](const Expression &expr) {
     if (complete) {
@@ -386,7 +386,8 @@ CollectLancePushedFilterIRParts(LogicalGet &get, const vector<string> &names,
       }
     }
     string filter_ir;
-    if (!TryBuildLanceExprFilterIR(get, names, types, true, *expr, filter_ir)) {
+    if (!TryBuildLanceExprFilterIR(get, names, types, json_columns, true, *expr,
+                                   filter_ir)) {
       mark_unencodable(*expr);
       continue;
     }
@@ -405,8 +406,8 @@ LancePushdownComplexFilter(ClientContext &, LogicalGet &get,
   auto &scan_bind = bind_data->Cast<LanceKnnBindData>();
   string unencodable;
   if (!CollectLancePushedFilterIRParts(
-          get, scan_bind.names, scan_bind.types, filters,
-          scan_bind.lance_pushed_filter_ir_parts, unencodable) &&
+          get, scan_bind.names, scan_bind.types, scan_bind.json_columns,
+          filters, scan_bind.lance_pushed_filter_ir_parts, unencodable) &&
       scan_bind.prefilter) {
     throw InvalidInputException(
         "lance_vector_search: predicate %s cannot be pushed to Lance as a "
@@ -532,6 +533,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                                     result->schema_root, result->arrow_table,
                                     result->names, result->types, names,
                                     return_types);
+      result->json_columns = table->JsonColumnNames();
       return std::move(result);
     }
   }
@@ -573,11 +575,13 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto schema_coercion =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = std::move(schema_coercion.json_columns);
   names.clear();
   for (const auto &name : result->names) {
     names.emplace_back(name);
@@ -610,7 +614,7 @@ LanceKnnInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
-      bind_data.names, bind_data.types, input, true);
+      bind_data.names, bind_data.types, bind_data.json_columns, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException("lance_vector_search requires filter pushdown "
                                 "for prefilterable columns when "
@@ -1001,6 +1005,7 @@ struct LanceSearchBindData : public TableFunctionData {
   ArrowTableSchema arrow_table;
   vector<string> names;
   vector<LogicalType> types;
+  vector<string> json_columns;
 
   vector<string> lance_pushed_filter_ir_parts;
 
@@ -1194,6 +1199,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
       PopulateNamespaceSearchSchema(
           context, *table, "_score", result->schema_root, result->arrow_table,
           result->names, result->types, names, return_types);
+      result->json_columns = table->JsonColumnNames();
       return std::move(result);
     }
   }
@@ -1234,11 +1240,13 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto schema_coercion =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = std::move(schema_coercion.json_columns);
   names.clear();
   for (const auto &name : result->names) {
     names.emplace_back(name);
@@ -1385,11 +1393,13 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         LanceFormatErrorSuffix());
   }
   lance_free_schema(schema_handle);
-  LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
+  auto schema_coercion =
+      LanceCoerceArrowSchemaForDuckDB(&result->schema_root.arrow_schema);
   ArrowTableFunction::PopulateArrowTableSchema(
       context, result->arrow_table, result->schema_root.arrow_schema);
   result->names = result->arrow_table.GetNames();
   result->types = result->arrow_table.GetTypes();
+  result->json_columns = std::move(schema_coercion.json_columns);
   names.clear();
   for (const auto &name : result->names) {
     names.emplace_back(name);
@@ -1408,8 +1418,8 @@ LanceSearchPushdownComplexFilter(ClientContext &, LogicalGet &get,
   auto &search_bind = bind_data->Cast<LanceSearchBindData>();
   string unencodable;
   if (!CollectLancePushedFilterIRParts(
-          get, search_bind.names, search_bind.types, filters,
-          search_bind.lance_pushed_filter_ir_parts, unencodable) &&
+          get, search_bind.names, search_bind.types, search_bind.json_columns,
+          filters, search_bind.lance_pushed_filter_ir_parts, unencodable) &&
       search_bind.prefilter) {
     throw InvalidInputException(
         "%s: predicate %s cannot be pushed to Lance as a required prefilter; "
@@ -1446,7 +1456,7 @@ LanceSearchInitGlobal(ClientContext &, TableFunctionInitInput &input) {
   }
 
   auto table_filters = BuildLanceTableFilterIRParts(
-      bind_data.names, bind_data.types, input, true);
+      bind_data.names, bind_data.types, bind_data.json_columns, input, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"

@@ -1554,6 +1554,21 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
 
       switch (bound_action->action_type) {
       case MergeActionType::MERGE_UPDATE: {
+        vector<string> updated_json_columns;
+        for (auto column_idx : bound_action->columns) {
+          auto &target_column = op.table.GetColumns().GetColumn(column_idx);
+          if (lance_table->IsJsonColumn(
+                  target_column.Name().GetIdentifierName())) {
+            updated_json_columns.push_back(
+                target_column.Name().GetIdentifierName());
+          }
+        }
+        if (!updated_json_columns.empty()) {
+          throw NotImplementedException(
+              "MERGE INTO Lance table '" + lance_table->name +
+              "' is not supported because it writes JSON column(s) [" +
+              StringUtil::Join(updated_json_columns, ", ") + "]");
+        }
         action->expressions = BuildMergeUpdateExpressions(op, *bound_action);
         action->update_columns = std::move(bound_action->columns);
         action->update_column_names.reserve(action->update_columns.size());
@@ -1566,6 +1581,12 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         break;
       }
       case MergeActionType::MERGE_INSERT:
+        if (lance_table->HasJsonColumns()) {
+          throw NotImplementedException(
+              "MERGE INTO Lance table '" + lance_table->name +
+              "' is not supported because it writes JSON column(s) [" +
+              StringUtil::Join(lance_table->JsonColumnNames(), ", ") + "]");
+        }
         action->expressions = BuildMergeInsertExpressions(op, *bound_action);
         break;
       case MergeActionType::MERGE_ERROR:

@@ -32,6 +32,25 @@ to avoid silently changing their on-disk types. For a scalar float16 column,
 `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
 and makes it writable.
 
+## JSON columns
+
+Lance JSON extension fields scan as JSON text with SQL type `VARCHAR`, including
+JSON fields nested in structs or lists. SQL predicates and aggregates use that
+text representation. Search predicates on JSON columns require
+`prefilter := false` when they cannot be pushed to Lance; they then filter the
+top-k results.
+
+`INSERT` and `MERGE INSERT` do not support tables containing JSON columns.
+`UPDATE` and `MERGE UPDATE` can change other columns, but cannot assign a
+JSON-containing column. `DELETE` remains supported. JSON columns can be renamed
+or dropped, but `ALTER COLUMN ... TYPE` rejects a JSON source. Computed
+`ADD COLUMN ... DEFAULT` expressions observe JSON as text.
+
+`COPY` uses its input Arrow types. To create or append native JSON, use DuckDB
+`JSON` input values with `arrow_lossless_conversion = true`. Appending ordinary
+`VARCHAR` or bytes to an existing JSON field fails Lance's schema check.
+Overwrite mode can replace the dataset schema.
+
 ## Blob columns and write inputs
 
 SQL `BLOB` columns read and write real bytes. In addition, a write can carry

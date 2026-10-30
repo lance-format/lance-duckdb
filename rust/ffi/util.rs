@@ -7,6 +7,7 @@ use arrow::datatypes::Schema;
 use datafusion_expr::Expr;
 use lance::dataset::scanner::Scanner;
 use lance::session::Session;
+use lance_arrow::json::lance_json_to_arrow_json;
 use lance_core::datatypes::Schema as LanceSchema;
 
 use crate::error::ErrorCode;
@@ -265,7 +266,12 @@ pub(crate) unsafe fn batch_handle<'a>(batch: *mut c_void) -> FfiResult<&'a Recor
 pub(crate) fn schema_to_ffi_arrow_schema(
     schema: &Schema,
 ) -> FfiResult<arrow::ffi::FFI_ArrowSchema> {
-    let data_type = arrow::datatypes::DataType::Struct(schema.fields().clone());
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| Arc::new(lance_json_to_arrow_json(field)))
+        .collect::<Vec<_>>();
+    let data_type = arrow::datatypes::DataType::Struct(fields.into());
     arrow::ffi::FFI_ArrowSchema::try_from(&data_type)
         .map_err(|err| FfiError::new(ErrorCode::SchemaExport, format!("schema export: {err}")))
 }

@@ -36,6 +36,16 @@ static bool ExecIrFailfast() {
   return std::getenv("LANCE_EXEC_PUSHDOWN_FAILFAST") != nullptr;
 }
 
+static bool IsJsonExecColumn(const LanceScanBindData &scan_bind,
+                             const string &name) {
+  for (const auto &json_column : scan_bind.json_columns) {
+    if (StringUtil::CIEquals(json_column, name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void WriteU8(string &out, uint8_t v) {
   out.push_back(static_cast<char>(v));
 }
@@ -443,7 +453,7 @@ static bool TryEncodeExecExpr(
       return false;
     }
     auto &name = scan_bind.names[col_id];
-    if (name.empty()) {
+    if (name.empty() || IsJsonExecColumn(scan_bind, name)) {
       return false;
     }
     out_col_idxs.emplace(col_id);
@@ -479,7 +489,7 @@ static bool TryEncodeExecExpr(
       return false;
     }
     auto &name = scan_bind.names[col_id];
-    if (name.empty()) {
+    if (name.empty() || IsJsonExecColumn(scan_bind, name)) {
       return false;
     }
     out_col_idxs.emplace(col_id);
