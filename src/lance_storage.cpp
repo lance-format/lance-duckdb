@@ -1155,13 +1155,17 @@ private:
                       const EntryLookupInfo &lookup_info,
                       optional_ptr<const Identifier> physical_name = nullptr) {
     auto native = DuckSchemaEntry::LookupEntry(transaction, lookup_info);
-    if (native || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY ||
-        !transaction.context) {
+    if (native || lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
       return native;
     }
     lock_guard<mutex> guard(table_lock);
     auto &name = lookup_info.GetEntryIdentifier();
     auto found = tables.find(name);
+    if (!transaction.context) {
+      // Native dependency commit checks have no query context. Keep cached
+      // tables visible without opening datasets or resolving credentials.
+      return found == tables.end() ? nullptr : found->second.get();
+    }
     if (found == tables.end()) {
       Identifier backend_name = name;
       if (directory_ns) {
