@@ -217,6 +217,26 @@ ListRestNamespaceTables(const string &endpoint, const string &namespace_id,
   return LanceConsumeStringList(tables);
 }
 
+static vector<string> SplitRestNamespaceId(const string &id,
+                                           const string &delimiter) {
+  if (id.empty() || id == delimiter) {
+    return {};
+  }
+  // Preserve empty components, matching Rust split_id. StringUtil::Split drops
+  // them.
+  vector<string> result;
+  idx_t start = 0;
+  while (true) {
+    auto next = id.find(delimiter, start);
+    if (next == string::npos) {
+      result.push_back(id.substr(start));
+      return result;
+    }
+    result.push_back(id.substr(start, next - start));
+    start = next + delimiter.size();
+  }
+}
+
 static string AppendRestNamespaceId(const string &namespace_id,
                                     const string &table_name,
                                     const string &delimiter) {
@@ -233,7 +253,15 @@ static string AppendRestNamespaceId(const string &namespace_id,
   if (namespace_id.empty() || namespace_id == separator) {
     return table_name;
   }
-  return namespace_id + separator + table_name;
+  auto expected = SplitRestNamespaceId(namespace_id, separator);
+  expected.push_back(table_name);
+  auto joined = namespace_id + separator + table_name;
+  if (SplitRestNamespaceId(joined, separator) != expected) {
+    throw InvalidInputException("Lance REST identifier cannot round-trip with "
+                                "the configured delimiter '%s'",
+                                separator);
+  }
+  return joined;
 }
 
 static bool FindRestNamespaceTableId(const string &namespace_id,
@@ -659,6 +687,10 @@ public:
       table_default_generator = make_uniq<LanceDirectoryDefaultGenerator>(
           catalog, *this, this->directory_ns);
     }
+  }
+
+  optional_ptr<const LanceRestNamespaceConfig> RestNamespace() const {
+    return rest_ns.get();
   }
 
   vector<string> CachedDatasetKeys(ClientContext &context) {
@@ -1179,6 +1211,11 @@ private:
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
 };
 
+static bool IsProtectedLanceSchema(const Identifier &name) {
+  return name == DEFAULT_SCHEMA ||
+         DefaultSchemaGenerator::IsDefaultSchema(name);
+}
+
 // Native CatalogSet owns schema entries and calls GetDefaultEntries without a
 // context. ScanSchemas preloads the snapshot; point creation loads it itself.
 class LanceSchemaDefaultGenerator final : public DefaultGenerator {
@@ -1225,7 +1262,7 @@ public:
     identifier_map_t<string> validated;
     for (const auto &name : listed) {
       auto identifier = Identifier(name);
-      if (DefaultSchemaGenerator::IsDefaultSchema(identifier)) {
+      if (IsProtectedLanceSchema(identifier)) {
         throw CatalogException(
             "Lance child namespace '%s' conflicts with a reserved schema",
             name);
@@ -1250,11 +1287,16 @@ public:
     return child;
   }
 
-  unique_ptr<CatalogEntry> CreateDefaultEntry(ClientContext &context,
+  unique_ptr<CatalogEntry> CreateDefaultEntry(CatalogTransaction transaction,
                                               const Identifier &name) override {
     if (DefaultSchemaGenerator::IsDefaultSchema(name)) {
+      DefaultSchemaGenerator defaults(catalog);
+      return defaults.CreateDefaultEntry(transaction, name);
+    }
+    if (name == DEFAULT_SCHEMA || !transaction.context) {
       return nullptr;
     }
+    auto &context = *transaction.context;
     EnsureLoaded(context);
     string physical_name;
     {
@@ -1282,7 +1324,8 @@ public:
       throw InternalException(
           "Lance schema enumeration requires a query context");
     }
-    vector<Identifier> result;
+    DefaultSchemaGenerator defaults(catalog);
+    auto result = defaults.GetDefaultEntries();
     for (const auto &name : names) {
       result.push_back(name.first);
     }
@@ -1345,8 +1388,7 @@ public:
       return ErrorData(ExceptionType::NOT_IMPLEMENTED,
                        "Nested schemas are not supported by Lance attachments");
     }
-    if (info.internal ||
-        DefaultSchemaGenerator::IsDefaultSchema(info.SchemaName())) {
+    if (info.internal || IsProtectedLanceSchema(info.SchemaName())) {
       return ErrorData();
     }
     if (!rest_ns) {
@@ -1380,7 +1422,7 @@ public:
       throw NotImplementedException(
           "CREATE OR REPLACE SCHEMA is not supported for Lance namespaces");
     }
-    if (DefaultSchemaGenerator::IsDefaultSchema(info.SchemaName())) {
+    if (IsProtectedLanceSchema(info.SchemaName())) {
       return DuckCatalog::CreateSchema(transaction, info);
     }
     schema_generator->EnsureLoaded(context);
@@ -1443,8 +1485,7 @@ public:
     if (!schema) {
       return;
     }
-    if (schema->internal ||
-        DefaultSchemaGenerator::IsDefaultSchema(schema->name)) {
+    if (schema->internal || IsProtectedLanceSchema(schema->name)) {
       throw CatalogException("Cannot drop protected Lance schema '%s'",
                              schema->name);
     }
@@ -1577,6 +1618,11 @@ public:
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
     }
     if (rest_ns) {
+      auto *schema = dynamic_cast<LanceSchemaEntry *>(&op.schema);
+      auto target_ns = schema ? schema->RestNamespace() : nullptr;
+      if (!target_ns) {
+        throw BinderException("CREATE TABLE AS requires a Lance schema");
+      }
       class PhysicalLanceCreateTableAs final : public PhysicalOperator {
       public:
         PhysicalLanceCreateTableAs(
@@ -1872,31 +1918,32 @@ public:
       // Use LIST TABLES to implement conflict behavior in a side-effect-free
       // way.
       unordered_map<string, Value> overrides;
-      if (!rest_ns->bearer_token_override.empty()) {
-        overrides["bearer_token"] = Value(rest_ns->bearer_token_override);
+      if (!target_ns->bearer_token_override.empty()) {
+        overrides["bearer_token"] = Value(target_ns->bearer_token_override);
       }
-      if (!rest_ns->api_key_override.empty()) {
-        overrides["api_key"] = Value(rest_ns->api_key_override);
+      if (!target_ns->api_key_override.empty()) {
+        overrides["api_key"] = Value(target_ns->api_key_override);
       }
       string bearer_token;
       string api_key;
-      ResolveLanceNamespaceAuth(context, rest_ns->endpoint, overrides,
+      ResolveLanceNamespaceAuth(context, target_ns->endpoint, overrides,
                                 bearer_token, api_key);
 
       vector<string> discovered;
       string list_error;
       if (!TryLanceNamespaceListTables(
-              context, rest_ns->endpoint, rest_ns->namespace_id, bearer_token,
-              api_key, rest_ns->delimiter, rest_ns->headers_tsv, discovered,
-              list_error)) {
+              context, target_ns->endpoint, target_ns->namespace_id,
+              bearer_token, api_key, target_ns->delimiter,
+              target_ns->headers_tsv, discovered, list_error)) {
         throw IOException("Failed to list tables from Lance namespace: " +
                           (list_error.empty() ? "unknown error" : list_error));
       }
 
       string existing_id;
       auto exists = FindRestNamespaceTableId(
-          rest_ns->namespace_id, create_info.GetTableName().GetIdentifierName(),
-          rest_ns->delimiter, discovered, existing_id);
+          target_ns->namespace_id,
+          create_info.GetTableName().GetIdentifierName(), target_ns->delimiter,
+          discovered, existing_id);
 
       if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
           exists) {
@@ -1912,9 +1959,9 @@ public:
       auto types = create_info.columns.GetColumnTypes();
       string mode = CreateTableModeFromConflict(create_info.on_conflict);
       auto &create_as = planner.Make<PhysicalLanceCreateTableAs>(
-          op.types, rest_ns->endpoint, rest_ns->namespace_id,
-          rest_ns->delimiter, rest_ns->bearer_token_override,
-          rest_ns->api_key_override, rest_ns->headers_tsv,
+          op.types, target_ns->endpoint, target_ns->namespace_id,
+          target_ns->delimiter, target_ns->bearer_token_override,
+          target_ns->api_key_override, target_ns->headers_tsv,
           create_info.GetTableName().GetIdentifierName(), mode,
           data_storage_version, std::move(names), std::move(types),
           op.estimated_cardinality);

@@ -55,7 +55,10 @@ SQL table names are leaf names within the attached namespace. For example,
 `default$orders`. Reads and writes use that complete ID. With the default `$`
 delimiter, `lance_ns.main."orders.2026"` addresses the single table component
 `orders.2026`. A table name containing the active delimiter is rejected because
-the REST protocol cannot distinguish it from a namespace boundary.
+the REST protocol cannot distinguish it from a namespace boundary. Composed
+identifiers must also round-trip through the configured delimiter. For example,
+namespace `a:` plus child `b` cannot be represented with delimiter `::`, because
+`a:::b` decodes as `a` and `:b`; such operations fail before remote mutation.
 Use the delimiter itself as the namespace ID to attach the root namespace.
 
 Table enumeration accepts either full IDs with the attached namespace prefix
