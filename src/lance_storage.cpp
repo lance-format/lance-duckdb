@@ -4,7 +4,6 @@
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
-#include "duckdb/catalog/default/default_generator.hpp"
 #include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/catalog/duck_catalog.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -267,11 +266,26 @@ FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
   return matched;
 }
 
-class LanceDirectoryDefaultGenerator : public DefaultGenerator {
+// Namespace enumeration needs the current context for credential resolution.
+// DuckDB's DefaultGenerator only supports context-free enumeration.
+class LanceTableGenerator {
+public:
+  explicit LanceTableGenerator(Catalog &catalog) : catalog(catalog) {}
+  virtual ~LanceTableGenerator() = default;
+
+  virtual unique_ptr<CatalogEntry>
+  CreateDefaultEntry(ClientContext &context, const Identifier &entry_name) = 0;
+  virtual vector<Identifier> GetDefaultEntries(ClientContext &context) = 0;
+
+protected:
+  Catalog &catalog;
+};
+
+class LanceDirectoryDefaultGenerator : public LanceTableGenerator {
 public:
   LanceDirectoryDefaultGenerator(Catalog &catalog, SchemaCatalogEntry &schema,
                                  shared_ptr<LanceDirectoryNamespaceConfig> ns)
-      : DefaultGenerator(catalog), schema(schema), ns(std::move(ns)) {}
+      : LanceTableGenerator(catalog), schema(schema), ns(std::move(ns)) {}
 
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
@@ -344,7 +358,7 @@ public:
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  vector<Identifier> GetDefaultEntries() override {
+  vector<Identifier> GetDefaultEntries(ClientContext &) override {
     if (!ns) {
       return {};
     }
@@ -358,11 +372,9 @@ public:
             inserted.first->GetIdentifierName(), name, ns->root);
       }
     }
-    // Filter out tables whose datasets cannot be opened (e.g. corrupt
-    // manifests). CreateDefaultEntries requires every entry to produce
-    // a non-null CatalogEntry, but CreateDefaultEntry must return
-    // nullptr for datasets that are not yet written (CTAS planning
-    // phase). Filtering here avoids the conflict.
+    // Catalog scans require every listed table to produce an entry. Filter
+    // unreadable datasets here, while point lookup can still return nullptr
+    // for a dataset that CTAS has not written yet.
     vector<Identifier> valid;
     vector<const char *> key_ptrs;
     vector<const char *> value_ptrs;
@@ -405,13 +417,13 @@ static LanceTableSchema LanceTableSchemaFromJson(ClientContext &context,
   return LanceTableSchema::FromArrow(context, root.arrow_schema, arrow_table);
 }
 
-class LanceRestNamespaceDefaultGenerator : public DefaultGenerator {
+class LanceRestNamespaceDefaultGenerator : public LanceTableGenerator {
 public:
   LanceRestNamespaceDefaultGenerator(
       Catalog &catalog, SchemaCatalogEntry &schema, string endpoint,
       string namespace_id, string delimiter, string bearer_token_override,
       string api_key_override, string headers_tsv)
-      : DefaultGenerator(catalog), schema(schema),
+      : LanceTableGenerator(catalog), schema(schema),
         endpoint(std::move(endpoint)), namespace_id(std::move(namespace_id)),
         delimiter(std::move(delimiter)),
         bearer_token_override(std::move(bearer_token_override)),
@@ -424,17 +436,9 @@ public:
     const auto &entry_name = entry_name_p.GetIdentifierName();
     auto table_id =
         GetRestNamespaceTableId(namespace_id, entry_name, delimiter);
-    unordered_map<string, Value> overrides;
-    if (!bearer_token_override.empty()) {
-      overrides["bearer_token"] = Value(bearer_token_override);
-    }
-    if (!api_key_override.empty()) {
-      overrides["api_key"] = Value(api_key_override);
-    }
     string bearer_token;
     string api_key;
-    ResolveLanceNamespaceAuth(context, endpoint, overrides, bearer_token,
-                              api_key);
+    ResolveAuth(context, bearer_token, api_key);
 
     const char *schema_ptr = nullptr;
     auto rc = lance_namespace_describe_table_with_schema(
@@ -478,14 +482,29 @@ public:
         LanceTableSchema::FromDataset(context, dataset.get()));
   }
 
-  vector<Identifier> GetDefaultEntries() override {
-    auto names =
-        ListRestNamespaceTables(endpoint, namespace_id, bearer_token_override,
-                                api_key_override, delimiter, headers_tsv);
+  vector<Identifier> GetDefaultEntries(ClientContext &context) override {
+    string bearer_token;
+    string api_key;
+    ResolveAuth(context, bearer_token, api_key);
+    auto names = ListRestNamespaceTables(endpoint, namespace_id, bearer_token,
+                                         api_key, delimiter, headers_tsv);
     return vector<Identifier>(names.begin(), names.end());
   }
 
 private:
+  void ResolveAuth(ClientContext &context, string &bearer_token,
+                   string &api_key) const {
+    unordered_map<string, Value> overrides;
+    if (!bearer_token_override.empty()) {
+      overrides["bearer_token"] = Value(bearer_token_override);
+    }
+    if (!api_key_override.empty()) {
+      overrides["api_key"] = Value(api_key_override);
+    }
+    ResolveLanceNamespaceAuth(context, endpoint, overrides, bearer_token,
+                              api_key);
+  }
+
   unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
                                               const string &table_id,
                                               LanceTableSchema live) {
@@ -615,7 +634,7 @@ public:
       : DuckSchemaEntry(catalog, info), directory_ns(std::move(directory_ns)),
         rest_ns(std::move(rest_ns)) {}
 
-  void SetTableDefaultGenerator(unique_ptr<DefaultGenerator> generator) {
+  void SetTableDefaultGenerator(unique_ptr<LanceTableGenerator> generator) {
     table_default_generator = std::move(generator);
   }
 
@@ -707,7 +726,7 @@ public:
     vector<Identifier> names;
     {
       lock_guard<mutex> guard(table_lock);
-      names = table_default_generator->GetDefaultEntries();
+      names = table_default_generator->GetDefaultEntries(context);
     }
     for (auto &name : names) {
       auto entry = LookupEntryInternal(
@@ -1089,7 +1108,7 @@ private:
 
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
-  unique_ptr<DefaultGenerator> table_default_generator;
+  unique_ptr<LanceTableGenerator> table_default_generator;
   mutex table_lock;
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
 };
@@ -1659,7 +1678,7 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
   auto delimiter = GetLanceNamespaceDelimiter(info);
   auto headers_tsv = GetLanceNamespaceHeaders(info);
 
-  unique_ptr<DefaultGenerator> generator;
+  unique_ptr<LanceTableGenerator> generator;
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
 
