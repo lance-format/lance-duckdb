@@ -446,6 +446,7 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
   bool has_raw_params_json = false;
   string raw_params_json;
   vector<pair<string, string>> passthrough;
+  case_insensitive_set_t seen_keys;
   for (auto &kv : kvs) {
     auto eq_pos = kv.find('=');
     if (eq_pos == string::npos) {
@@ -456,6 +457,12 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
     auto val = TrimCopy(kv.substr(eq_pos + 1));
     if (key.empty()) {
       out_error = "WITH (...) entry key cannot be empty";
+      return false;
+    }
+    // Option names are case-insensitive, as in DuckDB's own WITH clauses, so a
+    // repeated name would silently drop one of its values.
+    if (!seen_keys.insert(key).second) {
+      out_error = "Duplicate option \"" + key + "\" in WITH clause";
       return false;
     }
     auto key_lower = StringUtil::Lower(key);
@@ -494,7 +501,8 @@ static bool TryBuildParamsJsonFromWithClause(const string &with_clause_sql,
       }
       continue;
     }
-    passthrough.emplace_back(std::move(key), std::move(val));
+    // Lance option names are lower-case.
+    passthrough.emplace_back(std::move(key_lower), std::move(val));
   }
 
   if (has_raw_params_json) {
@@ -669,7 +677,7 @@ static void BuildLanceParamsJsonFromDuckdbWithOptions(
       has_raw_params_json = true;
       continue;
     }
-    passthrough.emplace_back(kv.first, kv.second);
+    passthrough.emplace_back(key_lower, kv.second);
   }
 
   if (has_raw_params_json) {

@@ -686,169 +686,180 @@ fn is_vector_index_type(index_type: &str) -> bool {
     )
 }
 
+/// Options a vector index reads from `params_json`. An unknown name or a value
+/// of the wrong type is an error instead of a silent default, as for the
+/// index optimize options above.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct VectorIndexOptions {
+    metric_type: Option<String>,
+    version: Option<String>,
+    num_partitions: Option<usize>,
+    num_bits: Option<u8>,
+    num_sub_vectors: Option<usize>,
+    max_iterations: Option<usize>,
+    sample_rate: Option<usize>,
+    hnsw_m: Option<usize>,
+    hnsw_ef_construction: Option<usize>,
+    hnsw_max_level: Option<u16>,
+    /// `null` disables prefetching; leaving the option out keeps Lance's default.
+    #[serde(deserialize_with = "deserialize_present")]
+    hnsw_prefetch_distance: Option<Option<usize>>,
+}
+
+/// Wraps a present value, `null` included, in `Some`; a missing field keeps
+/// the container default (`None`).
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+impl VectorIndexOptions {
+    /// The first option set here that `index_type` does not read. The
+    /// destructuring names every field, so a new option does not compile until
+    /// it is listed here.
+    fn unused_by(&self, index_type: &str) -> Option<&'static str> {
+        let Self {
+            metric_type: _,
+            version: _,
+            num_partitions: _,
+            num_bits,
+            num_sub_vectors,
+            max_iterations,
+            sample_rate,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_max_level,
+            hnsw_prefetch_distance,
+        } = self;
+        let pq = matches!(index_type, "IVF_PQ" | "IVF_HNSW_PQ");
+        let sq = matches!(index_type, "IVF_SQ" | "IVF_HNSW_SQ");
+        let hnsw = index_type.starts_with("IVF_HNSW_");
+        let reads_num_bits = pq || sq || index_type == "IVF_RQ";
+        [
+            ("num_bits", num_bits.is_some(), reads_num_bits),
+            ("num_sub_vectors", num_sub_vectors.is_some(), pq),
+            ("max_iterations", max_iterations.is_some(), pq),
+            ("sample_rate", sample_rate.is_some(), sq),
+            ("hnsw_m", hnsw_m.is_some(), hnsw),
+            ("hnsw_ef_construction", hnsw_ef_construction.is_some(), hnsw),
+            ("hnsw_max_level", hnsw_max_level.is_some(), hnsw),
+            (
+                "hnsw_prefetch_distance",
+                hnsw_prefetch_distance.is_some(),
+                hnsw,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, set, read)| *set && !*read)
+        .map(|(name, _, _)| name)
+    }
+
+    fn hnsw(&self) -> HnswBuildParams {
+        let mut hnsw = HnswBuildParams::default();
+        if let Some(m) = self.hnsw_m {
+            hnsw.m = m;
+        }
+        if let Some(ef_construction) = self.hnsw_ef_construction {
+            hnsw.ef_construction = ef_construction;
+        }
+        if let Some(max_level) = self.hnsw_max_level {
+            hnsw.max_level = max_level;
+        }
+        if let Some(prefetch_distance) = self.hnsw_prefetch_distance {
+            hnsw.prefetch_distance = prefetch_distance;
+        }
+        hnsw
+    }
+
+    fn sq(&self) -> lance_index::vector::sq::builder::SQBuildParams {
+        lance_index::vector::sq::builder::SQBuildParams {
+            num_bits: self.num_bits.unwrap_or(8).into(),
+            sample_rate: self.sample_rate.unwrap_or(256),
+        }
+    }
+}
+
 fn build_vector_params(
     index_type: &str,
     params_json: Option<&str>,
 ) -> FfiResult<VectorIndexParams> {
-    let mut params = serde_json::Map::<String, serde_json::Value>::new();
-    if let Some(json) = params_json {
-        let v: serde_json::Value = serde_json::from_str(json).map_err(|err| {
-            FfiError::new(
-                ErrorCode::DatasetCreateIndex,
-                format!("params_json is not valid json: {err}"),
-            )
-        })?;
-        if let serde_json::Value::Object(m) = v {
-            params = m;
-        } else {
+    let options: VectorIndexOptions = match params_json {
+        // serde also fills a struct from a JSON array, by field position, so
+        // only an object names its options.
+        Some(json) if !json.trim_start().starts_with('{') => {
             return Err(FfiError::new(
                 ErrorCode::DatasetCreateIndex,
-                "params_json must be a JSON object",
-            ));
+                format!("{index_type} options must be a JSON object"),
+            ))
         }
+        Some(json) => serde_json::from_str(json).map_err(|err| {
+            FfiError::new(
+                ErrorCode::DatasetCreateIndex,
+                format!("{index_type} options: {err}"),
+            )
+        })?,
+        None => VectorIndexOptions::default(),
+    };
+    if let Some(name) = options.unused_by(index_type) {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("{index_type} does not accept option '{name}'"),
+        ));
     }
 
-    let metric = params
-        .get("metric_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("l2");
+    let metric = options.metric_type.as_deref().unwrap_or("l2");
     let metric_type = DistanceType::try_from(metric).map_err(|err| {
         FfiError::new(ErrorCode::DatasetCreateIndex, format!("metric_type: {err}"))
     })?;
-
-    let version = params
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("v3");
-    let version = IndexFileVersion::try_from(version)
+    let version = IndexFileVersion::try_from(options.version.as_deref().unwrap_or("v3"))
         .map_err(|err| FfiError::new(ErrorCode::DatasetCreateIndex, format!("version: {err}")))?;
+    // Lance reads the file version only for IVF_PQ and builds V3 for the rest.
+    if matches!(version, IndexFileVersion::Legacy) && index_type != "IVF_PQ" {
+        return Err(FfiError::new(
+            ErrorCode::DatasetCreateIndex,
+            format!("{index_type} does not accept version 'legacy'"),
+        ));
+    }
+    let num_partitions = options.num_partitions.unwrap_or(256);
+    let ivf = || lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
 
-    let num_partitions = params
-        .get("num_partitions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(256) as usize;
-
-    let out = match index_type {
+    let mut out = match index_type {
         "IVF_FLAT" => VectorIndexParams::ivf_flat(num_partitions, metric_type),
-        "IVF_PQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
-            let num_sub_vectors = params
-                .get("num_sub_vectors")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(16) as usize;
-            let max_iterations = params
-                .get("max_iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as usize;
-            VectorIndexParams::ivf_pq(
-                num_partitions,
-                num_bits,
-                num_sub_vectors,
-                metric_type,
-                max_iterations,
-            )
-        }
+        "IVF_PQ" => VectorIndexParams::ivf_pq(
+            num_partitions,
+            options.num_bits.unwrap_or(8),
+            options.num_sub_vectors.unwrap_or(16),
+            metric_type,
+            options.max_iterations.unwrap_or(50),
+        ),
         "IVF_RQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
-            VectorIndexParams::ivf_rq(num_partitions, num_bits, metric_type)
+            VectorIndexParams::ivf_rq(num_partitions, options.num_bits.unwrap_or(8), metric_type)
         }
-        "IVF_SQ" => {
-            let num_bits = params.get("num_bits").and_then(|v| v.as_u64()).unwrap_or(8) as u8;
-            let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
-            let sq = lance_index::vector::sq::builder::SQBuildParams {
-                num_bits: num_bits as u16,
-                sample_rate: params
-                    .get("sample_rate")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(256) as usize,
-            };
-            VectorIndexParams::with_ivf_sq_params(metric_type, ivf, sq)
-        }
-        "IVF_HNSW_FLAT" => {
-            let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
-            let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
-            VectorIndexParams::ivf_hnsw(metric_type, ivf, hnsw)
-        }
+        "IVF_SQ" => VectorIndexParams::with_ivf_sq_params(metric_type, ivf(), options.sq()),
+        "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(metric_type, ivf(), options.hnsw()),
         "IVF_HNSW_PQ" => {
-            let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
-            let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
-
             let mut pq = PQBuildParams::default();
-            if let Some(v) = params.get("num_bits").and_then(|v| v.as_u64()) {
-                pq.num_bits = v as usize;
+            if let Some(num_bits) = options.num_bits {
+                pq.num_bits = num_bits.into();
             }
-            if let Some(v) = params.get("num_sub_vectors").and_then(|v| v.as_u64()) {
-                pq.num_sub_vectors = v as usize;
+            if let Some(num_sub_vectors) = options.num_sub_vectors {
+                pq.num_sub_vectors = num_sub_vectors;
             }
-            if let Some(v) = params.get("max_iterations").and_then(|v| v.as_u64()) {
-                pq.max_iters = v as usize;
+            if let Some(max_iterations) = options.max_iterations {
+                pq.max_iters = max_iterations;
             }
-            VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf, hnsw, pq)
+            VectorIndexParams::with_ivf_hnsw_pq_params(metric_type, ivf(), options.hnsw(), pq)
         }
-        "IVF_HNSW_SQ" => {
-            let ivf = lance_index::vector::ivf::IvfBuildParams::new(num_partitions);
-            let mut hnsw = HnswBuildParams::default();
-            if let Some(v) = params.get("hnsw_m").and_then(|v| v.as_u64()) {
-                hnsw.m = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_ef_construction").and_then(|v| v.as_u64()) {
-                hnsw.ef_construction = v as usize;
-            }
-            if let Some(v) = params.get("hnsw_max_level").and_then(|v| v.as_u64()) {
-                hnsw.max_level = v as u16;
-            }
-            if let Some(v) = params.get("hnsw_prefetch_distance") {
-                if v.is_null() {
-                    hnsw.prefetch_distance = None;
-                } else if let Some(u) = v.as_u64() {
-                    hnsw.prefetch_distance = Some(u as usize);
-                }
-            }
-
-            let mut sq = lance_index::vector::sq::builder::SQBuildParams {
-                num_bits: 8,
-                sample_rate: 256,
-            };
-            if let Some(v) = params.get("num_bits").and_then(|v| v.as_u64()) {
-                sq.num_bits = v as u16;
-            }
-            if let Some(v) = params.get("sample_rate").and_then(|v| v.as_u64()) {
-                sq.sample_rate = v as usize;
-            }
-            VectorIndexParams::with_ivf_hnsw_sq_params(metric_type, ivf, hnsw, sq)
-        }
+        "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
+            metric_type,
+            ivf(),
+            options.hnsw(),
+            options.sq(),
+        ),
         other => {
             return Err(FfiError::new(
                 ErrorCode::DatasetCreateIndex,
@@ -856,8 +867,6 @@ fn build_vector_params(
             ))
         }
     };
-
-    let mut out = out;
     out.version(version);
     Ok(out)
 }
@@ -966,5 +975,163 @@ mod tests {
         let err = canonicalize_lance_field_path(&schema, "value", "index column").unwrap_err();
 
         assert!(err.message.contains("index column not found"));
+    }
+
+    fn hnsw_values(hnsw: &HnswBuildParams) -> String {
+        format!(
+            "hnsw {} {} {} {:?}",
+            hnsw.m, hnsw.ef_construction, hnsw.max_level, hnsw.prefetch_distance
+        )
+    }
+
+    /// The option values each stage of `params` carries.
+    fn stage_values(params: &VectorIndexParams) -> Vec<String> {
+        use lance::index::vector::StageParams;
+        params
+            .stages
+            .iter()
+            .map(|stage| match stage {
+                StageParams::Ivf(ivf) => format!("ivf {:?}", ivf.num_partitions),
+                StageParams::PQ(pq) => {
+                    format!("pq {} {} {}", pq.num_bits, pq.num_sub_vectors, pq.max_iters)
+                }
+                StageParams::SQ(sq) => format!("sq {} {}", sq.num_bits, sq.sample_rate),
+                StageParams::RQ(rq) => format!("rq {}", rq.num_bits),
+                StageParams::Hnsw(hnsw) => hnsw_values(hnsw),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vector_index_options_are_applied() {
+        let params = build_vector_params(
+            "IVF_FLAT",
+            Some(r#"{"metric_type":"cosine","num_partitions":2,"version":"v3"}"#),
+        )
+        .unwrap();
+        assert_eq!(params.metric_type, DistanceType::Cosine);
+        assert_eq!(stage_values(&params), ["ivf Some(2)"]);
+
+        let params = build_vector_params("IVF_PQ", Some(r#"{"version":"legacy"}"#)).unwrap();
+        assert!(matches!(params.version, IndexFileVersion::Legacy));
+
+        // Every option a type reads reaches its stage, and an HNSW option left
+        // out keeps Lance's default. `null` disables HNSW prefetching.
+        let hnsw_default = hnsw_values(&HnswBuildParams::default());
+        let hnsw_m8 = hnsw_values(&HnswBuildParams {
+            m: 8,
+            ..Default::default()
+        });
+        let hnsw_prefetch4 = hnsw_values(&HnswBuildParams {
+            prefetch_distance: Some(4),
+            ..Default::default()
+        });
+        for (index_type, json, expected) in [
+            (
+                "IVF_PQ",
+                r#"{"num_partitions":2,"num_bits":4,"num_sub_vectors":4,"max_iterations":10}"#,
+                &["ivf Some(2)", "pq 4 4 10"][..],
+            ),
+            ("IVF_RQ", r#"{"num_bits":1}"#, &["ivf Some(256)", "rq 1"]),
+            (
+                "IVF_SQ",
+                r#"{"num_bits":4,"sample_rate":128}"#,
+                &["ivf Some(256)", "sq 4 128"],
+            ),
+            (
+                "IVF_HNSW_FLAT",
+                "{}",
+                &["ivf Some(256)", hnsw_default.as_str()],
+            ),
+            (
+                "IVF_HNSW_FLAT",
+                r#"{"hnsw_m":8,"hnsw_ef_construction":64,"hnsw_max_level":5,"hnsw_prefetch_distance":null}"#,
+                &["ivf Some(256)", "hnsw 8 64 5 None"],
+            ),
+            (
+                "IVF_HNSW_PQ",
+                r#"{"hnsw_m":8,"num_bits":4,"num_sub_vectors":4,"max_iterations":10}"#,
+                &["ivf Some(256)", hnsw_m8.as_str(), "pq 4 4 10"],
+            ),
+            (
+                "IVF_HNSW_SQ",
+                r#"{"hnsw_prefetch_distance":4,"num_bits":4,"sample_rate":128}"#,
+                &["ivf Some(256)", hnsw_prefetch4.as_str(), "sq 4 128"],
+            ),
+        ] {
+            let params = build_vector_params(index_type, Some(json))
+                .unwrap_or_else(|err| panic!("{index_type} {json}: {}", err.message));
+            assert_eq!(stage_values(&params), expected, "{index_type} {json}");
+        }
+    }
+
+    #[test]
+    fn vector_index_options_reject_values_they_would_ignore() {
+        for (index_type, json, expected) in [
+            (
+                "IVF_FLAT",
+                r#"{"version":"legacy"}"#,
+                "IVF_FLAT does not accept version 'legacy'",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"metric":"cosine"}"#,
+                "unknown field `metric`",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"num_partition":2}"#,
+                "unknown field `num_partition`",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"num_sub_vectors":4}"#,
+                "IVF_FLAT does not accept option 'num_sub_vectors'",
+            ),
+            (
+                "IVF_HNSW_FLAT",
+                r#"{"sample_rate":4}"#,
+                "IVF_HNSW_FLAT does not accept option 'sample_rate'",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"num_partitions":"2"}"#,
+                "invalid type: string \"2\", expected usize",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"num_partitions":-1}"#,
+                "invalid value: integer `-1`, expected usize",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"metric_type":1}"#,
+                "invalid type: integer `1`, expected a string",
+            ),
+            (
+                "IVF_PQ",
+                r#"{"num_bits":300}"#,
+                "invalid value: integer `300`, expected u8",
+            ),
+            ("IVF_FLAT", "5", "IVF_FLAT options must be a JSON object"),
+            ("IVF_FLAT", "[]", "IVF_FLAT options must be a JSON object"),
+            (
+                "IVF_FLAT",
+                r#"["cosine", "v3", 1]"#,
+                "IVF_FLAT options must be a JSON object",
+            ),
+            (
+                "IVF_FLAT",
+                r#"{"metric_type":"cosine","metric_type":"l2"}"#,
+                "duplicate field `metric_type`",
+            ),
+        ] {
+            let err = build_vector_params(index_type, Some(json)).unwrap_err();
+            assert!(
+                err.message.contains(expected),
+                "{index_type} {json}: {}",
+                err.message
+            );
+        }
     }
 }

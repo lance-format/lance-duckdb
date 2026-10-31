@@ -663,6 +663,22 @@ USING INVERTED;
 
 Notes:
 - `CREATE INDEX` currently supports a single column.
+- Option names in `WITH (...)` are case-insensitive, and each option may be given once.
+- Vector indices accept these options; any other option, or a value of the wrong type, is an error:
+  - every type: `metric_type` (`l2` by default, `euclidean`, `cosine`, `dot`, `hamming`),
+    `num_partitions` (default 256), `version` (`v3`; `legacy` only for `IVF_PQ`)
+  - `IVF_PQ`, `IVF_HNSW_PQ`: `num_bits` (default 8), `num_sub_vectors` (16), `max_iterations` (50)
+  - `IVF_SQ`, `IVF_HNSW_SQ`: `num_bits` (default 8), `sample_rate` (256)
+  - `IVF_RQ`: `num_bits` (default 8)
+  - `IVF_HNSW_*`: `hnsw_m`, `hnsw_ef_construction`, `hnsw_max_level`, `hnsw_prefetch_distance`
+    (Lance's defaults). To disable prefetching, give the full option set as `params` JSON with
+    `"hnsw_prefetch_distance": null`.
+- Scalar and full-text index options are passed to Lance with lower-cased names. Lance validates
+  their values and ignores names it does not recognize.
+- `params = '<json object>'` supplies the complete option set, with names as written, and cannot
+  be combined with other options except `replace` and `train`.
+- For optional vector parameters, JSON `null` means omission, except that
+  `hnsw_prefetch_distance: null` disables prefetching.
 - Vector indices require a fixed-size vector column. If a dataset was written with
   `FLOAT[]` / `DOUBLE[]`, first cast it with `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT[N]`
   (or `DOUBLE[N]`) and then create the index.

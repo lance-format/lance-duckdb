@@ -37,10 +37,69 @@ WITH replace must be a boolean
 # A raw params JSON is the complete parameter set, so combining it with sibling
 # options would silently drop those siblings and build a different index.
 statement error
-CREATE INDEX bad_params_combo_idx ON 'test/.tmp/index_ddl_base.lance' (vec)
+CREATE INDEX bad_params_combo_idx ON '{TEST_DIR}/index_ddl_base.lance' (vec)
 USING IVF_FLAT WITH (params='{"num_partitions":1}', metric_type='cosine');
 ----
 WITH params cannot be combined with other index options
+
+# Option names are case-insensitive, like DuckDB's own WITH options.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_ddl_options.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX vec_cosine_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (Num_Partitions=1, METRIC_TYPE='cosine');
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_options.lance';
+----
+vec_cosine_idx	<REGEX>:.*	vec	2048	<REGEX>:.*"metric_type":"COSINE".*
+
+statement error
+CREATE INDEX dup_option_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (metric_type='cosine', METRIC_TYPE='l2');
+----
+Duplicate option "METRIC_TYPE" in WITH clause
+
+# A vector index rejects an option it would not read instead of building with
+# a default: pylance's `metric`, a misspelled name, an option of another index
+# type, and a value of the wrong type.
+statement error
+CREATE INDEX bad_metric_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric='cosine');
+----
+unknown field `metric`
+
+statement error
+CREATE INDEX bad_partitions_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (num_partition=1, metric_type='cosine');
+----
+unknown field `num_partition`
+
+statement error
+CREATE INDEX bad_pq_option_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, num_sub_vectors=4);
+----
+IVF_FLAT does not accept option 'num_sub_vectors'
+
+statement error
+CREATE INDEX bad_partitions_type_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (num_partitions='1', metric_type='cosine');
+----
+invalid type: string "1", expected usize
+
+# A JSON array would otherwise fill the options by position.
+statement error
+CREATE INDEX bad_params_array_idx ON '{TEST_DIR}/index_ddl_options.lance' (vec)
+USING IVF_FLAT WITH (params='["cosine", "v3", 1]');
+----
+IVF_FLAT options must be a JSON object
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_ddl_options.lance';
+----
+vec_cosine_idx	<REGEX>:.*	vec	2048	<REGEX>:.*
 
 statement ok
 ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
@@ -51,6 +110,12 @@ CREATE INDEX bad_params_combo_native_idx ON ns.main.index_ddl_base (label)
 USING BTREE WITH (params='{"foo":1}', metric_type='cosine');
 ----
 WITH params cannot be combined with other index options
+
+statement error
+CREATE INDEX bad_metric_native_idx ON ns.main.index_ddl_options (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric='cosine');
+----
+unknown field `metric`
 
 statement ok
 CREATE INDEX attached_label_idx ON ns.main.index_ddl_base (label) USING BTREE;
@@ -359,6 +424,14 @@ COPY (
   UNION ALL
   SELECT 3::BIGINT AS id, 'other text'::VARCHAR AS text
 ) TO '{TEST_DIR}/index_ddl_text.lance' (FORMAT lance, mode 'overwrite');
+
+# Scalar index options reach Lance in lower case, so Lance validates this
+# tokenizer instead of ignoring an option name it does not know.
+statement error
+CREATE INDEX bad_tokenizer_idx ON '{TEST_DIR}/index_ddl_text.lance' (text)
+USING INVERTED WITH (Base_Tokenizer='no_such_tokenizer');
+----
+unknown base tokenizer no_such_tokenizer
 
 statement ok
 CREATE INDEX text_idx ON '{TEST_DIR}/index_ddl_text.lance' (text)
