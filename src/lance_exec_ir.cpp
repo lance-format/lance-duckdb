@@ -246,6 +246,13 @@ static bool TryEncodeExecExpr(
     idx_t projection_stack_offset, const Expression &expr, string &out,
     unordered_set<idx_t> &out_col_idxs);
 
+// DataFusion's integer arithmetic wraps on overflow, while DuckDB's raises an
+// error, so `avg(a * b)` would return a wrong value instead of failing.
+// Integer arithmetic stays in DuckDB.
+static bool IsWrappingExecArithmetic(const LogicalType &result_type) {
+  return result_type.IsIntegral();
+}
+
 static bool TryEncodeLiteral(const Value &v, string &out) {
   WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::LITERAL));
   if (v.IsNull()) {
@@ -500,7 +507,8 @@ static bool TryEncodeExecExpr(
   case ExpressionClass::BOUND_FUNCTION: {
     auto &fn = expr.Cast<BoundFunctionExpression>();
     ExecIrBinaryOp bop;
-    if (!TryMapBinaryOp(fn, bop)) {
+    if (!TryMapBinaryOp(fn, bop) ||
+        IsWrappingExecArithmetic(expr.GetReturnType())) {
       return false;
     }
     WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::BINARY));
