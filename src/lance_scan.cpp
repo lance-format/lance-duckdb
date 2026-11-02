@@ -3011,11 +3011,28 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     if (preserve_avg) {
       bool has_avg = false;
       for (const auto &expr : agg_op.expressions) {
-        if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
-            expr->Cast<BoundAggregateExpression>().Function().GetName() ==
-                "avg") {
-          has_avg = true;
-          break;
+        if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+          continue;
+        }
+        auto &aggr = expr->Cast<BoundAggregateExpression>();
+        if (aggr.Function().GetName() != "avg") {
+          continue;
+        }
+        has_avg = true;
+        // DuckDB divides an integer or DECIMAL AVG either as SUM / COUNT,
+        // when AggregateFunctionRewriter rewrites it, or in AVG's finalize,
+        // and the two round differently. Leave it to the later pass, which
+        // sees DuckDB's decision.
+        if (aggr.GetChildren().size() == 1) {
+          switch (aggr.GetChildren()[0]->GetReturnType().id()) {
+          case LogicalTypeId::SMALLINT:
+          case LogicalTypeId::INTEGER:
+          case LogicalTypeId::BIGINT:
+          case LogicalTypeId::DECIMAL:
+            return nullptr;
+          default:
+            break;
+          }
         }
       }
       if (!has_avg) {
@@ -3158,13 +3175,51 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
     }
 
     string exec_ir;
+    vector<LanceExecIRFinish> finishes;
     if (!TryEncodeLanceExecIRv1(scan_get, scan_bind, filter_ir_msg,
                                 extra_scan_col_ids, projection_stack, agg_op,
-                                order_op, post_projection, exec_ir)) {
+                                order_op, post_projection, exec_ir, finishes)) {
       if (failfast()) {
         throw IOException("Lance exec pushdown: ExecIR encode failed");
       }
       return nullptr;
+    }
+    // Integer SUMs arrive as DECIMAL(38, 0), AVGs as their exact sum and
+    // count; DuckDB computes the results from them.
+    vector<LogicalType> exec_expected_types;
+    vector<unique_ptr<Expression>> output_expressions;
+    {
+      auto group_count = agg_op.groups.size();
+      idx_t next = 0;
+      for (idx_t i = 0; i < expected_types.size(); i++) {
+        auto column = exec_expected_types.size();
+        if (i < group_count || next == finishes.size() ||
+            finishes[next].aggregate_index != i - group_count) {
+          exec_expected_types.push_back(expected_types[i]);
+          output_expressions.push_back(
+              make_uniq<BoundReferenceExpression>(expected_types[i], column));
+          continue;
+        }
+        auto &finish = finishes[next++];
+        exec_expected_types.push_back(finish.sum_type);
+        unique_ptr<Expression> count;
+        if (finish.kind == LanceExecIRFinish::Kind::AVG) {
+          exec_expected_types.push_back(LogicalType::BIGINT);
+          count = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT,
+                                                      column + 1);
+        }
+        auto result = BuildLanceExecFinish(
+            context, finish,
+            make_uniq<BoundReferenceExpression>(finish.sum_type, column),
+            std::move(count));
+        if (result->GetReturnType() != expected_types[i]) {
+          return bail("Lance exec pushdown: aggregate result type mismatch");
+        }
+        output_expressions.push_back(std::move(result));
+      }
+      if (finishes.empty()) {
+        output_expressions.clear();
+      }
     }
 
     vector<LogicalType> exec_types;
@@ -3216,18 +3271,18 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       return nullptr;
     }
 
-    if (exec_types.size() != expected_types.size()) {
+    if (exec_types.size() != exec_expected_types.size()) {
       if (failfast()) {
         throw IOException("Lance exec pushdown: type count mismatch");
       }
       return nullptr;
     }
     for (idx_t i = 0; i < exec_types.size(); i++) {
-      if (exec_types[i] != expected_types[i]) {
+      if (exec_types[i] != exec_expected_types[i]) {
         if (failfast()) {
           throw IOException("Lance exec pushdown: type mismatch at column " +
                             to_string(i) + ": expected " +
-                            expected_types[i].ToString() + ", got " +
+                            exec_expected_types[i].ToString() + ", got " +
                             exec_types[i].ToString());
         }
         return nullptr;
@@ -3255,7 +3310,7 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
 
     auto exec = make_uniq<LogicalLanceExec>(
         agg_op.group_index, agg_op.aggregate_index, agg_op.groups.size(),
-        expected_types, std::move(exec_get));
+        expected_types, std::move(exec_get), std::move(output_expressions));
     exec->SetEstimatedCardinality(estimated_cardinality);
     return std::move(exec);
   };
@@ -3273,11 +3328,17 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
         child = child->children[0].get();
       }
       if (child &&
-          child->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+          child->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+          !order.HasProjectionMap()) {
         auto &agg = child->Cast<LogicalAggregate>();
+        // Parents refer to the ORDER's columns, which are the projection's
+        // when there is one.
+        auto bindings = op->GetColumnBindings();
         if (auto rewritten =
                 try_rewrite(agg, &order, post_projection, op->types,
                             child->estimated_cardinality)) {
+          static_cast<LogicalLanceExec &>(*rewritten)
+              .SetColumnBindings(std::move(bindings));
           return rewritten;
         }
       }
@@ -3302,6 +3363,9 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
 
 static void LanceExecPushdownOptimizer(OptimizerExtensionInput &input,
                                        unique_ptr<LogicalOperator> &plan) {
+  // Built-in passes after AggregateFunctionRewriter can leave operator types
+  // stale, and the exec rewrite compares them with the exec schema.
+  plan->ResolveOperatorTypes();
   plan = LanceExecPushdown(input.context, input.optimizer, std::move(plan));
 }
 

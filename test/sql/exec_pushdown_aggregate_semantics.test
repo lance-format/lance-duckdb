@@ -1,0 +1,309 @@
+# name: test/sql/exec_pushdown_aggregate_semantics.test
+# description: Exec pushdown keeps DuckDB's results for avg and floating-point GROUP BY keys
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT
+    i::BIGINT AS id,
+    CASE WHEN i = 0 THEN 1.00 ELSE 0.00 END::DECIMAL(15, 2) AS d,
+    CASE i % 4
+      WHEN 0 THEN '-0.0'::DOUBLE
+      WHEN 1 THEN '0.0'::DOUBLE
+      WHEN 2 THEN 'NaN'::DOUBLE
+      ELSE 1.5::DOUBLE
+    END AS f
+  FROM range(128) t(i)
+) TO '{TEST_DIR}/exec_pushdown_aggregate_semantics.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 32);
+
+# DuckDB sums DECIMAL exactly; the mean 1/128 needs 7 decimals.
+query T
+SELECT avg(d)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics.lance';
+----
+0.0078125
+
+query II
+EXPLAIN (FORMAT JSON) SELECT avg(d) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# A BIGINT sum that a Float64 accumulator cannot hold: 2^53 followed by 6360
+# ones; the exact mean is (2^53 + 6360) / 6361 = 1416003655832.
+statement ok
+COPY (
+  SELECT CASE WHEN i = 0 THEN 9007199254740992 ELSE 1 END::BIGINT AS b
+  FROM range(6361) t(i)
+  ORDER BY i
+) TO '{TEST_DIR}/exec_pushdown_aggregate_semantics_big.lance' (FORMAT lance, mode 'overwrite');
+
+query T
+SELECT avg(b)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_big.lance';
+----
+1416003655832.0
+
+query II
+EXPLAIN (FORMAT JSON) SELECT avg(b) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_big.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# Averages round as DuckDB's own plan over the same scan, bit for bit across
+# fragments. DuckDB divides in AVG's finalize when the average stands alone
+# and rewrites it into SUM(x) / COUNT(x) when the aggregate can share the
+# count; the two round differently. The BIGINT column needs more than 53 bits,
+# so its finalize also depends on the platform's long double.
+statement ok
+COPY (
+  SELECT
+    (i % 300)::BIGINT AS g,
+    (((hash(i)::UBIGINT % 2000000)::BIGINT - 1000000) / 100.0)::DECIMAL(15, 2) AS d,
+    CASE WHEN i % 7 = 0 THEN NULL
+         ELSE (((hash(i * 3)::UBIGINT % 200000)::BIGINT - 100000) / 1000.0)::DECIMAL(12, 3)
+    END AS e,
+    (1730000000000000 + (hash(i * 5)::UBIGINT % 1000000007))::BIGINT AS b,
+    ((hash(i * 7)::UBIGINT % 1000000000)::DECIMAL(38, 4) * 1000000000000000)::DECIMAL(38, 4) AS w,
+    CASE WHEN i % 11 = 0 THEN NULL
+         ELSE (1730000000000000 + (hash(i * 13)::UBIGINT % 1000000007))::BIGINT
+    END AS nb,
+    ((hash(i * 17)::UBIGINT % 60000)::BIGINT - 30000)::SMALLINT AS sm,
+    (((hash(i * 19)::UBIGINT % 19999)::BIGINT - 9999) / 10.0)::DECIMAL(4, 1) AS q
+  FROM range(30000) t(i)
+) TO '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 4000);
+
+statement ok
+CREATE TABLE exec_results AS
+SELECT 'avg' AS shape, g, avg(d) AS a, NULL::DOUBLE AS b
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg, sum', g, avg(d), sum(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg, sum + 0', g, avg(d), sum(d + 0)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable, count', g, avg(e), count(e)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable, avg', g, avg(e), avg(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint', g, avg(b), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg decimal(38)', g, avg(w), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint, count', g, avg(b), count(b)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint, count * 1', g, avg(b), count(b * 1)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable bigint, count + 0', g, avg(nb), count(nb + 0)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg smallint', g, avg(sm), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg decimal(4), sum bigint', g, avg(q), sum(b)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'ungrouped', NULL, avg(e), avg(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance';
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, avg(e), count(e) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, avg(b) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# DuckDB shares the count once EXPRESSION_REWRITER turns `nb + 0` into `nb`.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, avg(nb), count(nb + 0) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, avg(sm), avg(q) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# A DECIMAL(38) sum can overflow, which DataFusion wraps and DuckDB reports,
+# so DuckDB keeps summing and averaging it, grouped or not.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, avg(w) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<!REGEX>:[\s\S]*Lance Exec IR Bytes[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT avg(w) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance';
+----
+physical_plan	<!REGEX>:[\s\S]*Lance Exec IR Bytes[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT sum(w) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance';
+----
+physical_plan	<!REGEX>:[\s\S]*Lance Exec IR Bytes[\s\S]*
+
+statement ok
+CREATE TABLE exec_sums AS
+SELECT g, sum(b) AS s, sum(sm) AS t, sum(d) AS u
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE TABLE duckdb_sums AS
+SELECT g, sum(b) AS s, sum(sm) AS t, sum(d) AS u
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+
+statement ok
+CREATE TABLE duckdb_results AS
+SELECT 'avg' AS shape, g, avg(d) AS a, NULL::DOUBLE AS b
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg, sum', g, avg(d), sum(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg, sum + 0', g, avg(d), sum(d + 0)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable, count', g, avg(e), count(e)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable, avg', g, avg(e), avg(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint', g, avg(b), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg decimal(38)', g, avg(w), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint, count', g, avg(b), count(b)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg bigint, count * 1', g, avg(b), count(b * 1)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg nullable bigint, count + 0', g, avg(nb), count(nb + 0)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg smallint', g, avg(sm), NULL
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'avg decimal(4), sum bigint', g, avg(q), sum(b)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g
+UNION ALL
+SELECT 'ungrouped', NULL, avg(e), avg(d)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance';
+
+statement ok
+RESET disabled_optimizers;
+
+# Integer sums are exact HUGEINTs.
+query TI
+SELECT (SELECT typeof(s) FROM exec_sums LIMIT 1), count(*)
+FROM (SELECT * FROM exec_sums EXCEPT SELECT * FROM duckdb_sums);
+----
+HUGEINT	0
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, sum(b) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# DataFusion's integer arithmetic wraps where DuckDB's raises an error, so an
+# integer sum of an expression stays in DuckDB.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, sum(b * 2) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance' GROUP BY g;
+----
+physical_plan	<!REGEX>:[\s\S]*Lance Exec IR Bytes[\s\S]*
+
+statement error
+SELECT sum(b * 10000) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance';
+----
+Overflow
+
+# ORDER BY a pushed integer sum, and by a key next to an average DuckDB
+# finishes after the exec plan.
+query II
+SELECT g, sum(b) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance'
+WHERE g < 4 GROUP BY g ORDER BY 2;
+----
+2	173000047702598171
+1	173000048019095814
+0	173000051043374563
+3	173000053409932251
+
+# A parent of the ordered aggregate refers to the ORDER BY's columns.
+query II
+WITH s AS (
+  SELECT g, sum(b) AS t FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance'
+  GROUP BY g ORDER BY g
+)
+SELECT g, t FROM s WHERE g < 2;
+----
+0	173000051043374563
+1	173000048019095814
+
+query II
+EXPLAIN (FORMAT JSON)
+WITH s AS (
+  SELECT g, sum(b) AS t FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance'
+  GROUP BY g ORDER BY g
+)
+SELECT g, t FROM s WHERE g < 2;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query IR
+SELECT g, avg(sm) AS a FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics_groups.lance'
+WHERE g < 4 GROUP BY g ORDER BY g DESC;
+----
+3	3885.66
+2	244.72
+1	1726.76
+0	-894.06
+
+query TI
+SELECT shape, count(*) FROM (SELECT * FROM exec_results EXCEPT SELECT * FROM duckdb_results)
+GROUP BY shape ORDER BY shape;
+----
+
+query I
+SELECT count(*) FROM exec_results;
+----
+3601
+
+# -0.0 and 0.0 are one GROUP BY key.
+query I
+SELECT count(*)
+FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics.lance'
+GROUP BY f
+ORDER BY 1;
+----
+32
+32
+64
+
+# Floating-point averages keep running through the exec plan.
+query II
+EXPLAIN (FORMAT JSON) SELECT avg(f) FROM '{TEST_DIR}/exec_pushdown_aggregate_semantics.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
