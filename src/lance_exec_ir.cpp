@@ -246,6 +246,19 @@ static bool TryEncodeExecExpr(
     idx_t projection_stack_offset, const Expression &expr, string &out,
     unordered_set<idx_t> &out_col_idxs);
 
+// The literal operand of a binary operator over `decimal_type`. DuckDB's
+// decimal arithmetic keeps each operand's own scale (`d * 1.125` multiplies
+// by 1.125 whatever the scale of d), and DataFusion's decimal arithmetic does
+// too, so a DECIMAL literal is sent as it is. Casting it to the other
+// operand's type would round it (1.125 to 1.13 for a DECIMAL(15, 2) d).
+static Value ExecDecimalOperand(const Value &value,
+                                const LogicalType &decimal_type) {
+  if (value.type().id() == LogicalTypeId::DECIMAL) {
+    return value;
+  }
+  return value.DefaultCastAs(decimal_type);
+}
+
 static bool TryEncodeLiteral(const Value &v, string &out) {
   WriteU8(out, static_cast<uint8_t>(ExecIrExprTag::LITERAL));
   if (v.IsNull()) {
@@ -527,7 +540,7 @@ static bool TryEncodeExecExpr(
         auto &c = child_expr->Cast<BoundConstantExpression>();
         Value v;
         try {
-          v = c.GetValue().DefaultCastAs(*decimal_type);
+          v = ExecDecimalOperand(c.GetValue(), *decimal_type);
         } catch (...) {
           return false;
         }
@@ -589,7 +602,7 @@ static bool TryEncodeExecExpr(
         auto &c = child_expr->Cast<BoundConstantExpression>();
         Value v;
         try {
-          v = c.GetValue().DefaultCastAs(*decimal_type);
+          v = ExecDecimalOperand(c.GetValue(), *decimal_type);
         } catch (...) {
           return false;
         }
