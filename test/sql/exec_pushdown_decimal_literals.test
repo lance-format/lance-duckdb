@@ -1,0 +1,57 @@
+# name: test/sql/exec_pushdown_decimal_literals.test
+# description: Exec pushdown keeps the scale of DECIMAL literals in aggregate arguments
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT (i % 3)::BIGINT AS g, (100 + i * 1.01)::DECIMAL(15, 2) AS d
+  FROM range(300) t(i)
+) TO '{TEST_DIR}/exec_pushdown_decimal_literals.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 100);
+
+# DuckDB multiplies by 1.125 whatever the scale of d; rounding the literal to
+# d's two decimals would multiply by 1.13.
+query I
+SELECT sum(d * 1.125)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' WHERE g = 0;
+----
+28123.31250
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, sum(d * 1.125) FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+statement ok
+CREATE TABLE exec_results AS
+SELECT 'mul' AS k, g, sum(d * 1.125)::VARCHAR AS v FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'literal left', g, sum(0.125 * d)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'nested', g, sum(d * (1 - 0.0625))::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'add', g, sum(d + 0.005)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'min', g, min(d * 1.125)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'integer literal', g, sum(d * 3)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement ok
+CREATE TABLE duckdb_results AS
+SELECT 'mul' AS k, g, sum(d * 1.125)::VARCHAR AS v FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'literal left', g, sum(0.125 * d)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'nested', g, sum(d * (1 - 0.0625))::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'add', g, sum(d + 0.005)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'min', g, min(d * 1.125)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g
+UNION ALL SELECT 'integer literal', g, sum(d * 3)::VARCHAR FROM '{TEST_DIR}/exec_pushdown_decimal_literals.lance' GROUP BY g;
+
+statement ok
+RESET disabled_optimizers;
+
+query TI
+SELECT k, count(*) FROM (SELECT * FROM exec_results EXCEPT SELECT * FROM duckdb_results) GROUP BY k ORDER BY k;
+----
+
+query I
+SELECT count(*) FROM exec_results;
+----
+18

@@ -1,0 +1,152 @@
+# name: test/sql/pushdown_semantics.test
+# description: Pushed predicates select the same rows as DuckDB evaluates
+# group: [sql]
+
+require lance
+
+require icu
+
+statement ok
+SET TimeZone = 'America/New_York';
+
+statement ok
+ATTACH '{TEST_DIR}/pushdown_semantics' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.s AS SELECT * FROM (VALUES
+  (1, 'straße'), (2, 'strasse'), (3, 'STRASSE'), (4, 'İstanbul'),
+  (5, 'a\_c'), (6, 'a_c'), (7, 'ΣΊΣΥΦΟΣ'), (8, 'σίσυφος'), (9, 'é1'),
+  (10, 'abc')
+) v(id, s);
+
+# Without ESCAPE, a backslash in a LIKE pattern is a literal character.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE s LIKE 'a\_c';
+----
+5
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE s LIKE '%\%';
+----
+5
+
+# DuckDB maps case one code point to one code point.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE upper(s) = 'STRASSE';
+----
+2,3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE lower(s) = 'istanbul';
+----
+4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE s ILIKE 'σίσυφος';
+----
+8
+
+# A row that Lance matched but DuckDB rejects must not use up the LIMIT.
+query I
+SELECT count(*) FROM (SELECT id FROM ns.main.s WHERE s ILIKE 'σίσυφος' LIMIT 1);
+----
+1
+
+# RE2 classes such as \w are ASCII-only.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE NOT regexp_matches(s, '^\w+$');
+----
+1,4,5,7,8,9
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.s WHERE regexp_matches(s, '^[a-z]+$');
+----
+2,10
+
+# Exact shapes stay pushed, LIMIT included; the others stay in DuckDB.
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM ns.main.s WHERE s LIKE 'a\_c' LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM ns.main.s WHERE s ILIKE 'σίσυφος' LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM ns.main.s WHERE regexp_matches(s, '^\w+$') LIMIT 1;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
+
+# A search prefilter must be exact, so these shapes cannot be required prefilters.
+statement error
+SELECT id FROM lance_vector_search('test/data/search_test_data.lance', 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 3, prefilter = true, use_index = false) WHERE text ILIKE '%PUPPY%';
+----
+cannot be pushed to Lance as a required prefilter
+
+query I
+SELECT id FROM lance_vector_search('test/data/search_test_data.lance', 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 3, prefilter = false, use_index = false) WHERE text ILIKE '%PUPPY%' ORDER BY id;
+----
+1
+3
+
+# TIMESTAMPTZ values are instants. The column is stored with the session zone.
+statement ok
+CREATE TABLE ns.main.ts AS SELECT * FROM (VALUES
+  (1, TIMESTAMPTZ '2021-03-14 05:00:00+00'),
+  (2, TIMESTAMPTZ '2021-03-14 09:00:00+00'),
+  (3, TIMESTAMPTZ '2021-03-14 12:00:00+00'),
+  (4, TIMESTAMPTZ '2021-03-14 16:00:00+00')
+) v(id, t);
+
+# 06:00 in New York is 10:00 UTC on this day.
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.ts WHERE t < TIMESTAMP '2021-03-14 06:00:00';
+----
+1,2
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.ts
+WHERE t BETWEEN TIMESTAMPTZ '2021-03-14 09:00:00+00' AND TIMESTAMPTZ '2021-03-14 12:00:00+00';
+----
+2,3
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.ts
+WHERE t IN (TIMESTAMPTZ '2021-03-14 12:00:00+00', TIMESTAMPTZ '2021-03-14 16:00:00+00');
+----
+3,4
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.ts
+WHERE t = TIMESTAMPTZ '2021-03-14 12:00:00+00' OR t > TIMESTAMPTZ '2021-03-14 15:00:00+00';
+----
+3,4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ns.main.ts WHERE t < TIMESTAMP '2021-03-14 06:00:00';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "0"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+# DELETE and UPDATE act on the rows the predicate selects.
+statement ok
+DELETE FROM ns.main.s WHERE upper(s) = 'STRASSE';
+
+statement ok
+UPDATE ns.main.s SET s = 'X' WHERE s LIKE 'a\_c';
+
+query T
+SELECT string_agg(id::VARCHAR || '=' || s, ',' ORDER BY id) FROM ns.main.s WHERE id <= 6;
+----
+1=straße,4=İstanbul,5=X,6=a_c
+
+statement ok
+DELETE FROM ns.main.ts WHERE t < TIMESTAMP '2021-03-14 06:00:00';
+
+query T
+SELECT string_agg(id::VARCHAR, ',' ORDER BY id) FROM ns.main.ts;
+----
+3,4

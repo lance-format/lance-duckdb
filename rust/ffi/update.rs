@@ -852,9 +852,10 @@ fn group_column_rows(
     let rowid_column = &batch.columns()[1];
     let row_ids = read_row_ids(rowid_column)?;
 
-    let mut groups: HashMap<u32, (Vec<u64>, Vec<bool>)> = HashMap::new();
+    // Fragment id -> (row ids, positions of their values in the batch).
+    let mut groups: HashMap<u32, (Vec<u64>, Vec<u32>)> = HashMap::new();
     let mut seen: HashSet<u64> = HashSet::new();
-    for &row_id in row_ids.iter() {
+    for (position, &row_id) in row_ids.iter().enumerate() {
         if !seen.insert(row_id) {
             continue;
         }
@@ -865,21 +866,20 @@ fn group_column_rows(
         if deleted_addrs.contains(addr) {
             continue;
         }
+        let position = u32::try_from(position)
+            .map_err(|_| format!("update batch for column '{column_name}' is too large"))?;
         let fragment_id = RowAddress::from(addr).fragment_id();
-        groups
-            .entry(fragment_id)
-            .or_insert_with(|| (Vec::new(), Vec::new()));
-        let entry = groups.get_mut(&fragment_id).expect("entry just inserted");
+        let entry = groups.entry(fragment_id).or_default();
         entry.0.push(row_id);
-        entry.1.push(true);
+        entry.1.push(position);
     }
 
     let mut result = HashMap::with_capacity(groups.len());
-    for (fragment_id, (ids, mask)) in groups {
-        let mask_array: arrow_array::BooleanArray = mask.into();
-        let sliced = arrow::compute::filter(value_column, &mask_array)
+    for (fragment_id, (ids, positions)) in groups {
+        let indices = arrow_array::UInt32Array::from(positions);
+        let values = arrow::compute::take(value_column, &indices, None)
             .map_err(|err| format!("failed to slice update column '{column_name}': {err}"))?;
-        result.insert(fragment_id, (ids, sliced));
+        result.insert(fragment_id, (ids, values));
     }
     Ok(result)
 }
@@ -1142,6 +1142,141 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lance-dml-{tag}-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn value_batch(values: Vec<i64>, row_ids: Vec<u64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("v", DataType::Int64, true),
+                ArrowField::new("_rowid", DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(values)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn grouped_values(
+        groups: &HashMap<u32, (Vec<u64>, ArrayRef)>,
+        fragment_id: u32,
+    ) -> (Vec<u64>, Vec<i64>) {
+        let (ids, values) = &groups[&fragment_id];
+        (
+            ids.clone(),
+            values.as_primitive::<Int64Type>().values().to_vec(),
+        )
+    }
+
+    #[test]
+    fn group_column_rows_keeps_each_rows_value() {
+        let addr =
+            |fragment: u32, offset: u32| u64::from(RowAddress::new_from_parts(fragment, offset));
+        // One batch interleaves two fragments, repeats a row (the first value
+        // wins) and includes a deleted row, so values must follow their rows.
+        let batch = value_batch(
+            vec![10, 20, 30, 40, 50, 60],
+            vec![
+                addr(0, 0),
+                addr(1, 0),
+                addr(0, 1),
+                addr(0, 2),
+                addr(1, 0),
+                addr(1, 1),
+            ],
+        );
+        let mut deleted = RoaringTreemap::new();
+        deleted.insert(addr(0, 1));
+
+        let groups = group_column_rows("v", &batch, None, &deleted).unwrap();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            grouped_values(&groups, 0),
+            (vec![addr(0, 0), addr(0, 2)], vec![10, 40])
+        );
+        assert_eq!(
+            grouped_values(&groups, 1),
+            (vec![addr(1, 0), addr(1, 1)], vec![20, 60])
+        );
+    }
+
+    #[test]
+    fn group_column_rows_keeps_each_rows_value_with_stable_row_ids() {
+        let dir = temp_uri("group-stable");
+        let uri = dir.to_string_lossy().to_string();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        for (mode, ids) in [
+            (WriteMode::Create, vec![1, 2, 3]),
+            (WriteMode::Append, vec![4]),
+        ] {
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(ids))])
+                .unwrap();
+            let params = WriteParams {
+                mode,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            };
+            runtime::block_on(lance::Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone()),
+                &uri,
+                Some(params),
+            ))
+            .unwrap()
+            .unwrap();
+        }
+        let dataset = runtime::block_on(lance::Dataset::open(&uri))
+            .unwrap()
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        let mut stream = runtime::block_on(scanner.try_into_stream())
+            .unwrap()
+            .unwrap();
+        let mut row_id_of = HashMap::new();
+        while let Some(batch) = runtime::block_on(stream.next()).unwrap() {
+            let batch = batch.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int64Type>();
+            let row_ids = batch
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            for i in 0..batch.num_rows() {
+                row_id_of.insert(ids.value(i), row_ids.value(i));
+            }
+        }
+        assert_eq!(row_id_of.len(), 4);
+
+        let index = runtime::block_on(build_row_id_index(&dataset))
+            .unwrap()
+            .unwrap();
+        // Ids 1 and 3 live in the first fragment, id 4 in the second.
+        let batch = value_batch(
+            vec![100, 300, 400],
+            vec![row_id_of[&1], row_id_of[&3], row_id_of[&4]],
+        );
+        let groups = group_column_rows("v", &batch, Some(&index), &RoaringTreemap::new()).unwrap();
+
+        let first = dataset.get_fragments()[0].id() as u32;
+        let second = dataset.get_fragments()[1].id() as u32;
+        assert_eq!(
+            grouped_values(&groups, first),
+            (vec![row_id_of[&1], row_id_of[&3]], vec![100, 300])
+        );
+        assert_eq!(
+            grouped_values(&groups, second),
+            (vec![row_id_of[&4]], vec![400])
+        );
     }
 
     #[test]
