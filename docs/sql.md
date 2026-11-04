@@ -377,6 +377,7 @@ Filter semantics:
 These notes apply to all three search functions.
 
 - Comparison predicates (`=`, `>`, numeric `IN`, ...) and string predicates (`starts_with`, `LIKE`, `regexp_matches`) push down into Lance.
+- `ILIKE`, `lower`/`upper`, and regular expressions that use `\d`, `\w`, `\s` or `\b` are evaluated by DuckDB, because Lance applies Unicode rules to case mapping and to these classes, so its results would differ from DuckDB's. With `prefilter=true` they raise an error; apply them after the search with `prefilter := false`.
 - Containment predicates over list columns — `array_has_any` and `array_has_all` — push down. With `prefilter=true` and a `LABEL_LIST` index on the list column, Lance answers them from the index; without one, Lance evaluates them with a scan. The index is used for `VARCHAR[]` and `BIGINT[]` element types; narrower integer widths still push and prefilter, but scan.
 - `IS NULL` / `IS NOT NULL` on list columns push down. No scalar index answers them.
 - Containment forms that cannot push — empty or non-constant needles, needles containing `NULL`, `array_has` / `array_contains`, and the `&&` / `@>` / `<@` aliases — are evaluated by DuckDB after the search.

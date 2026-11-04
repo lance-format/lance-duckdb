@@ -33,11 +33,12 @@ SELECT count(*) FROM 'test/data/test_data.lance' WHERE name LIKE '%li%';
 ----
 2
 
-# ILIKE + LIMIT: case-insensitive LIKE should also push down
+# ILIKE + LIMIT: ILIKE is not pushed (DataFusion folds non-ASCII case
+# differently), so DuckDB applies the LIMIT after its own filter
 query II
 EXPLAIN (FORMAT JSON) SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE '%LI%' LIMIT 2;
 ----
-physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Limit Offset Pushdown": "false"[\s\S]*
 
 query I
 SELECT count(*) FROM (SELECT * FROM 'test/data/test_data.lance' WHERE name ILIKE '%LI%' LIMIT 2);
