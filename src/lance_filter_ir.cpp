@@ -4,6 +4,7 @@
 #include "lance_expr_ir.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -143,6 +144,62 @@ static bool TryEncodeLanceFilterIRScalarFunction(const string &name,
   return TryEncodeLanceExprIRScalarFunction(name, args, out_ir);
 }
 
+// Lance evaluates pushed predicates with DataFusion, and a pushed predicate
+// must select exactly the rows DuckDB would: the table-filter path trusts the
+// result, DELETE and UPDATE act on it, and LIMIT is pushed through filters.
+// The helpers below decline or translate the shapes whose DataFusion semantics
+// differ from DuckDB's.
+
+// DuckDB casts to and from TIMESTAMPTZ with the session time zone (ICU), while
+// Value::DefaultCastAs uses UTC, so folding such a cast of a constant here
+// would encode another instant.
+static bool IsSessionDependentConstantCast(const LogicalType &from,
+                                           const LogicalType &to) {
+  return from != to &&
+         (TypeVisitor::Contains(from, LogicalTypeId::TIMESTAMP_TZ) ||
+          TypeVisitor::Contains(to, LogicalTypeId::TIMESTAMP_TZ));
+}
+
+// RE2 matches `\d \w \s \b` (and their negations) against ASCII only, the
+// Rust regex engine behind DataFusion against Unicode.
+static bool RegexHasUnicodeSensitiveClass(const string &pattern) {
+  for (idx_t i = 0; i + 1 < pattern.size(); i++) {
+    if (pattern[i] != '\\') {
+      continue;
+    }
+    switch (pattern[i + 1]) {
+    case 'd':
+    case 'D':
+    case 'w':
+    case 'W':
+    case 's':
+    case 'S':
+    case 'b':
+    case 'B':
+      return true;
+    default:
+      i++;
+      break;
+    }
+  }
+  return false;
+}
+
+// Without ESCAPE, DuckDB's LIKE treats `\` as a literal character, while
+// DataFusion's LIKE uses `\` as its default escape. Doubling each backslash
+// keeps the DuckDB meaning under DataFusion's default escape.
+static string EscapeLikeBackslashes(const string &pattern) {
+  string escaped;
+  escaped.reserve(pattern.size());
+  for (auto c : pattern) {
+    if (c == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
 static bool TryGetNonNullVarcharConstant(const Expression &expr,
                                          string &out_value) {
   if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
@@ -168,7 +225,9 @@ static bool TryGetNonNullVarcharConstant(const Expression &expr,
       return false;
     }
     auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
-    if (c.GetValue().IsNull()) {
+    if (c.GetValue().IsNull() ||
+        IsSessionDependentConstantCast(c.GetValue().type(),
+                                       cast.GetReturnType())) {
       return false;
     }
     try {
@@ -203,7 +262,9 @@ static bool TryGetNonNullListConstant(const Expression &expr,
       return false;
     }
     auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
-    if (c.GetValue().IsNull()) {
+    if (c.GetValue().IsNull() ||
+        IsSessionDependentConstantCast(c.GetValue().type(),
+                                       cast.GetReturnType())) {
       return false;
     }
     try {
@@ -254,6 +315,10 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
         return false;
       }
       auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+      if (IsSessionDependentConstantCast(c.GetValue().type(),
+                                         cast.GetReturnType())) {
+        return false;
+      }
       try {
         auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
         return TryEncodeLanceFilterIRLiteral(casted, out_expr_ir);
@@ -294,19 +359,11 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
         }
       }
 
+      // DuckDB's lower()/upper() map one code point to one code point;
+      // DataFusion's use full Unicode case mapping ('ß' -> "SS").
       if (func.Function().GetName().GetIdentifierName() == "lower" ||
           func.Function().GetName().GetIdentifierName() == "upper") {
-        if (func.GetChildren().size() != 1) {
-          return false;
-        }
-        string input_ir;
-        if (!build_from_expr(*func.GetChildren()[0], input_ir)) {
-          return false;
-        }
-        vector<string> args;
-        args.push_back(std::move(input_ir));
-        return TryEncodeLanceFilterIRScalarFunction(
-            func.Function().GetName().GetIdentifierName(), args, out_expr_ir);
+        return false;
       }
 
       if (func.Function().GetName().GetIdentifierName() == "starts_with" ||
@@ -854,6 +911,10 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
       return false;
     }
     auto &c = cast.GetChildren()[0]->Cast<BoundConstantExpression>();
+    if (IsSessionDependentConstantCast(c.GetValue().type(),
+                                       cast.GetReturnType())) {
+      return false;
+    }
     try {
       auto casted = c.GetValue().DefaultCastAs(cast.GetReturnType());
       return TryEncodeLanceFilterIRLiteral(casted, out_ir);
@@ -930,21 +991,11 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
                                           out_ir);
     }
 
+    // DuckDB's lower()/upper() map one code point to one code point;
+    // DataFusion's use full Unicode case mapping ('ß' -> "SS").
     if (func.Function().GetName().GetIdentifierName() == "lower" ||
         func.Function().GetName().GetIdentifierName() == "upper") {
-      if (func.GetChildren().size() != 1 || !func.GetChildren()[0]) {
-        return false;
-      }
-      string input_ir;
-      if (!TryBuildLanceExprFilterIR(get, names, types, json_columns,
-                                     exclude_computed_columns,
-                                     *func.GetChildren()[0], input_ir)) {
-        return false;
-      }
-      vector<string> args;
-      args.push_back(std::move(input_ir));
-      return TryEncodeLanceFilterIRScalarFunction(
-          func.Function().GetName().GetIdentifierName(), args, out_ir);
+      return false;
     }
 
     if (func.Function().GetName().GetIdentifierName() == "starts_with" ||
@@ -1027,7 +1078,8 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
 
       string pattern_value;
       if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1],
-                                        pattern_value)) {
+                                        pattern_value) ||
+          RegexHasUnicodeSensitiveClass(pattern_value)) {
         return false;
       }
       string pattern_ir;
@@ -1061,17 +1113,12 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     if (func.Function().GetName().GetIdentifierName() == "~~") {
       case_insensitive = false;
       has_escape = false;
-    } else if (func.Function().GetName().GetIdentifierName() == "~~*") {
-      case_insensitive = true;
-      has_escape = false;
     } else if (func.Function().GetName().GetIdentifierName() == "like_escape") {
       case_insensitive = false;
       has_escape = true;
-    } else if (func.Function().GetName().GetIdentifierName() ==
-               "ilike_escape") {
-      case_insensitive = true;
-      has_escape = true;
     } else {
+      // ILIKE: DuckDB lowers both sides with its 1:1 case mapping, DataFusion
+      // folds non-ASCII text with Unicode case folding.
       return false;
     }
 
@@ -1095,6 +1142,9 @@ bool TryBuildLanceExprFilterIR(const LogicalGet &get,
     string pattern_value;
     if (!TryGetNonNullVarcharConstant(*func.GetChildren()[1], pattern_value)) {
       return false;
+    }
+    if (!has_escape) {
+      pattern_value = EscapeLikeBackslashes(pattern_value);
     }
     string pattern_ir;
     if (!TryEncodeLanceFilterIRLiteral(Value(pattern_value), pattern_ir)) {

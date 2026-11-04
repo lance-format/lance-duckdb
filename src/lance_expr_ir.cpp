@@ -88,6 +88,8 @@ enum class LanceUpdateExprIRLiteralTag : uint8_t {
   TIMESTAMP = 8,
   DECIMAL128 = 9,
   LIST = 10,
+  // A UTC instant (TIMESTAMPTZ), microseconds.
+  TIMESTAMP_TZ = 11,
 };
 
 enum class LanceUpdateExprIRTimestampUnit : uint8_t {
@@ -282,11 +284,23 @@ static void AppendLiteralPayload(const Value &value, string &out) {
     AppendI32(out, d.days);
     return;
   }
+  case LogicalTypeId::TIMESTAMP_TZ: {
+    // TIMESTAMPTZ is a UTC instant. Without a zone, DataFusion would read it
+    // as wall-clock time in the column's zone.
+    auto v = value.GetValue<int64_t>();
+    if (!timestamp_t(v).IsFinite()) {
+      throw NotImplementedException(
+          "Lance UPDATE does not support infinite TIMESTAMP literals");
+    }
+    AppendU8(out,
+             static_cast<uint8_t>(LanceUpdateExprIRLiteralTag::TIMESTAMP_TZ));
+    AppendI64(out, v);
+    return;
+  }
   case LogicalTypeId::TIMESTAMP:
   case LogicalTypeId::TIMESTAMP_SEC:
   case LogicalTypeId::TIMESTAMP_MS:
-  case LogicalTypeId::TIMESTAMP_NS:
-  case LogicalTypeId::TIMESTAMP_TZ: {
+  case LogicalTypeId::TIMESTAMP_NS: {
     auto v = value.GetValue<int64_t>();
     if (!timestamp_t(v).IsFinite()) {
       throw NotImplementedException(
@@ -305,7 +319,6 @@ static void AppendLiteralPayload(const Value &value, string &out) {
       unit = LanceUpdateExprIRTimestampUnit::NANOSECOND;
       break;
     case LogicalTypeId::TIMESTAMP:
-    case LogicalTypeId::TIMESTAMP_TZ:
     default:
       unit = LanceUpdateExprIRTimestampUnit::MICROSECOND;
       break;

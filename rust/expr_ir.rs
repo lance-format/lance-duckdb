@@ -35,6 +35,7 @@ const LIT_DATE32: u8 = 7;
 const LIT_TIMESTAMP: u8 = 8;
 const LIT_DECIMAL128: u8 = 9;
 const LIT_LIST: u8 = 10;
+const LIT_TIMESTAMP_TZ: u8 = 11;
 
 const TYPE_BOOL: u8 = 1;
 const TYPE_INT8: u8 = 2;
@@ -51,6 +52,11 @@ const TYPE_VARCHAR: u8 = 12;
 const TYPE_DATE32: u8 = 13;
 const TYPE_TIMESTAMP: u8 = 14;
 const TYPE_DECIMAL128: u8 = 15;
+
+/// DuckDB's TIMESTAMPTZ is a UTC instant. Tagging its literals with UTC makes
+/// DataFusion compare them as instants against zoned columns, instead of
+/// reading them as wall-clock time in the column's zone.
+const UTC: &str = "UTC";
 
 const TS_UNIT_SECOND: u8 = 0;
 const TS_UNIT_MILLISECOND: u8 = 1;
@@ -530,6 +536,9 @@ fn parse_literal_value(cursor: &mut Cursor<'_>) -> Result<ScalarValue, String> {
                 TS_UNIT_NANOSECOND => ScalarValue::TimestampNanosecond(Some(value), None),
                 other => return Err(format!("invalid expr_ir timestamp unit: {other}")),
             }
+        }
+        LIT_TIMESTAMP_TZ => {
+            ScalarValue::TimestampMicrosecond(Some(cursor.read_i64()?), Some(UTC.into()))
         }
         LIT_DECIMAL128 => {
             let precision = cursor.read_u8()?;
