@@ -9,6 +9,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -213,6 +214,34 @@ static bool TryMapAggFunc(const BoundAggregateExpression &agg,
     return true;
   }
   return false;
+}
+
+static bool IsExecIntegerSumInput(const LogicalType &type) {
+  return type.id() == LogicalTypeId::SMALLINT ||
+         type.id() == LogicalTypeId::INTEGER ||
+         type.id() == LogicalTypeId::BIGINT;
+}
+
+// A DECIMAL whose sums can leave DECIMAL(38): DataFusion's SUM wraps there,
+// where DuckDB raises an error. Sums of values with at most 18 digits cannot.
+static bool IsExecWideDecimal(const LogicalType &type) {
+  return type.id() == LogicalTypeId::DECIMAL &&
+         DecimalType::GetWidth(type) > Decimal::MAX_WIDTH_INT64;
+}
+
+static void WriteExecDecimalTypeHint(string &out, uint8_t width,
+                                     uint8_t scale) {
+  WriteU8(out, static_cast<uint8_t>(ExecIrOutputTypeTag::DECIMAL));
+  WriteU8(out, width);
+  WriteU8(out, scale);
+}
+
+static string ExecAvgSumName(idx_t agg_idx) {
+  return "__lance_avg_sum_" + to_string(agg_idx);
+}
+
+static string ExecAvgCountName(idx_t agg_idx) {
+  return "__lance_avg_count_" + to_string(agg_idx);
 }
 
 static bool TryMapBinaryOp(const BoundFunctionExpression &fn,
@@ -639,7 +668,9 @@ bool TryEncodeLanceExecIRv1(
     const string &filter_ir_msg, const vector<idx_t> &extra_scan_col_ids,
     const vector<const vector<unique_ptr<Expression>> *> &projection_stack,
     const LogicalAggregate &aggregate, const LogicalOrder *order,
-    const LogicalProjection *post_projection, string &out_exec_ir) {
+    const LogicalProjection *post_projection, string &out_exec_ir,
+    vector<LanceExecIRFinish> &out_finishes) {
+  out_finishes.clear();
   if (!aggregate.grouping_functions.empty()) {
     if (ExecIrFailfast()) {
       throw IOException("ExecIR grouping functions not supported");
@@ -694,6 +725,11 @@ bool TryEncodeLanceExecIRv1(
     string encoded_args;
     string output_type_hint;
     uint32_t arg_count;
+    // An AVG in `out_finishes`, encoded as SUM(CAST(x AS DECIMAL(38, s))) and
+    // COUNT(x).
+    bool avg_finish = false;
+    string sum_args;
+    uint8_t sum_scale = 0;
   };
 
   std::function<bool(const Expression &)> is_supported_group_expr;
@@ -729,6 +765,16 @@ bool TryEncodeLanceExecIRv1(
       }
       return false;
     }
+    // DuckDB groups -0.0 with 0.0, while DataFusion keeps them apart.
+    auto group_type = expr->GetReturnType().id();
+    if (group_type == LogicalTypeId::FLOAT ||
+        group_type == LogicalTypeId::DOUBLE) {
+      if (ExecIrFailfast()) {
+        throw IOException("ExecIR floating-point group key not supported: " +
+                          expr->ToString());
+      }
+      return false;
+    }
     string expr_buf;
     unordered_set<idx_t> tmp_idxs;
     tmp_idxs.reserve(4);
@@ -760,7 +806,8 @@ bool TryEncodeLanceExecIRv1(
   vector<EncodedAgg> aggs;
   aggs.reserve(aggregate.expressions.size());
 
-  for (auto &expr : aggregate.expressions) {
+  for (idx_t agg_idx = 0; agg_idx < aggregate.expressions.size(); agg_idx++) {
+    auto &expr = aggregate.expressions[agg_idx];
     if (!expr) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR aggregate expression is null");
@@ -853,7 +900,15 @@ bool TryEncodeLanceExecIRv1(
     EncodedAgg enc;
     enc.func = func;
     enc.output_name = expr->GetName().GetIdentifierName();
-    if (!TryEncodeOutputTypeHint(expr->GetReturnType(), enc.output_type_hint)) {
+    // DuckDB sums integers into a HUGEINT, which the exec plan returns as
+    // DECIMAL(38, 0) (LanceExecIRFinish::Kind::INTEGER_SUM).
+    auto integer_sum = func == ExecIrAggFunc::SUM && arg_expr &&
+                       IsExecIntegerSumInput(arg_expr->GetReturnType());
+    if (integer_sum) {
+      WriteExecDecimalTypeHint(enc.output_type_hint, Decimal::MAX_WIDTH_INT128,
+                               0);
+    } else if (!TryEncodeOutputTypeHint(expr->GetReturnType(),
+                                        enc.output_type_hint)) {
       if (ExecIrFailfast()) {
         throw IOException("ExecIR aggregate output type unsupported: " +
                           expr->GetReturnType().ToString());
@@ -885,8 +940,54 @@ bool TryEncodeLanceExecIRv1(
       arg_count = 1;
     }
 
-    enc.encoded_args = std::move(args_buf);
     enc.arg_count = arg_count;
+    enc.encoded_args = std::move(args_buf);
+    if (arg_expr &&
+        (func == ExecIrAggFunc::SUM || func == ExecIrAggFunc::AVG)) {
+      auto &input_type = arg_expr->GetReturnType();
+      auto is_decimal = input_type.id() == LogicalTypeId::DECIMAL;
+      auto scale = is_decimal ? DecimalType::GetScale(input_type) : uint8_t(0);
+      if (IsExecWideDecimal(input_type)) {
+        if (ExecIrFailfast()) {
+          throw IOException("ExecIR sum/avg input type not supported: " +
+                            input_type.ToString());
+        }
+        return false;
+      }
+      // CAST(x AS DECIMAL(38, s)): an exact sum, which cannot overflow for
+      // integers and DECIMAL(p <= 18).
+      string exact_sum_args;
+      WriteU8(exact_sum_args, static_cast<uint8_t>(ExecIrExprTag::CAST));
+      WriteExecDecimalTypeHint(exact_sum_args, Decimal::MAX_WIDTH_INT128,
+                               scale);
+      exact_sum_args += enc.encoded_args;
+      // DataFusion's integer arithmetic wraps where DuckDB's raises an
+      // error, so integer sums and averages take plain columns only.
+      if (IsExecIntegerSumInput(input_type) &&
+          (enc.encoded_args.empty() ||
+           static_cast<uint8_t>(enc.encoded_args[0]) !=
+               static_cast<uint8_t>(ExecIrExprTag::COLUMN_REF))) {
+        if (ExecIrFailfast()) {
+          throw IOException("ExecIR integer sum/avg argument not a column: " +
+                            arg_expr->ToString());
+        }
+        return false;
+      }
+      if (func == ExecIrAggFunc::AVG &&
+          (is_decimal || IsExecIntegerSumInput(input_type))) {
+        enc.avg_finish = true;
+        enc.sum_args = std::move(exact_sum_args);
+        enc.sum_scale = scale;
+        out_finishes.push_back(LanceExecIRFinish{
+            LanceExecIRFinish::Kind::AVG, agg_idx, input_type,
+            LogicalType::DECIMAL(Decimal::MAX_WIDTH_INT128, scale)});
+      } else if (integer_sum) {
+        enc.encoded_args = std::move(exact_sum_args);
+        out_finishes.push_back(LanceExecIRFinish{
+            LanceExecIRFinish::Kind::INTEGER_SUM, agg_idx, input_type,
+            LogicalType::DECIMAL(Decimal::MAX_WIDTH_INT128, 0)});
+      }
+    }
     aggs.push_back(std::move(enc));
   }
 
@@ -961,26 +1062,45 @@ bool TryEncodeLanceExecIRv1(
     }
   }
 
-  if (NumericCast<idx_t>(aggs.size()) >
+  auto exec_agg_count = aggs.size();
+  for (auto &finish : out_finishes) {
+    if (finish.kind == LanceExecIRFinish::Kind::AVG) {
+      exec_agg_count++;
+    }
+  }
+  if (NumericCast<idx_t>(exec_agg_count) >
       NumericCast<idx_t>(NumericLimits<uint32_t>::Maximum())) {
     return false;
   }
-  WriteU32(out_exec_ir, NumericCast<uint32_t>(aggs.size()));
-  for (auto &agg : aggs) {
-    WriteU8(out_exec_ir, static_cast<uint8_t>(agg.func));
-    WriteString(out_exec_ir, agg.output_name);
-    WriteU32(out_exec_ir, agg.arg_count);
-    if (!agg.encoded_args.empty()) {
-      WriteBytes(out_exec_ir,
-                 reinterpret_cast<const_data_ptr_t>(agg.encoded_args.data()),
-                 NumericCast<idx_t>(agg.encoded_args.size()));
+  WriteU32(out_exec_ir, NumericCast<uint32_t>(exec_agg_count));
+  auto write_agg = [&](ExecIrAggFunc func, const string &name,
+                       uint32_t arg_count, const string &args,
+                       const string &type_hint) {
+    WriteU8(out_exec_ir, static_cast<uint8_t>(func));
+    WriteString(out_exec_ir, name);
+    WriteU32(out_exec_ir, arg_count);
+    WriteBytes(out_exec_ir, reinterpret_cast<const_data_ptr_t>(args.data()),
+               NumericCast<idx_t>(args.size()));
+    WriteBytes(out_exec_ir,
+               reinterpret_cast<const_data_ptr_t>(type_hint.data()),
+               NumericCast<idx_t>(type_hint.size()));
+  };
+  for (idx_t agg_idx = 0; agg_idx < aggs.size(); agg_idx++) {
+    auto &agg = aggs[agg_idx];
+    if (!agg.avg_finish) {
+      write_agg(agg.func, agg.output_name, agg.arg_count, agg.encoded_args,
+                agg.output_type_hint);
+      continue;
     }
-    if (!agg.output_type_hint.empty()) {
-      WriteBytes(
-          out_exec_ir,
-          reinterpret_cast<const_data_ptr_t>(agg.output_type_hint.data()),
-          NumericCast<idx_t>(agg.output_type_hint.size()));
-    }
+    string sum_type_hint;
+    WriteExecDecimalTypeHint(sum_type_hint, Decimal::MAX_WIDTH_INT128,
+                             agg.sum_scale);
+    string count_type_hint;
+    WriteU8(count_type_hint, static_cast<uint8_t>(ExecIrOutputTypeTag::INT64));
+    write_agg(ExecIrAggFunc::SUM, ExecAvgSumName(agg_idx), 1, agg.sum_args,
+              sum_type_hint);
+    write_agg(ExecIrAggFunc::COUNT, ExecAvgCountName(agg_idx), 1,
+              agg.encoded_args, count_type_hint);
   }
 
   vector<string> output_names;
@@ -1083,6 +1203,8 @@ bool TryEncodeLanceExecIRv1(
       }
 
       string name;
+      // Position among the outputs: groups, then aggregates.
+      idx_t out_idx = DConstants::INVALID_INDEX;
       if (node.expression->GetExpressionClass() == ExpressionClass::BOUND_REF) {
         auto &ref = node.expression->Cast<BoundReferenceExpression>();
         auto idx = NumericCast<idx_t>(ref.Index());
@@ -1093,6 +1215,7 @@ bool TryEncodeLanceExecIRv1(
           return false;
         }
         name = output_names[idx];
+        out_idx = idx;
       } else if (node.expression->GetExpressionClass() ==
                  ExpressionClass::BOUND_COLUMN_REF) {
         auto &colref = node.expression->Cast<BoundColumnRefExpression>();
@@ -1104,6 +1227,7 @@ bool TryEncodeLanceExecIRv1(
             return false;
           }
           name = groups[colref.Binding().column_index].output_name;
+          out_idx = colref.Binding().column_index.GetIndex();
         } else if (colref.Binding().table_index == aggregate.aggregate_index) {
           if (colref.Binding().column_index >= aggs.size()) {
             if (ExecIrFailfast()) {
@@ -1113,6 +1237,7 @@ bool TryEncodeLanceExecIRv1(
             return false;
           }
           name = aggs[colref.Binding().column_index].output_name;
+          out_idx = groups.size() + colref.Binding().column_index.GetIndex();
         } else if (post_projection && colref.Binding().table_index ==
                                           post_projection->table_index) {
           auto idx = colref.Binding().column_index.GetIndex();
@@ -1124,6 +1249,7 @@ bool TryEncodeLanceExecIRv1(
             return false;
           }
           name = output_names[idx];
+          out_idx = idx;
         } else {
           if (ExecIrFailfast()) {
             throw IOException(
@@ -1140,6 +1266,15 @@ bool TryEncodeLanceExecIRv1(
         return false;
       }
 
+      // DuckDB divides an AVG in `out_finishes` after the exec plan, so the
+      // plan cannot sort by it. An integer SUM sorts the same as DECIMAL(38).
+      if (out_idx >= groups.size() && out_idx != DConstants::INVALID_INDEX &&
+          aggs[out_idx - groups.size()].avg_finish) {
+        if (ExecIrFailfast()) {
+          throw IOException("ExecIR order by an avg not supported");
+        }
+        return false;
+      }
       bool asc = node.type == OrderType::ASCENDING;
       bool nulls_first = node.null_order == OrderByNullType::NULLS_FIRST;
       order_by.emplace_back(std::move(name), asc, nulls_first);
@@ -1158,6 +1293,90 @@ bool TryEncodeLanceExecIRv1(
   }
 
   return true;
+}
+
+namespace {
+
+struct LanceAvgFinalizeData : public FunctionData {
+  LanceAvgFinalizeData(bool long_double_p, bool decimal_p, double scale_p)
+      : long_double(long_double_p), decimal(decimal_p), scale(scale_p) {}
+
+  // DuckDB divides in long double unless the AVG input is 16-bit.
+  bool long_double;
+  bool decimal;
+  double scale;
+
+  unique_ptr<FunctionData> Copy() const override {
+    return make_uniq<LanceAvgFinalizeData>(long_double, decimal, scale);
+  }
+
+  bool Equals(const FunctionData &other_p) const override {
+    auto &other = other_p.Cast<LanceAvgFinalizeData>();
+    return long_double == other.long_double && decimal == other.decimal &&
+           scale == other.scale;
+  }
+};
+
+// The Finalize of DuckDB's IntegerAverageOperation (16-bit inputs) and
+// IntegerAverageOperationHugeint (extension/core_functions/aggregate/
+// algebraic/avg.cpp), applied to the unscaled sum and the count.
+void LanceAvgFinalize(DataChunk &args, ExpressionState &state, Vector &result) {
+  auto &info = state.expr.Cast<BoundFunctionExpression>()
+                   .BindInfo()
+                   ->Cast<LanceAvgFinalizeData>();
+  BinaryExecutor::Execute<hugeint_t, int64_t, double>(
+      args.data[0], args.data[1], result, args.size(),
+      [&](hugeint_t sum, int64_t count) -> optional<double> {
+        if (count <= 0) {
+          return nullopt;
+        }
+        if (!info.long_double) {
+          int64_t value;
+          if (!Hugeint::TryCast(sum, value)) {
+            throw OutOfRangeException("Lance exec avg: sum %s out of range",
+                                      sum.ToString());
+          }
+          double divident = double(uint64_t(count));
+          if (info.decimal) {
+            divident *= info.scale;
+          }
+          return double(value) / divident;
+        }
+        long double divident = static_cast<long double>(uint64_t(count));
+        if (info.decimal) {
+          divident *= info.scale;
+        }
+        return static_cast<double>(Hugeint::Cast<long double>(sum) / divident);
+      });
+}
+
+} // namespace
+
+unique_ptr<Expression> BuildLanceExecFinish(ClientContext &context,
+                                            const LanceExecIRFinish &finish,
+                                            unique_ptr<Expression> sum,
+                                            unique_ptr<Expression> count) {
+  if (finish.kind == LanceExecIRFinish::Kind::INTEGER_SUM) {
+    return BoundCastExpression::AddCastToType(context, std::move(sum),
+                                              LogicalType::HUGEINT);
+  }
+  auto decimal = finish.input_type.id() == LogicalTypeId::DECIMAL;
+  auto scale =
+      decimal
+          ? Hugeint::Cast<double>(Hugeint::POWERS_OF_TEN[DecimalType::GetScale(
+                finish.input_type)])
+          : 1.0;
+  ScalarFunction finalize("__lance_avg_finalize",
+                          {sum->GetReturnType(), LogicalType::BIGINT},
+                          LogicalType::DOUBLE, LanceAvgFinalize);
+  vector<unique_ptr<Expression>> children;
+  children.push_back(std::move(sum));
+  children.push_back(std::move(count));
+  return make_uniq<BoundFunctionExpression>(
+      BoundScalarFunction(finalize), std::move(children),
+      make_uniq<LanceAvgFinalizeData>(finish.input_type.InternalType() !=
+                                          PhysicalType::INT16,
+                                      decimal, scale));
 }
 
 } // namespace duckdb
