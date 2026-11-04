@@ -1,0 +1,38 @@
+# name: test/sql/exec_pushdown_integer_overflow.test
+# description: Integer arithmetic that overflows inside a pushed aggregate fails as in DuckDB
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT (i % 2)::BIGINT AS g, (50000 + i)::INTEGER AS a, (4000000000000000000 + i)::BIGINT AS b
+  FROM range(10) t(i)
+) TO '{TEST_DIR}/exec_pushdown_integer_overflow.lance' (FORMAT lance, mode 'overwrite');
+
+# DataFusion's integer arithmetic wraps; DuckDB raises an error.
+statement error
+SELECT avg(a * a) FROM '{TEST_DIR}/exec_pushdown_integer_overflow.lance';
+----
+Overflow in multiplication of INT32
+
+statement error
+SELECT g, avg(a * a) FROM '{TEST_DIR}/exec_pushdown_integer_overflow.lance' GROUP BY g;
+----
+Overflow in multiplication of INT32
+
+statement error
+SELECT sum(CAST(b * 3 AS DOUBLE)) FROM '{TEST_DIR}/exec_pushdown_integer_overflow.lance';
+----
+Overflow in multiplication of INT64
+
+query R
+SELECT avg(a + 1) FROM '{TEST_DIR}/exec_pushdown_integer_overflow.lance';
+----
+50005.5
+
+# Aggregates over plain integer columns are still pushed.
+query II
+EXPLAIN (FORMAT JSON) SELECT avg(a) FROM '{TEST_DIR}/exec_pushdown_integer_overflow.lance';
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
