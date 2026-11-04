@@ -184,5 +184,53 @@ SELECT count(*) FROM merge_ns.main.lance_merge_duplicate_delete;
 ----
 1
 
+# MERGE whose matched rows span two fragments writes each row its own value.
+statement ok
+CREATE TEMP TABLE lance_merge_two_fragments_src AS
+SELECT * FROM (VALUES (1::BIGINT, 100::BIGINT), (3, 300), (4, 400)) s(id, v);
+
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_two_fragments AS
+SELECT * FROM (VALUES (1::BIGINT, 10::BIGINT), (2, 20), (3, 30)) v(id, v);
+
+statement ok
+INSERT INTO merge_ns.main.lance_merge_two_fragments VALUES (4, 40);
+
+statement ok
+MERGE INTO merge_ns.main.lance_merge_two_fragments AS t
+USING lance_merge_two_fragments_src AS src
+ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET v = src.v;
+
+query II
+SELECT id, v FROM merge_ns.main.lance_merge_two_fragments ORDER BY id;
+----
+1	100
+2	20
+3	300
+4	400
+
+# UPDATE without SET also assigns the key column, which must stay with its row.
+statement ok
+CREATE OR REPLACE TABLE merge_ns.main.lance_merge_two_fragments_key AS
+SELECT * FROM (VALUES (1::BIGINT, 10::BIGINT), (2, 20), (3, 30)) v(id, v);
+
+statement ok
+INSERT INTO merge_ns.main.lance_merge_two_fragments_key VALUES (4, 40);
+
+statement ok
+MERGE INTO merge_ns.main.lance_merge_two_fragments_key
+USING lance_merge_two_fragments_src
+USING (id)
+WHEN MATCHED THEN UPDATE;
+
+query II
+SELECT id, v FROM merge_ns.main.lance_merge_two_fragments_key ORDER BY id;
+----
+1	100
+2	20
+3	300
+4	400
+
 statement ok
 DETACH merge_ns;
