@@ -6,6 +6,7 @@ use std::ptr;
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use arrow::ipc::reader::{FileReader, StreamReader};
+use arrow::record_batch::RecordBatchReader;
 use datafusion_expr::Expr;
 use datafusion_sql::unparser::dialect::CustomDialectBuilder;
 use datafusion_sql::unparser::Unparser;
@@ -322,14 +323,27 @@ async fn execute_query_table(
     }
 }
 
+fn collect_ipc_batches(
+    reader: impl RecordBatchReader,
+    encoding: &str,
+) -> FfiResult<Vec<RecordBatch>> {
+    let schema = reader.schema();
+    let mut batches = reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
+        FfiError::new(
+            ErrorCode::NamespaceQueryTable,
+            format!("read Arrow IPC {encoding}: {err}"),
+        )
+    })?;
+    // Keep the response schema observable by the decoder even with no rows.
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(schema));
+    }
+    Ok(batches)
+}
+
 fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
     match FileReader::try_new(Cursor::new(bytes.clone()), None) {
-        Ok(reader) => reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
-            FfiError::new(
-                ErrorCode::NamespaceQueryTable,
-                format!("read Arrow IPC file: {err}"),
-            )
-        }),
+        Ok(reader) => collect_ipc_batches(reader, "file"),
         Err(file_err) => {
             let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|stream_err| {
                 FfiError::new(
@@ -339,12 +353,7 @@ fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
                     ),
                 )
             })?;
-            reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
-                FfiError::new(
-                    ErrorCode::NamespaceQueryTable,
-                    format!("read Arrow IPC stream: {err}"),
-                )
-            })
+            collect_ipc_batches(reader, "stream")
         }
     }
 }

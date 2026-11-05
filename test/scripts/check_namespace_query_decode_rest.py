@@ -115,7 +115,7 @@ def rows(start: int, count: int, mode: str) -> pa.Table:
             "id": pa.array(ids, pa.int64()),
             "txt": pa.array([f"row-{i}" for i in ids], pa.large_string()),
             "vec": pa.array([[float(i), 0.0] for i in ids], pa.list_(pa.float32(), 2)),
-            "label": pa.array([f"label-{i}" if i % 3 else None for i in ids]).dictionary_encode(),
+            "label": pa.array([f"label-{i}" if i % 3 else None for i in ids], pa.string()).dictionary_encode(),
             "payload": pa.array([f"blob-{i}".encode() for i in ids], pa.large_binary()),
             "tags": pa.array([[f"tag-{i}", None] for i in ids], pa.large_list(pa.large_string())),
             "day": pa.array([datetime.date(2020, 1, 1) + datetime.timedelta(days=i) for i in ids], pa.date64()),
@@ -162,11 +162,14 @@ def main() -> None:
                         response["schema"] = SCHEMA
                 elif path.endswith("/query"):
                     requests.append({"name": name, **request})
+                    mode = name.removeprefix("empty_").removeprefix("file_")
                     search = bool(request.get("full_text_query") or request.get("vector"))
                     metric = "_score" if request.get("full_text_query") else "_distance"
-                    chunks = [rows(0, 2, name)]
+                    chunks = [rows(0, 2, mode)]
                     if name == "many":
                         chunks = [rows(0, 2500, name), rows(2500, 3, name)]
+                    elif name == "leading_empty":
+                        chunks = [rows(0, 0, "normal"), rows(0, 2, "normal")]
                     tables = []
                     for table in chunks:
                         if search:
@@ -176,32 +179,45 @@ def main() -> None:
                         columns = (request.get("columns") or {}).get("column_names")
                         if columns and not search:
                             table = table.select(columns)
-                        if name == "missing":
+                        if mode == "missing":
                             table = table.drop(["txt"])
-                        elif name == "duplicate":
+                        elif mode == "duplicate":
                             table = table.append_column("txt", table["txt"])
-                        elif name == "wrong_type":
+                        elif mode == "wrong_type":
                             table = table.set_column(
                                 table.schema.get_field_index("txt"), "txt", pa.array([42] * table.num_rows, pa.int64())
                             )
-                        elif name == "wrong_metric" and search:
+                        elif mode == "wrong_metric" and search:
                             table = table.set_column(
                                 table.schema.get_field_index(metric),
                                 metric,
                                 pa.array([0.5] * table.num_rows, pa.float64()),
                             )
-                        elif name == "extra":
+                        elif mode == "missing_rowid":
+                            table = table.drop(["_rowid"])
+                        elif mode == "wrong_rowid":
+                            table = table.set_column(table.schema.get_field_index("_rowid"), "_rowid", table["id"])
+                        elif mode == "extra":
                             table = table.append_column("unrequested", pa.nulls(table.num_rows))
                         if name == "reordered":
                             table = table.select(list(reversed(table.column_names)))
                         tables.append(table)
                     sink = pa.BufferOutputStream()
-                    factory = pa.ipc.new_file if name == "file" else pa.ipc.new_stream
+                    factory = pa.ipc.new_file if name == "file" or name.startswith("empty_file") else pa.ipc.new_stream
                     with factory(sink, tables[0].schema) as writer:
-                        if name != "empty":
+                        if name != "empty" and not name.startswith("empty_"):
                             for table in tables:
-                                writer.write_table(table)
+                                if table.num_rows == 0:
+                                    writer.write_batch(
+                                        pa.RecordBatch.from_arrays(
+                                            [column.combine_chunks() for column in table.columns], schema=table.schema
+                                        )
+                                    )
+                                else:
+                                    writer.write_table(table)
                     response = sink.getvalue().to_pybytes()
+                    if name == "leading_empty":
+                        assert [batch.num_rows for batch in pa.ipc.open_stream(response)] == [0, 2]
                     content_type = "application/vnd.apache.arrow.stream"
                 else:
                     self.send_error(404)
@@ -233,6 +249,7 @@ def main() -> None:
             error: str = "",
             suffix: str = "",
             prepared: bool = False,
+            error_type: str = "Invalid Input Error:",
         ) -> None:
             source = f"ns.main.{name}"
             if kind == "fts":
@@ -252,7 +269,7 @@ def main() -> None:
                 env={**os.environ, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
             )
             if error:
-                passed = result.returncode != 0 and "Invalid Input Error:" in result.stderr and error in result.stderr
+                passed = result.returncode != 0 and error_type in result.stderr and error in result.stderr
             else:
                 try:
                     actual = json.loads(result.stdout) if result.stdout.strip() else []
@@ -272,7 +289,7 @@ def main() -> None:
 
         try:
             for kind in ("scan", "fts", "knn"):
-                for mode in ("normal", "file", "reordered", "extra", "fallback"):
+                for mode in ("normal", "file", "reordered", "extra", "fallback", "leading_empty"):
                     check(
                         mode,
                         kind,
@@ -313,6 +330,30 @@ def main() -> None:
                         "reordered", kind, "_rowid::BIGINT AS rid", [{"rid": 0}, {"rid": 1}], suffix="ORDER BY _rowid"
                     )
                 check("empty", kind, "txt", [])
+                for container in ("empty", "empty_file"):
+                    check(container, kind, "label, payload, tags, nested", [])
+                    check(container + "_nanos", kind, "nested", [])
+                    check(container + "_missing", kind, "txt", error='missing column "txt"')
+                    check(container + "_duplicate", kind, "txt", error='duplicate column "txt"')
+                    check(
+                        container + "_wrong_type", kind, "txt", error='column "txt" has type BIGINT, expected VARCHAR'
+                    )
+                    if kind != "scan":
+                        check(container, kind, "_rowid", [])
+                        check(
+                            container + "_missing_rowid",
+                            kind,
+                            "_rowid",
+                            error="response has no _rowid column",
+                            error_type="IO Error:",
+                        )
+                        check(
+                            container + "_wrong_rowid",
+                            kind,
+                            "_rowid",
+                            error="response has _rowid of type Int64, expected UInt64",
+                            error_type="IO Error:",
+                        )
                 for mode in ("seconds", "milliseconds", "nanos", "timezone", "timezone_ns"):
                     check(
                         mode,
