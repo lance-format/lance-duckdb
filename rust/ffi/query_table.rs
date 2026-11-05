@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::io::Cursor;
 use std::ptr;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::DataType;
+use arrow::compute::{cast_with_options, CastOptions};
+use arrow::datatypes::{DataType, FieldRef, Schema};
 use arrow::ipc::reader::{FileReader, StreamReader};
 use arrow::record_batch::RecordBatchReader;
 use datafusion_expr::Expr;
@@ -323,9 +325,109 @@ async fn execute_query_table(
     }
 }
 
+fn query_field_storage(field: &FieldRef, in_array: bool) -> FieldRef {
+    let data_type = query_dictionary_storage(field.data_type(), in_array);
+    if &data_type == field.data_type() {
+        return field.clone();
+    }
+    Arc::new(field.as_ref().clone().with_data_type(data_type))
+}
+
+fn query_dictionary_storage(data_type: &DataType, in_array: bool) -> DataType {
+    match data_type {
+        DataType::Dictionary(_, value) if in_array || value.is_nested() => {
+            query_dictionary_storage(value, in_array)
+        }
+        DataType::FixedSizeList(field, size) => {
+            DataType::FixedSizeList(query_field_storage(field, true), *size)
+        }
+        DataType::List(field) => DataType::List(query_field_storage(field, true)),
+        DataType::LargeList(field) => DataType::LargeList(query_field_storage(field, true)),
+        DataType::ListView(field) => DataType::ListView(query_field_storage(field, true)),
+        DataType::LargeListView(field) => DataType::LargeListView(query_field_storage(field, true)),
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| query_field_storage(field, in_array))
+                .collect(),
+        ),
+        DataType::Map(field, sorted) => {
+            DataType::Map(query_field_storage(field, in_array), *sorted)
+        }
+        DataType::Union(fields, mode) => DataType::Union(
+            fields
+                .iter()
+                .map(|(id, field)| (id, query_field_storage(field, in_array)))
+                .collect(),
+            *mode,
+        ),
+        DataType::RunEndEncoded(ends, values) => {
+            DataType::RunEndEncoded(ends.clone(), query_field_storage(values, in_array))
+        }
+        _ => data_type.clone(),
+    }
+}
+
+fn decode_query_dictionaries(
+    batch: RecordBatch,
+    requested: &HashSet<String>,
+) -> FfiResult<RecordBatch> {
+    let schema = batch.schema();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            if requested.contains(field.name()) {
+                query_field_storage(field, false)
+            } else {
+                field.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if fields.iter().zip(schema.fields()).all(|(a, b)| a == b) {
+        return Ok(batch);
+    }
+    // DuckDB cannot safely decode dictionary values that are containers, or
+    // dictionaries inside lists/arrays. Use Arrow's lossless dictionary
+    // decoding for only those layouts; ordinary batches retain their buffers.
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(&fields)
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(column.clone())
+            } else {
+                cast_with_options(column.as_ref(), field.data_type(), &options)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            FfiError::new(
+                ErrorCode::NamespaceQueryTable,
+                format!("decode Arrow dictionary storage: {err}"),
+            )
+        })?;
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map_err(|err| {
+        FfiError::new(
+            ErrorCode::NamespaceQueryTable,
+            format!("decoded Arrow dictionary batch: {err}"),
+        )
+    })
+}
+
 fn collect_ipc_batches(
     reader: impl RecordBatchReader,
     encoding: &str,
+    requested: &HashSet<String>,
 ) -> FfiResult<Vec<RecordBatch>> {
     let schema = reader.schema();
     let mut batches = reader.collect::<Result<Vec<_>, _>>().map_err(|err| {
@@ -338,12 +440,18 @@ fn collect_ipc_batches(
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(schema));
     }
-    Ok(batches)
+    batches
+        .into_iter()
+        .map(|batch| decode_query_dictionaries(batch, requested))
+        .collect()
 }
 
-fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
+fn ipc_bytes_to_batches(
+    bytes: Vec<u8>,
+    requested: &HashSet<String>,
+) -> FfiResult<Vec<RecordBatch>> {
     match FileReader::try_new(Cursor::new(bytes.clone()), None) {
-        Ok(reader) => collect_ipc_batches(reader, "file"),
+        Ok(reader) => collect_ipc_batches(reader, "file", requested),
         Err(file_err) => {
             let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|stream_err| {
                 FfiError::new(
@@ -353,7 +461,7 @@ fn ipc_bytes_to_batches(bytes: Vec<u8>) -> FfiResult<Vec<RecordBatch>> {
                     ),
                 )
             })?;
-            collect_ipc_batches(reader, "stream")
+            collect_ipc_batches(reader, "stream", requested)
         }
     }
 }
@@ -370,9 +478,10 @@ fn execute_to_batches(
     config: ParsedNamespaceQueryConfig,
     request: QueryTableRequest,
 ) -> FfiResult<Vec<RecordBatch>> {
+    let requested = config.columns.iter().cloned().collect();
     let bytes = runtime::block_on(execute_query_table(config, request))
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
-    ipc_bytes_to_batches(bytes)
+    ipc_bytes_to_batches(bytes, &requested)
 }
 
 /// Runs a search request. The search schema ends with its metric column and
@@ -383,6 +492,9 @@ fn execute_search_to_stream(
     mut request: QueryTableRequest,
     with_row_id: bool,
 ) -> FfiResult<StreamHandle> {
+    // Search responses still contain full rows. Keep the requested columns for
+    // local decoding without changing the namespace request's projection.
+    request.columns = None;
     if with_row_id {
         request.with_row_id = Some(true);
     }

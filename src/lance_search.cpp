@@ -365,7 +365,6 @@ struct LanceKnnGlobalState : public GlobalTableFunctionState {
   ArrowTableSchema pinned_arrow_table;
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
-  vector<string> namespace_columns;
   vector<string> native_columns;
 
   std::atomic<bool> explain_computed{false};
@@ -810,9 +809,9 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     LanceNamespaceQueryConfig config;
     FillLanceNamespaceQueryConfig(
         context.client, bind_data.namespace_config, bind_data.k,
-        bind_data.prefilter, bind_data.namespace_filter,
-        global.namespace_columns, option_key_ptrs, option_value_ptrs,
-        column_ptrs, bearer_token, api_key, config);
+        bind_data.prefilter, bind_data.namespace_filter, global.native_columns,
+        option_key_ptrs, option_value_ptrs, column_ptrs, bearer_token, api_key,
+        config);
     LanceNamespaceVectorSearchOptions options;
     options.vector_column = bind_data.vector_column.c_str();
     options.query_values = bind_data.query.data();
@@ -1200,7 +1199,6 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   ArrowTableSchema pinned_arrow_table;
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
-  vector<string> namespace_columns;
   vector<string> native_columns;
 
   idx_t MaxThreads() const override { return 1; }
@@ -1240,7 +1238,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
       LanceNamespaceQueryConfig config;
       FillLanceNamespaceQueryConfig(
           context, bind_data.namespace_config, bind_data.k, bind_data.prefilter,
-          bind_data.namespace_filter, global.namespace_columns, option_key_ptrs,
+          bind_data.namespace_filter, global.native_columns, option_key_ptrs,
           option_value_ptrs, column_ptrs, bearer_token, api_key, config);
       LanceNamespaceFtsSearchOptions options;
       options.text_column = bind_data.text_column.c_str();

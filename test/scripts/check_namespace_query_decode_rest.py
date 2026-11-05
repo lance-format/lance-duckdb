@@ -40,6 +40,40 @@ SCHEMA = {
         field("span", "duration"),
         field("ts", "timestamp"),
         field("half", "float16"),
+        field("fixed_labels", "fixed_size_list", length=2, fields=[field("item", "utf8")]),
+        field("plain_labels", "list", fields=[field("item", "utf8")]),
+        field("empty_plain_labels", "list", fields=[field("item", "utf8")]),
+        field("outer_fixed", "fixed_size_list", length=2, fields=[field("item", "int64")]),
+        field("outer_labels", "fixed_size_list", length=2, fields=[field("item", "utf8")]),
+        field("outer_struct", "struct", fields=[field("n", "int64"), field("s", "utf8")]),
+        field(
+            "empty_lists", "list", fields=[field("item", "fixed_size_list", length=2, fields=[field("item", "utf8")])]
+        ),
+        field(
+            "boxed_labels",
+            "struct",
+            fields=[
+                field("s", "fixed_size_list", length=2, fields=[field("item", "utf8")]),
+                field("l", "list", fields=[field("item", "fixed_size_list", length=2, fields=[field("item", "utf8")])]),
+                field(
+                    "m",
+                    "map",
+                    fields=[
+                        {
+                            **field(
+                                "entries",
+                                "struct",
+                                fields=[
+                                    {**field("key", "utf8"), "nullable": False},
+                                    field("value", "fixed_size_list", length=2, fields=[field("item", "utf8")]),
+                                ],
+                            ),
+                            "nullable": False,
+                        }
+                    ],
+                ),
+            ],
+        ),
         field(
             "nested",
             "struct",
@@ -95,6 +129,24 @@ def rows(start: int, count: int, mode: str) -> pa.Table:
     elif mode == "nested_null":
         timestamps[0] = 1
     timestamp_type = pa.timestamp(unit, zone)
+    label_values = pa.array([value for i in ids for value in (["b", "c"] if i % 2 else ["a", None])], pa.string())
+    fixed_labels = pa.FixedSizeListArray.from_arrays(
+        label_values.dictionary_encode().cast(pa.dictionary(pa.int8(), pa.string())), 2
+    )
+    offsets = pa.array(range(count + 1), pa.int32())
+    keys = pa.array([1 if i % 2 else None for i in ids], pa.int8())
+    outer_fixed = pa.DictionaryArray.from_arrays(keys, pa.array([[10, 20], [30, 40]], pa.list_(pa.int64(), 2)))
+    outer_labels = pa.DictionaryArray.from_arrays(keys, fixed_labels.slice(0, 2))
+    outer_struct = pa.DictionaryArray.from_arrays(keys, pa.array([{"n": 7, "s": "seven"}, {"n": 8, "s": "eight"}]))
+    empty_lists = pa.ListArray.from_arrays(pa.array([0] * (count + 1), pa.int32()), fixed_labels.slice(0, 0))
+    boxed_labels = pa.StructArray.from_arrays(
+        [
+            fixed_labels,
+            pa.ListArray.from_arrays(offsets, fixed_labels),
+            pa.MapArray.from_arrays(offsets, pa.array(["x"] * count, pa.string()), fixed_labels),
+        ],
+        names=["s", "l", "m"],
+    )
     nested_type = pa.struct(
         [
             ("s", timestamp_type),
@@ -122,6 +174,18 @@ def rows(start: int, count: int, mode: str) -> pa.Table:
             "span": pa.array([i + 1 for i in ids], pa.duration("s")),
             "ts": pa.array(timestamps, timestamp_type),
             "half": pa.array([1.5 if i % 2 else None for i in ids], pa.float16()),
+            "fixed_labels": fixed_labels,
+            "plain_labels": pa.ListArray.from_arrays(
+                pa.array([i * 2 for i in range(count + 1)], pa.int32()), label_values.dictionary_encode()
+            ),
+            "empty_plain_labels": pa.ListArray.from_arrays(
+                pa.array([0] * (count + 1), pa.int32()), label_values.dictionary_encode()
+            ),
+            "outer_fixed": outer_fixed,
+            "outer_labels": outer_labels,
+            "outer_struct": outer_struct,
+            "empty_lists": empty_lists,
+            "boxed_labels": boxed_labels,
             "nested": nested,
             "u": pa.array([bytes.fromhex("00112233445566778899aabbccddeeff") for _ in ids], pa.uuid()),
         }
@@ -140,7 +204,21 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="lance-query-decode-") as tmp:
         dataset = str(Path(tmp) / "fallback.lance")
-        lance.write_dataset(rows(0, 2, "normal"), dataset)
+        lance.write_dataset(
+            rows(0, 2, "normal").drop(
+                [
+                    "fixed_labels",
+                    "boxed_labels",
+                    "outer_fixed",
+                    "outer_labels",
+                    "outer_struct",
+                    "empty_lists",
+                    "plain_labels",
+                    "empty_plain_labels",
+                ]
+            ),
+            dataset,
+        )
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_: object) -> None:
@@ -199,6 +277,15 @@ def main() -> None:
                             table = table.set_column(table.schema.get_field_index("_rowid"), "_rowid", table["id"])
                         elif mode == "extra":
                             table = table.append_column("unrequested", pa.nulls(table.num_rows))
+                            values = pa.array(["unused"] * table.num_rows).dictionary_encode()
+                            lists = pa.ListArray.from_arrays(pa.array(range(table.num_rows + 1), pa.int32()), values)
+                            union = pa.UnionArray.from_dense(
+                                pa.array([0] * table.num_rows, pa.int8()),
+                                pa.array(range(table.num_rows), pa.int32()),
+                                [lists],
+                                field_names=["labels"],
+                            )
+                            table = table.append_column("unrequested_union", union)
                         if name == "reordered":
                             table = table.select(list(reversed(table.column_names)))
                         tables.append(table)
@@ -277,6 +364,8 @@ def main() -> None:
                     actual = result.stdout
                 passed = result.returncode == 0 and actual == expected
             passed = passed and len(requests) > start
+            if kind != "scan":
+                passed = passed and all(not request.get("columns") for request in requests[start:])
             results.append(
                 {
                     "case": f"{name}/{kind}/{projection}/{prepared}",
@@ -325,12 +414,47 @@ def main() -> None:
                 )
                 check("normal", kind, "txt", [{"txt": "row-0"}, {"txt": "row-1"}], suffix="ORDER BY id", prepared=True)
                 check("normal", kind, "half", [{"half": None}, {"half": 1.5}], suffix="ORDER BY id")
+                check(
+                    "normal",
+                    kind,
+                    "fixed_labels AS a, boxed_labels.s AS s, boxed_labels.l[1] AS l, boxed_labels.m['x'] AS m",
+                    [{key: values for key in ("a", "s", "l", "m")} for values in (["a", None], ["b", "c"])],
+                    suffix="ORDER BY id",
+                )
                 if kind != "scan":
                     check(
                         "reordered", kind, "_rowid::BIGINT AS rid", [{"rid": 0}, {"rid": 1}], suffix="ORDER BY _rowid"
                     )
                 check("empty", kind, "txt", [])
+                check(
+                    "normal",
+                    kind,
+                    "plain_labels, empty_plain_labels",
+                    [
+                        {"plain_labels": ["a", None], "empty_plain_labels": []},
+                        {"plain_labels": ["b", "c"], "empty_plain_labels": []},
+                    ],
+                    suffix="ORDER BY id",
+                )
+                check(
+                    "normal",
+                    kind,
+                    "outer_fixed, outer_labels, outer_struct, empty_lists",
+                    [
+                        {"outer_fixed": None, "outer_labels": None, "outer_struct": None, "empty_lists": []},
+                        {
+                            "outer_fixed": [30, 40],
+                            "outer_labels": ["b", "c"],
+                            "outer_struct": {"n": 8, "s": "eight"},
+                            "empty_lists": [],
+                        },
+                    ],
+                    suffix="ORDER BY id",
+                )
                 for container in ("empty", "empty_file"):
+                    check(container, kind, "plain_labels, empty_plain_labels", [])
+                    check(container, kind, "outer_fixed, outer_labels, outer_struct, empty_lists", [])
+                    check(container, kind, "fixed_labels, boxed_labels", [])
                     check(container, kind, "label, payload, tags, nested", [])
                     check(container + "_nanos", kind, "nested", [])
                     check(container + "_missing", kind, "txt", error='missing column "txt"')
