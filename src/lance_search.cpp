@@ -226,12 +226,12 @@ static bool ResolveSearchColumnIds(const vector<column_t> &column_ids,
   return with_row_id;
 }
 
-static idx_t PopulateNamespaceSearchSchema(
-    ClientContext &context, const LanceTableEntry &table,
-    const string &metric_name, ArrowSchemaWrapper &schema_root,
-    ArrowTableSchema &arrow_table, vector<string> &result_names,
-    vector<LogicalType> &result_types, vector<Identifier> &names,
-    vector<LogicalType> &return_types) {
+static idx_t PopulateNamespaceSearchSchema(const LanceTableEntry &table,
+                                           const string &metric_name,
+                                           vector<string> &result_names,
+                                           vector<LogicalType> &result_types,
+                                           vector<Identifier> &names,
+                                           vector<LogicalType> &return_types) {
   vector<string> field_names;
   vector<LogicalType> field_types;
   field_names.reserve(table.GetColumns().PhysicalColumnCount() + 2);
@@ -245,15 +245,8 @@ static idx_t PopulateNamespaceSearchSchema(
   field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
   field_types.push_back(LogicalType::UBIGINT);
 
-  memset(&schema_root.arrow_schema, 0, sizeof(schema_root.arrow_schema));
-  auto props = context.GetClientProperties();
-  ArrowConverter::ToArrowSchema(&schema_root.arrow_schema, field_types,
-                                field_names, props);
-  LanceCoerceArrowSchemaForDuckDB(&schema_root.arrow_schema);
-  ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table,
-                                               schema_root.arrow_schema);
-  result_names = arrow_table.GetNames();
-  result_types = arrow_table.GetTypes();
+  result_names = std::move(field_names);
+  result_types = std::move(field_types);
   return ExposeSearchColumns(result_names, result_types, names, return_types);
 }
 
@@ -280,9 +273,7 @@ GetSearchPinnedDataset(ClientContext &context,
 // Builds the Arrow schema that decodes a pinned dataset's search batches. The
 // bind schema came from the catalog, so the dataset must describe the same
 // columns, and each column the search reads must have the type it was bound
-// with; anything else is an error rather than a misread. Columns it does not
-// read may differ, because the bind schema went through DuckDB's Arrow export,
-// which does not keep every type: a UUID stored as arrow.uuid binds as VARCHAR.
+// with; anything else is an error rather than a misread.
 static void PopulatePinnedSearchSchema(
     ClientContext &context, void *schema_handle, const string &function_name,
     const string &table_name, const vector<string> &names,
@@ -393,6 +384,7 @@ struct LanceKnnLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
+  unique_ptr<LanceNamespaceResult> namespace_result;
   LanceKnnGlobalState *global_state = nullptr;
   bool filter_pushed_down = false;
   SelectionVector filter_sel;
@@ -652,10 +644,9 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
       result->namespace_config = table->NamespaceConfig();
       result->target = target.Reference();
       result->file_path = table->DatasetUri();
-      result->rowid_index = PopulateNamespaceSearchSchema(
-          context, *table, "_distance", result->schema_root,
-          result->arrow_table, result->names, result->types, names,
-          return_types);
+      result->rowid_index =
+          PopulateNamespaceSearchSchema(*table, "_distance", result->names,
+                                        result->types, names, return_types);
       result->json_columns = table->JsonColumnNames();
       return std::move(result);
     }
@@ -805,6 +796,12 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   }
 
   if (bind_data.namespace_backed && !global.pinned_dataset) {
+    vector<LogicalType> types;
+    for (auto col_id : global.column_ids) {
+      types.push_back(bind_data.types[col_id]);
+    }
+    result->namespace_result = make_uniq<LanceNamespaceResult>(
+        global.native_columns, std::move(types));
     vector<const char *> option_key_ptrs;
     vector<const char *> option_value_ptrs;
     vector<const char *> column_ptrs;
@@ -887,6 +884,10 @@ static bool LanceKnnLoadNextBatch(LanceKnnLocalState &local_state) {
   LanceArrowBatch exported(batch);
   auto &new_chunk = exported.array;
 
+  if (local_state.namespace_result) {
+    local_state.namespace_result->SetBatch(local_state, exported);
+  }
+
   if (local_state.global_state) {
     local_state.global_state->record_batches.fetch_add(1);
     auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
@@ -927,8 +928,13 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                        local_state.all_columns, false);
+      if (local_state.namespace_result) {
+        local_state.namespace_result->Scan(local_state,
+                                           local_state.all_columns);
+      } else {
+        ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
+                                          local_state.all_columns, false);
+      }
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -938,8 +944,12 @@ static void LanceKnnFunc(ClientContext &context, TableFunctionInput &data,
                               global_state.projection_ids);
     } else {
       output.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
-                                        false);
+      if (local_state.namespace_result) {
+        local_state.namespace_result->Scan(local_state, output);
+      } else {
+        ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
+                                          false);
+      }
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,
@@ -1204,6 +1214,7 @@ struct LanceSearchLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   void *stream = nullptr;
+  unique_ptr<LanceNamespaceResult> namespace_result;
   LanceSearchGlobalState *global_state = nullptr;
   bool filter_pushed_down = false;
   SelectionVector filter_sel;
@@ -1301,6 +1312,10 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
   LanceArrowBatch exported(batch);
   auto &new_chunk = exported.array;
 
+  if (local_state.namespace_result) {
+    local_state.namespace_result->SetBatch(local_state, exported);
+  }
+
   local_state.global_state->record_batches.fetch_add(1);
   auto rows = NumericCast<idx_t>(new_chunk->arrow_array.length);
   local_state.global_state->record_batch_rows.fetch_add(rows);
@@ -1366,8 +1381,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
       result->target = target.Reference();
       result->file_path = table->DatasetUri();
       result->rowid_index = PopulateNamespaceSearchSchema(
-          context, *table, "_score", result->schema_root, result->arrow_table,
-          result->names, result->types, names, return_types);
+          *table, "_score", result->names, result->types, names, return_types);
       result->json_columns = table->JsonColumnNames();
       return std::move(result);
     }
@@ -1681,6 +1695,7 @@ static unique_ptr<LocalTableFunctionState>
 LanceSearchLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
                      GlobalTableFunctionState *global_state) {
   auto &global = global_state->Cast<LanceSearchGlobalState>();
+  auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
 
   auto chunk = make_uniq<ArrowArrayWrapper>();
   auto result =
@@ -1689,6 +1704,14 @@ LanceSearchLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   result->filters = input.filters.get();
   result->global_state = &global;
   result->filter_pushed_down = global.filter_pushed_down;
+  if (bind_data.namespace_backed && !global.pinned_dataset) {
+    vector<LogicalType> types;
+    for (auto col_id : global.column_ids) {
+      types.push_back(bind_data.types[col_id]);
+    }
+    result->namespace_result = make_uniq<LanceNamespaceResult>(
+        global.native_columns, std::move(types));
+  }
   if (global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, global.scanned_types);
   }
@@ -1725,8 +1748,13 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
     if (global_state.CanRemoveFilterColumns()) {
       local_state.all_columns.Reset();
       local_state.all_columns.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                        local_state.all_columns, false);
+      if (local_state.namespace_result) {
+        local_state.namespace_result->Scan(local_state,
+                                           local_state.all_columns);
+      } else {
+        ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
+                                          local_state.all_columns, false);
+      }
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters,
@@ -1736,8 +1764,12 @@ static void LanceSearchFunc(ClientContext &context, TableFunctionInput &data,
                               global_state.projection_ids);
     } else {
       output.SetChildCardinality(output_size);
-      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
-                                        false);
+      if (local_state.namespace_result) {
+        local_state.namespace_result->Scan(local_state, output);
+      } else {
+        ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns, output,
+                                          false);
+      }
       local_state.chunk_offset += output_size;
       if (local_state.filters && !local_state.filter_pushed_down) {
         ApplyDuckDBFilters(context, *local_state.filters, output,

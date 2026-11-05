@@ -2,8 +2,13 @@
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 
 #include <memory>
 
@@ -50,6 +55,181 @@ LanceArrowBatch::LanceArrowBatch(void *batch, const char *export_error) {
   }
   batch_owner.reset();
   LanceCoerceArrowArrayForDuckDB(&schema.arrow_schema, &array->arrow_array);
+}
+
+static bool CastNamespaceTimestamp(Vector &source, Vector &target, idx_t count,
+                                   CastParameters &parameters) {
+  auto type = source.GetType().id();
+  bool all_valid = true;
+  UnaryExecutor::Execute<timestamp_t, timestamp_t>(
+      source, target, count, [&](timestamp_t value) -> optional<timestamp_t> {
+        if (!value.IsFinite()) {
+          return value;
+        }
+        try {
+          switch (type) {
+          case LogicalTypeId::TIMESTAMP_SEC:
+            return Timestamp::FromEpochSeconds(value.value);
+          case LogicalTypeId::TIMESTAMP_MS:
+            return Timestamp::FromEpochMs(value.value);
+          case LogicalTypeId::TIMESTAMP_NS:
+          case LogicalTypeId::TIMESTAMP_TZ_NS:
+            if (value.value % 1000 != 0) {
+              throw ConversionException("cannot convert nanosecond timestamp "
+                                        "without losing precision");
+            }
+            return Timestamp::FromEpochNanoSeconds(value.value);
+          default:
+            return value;
+          }
+        } catch (const ConversionException &error) {
+          HandleCastError::AssignError(ErrorData(error).RawMessage(),
+                                       parameters);
+          all_valid = false;
+          return optional<timestamp_t>();
+        }
+      });
+  return all_valid;
+}
+
+LanceNamespaceResult::LanceNamespaceResult(vector<string> names_p,
+                                           vector<LogicalType> types_p)
+    : names(std::move(names_p)), types(std::move(types_p)) {
+  // This private cast set leaves SQL casts and the session timezone unchanged.
+  for (auto type : {LogicalType::TIMESTAMP_S, LogicalType::TIMESTAMP_MS,
+                    LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_TZ,
+                    LogicalType::TIMESTAMP_TZ_NS}) {
+    casts.RegisterCastFunction(type, LogicalType::TIMESTAMP,
+                               BoundCastInfo(CastNamespaceTimestamp));
+  }
+}
+
+static bool NamespaceResultTypesMatch(const LogicalType &source,
+                                      const LogicalType &target) {
+  if (source == target) {
+    return true;
+  }
+  if (target == LogicalType::TIMESTAMP) {
+    switch (source.id()) {
+    case LogicalTypeId::TIMESTAMP_SEC:
+    case LogicalTypeId::TIMESTAMP_MS:
+    case LogicalTypeId::TIMESTAMP_NS:
+    case LogicalTypeId::TIMESTAMP_TZ:
+    case LogicalTypeId::TIMESTAMP_TZ_NS:
+      return true;
+    default:
+      return false;
+    }
+  }
+  if (source.id() != target.id()) {
+    return false;
+  }
+  switch (source.id()) {
+  case LogicalTypeId::LIST:
+  case LogicalTypeId::MAP:
+    return NamespaceResultTypesMatch(ListType::GetChildType(source),
+                                     ListType::GetChildType(target));
+  case LogicalTypeId::ARRAY:
+    return ArrayType::GetSize(source) == ArrayType::GetSize(target) &&
+           NamespaceResultTypesMatch(ArrayType::GetChildType(source),
+                                     ArrayType::GetChildType(target));
+  case LogicalTypeId::STRUCT: {
+    auto &source_fields = StructType::GetChildTypes(source);
+    auto &target_fields = StructType::GetChildTypes(target);
+    if (source_fields.size() != target_fields.size()) {
+      return false;
+    }
+    for (idx_t i = 0; i < source_fields.size(); i++) {
+      if (source_fields[i].first != target_fields[i].first ||
+          !NamespaceResultTypesMatch(source_fields[i].second,
+                                     target_fields[i].second)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+void LanceNamespaceResult::SetBatch(ArrowScanLocalState &state,
+                                    LanceArrowBatch &batch) {
+  auto &schema = batch.schema.arrow_schema;
+  LanceCoerceArrowSchemaForDuckDB(&schema);
+  unordered_map<string, idx_t> positions;
+  for (idx_t i = 0; i < NumericCast<idx_t>(schema.n_children); i++) {
+    auto name = schema.children[i]->name;
+    if (name && !positions.emplace(name, i).second) {
+      throw InvalidInputException(
+          "Lance namespace query_table response has duplicate column \"%s\"",
+          name);
+    }
+  }
+
+  arrow_columns.clear();
+  state.column_ids.clear();
+  vector<LogicalType> response_types;
+  convert_timestamps = false;
+  for (idx_t i = 0; i < names.size(); i++) {
+    auto entry = positions.find(names[i]);
+    if (entry == positions.end()) {
+      throw InvalidInputException(
+          "Lance namespace query_table response is missing column \"%s\"",
+          names[i]);
+    }
+    auto index = entry->second;
+    auto arrow_type =
+        ArrowType::GetArrowLogicalType(state.context, *schema.children[index]);
+    arrow_type->ThrowIfInvalid();
+    auto type = arrow_type->GetDuckType(true);
+    if (type != types[i]) {
+      // JsonArrowSchema represents timestamps as timezone-free microseconds.
+      // Preserve the response's epoch value, independently of the session zone.
+      if (!NamespaceResultTypesMatch(type, types[i])) {
+        throw InvalidInputException("Lance namespace query_table column \"%s\" "
+                                    "has type %s, expected %s",
+                                    names[i], type.ToString(),
+                                    types[i].ToString());
+      }
+      convert_timestamps = true;
+    }
+    response_types.push_back(type);
+    state.column_ids.push_back(NumericCast<column_t>(index));
+    arrow_columns.emplace(index, std::move(arrow_type));
+  }
+  decoded.Destroy();
+  if (convert_timestamps) {
+    decoded.Initialize(state.context, response_types);
+  }
+  // A response batch can replace a dictionary or change a field's encoding.
+  state.array_states.clear();
+}
+
+void LanceNamespaceResult::Scan(ArrowScanLocalState &state, DataChunk &output) {
+  if (!convert_timestamps) {
+    ArrowTableFunction::ArrowToDuckDB(state, arrow_columns, output, false);
+    return;
+  }
+  decoded.Reset();
+  decoded.SetChildCardinality(output.size());
+  ArrowTableFunction::ArrowToDuckDB(state, arrow_columns, decoded, false);
+  for (idx_t i = 0; i < types.size(); i++) {
+    auto &source = decoded.data[i];
+    auto &target = output.data[i];
+    if (source.GetType() == types[i]) {
+      target.Reference(source);
+      continue;
+    }
+    GetCastFunctionInput input(state.context);
+    string error;
+    if (!VectorOperations::TryCast(casts, input, source, target, output.size(),
+                                   &error, true)) {
+      throw InvalidInputException("Lance namespace query_table cannot "
+                                  "represent column \"%s\" as %s: %s",
+                                  names[i], types[i].ToString(), error);
+    }
+  }
 }
 
 namespace {

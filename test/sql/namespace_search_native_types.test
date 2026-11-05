@@ -1,0 +1,72 @@
+# name: test/sql/namespace_search_native_types.test
+# description: Namespace search decodes the Arrow types carried by its results
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/namespace_search_native_types' AS native_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE native_ns.main.t AS
+SELECT i::BIGINT AS id, 'match' AS txt, [i::FLOAT, 0.0]::FLOAT[2] AS vec,
+       (['a', 'b', 'c'][(i % 3) + 1])::ENUM('a', 'b', 'c') AS category
+FROM range(4) r(i);
+
+statement ok
+CREATE INDEX txt_idx ON native_ns.main.t (txt) USING INVERTED;
+
+query IT
+SELECT id, category FROM native_ns.main.t ORDER BY id;
+----
+0	a
+1	b
+2	c
+3	a
+
+query IT
+SELECT id, category FROM lance_fts('native_ns.main.t', 'txt', 'match', k = 10) ORDER BY id;
+----
+0	a
+1	b
+2	c
+3	a
+
+query IT
+SELECT id, category FROM lance_vector_search('native_ns.main.t', 'vec', [0.0, 0.0]::FLOAT[2], k = 4) ORDER BY id;
+----
+0	a
+1	b
+2	c
+3	a
+
+statement ok
+PREPARE hits AS SELECT category, id FROM lance_fts('native_ns.main.t', 'txt', $1, k = 10) ORDER BY id;
+
+query TI
+EXECUTE hits('match');
+----
+a	0
+b	1
+c	2
+a	3
+
+query I
+SELECT count(*) FROM lance_fts('native_ns.main.t', 'txt', 'absent', k = 10);
+----
+0
+
+statement ok
+DELETE FROM native_ns.main.t WHERE id IN (
+  SELECT id FROM lance_fts('native_ns.main.t', 'txt', 'match', k = 10) WHERE category = 'b'
+);
+
+query IT
+SELECT id, category FROM native_ns.main.t ORDER BY id;
+----
+0	a
+2	c
+3	a
+
+statement ok
+DETACH native_ns;
