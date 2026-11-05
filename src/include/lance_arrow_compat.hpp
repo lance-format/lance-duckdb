@@ -1,6 +1,8 @@
 #pragma once
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 
 #include <string>
 #include <vector>
@@ -55,6 +57,23 @@ struct LanceArrowBatch {
 
   ArrowSchemaWrapper schema;
   shared_ptr<ArrowArrayWrapper> array;
+};
+
+// Namespace responses choose their own Arrow encodings and column order. Bind
+// SQL types once, but import each response with the descriptors it carries.
+class LanceNamespaceResult {
+public:
+  LanceNamespaceResult(vector<string> names, vector<LogicalType> types);
+  void SetBatch(ArrowScanLocalState &state, LanceArrowBatch &batch);
+  void Scan(ArrowScanLocalState &state, DataChunk &output);
+
+private:
+  vector<string> names;
+  vector<LogicalType> types;
+  arrow_column_map_t arrow_columns;
+  DataChunk decoded;
+  CastFunctionSet casts;
+  bool convert_timestamps = false;
 };
 
 // Quick predicate — true when the schema needs format or metadata

@@ -843,10 +843,8 @@ WHERE id IN (SELECT id FROM hybrid_hit_ids);
 ----
 5	0
 
-# The pinned dataset must match the bind schema only in the columns the search
-# reads or filters on: a UUID column stored as arrow.uuid binds as VARCHAR. A
-# filter argument is applied to the pinned dataset as query_table would apply
-# it, before top-k when prefilter = true.
+# Namespace searches preserve catalog UUID types, including when DELETE pins
+# the dataset. Explicit filters still apply before top-k.
 statement ok
 SET arrow_lossless_conversion = true;
 
@@ -872,23 +870,22 @@ WHERE rowid IN (
   FROM lance_vector_search('rowid_ns.main.uuids', 'vec', [0.0, 0.0]::FLOAT[2], k = 2, filter = 'id > 0', prefilter = true)
 );
 
-statement error
-DELETE FROM rowid_ns.main.uuids
-WHERE u::VARCHAR IN (SELECT u FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10));
+query T
+SELECT DISTINCT typeof(u) FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10);
 ----
-Catalog Error: lance_fts cannot read column "u" of Lance table "rowid_ns.main.uuids" as VARCHAR from the dataset this statement pinned, which stores it as UUID
+UUID
 
-statement error
+statement ok
 DELETE FROM rowid_ns.main.uuids
-WHERE id IN (SELECT id FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10) WHERE u IS NOT NULL);
-----
-Catalog Error: lance_fts cannot read column "u" of Lance table "rowid_ns.main.uuids" as VARCHAR from the dataset this statement pinned, which stores it as UUID
+WHERE u IN (SELECT u FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10) WHERE id = 0);
+
+statement ok
+DELETE FROM rowid_ns.main.uuids
+WHERE id IN (SELECT id FROM lance_fts('rowid_ns.main.uuids', 'txt', 'w0', k = 10) WHERE u IS NOT NULL AND id = 4);
 
 query I
 SELECT id FROM rowid_ns.main.uuids ORDER BY id;
 ----
-0
-4
 6
 
 # A search of another table is not pinned by the DELETE.
