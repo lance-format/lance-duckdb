@@ -298,9 +298,12 @@ static bool TryGetLanceContainmentFunctionName(const string &duckdb_name,
   return false;
 }
 
+// `skipped_optional` is set when optional children of the filter's top-level
+// AND were left out of `out_ir`.
 static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
                                            const TableFilter &filter,
-                                           string &out_ir) {
+                                           string &out_ir,
+                                           bool &skipped_optional) {
   std::function<bool(const Expression &, string &)> build_from_expr;
 
   build_from_expr = [&](const Expression &expr, string &out_expr_ir) -> bool {
@@ -520,8 +523,36 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
 
   const auto &expression_filter =
       ExpressionFilter::GetExpressionFilter(filter, "Lance filter pushdown");
-  return expression_filter.expr &&
-         build_from_expr(*expression_filter.expr, out_ir);
+  if (!expression_filter.expr) {
+    return false;
+  }
+  auto &root = *expression_filter.expr;
+  if (root.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
+      root.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
+    return build_from_expr(root, out_ir);
+  }
+  vector<string> children;
+  for (auto &child : root.Cast<BoundConjunctionExpression>().GetChildren()) {
+    if (!child) {
+      return false;
+    }
+    if (ExpressionFilter::IsOptionalExpression(*child)) {
+      skipped_optional = true;
+      continue;
+    }
+    string child_ir;
+    if (!build_from_expr(*child, child_ir)) {
+      return false;
+    }
+    children.push_back(std::move(child_ir));
+  }
+  if (children.size() == 1) {
+    out_ir = std::move(children[0]);
+    return true;
+  }
+  return !children.empty() &&
+         TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
+                                           out_ir);
 }
 
 LanceFilterIRBuildResult
@@ -550,6 +581,16 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     auto scan_col_idx = it.GetIndex();
     auto &filter = it.Filter();
 
+    // DuckDB keeps the predicate behind an optional filter above the scan (an
+    // IN list or same-column OR it cannot express as a range, or a join's
+    // runtime filter), so skipping it, alone or as a conjunct, only loses a
+    // pruning hint. A predicate the query wrote reached the search functions'
+    // complex-filter pushdown too, which pushes it or rejects a required
+    // prefilter.
+    if (ExpressionFilter::IsOptionalFilter(filter)) {
+      result.all_filters_pushed = false;
+      continue;
+    }
     if (scan_col_idx >= input.column_ids.size()) {
       result.all_filters_pushed = false;
       result.all_prefilterable_filters_pushed = false;
@@ -583,16 +624,25 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
       continue;
     }
     string filter_ir;
-    if (!TryBuildLanceTableFilterIRExpr({col_ref_ir}, filter, filter_ir)) {
+    bool skipped_optional = false;
+    if (!TryBuildLanceTableFilterIRExpr({col_ref_ir}, filter, filter_ir,
+                                        skipped_optional)) {
       result.all_filters_pushed = false;
       result.all_prefilterable_filters_pushed = false;
       continue;
+    }
+    if (skipped_optional) {
+      result.all_filters_pushed = false;
     }
 
     result.parts.push_back(std::move(filter_ir));
   }
 
   for (const auto &filter : input.filters->GetMultiColumnFilters()) {
+    if (ExpressionFilter::IsOptionalFilter(*filter)) {
+      result.all_filters_pushed = false;
+      continue;
+    }
     const auto &expression_filter = ExpressionFilter::GetExpressionFilter(
         *filter, "Lance multi-column pushdown");
     vector<string> column_refs;
@@ -627,13 +677,17 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
       column_refs.push_back(std::move(column_ref));
     }
     string filter_ir;
-    if (!supported ||
-        !TryBuildLanceTableFilterIRExpr(column_refs, *filter, filter_ir)) {
+    bool skipped_optional = false;
+    if (!supported || !TryBuildLanceTableFilterIRExpr(
+                          column_refs, *filter, filter_ir, skipped_optional)) {
       result.all_filters_pushed = false;
       if (!computed) {
         result.all_prefilterable_filters_pushed = false;
       }
       continue;
+    }
+    if (skipped_optional) {
+      result.all_filters_pushed = false;
     }
     result.parts.push_back(std::move(filter_ir));
   }
