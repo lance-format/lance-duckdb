@@ -32,6 +32,15 @@ to avoid silently changing their on-disk types. For a scalar float16 column,
 `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
 and makes it writable.
 
+`INSERT`, `UPDATE`, `MERGE`, and `COPY ... (mode 'append')` write values as the
+Arrow types the table stores, so tables written by other Lance writers (for
+example with `large_string`, dictionary, `date64`, or millisecond timestamp
+columns) accept DuckDB values. A value the stored type cannot hold exactly,
+such as a fractional second in a seconds column, an `INTERVAL` with days in a
+`duration` column, or more distinct strings in a batch than a dictionary's key
+type can index, fails the statement instead of being truncated or stored as
+NULL.
+
 ## JSON columns
 
 Lance JSON extension fields scan as JSON text with SQL type `VARCHAR`, including
@@ -46,7 +55,7 @@ JSON-containing column. `DELETE` remains supported. JSON columns can be renamed
 or dropped, but `ALTER COLUMN ... TYPE` rejects a JSON source. To populate a
 derived text column, add the column and then use a separate `UPDATE` statement.
 
-`COPY` uses its input Arrow types. To create or append native JSON, use DuckDB
+`COPY` creates datasets with its input Arrow types. To create or append native JSON, use DuckDB
 `JSON` input values with `arrow_lossless_conversion = true`. Appending ordinary
 `VARCHAR` or bytes to an existing JSON field fails Lance's schema check.
 Overwrite mode can replace the dataset schema.

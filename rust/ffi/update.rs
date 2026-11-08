@@ -29,6 +29,7 @@ use super::blob::{
     is_blob_v2_field, plan_blob_conversions, BlobWriteContext, SourceOptionsMap,
 };
 
+use super::stored_type::cast_to_stored;
 use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
 use super::write::UncommittedTransaction;
 
@@ -816,7 +817,7 @@ fn build_blob_bytes_array(column_name: &str, array: &ArrayRef) -> Result<ArrayRe
 /// Blob v2 targets accept raw bytes (wrapped into the canonical logical
 /// struct) or an already-logical blob array (e.g. produced by the writer's
 /// input conversion for reference/ingest values). Non-blob columns are cast
-/// when the DuckDB-exported type differs from the stored field.
+/// to the stored field when the DuckDB-exported type differs from it.
 fn normalize_value_column(
     column_name: &str,
     array: &ArrayRef,
@@ -830,11 +831,8 @@ fn normalize_value_column(
                 "blob update column '{column_name}' has unsupported value type {other}"
             )),
         }
-    } else if array.data_type() == target_field.data_type() {
-        Ok(array.clone())
     } else {
-        arrow::compute::cast(array, target_field.data_type())
-            .map_err(|err| format!("cannot cast update column '{column_name}': {err}"))
+        cast_to_stored(column_name, array, target_field.data_type())
     }
 }
 

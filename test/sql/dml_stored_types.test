@@ -1,0 +1,175 @@
+# name: test/sql/dml_stored_types.test
+# description: INSERT, UPDATE and MERGE write values as the Arrow types the table stores
+# group: [sql]
+
+require lance
+
+require icu
+
+statement ok
+SET TimeZone = 'UTC';
+
+# Copy the fixture byte-for-byte into this test's private directory. A Lance
+# SQL round trip would store DuckDB's Arrow types and erase the condition under
+# test. Fixture: test/data/stored_types_fixture.lance, written by pylance with
+# large_string, large_list, dictionary, date64, time32[s], timestamp[ms, UTC],
+# duration[s] and fixed_size_binary(4) columns.
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/stored_types_fixture.lance' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+foreach directory _versions _transactions data
+
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/stored_types_fixture.lance/{directory}' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+endloop
+
+foreach file _transactions/0-0da4e71c-e0aa-44ca-8eb9-f7ff97aa0b86.txn _versions/18446744073709551614.manifest _versions/latest_version_hint.json data/1010011111100001101001112c6377499c936e736dac8690a4.lance
+
+statement ok
+COPY (SELECT content FROM read_blob('test/data/stored_types_fixture.lance/{file}'))
+TO '{TEST_DIR}/stored_types_fixture.lance/{file}' (FORMAT BLOB);
+
+endloop
+
+statement ok
+ATTACH '{TEST_DIR}' AS st (TYPE LANCE);
+
+statement ok
+INSERT INTO st.main.stored_types_fixture VALUES
+  (3, 'c', ['w'], 'green', DATE '2024-01-03', TIME '00:00:03',
+   TIMESTAMPTZ '2024-01-03 00:00:00.003+00', INTERVAL 3 SECOND, '\xAA\xBB\xCC\xDD'::BLOB);
+
+statement ok
+MERGE INTO st.main.stored_types_fixture t
+USING (SELECT 4 AS id, 'd' AS s, DATE '2024-01-04' AS d) src ON t.id = src.id
+WHEN NOT MATCHED THEN INSERT (id, s, d) VALUES (src.id, src.s, src.d);
+
+statement ok
+UPDATE st.main.stored_types_fixture
+SET t = TIME '00:00:05', dur = INTERVAL 5 SECOND, fsb = '\x0A\x0B\x0C\x0D'::BLOB
+WHERE id = 1;
+
+query ITTTTTTTT
+SELECT * FROM st.main.stored_types_fixture ORDER BY id;
+----
+1	a	[x]	red	2024-01-01	00:00:05	2024-01-01 00:00:00.001+00	00:00:05	\x0A\x0B\x0C\x0D
+2	b	[y, z]	blue	2024-01-02	00:00:02	2024-01-02 00:00:00.002+00	00:00:02	\x05\x06\x07\x08
+3	c	[w]	green	2024-01-03	00:00:03	2024-01-03 00:00:00.003+00	00:00:03	\xAA\xBB\xCC\xDD
+4	d	NULL	NULL	2024-01-04	NULL	NULL	NULL	NULL
+
+# A value the stored type cannot hold fails the statement instead of being
+# stored as NULL or truncated.
+statement error
+INSERT INTO st.main.stored_types_fixture (id, ts) VALUES (9, TIMESTAMPTZ '2024-01-03 00:00:00.000123+00');
+----
+<REGEX>:.*column 'ts'.*would be stored as a different value.*
+
+statement error
+UPDATE st.main.stored_types_fixture SET t = TIME '00:00:01.9' WHERE id = 1;
+----
+<REGEX>:.*column 't'.*would be stored as a different value.*
+
+statement error
+UPDATE st.main.stored_types_fixture SET dur = INTERVAL 1500 MILLISECONDS WHERE id = 1;
+----
+<REGEX>:.*column 'dur'.*would be stored as a different value.*
+
+statement error
+UPDATE st.main.stored_types_fixture SET dur = INTERVAL 1 DAY WHERE id = 1;
+----
+<REGEX>:.*column 'dur'.*non-zero months or days.*
+
+statement error
+UPDATE st.main.stored_types_fixture SET fsb = '\x01\x02\x03\x04\x05\x06\x07'::BLOB WHERE id = 1;
+----
+<REGEX>:.*column 'fsb'.*
+
+statement error
+MERGE INTO st.main.stored_types_fixture t
+USING (SELECT 2 AS id, INTERVAL 1 MONTH AS dur) src ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET dur = src.dur;
+----
+<REGEX>:.*column 'dur'.*non-zero months or days.*
+
+query IIIT
+SELECT count(*), count(t), count(dur), max(fsb) FILTER (WHERE id = 1)
+FROM st.main.stored_types_fixture;
+----
+4	3	3	\x0A\x0B\x0C\x0D
+
+# COPY append takes the query's types, so only representations of the same SQL
+# type are cast; other types still fail Lance's schema check.
+statement ok
+COPY (
+  SELECT 5::BIGINT AS id, 'e' AS s, ['v'] AS tags, 'red' AS cat, DATE '2024-01-05' AS d,
+    TIME '00:00:05' AS t, TIMESTAMPTZ '2024-01-05 00:00:00.005+00' AS ts,
+    INTERVAL 5 SECOND AS dur, '\x01\x01\x01\x01'::BLOB AS fsb
+) TO '{TEST_DIR}/stored_types_fixture.lance' (FORMAT lance, mode 'append');
+
+query ITT
+SELECT id, s, ts FROM st.main.stored_types_fixture WHERE id = 5;
+----
+5	e	2024-01-05 00:00:00.005+00
+
+statement error
+COPY (
+  SELECT 6::BIGINT AS id, 'f' AS s, ['u'] AS tags, 'red' AS cat, DATE '2024-01-06' AS d,
+    TIME '00:00:06' AS t, 1704499200000::BIGINT AS ts,
+    INTERVAL 6 SECOND AS dur, '\x01\x01\x01\x01'::BLOB AS fsb
+) TO '{TEST_DIR}/stored_types_fixture.lance' (FORMAT lance, mode 'append');
+----
+<REGEX>:.*different schema.*
+
+statement error
+COPY (
+  SELECT 6::BIGINT AS id, 'f' AS s, ['u'] AS tags, 'red' AS cat, DATE '2024-01-06' AS d,
+    TIME '00:00:06' AS t, TIMESTAMP '2024-01-06 00:00:00' AS ts,
+    INTERVAL 6 SECOND AS dur, '\x01\x01\x01\x01'::BLOB AS fsb
+) TO '{TEST_DIR}/stored_types_fixture.lance' (FORMAT lance, mode 'append');
+----
+<REGEX>:.*different schema.*
+
+query I
+SELECT count(*) FROM st.main.stored_types_fixture;
+----
+5
+
+# DuckDB labels TIMESTAMPTZ with the session time zone; the instant is what the
+# column stores.
+statement ok
+CREATE TABLE st.main.tz_append AS SELECT 1 AS id, TIMESTAMPTZ '2024-01-01 00:00:00+00' AS ts;
+
+statement ok
+SET TimeZone = 'Asia/Shanghai';
+
+statement ok
+INSERT INTO st.main.tz_append VALUES (2, TIMESTAMPTZ '2024-01-01 00:00:00+00');
+
+statement ok
+SET TimeZone = 'UTC';
+
+query IT
+SELECT id, ts FROM st.main.tz_append ORDER BY id;
+----
+1	2024-01-01 00:00:00+00
+2	2024-01-01 00:00:00+00
+
+# A table created from an ENUM stores a dictionary; DuckDB reads it as VARCHAR.
+statement ok
+CREATE TYPE stored_mood AS ENUM ('happy', 'sad');
+
+statement ok
+CREATE TABLE st.main.enum_append AS SELECT 1 AS id, 'happy'::stored_mood AS m;
+
+statement ok
+INSERT INTO st.main.enum_append VALUES (2, 'sad'), (3, 'calm');
+
+query IT
+SELECT id, m FROM st.main.enum_append ORDER BY id;
+----
+1	happy
+2	sad
+3	calm
