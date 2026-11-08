@@ -368,23 +368,27 @@ public:
     CreateTableInfo info(schema, Identifier(entry_name));
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
-    vector<string> coerced;
-    vector<string> json_columns;
-    vector<bool> blob_columns;
-    vector<string> writable_blob_v2_columns;
+    LanceTableSchema live;
     try {
-      auto live = LanceTableSchema::FromDataset(context, dataset);
-      info.columns = std::move(live.columns);
-      info.constraints = std::move(live.constraints);
-      coerced = std::move(live.coerced_columns);
-      json_columns = std::move(live.json_columns);
-      blob_columns = std::move(live.blob_columns);
-      writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
+      live = LanceTableSchema::FromDataset(context, dataset);
     } catch (...) {
       lance_close_dataset(dataset);
       return nullptr;
     }
+    try {
+      live.LoadTableComment(dataset);
+    } catch (...) {
+      lance_close_dataset(dataset);
+      throw;
+    }
     lance_close_dataset(dataset);
+    info.columns = std::move(live.columns);
+    info.constraints = std::move(live.constraints);
+    info.comment = live.comment;
+    auto coerced = std::move(live.coerced_columns);
+    auto json_columns = std::move(live.json_columns);
+    auto blob_columns = std::move(live.blob_columns);
+    auto writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
 
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Directory;
@@ -522,9 +526,9 @@ public:
       throw IOException("Failed to open Lance namespace table: " + table_id +
                         error);
     }
-    return MakeNamespaceEntry(
-        entry_name, table_id,
-        LanceTableSchema::FromDataset(context, dataset.get()));
+    auto live = LanceTableSchema::FromDataset(context, dataset.get());
+    live.LoadTableComment(dataset.get());
+    return MakeNamespaceEntry(entry_name, table_id, std::move(live));
   }
 
   vector<Identifier> GetDefaultEntries(ClientContext &context) override {
@@ -558,6 +562,7 @@ private:
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
     info.columns = std::move(live.columns);
     info.constraints = std::move(live.constraints);
+    info.comment = live.comment;
     LanceNamespaceTableConfig cfg;
     cfg.kind = LanceNamespaceKind::Rest;
     cfg.endpoint = endpoint;

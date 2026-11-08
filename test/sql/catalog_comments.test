@@ -1,0 +1,61 @@
+# name: test/sql/catalog_comments.test
+# description: COMMENT ON survives DETACH and ATTACH of a Lance namespace
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/catalog_comments' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.t AS SELECT 1::BIGINT AS id, 'a' AS status;
+
+statement ok
+COMMENT ON TABLE ns.main.t IS 'orders';
+
+statement ok
+COMMENT ON COLUMN ns.main.t.status IS 'order status';
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/catalog_comments' AS ns (TYPE LANCE);
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'ns' AND table_name = 't';
+----
+orders
+
+query TT
+SELECT column_name, comment FROM duckdb_columns()
+WHERE database_name = 'ns' AND table_name = 't' ORDER BY column_index;
+----
+id	NULL
+status	order status
+
+# Column names are not parsed as Lance field paths.
+statement ok
+CREATE TABLE ns.main.quoted AS SELECT 1::BIGINT AS "a`b";
+
+statement ok
+COMMENT ON TABLE ns.main.quoted IS 'quoted';
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/catalog_comments' AS ns (TYPE LANCE);
+
+query TT
+SELECT t.comment, c.column_name
+FROM duckdb_tables() t JOIN duckdb_columns() c USING (database_name, table_name)
+WHERE database_name = 'ns' AND table_name = 'quoted';
+----
+quoted	a`b
+
+# A second connection discovers the table with its comments as well.
+query T con2
+SELECT comment FROM duckdb_tables() WHERE database_name = 'ns' AND table_name = 't';
+----
+orders
