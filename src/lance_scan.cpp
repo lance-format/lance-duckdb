@@ -3733,10 +3733,29 @@ static void LanceExecGetMetrics(TableFunctionGetMetricsInput &input) {
   input.operator_metrics.SetExtraInfo(std::move(result));
 }
 
+// A plan cannot rebuild these scans from their serialized form: an attached
+// table's scan is bound from its catalog entry and is not in the function
+// catalog, and `__lance_exec` rebound from its serialized arguments receives a
+// corrupted exec IR. Reporting that the way DuckDB's own scans do lets
+// optimizers that copy plans (CTE inlining, window self-joins) keep the
+// original plan instead of failing the query.
+static void LanceScanSerialize(Serializer &, const optional_ptr<FunctionData>,
+                               const BoundTableFunction &function) {
+  throw NotImplementedException("%s cannot be serialized", function.GetName());
+}
+
+static unique_ptr<FunctionData>
+LanceScanDeserialize(Deserializer &, BoundTableFunction &function) {
+  throw NotImplementedException("%s cannot be deserialized",
+                                function.GetName());
+}
+
 static TableFunction LanceExecFunction() {
   TableFunction function(
       "__lance_exec", {LogicalType::VARCHAR, LogicalType::BLOB}, LanceExecFunc,
       LanceExecBind, LanceExecInitGlobal, LanceExecLocalInit);
+  function.serialize = LanceScanSerialize;
+  function.deserialize = LanceScanDeserialize;
   function.to_string = LanceExecToString;
   function.get_metrics = LanceExecGetMetrics;
   return function;
