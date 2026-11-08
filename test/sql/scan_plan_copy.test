@@ -1,0 +1,36 @@
+# name: test/sql/scan_plan_copy.test
+# description: Plans that DuckDB copies keep working over attached Lance tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT range::BIGINT AS id, (range % 7)::BIGINT AS g FROM range(1000))
+TO '{TEST_DIR}/scan_plan_copy/t.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/scan_plan_copy' AS ns (TYPE LANCE);
+
+# A CTE referenced twice under a LIMIT is inlined by copying its plan. The scan
+# of an attached table cannot be copied, so the CTE stays materialized.
+query II
+WITH c AS (SELECT id, g FROM ns.main.t WHERE g = 3)
+SELECT a.id, b.id FROM c a JOIN c b ON a.id = b.id ORDER BY a.id LIMIT 3;
+----
+3	3
+10	10
+17	17
+
+query I
+WITH c AS (SELECT id FROM ns.main.t WHERE g = 1)
+SELECT count(*) FROM (SELECT id FROM c LIMIT 5) x, (SELECT id FROM c LIMIT 5) y;
+----
+25
+
+query II
+SELECT id, row_number() OVER (PARTITION BY g ORDER BY id) AS rn
+FROM ns.main.t QUALIFY rn = 1 ORDER BY id LIMIT 3;
+----
+0	1
+1	1
+2	1
