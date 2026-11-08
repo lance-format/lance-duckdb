@@ -550,9 +550,8 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
     out_ir = std::move(children[0]);
     return true;
   }
-  return !children.empty() &&
-         TryEncodeLanceFilterIRConjunction(LanceFilterIRTag::AND, children,
-                                           out_ir);
+  return !children.empty() && TryEncodeLanceFilterIRConjunction(
+                                  LanceFilterIRTag::AND, children, out_ir);
 }
 
 LanceFilterIRBuildResult
