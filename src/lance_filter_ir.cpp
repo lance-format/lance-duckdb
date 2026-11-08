@@ -298,8 +298,8 @@ static bool TryGetLanceContainmentFunctionName(const string &duckdb_name,
   return false;
 }
 
-// `skipped_optional` is set when optional children of the filter's top-level
-// AND were left out of `out_ir`.
+// `skipped_optional` is set when optional conjuncts of the filter's AND chain
+// were left out of `out_ir`.
 static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
                                            const TableFilter &filter,
                                            string &out_ir,
@@ -526,25 +526,36 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
   if (!expression_filter.expr) {
     return false;
   }
-  auto &root = *expression_filter.expr;
-  if (root.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
-      root.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
-    return build_from_expr(root, out_ir);
-  }
+  // TableFilterSet::PushFilter nests an AND per filter pushed to a column, so
+  // the optional conjuncts can sit at any depth of the AND chain. They are
+  // left out there only: under OR or NOT a missing operand would change the
+  // predicate, so those subtrees keep requiring every operand to encode.
   vector<string> children;
-  for (auto &child : root.Cast<BoundConjunctionExpression>().GetChildren()) {
-    if (!child) {
-      return false;
+  std::function<bool(const Expression &)> collect_conjuncts =
+      [&](const Expression &expr) -> bool {
+    if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+        expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+      for (auto &child :
+           expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+        if (!child || !collect_conjuncts(*child)) {
+          return false;
+        }
+      }
+      return true;
     }
-    if (ExpressionFilter::IsOptionalExpression(*child)) {
+    if (ExpressionFilter::IsOptionalExpression(expr)) {
       skipped_optional = true;
-      continue;
+      return true;
     }
     string child_ir;
-    if (!build_from_expr(*child, child_ir)) {
+    if (!build_from_expr(expr, child_ir)) {
       return false;
     }
     children.push_back(std::move(child_ir));
+    return true;
+  };
+  if (!collect_conjuncts(*expression_filter.expr)) {
+    return false;
   }
   if (children.size() == 1) {
     out_ir = std::move(children[0]);
