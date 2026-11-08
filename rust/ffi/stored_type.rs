@@ -45,11 +45,10 @@ fn representation_change(field: &Field, stored: &Field) -> Option<bool> {
                 == std::mem::discriminant(stored.data_type());
             Some(representation_change(item, stored_item)? || !same_kind)
         }
-        (DataType::FixedSizeList(item, size), DataType::FixedSizeList(stored_item, stored_size))
-            if size == stored_size =>
-        {
-            representation_change(item, stored_item)
-        }
+        (
+            DataType::FixedSizeList(item, size),
+            DataType::FixedSizeList(stored_item, stored_size),
+        ) if size == stored_size => representation_change(item, stored_item),
         (DataType::Map(entries, _), DataType::Map(stored_entries, _)) => {
             representation_change(entries, stored_entries)
         }
@@ -138,7 +137,9 @@ fn may_truncate(from: &DataType, to: &DataType) -> bool {
         }
         (
             DataType::List(item) | DataType::LargeList(item) | DataType::FixedSizeList(item, _),
-            DataType::List(to_item) | DataType::LargeList(to_item) | DataType::FixedSizeList(to_item, _),
+            DataType::List(to_item)
+            | DataType::LargeList(to_item)
+            | DataType::FixedSizeList(to_item, _),
         )
         | (DataType::Map(item, _), DataType::Map(to_item, _)) => {
             may_truncate(item.data_type(), to_item.data_type())
@@ -157,8 +158,12 @@ fn may_truncate(from: &DataType, to: &DataType) -> bool {
 
 /// `field` restated with the type and metadata the destination records.
 pub(super) fn stored_field(field: &Field, stored: &Field) -> Field {
-    Field::new(field.name(), stored.data_type().clone(), field.is_nullable())
-        .with_metadata(stored.metadata().clone())
+    Field::new(
+        field.name(),
+        stored.data_type().clone(),
+        field.is_nullable(),
+    )
+    .with_metadata(stored.metadata().clone())
 }
 
 /// Casts every column of `batch` that `needs_stored_cast` selects to its
@@ -326,11 +331,22 @@ mod tests {
             &with_json(lance_arrow::json::json_field("j", true), "UTC")
         ));
         // Values DuckDB reads as another SQL type are left to Lance's check.
-        let ts = |tz: Option<&str>| field(DataType::Timestamp(TimeUnit::Microsecond, tz.map(Into::into)));
+        let ts = |tz: Option<&str>| {
+            field(DataType::Timestamp(
+                TimeUnit::Microsecond,
+                tz.map(Into::into),
+            ))
+        };
         assert!(!needs_stored_cast(&field(DataType::Int64), &ts(None)));
         assert!(!needs_stored_cast(&ts(None), &ts(Some("UTC"))));
-        assert!(!needs_stored_cast(&field(DataType::Int32), &field(DataType::Int64)));
-        assert!(!needs_stored_cast(&field(DataType::Int32), &field(DataType::Date32)));
+        assert!(!needs_stored_cast(
+            &field(DataType::Int32),
+            &field(DataType::Int64)
+        ));
+        assert!(!needs_stored_cast(
+            &field(DataType::Int32),
+            &field(DataType::Date32)
+        ));
     }
 
     #[test]
