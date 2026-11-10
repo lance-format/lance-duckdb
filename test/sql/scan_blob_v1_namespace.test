@@ -1,0 +1,73 @@
+# name: test/sql/scan_blob_v1_namespace.test
+# description: Attached Blob v1 columns materialize as BLOB bytes
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/data' AS blob_v1_ns (TYPE LANCE);
+
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE blob_v1_ns.main.blob_v1_reads)
+ORDER BY column_name;
+----
+id	BIGINT
+payload	BLOB
+
+query I
+SELECT count(*)
+FROM blob_v1_ns.main.blob_v1_reads;
+----
+4
+
+# Projecting only the non-blob column must not depend on the blob reader.
+query I
+SELECT id
+FROM blob_v1_ns.main.blob_v1_reads
+ORDER BY id;
+----
+0
+1
+2
+3
+
+# The original report projected the blob column directly after ATTACH.
+query TI
+SELECT id, octet_length(payload)
+FROM blob_v1_ns.main.blob_v1_reads
+LIMIT 1;
+----
+0	13
+
+query T
+SELECT hex(payload)
+FROM blob_v1_ns.main.blob_v1_reads
+WHERE id = 0;
+----
+6C65676163792D696E6C696E65
+
+query I
+SELECT id
+FROM blob_v1_ns.main.blob_v1_reads
+WHERE payload = 'legacy-inline'::BLOB;
+----
+0
+
+# A filtered projection still materializes the selected blob and preserves NULL.
+query TI
+SELECT id, octet_length(payload)
+FROM blob_v1_ns.main.blob_v1_reads
+WHERE id = 0;
+----
+0	13
+
+query I
+SELECT octet_length(payload)
+FROM blob_v1_ns.main.blob_v1_reads
+WHERE id = 2;
+----
+NULL
+
+statement ok
+DETACH blob_v1_ns;
