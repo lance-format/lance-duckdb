@@ -1,0 +1,128 @@
+# name: test/sql/scan_list_contains_pushdown.test
+# description: list_contains and array_contains keep correct rows with pushed limits
+# group: [sql]
+
+require lance
+
+# Keep row order stable so LIMIT without ORDER BY exercises the original
+# early-truncation failure: the first row does not match, the second one does.
+statement ok
+PRAGMA threads=1;
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (1::BIGINT, 'skip'::VARCHAR, ['food']::VARCHAR[]),
+    (2::BIGINT, 'keep'::VARCHAR, ['foo']::VARCHAR[]),
+    (3::BIGINT, 'keep'::VARCHAR, ['bar', 'foo']::VARCHAR[]),
+    (4::BIGINT, 'keep'::VARCHAR, NULL::VARCHAR[]),
+    (5::BIGINT, 'keep'::VARCHAR, ['foo', NULL]::VARCHAR[]),
+    (6::BIGINT, 'keep'::VARCHAR, []::VARCHAR[])
+  ) t(id, grp, tags)
+) TO '__TEST_DIR__/scan_list_contains/tags.lance' (FORMAT lance, mode 'overwrite');
+
+# --- replacement scans ---
+
+query I
+SELECT id
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE list_contains(tags, 'foo')
+ORDER BY id;
+----
+2
+3
+5
+
+query I
+SELECT id
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE array_contains(tags, 'foo')
+ORDER BY id;
+----
+2
+3
+5
+
+# The first row does not match. Returning an empty result here means LIMIT was
+# applied before the containment predicate.
+query I
+SELECT id
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE list_contains(tags, 'foo')
+LIMIT 1;
+----
+2
+
+query I
+SELECT id
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE array_contains(tags, 'foo')
+LIMIT 1;
+----
+2
+
+query I
+SELECT id
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE grp = 'keep' AND list_contains(tags, 'foo')
+LIMIT 1;
+----
+2
+
+query I
+SELECT count(*)
+FROM '__TEST_DIR__/scan_list_contains/tags.lance'
+WHERE list_contains(tags, 'foo');
+----
+3
+
+# --- attached directory namespace ---
+
+statement ok
+ATTACH '__TEST_DIR__/scan_list_contains' AS list_contains_ns (TYPE LANCE);
+
+query I
+SELECT id
+FROM list_contains_ns.main.tags
+WHERE list_contains(tags, 'foo')
+ORDER BY id;
+----
+2
+3
+5
+
+query I
+SELECT id
+FROM list_contains_ns.main.tags
+WHERE array_contains(tags, 'foo')
+ORDER BY id;
+----
+2
+3
+5
+
+query I
+SELECT id
+FROM list_contains_ns.main.tags
+WHERE list_contains(tags, 'foo')
+LIMIT 1;
+----
+2
+
+query I
+SELECT count(*)
+FROM list_contains_ns.main.tags
+WHERE list_contains(tags, 'foo');
+----
+3
+
+query I
+SELECT id
+FROM list_contains_ns.main.tags
+WHERE grp = 'keep' AND array_contains(tags, 'foo')
+LIMIT 1;
+----
+2
+
+statement ok
+DETACH list_contains_ns;
