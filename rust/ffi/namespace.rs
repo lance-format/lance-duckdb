@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use arrow::ffi::FFI_ArrowSchema;
 use async_trait::async_trait;
 use lance::dataset::builder::DatasetBuilder;
+use lance::session::Session;
 use lance::Dataset;
 use lance_core::Error as LanceError;
 
@@ -29,7 +30,7 @@ use super::source_resolver::{
     activate_source_resolution_for_session, normalize_s3_uri,
     resolve_dataset_storage_options_for_session,
 };
-use super::types::{DatasetHandle, SessionHandle};
+use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, export_string_list, optional_session_handle, schema_to_ffi_arrow_schema,
     to_c_string, FfiError, FfiResult, LanceStringList,
@@ -165,7 +166,7 @@ impl LanceNamespace for DescribeObservingNamespace {
 async fn load_dataset_from_namespace(
     namespace: Arc<dyn LanceNamespace>,
     table_id_segments: Vec<String>,
-    session: Option<&SessionHandle>,
+    session: Option<Arc<Session>>,
     session_ptr: *mut c_void,
 ) -> FfiResult<Dataset> {
     record_namespace_describe();
@@ -1526,12 +1527,14 @@ mod tests {
                     .collect(),
                 ..Default::default()
             };
-            buffers
-                .key_ptrs
-                .extend(buffers.keys.iter().map(|key| key.as_ptr()));
-            buffers
-                .value_ptrs
-                .extend(buffers.values.iter().map(|value| value.as_ptr()));
+            let TestResolverBuffers {
+                keys,
+                values,
+                key_ptrs,
+                value_ptrs,
+            } = &mut *buffers;
+            key_ptrs.extend(keys.iter().map(|key| key.as_ptr()));
+            value_ptrs.extend(values.iter().map(|value| value.as_ptr()));
             unsafe {
                 *out_count = buffers.keys.len();
                 if buffers.keys.is_empty() {
