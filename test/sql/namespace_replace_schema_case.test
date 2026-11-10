@@ -26,10 +26,16 @@ SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/Foo.lance'
 ----
 0
 
-statement error
-SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/foo.lance';
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/nsroot_replace_schema_case/*.lance/');
 ----
-IO Error: Failed to open Lance dataset:
+1
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/nsroot_replace_schema_case/*.lance/')
+WHERE ends_with(replace(file, '\', '/'), '/Foo.lance');
+----
+1
 
 statement ok
 CREATE OR REPLACE TABLE ns.main.foo AS SELECT 11::BIGINT AS id, 'ctas'::VARCHAR AS label;
@@ -44,10 +50,16 @@ SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/Foo.lance'
 ----
 1
 
-statement error
-SELECT count(*) FROM '__TEST_DIR__/nsroot_replace_schema_case/foo.lance';
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/nsroot_replace_schema_case/*.lance/');
 ----
-IO Error: Failed to open Lance dataset:
+1
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/nsroot_replace_schema_case/*.lance/')
+WHERE ends_with(replace(file, '\', '/'), '/Foo.lance');
+----
+1
 
 statement ok
 DETACH ns;
