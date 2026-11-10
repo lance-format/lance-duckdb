@@ -19,7 +19,7 @@ class ClientContext;
 struct ArrowTableSchema;
 
 // A transient interpretation shared by catalog discovery, rebuild, and
-// freshness checks. Comments are loaded separately and never affect binding.
+// freshness checks. Comments never affect binding or freshness.
 struct LanceTableSchema {
   // Read original Arrow formats, coerce the schema in place, and populate
   // the same Arrow mapping that scan binding uses.
@@ -27,7 +27,12 @@ struct LanceTableSchema {
                                     ArrowTableSchema &arrow_table);
   static LanceTableSchema FromDataset(ClientContext &context, void *dataset);
 
+  // Reads the table comment, which COMMENT ON stores as Lance table metadata.
+  // Column comments are field metadata, which FromArrow reads.
+  void LoadTableComment(void *dataset);
+
   ColumnList columns;
+  Value comment;
   vector<unique_ptr<Constraint>> constraints;
   vector<string> coerced_columns;
   // Top-level columns whose field or a descendant carries a canonical

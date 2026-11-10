@@ -73,6 +73,11 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
     auto &field = *schema.children[i];
     ColumnDefinition column(Identifier(names[i]), types[i]);
     RestoreColumnDefault(context, field, column);
+    // COMMENT ON COLUMN stores the comment as Lance field metadata.
+    auto comment = ArrowSchemaMetadata(field.metadata).GetOption("comment");
+    if (!comment.empty()) {
+      column.SetComment(Value(comment));
+    }
     result.columns.AddColumn(std::move(column));
     result.blob_columns.push_back(LanceArrowFieldContainsBlob(field));
     // Only genuinely Blob v2 fields accept the LANCE_BLOB_INPUT write type.
@@ -163,20 +168,16 @@ static unordered_map<string, string> ParseTsvKvs(const char *ptr) {
   return out;
 }
 
-static void LoadLanceColumnComments(void *dataset, ColumnList &columns) {
-  for (idx_t i = 0; i < columns.LogicalColumnCount(); i++) {
-    auto &column = columns.GetColumnMutable(LogicalIndex(i));
-    auto *metadata =
-        lance_dataset_list_field_metadata(dataset, column.Name().c_str());
-    if (!metadata) {
-      throw IOException("Failed to list field metadata from Lance dataset" +
-                        LanceFormatErrorSuffix());
-    }
-    auto kvs = ParseTsvKvs(metadata);
-    auto it = kvs.find("comment");
-    if (it != kvs.end()) {
-      column.SetComment(Value(it->second));
-    }
+void LanceTableSchema::LoadTableComment(void *dataset) {
+  auto *table_metadata = lance_dataset_list_table_metadata(dataset);
+  if (!table_metadata) {
+    throw IOException("Failed to list table metadata from Lance dataset" +
+                      LanceFormatErrorSuffix());
+  }
+  auto table_kvs = ParseTsvKvs(table_metadata);
+  auto it = table_kvs.find("comment");
+  if (it != table_kvs.end()) {
+    comment = Value(it->second);
   }
 }
 
@@ -203,13 +204,14 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   vector<string> writable_blob_v2_columns;
   try {
     auto live = LanceTableSchema::FromDataset(context, dataset);
+    live.LoadTableComment(dataset);
+    create_info.comment = live.comment;
     create_info.columns = std::move(live.columns);
     create_info.constraints = std::move(live.constraints);
     coerced = std::move(live.coerced_columns);
     json_columns = std::move(live.json_columns);
     blob_columns = std::move(live.blob_columns);
     writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
-    LoadLanceColumnComments(dataset, create_info.columns);
   } catch (...) {
     lance_close_dataset(dataset);
     throw;
@@ -227,18 +229,6 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   entry->SetJsonColumnNames(std::move(json_columns));
   entry->SetBlobColumns(std::move(blob_columns));
   entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
-
-  auto *table_md = lance_dataset_list_table_metadata(dataset);
-  if (!table_md) {
-    lance_close_dataset(dataset);
-    throw IOException("Failed to list table metadata from Lance dataset" +
-                      LanceFormatErrorSuffix());
-  }
-  auto table_kvs = ParseTsvKvs(table_md);
-  auto it = table_kvs.find("comment");
-  if (it != table_kvs.end()) {
-    entry->comment = Value(it->second);
-  }
 
   lance_close_dataset(dataset);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
