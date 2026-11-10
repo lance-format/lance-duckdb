@@ -29,6 +29,11 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                 string &out_open_path,
                                 vector<string> &out_option_keys,
                                 vector<string> &out_option_values);
+void ResolveLanceDirectoryStorageOptions(ClientContext &context,
+                                         const string &path,
+                                         string &out_open_path,
+                                         vector<string> &out_option_keys,
+                                         vector<string> &out_option_values);
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,
                                      vector<const char *> &out_key_ptrs,

@@ -1,5 +1,5 @@
 # name: test/sql/namespace_attach_s3_minio.test
-# description: ATTACH TYPE LANCE directory namespace against S3-compatible MinIO (regression for #206).
+# description: ATTACH TYPE LANCE directory namespace against S3-compatible MinIO (regressions for #206 and #221).
 # group: [sql]
 
 # Before the fix, the catalog was always empty on non-AWS S3-compatible endpoints:
@@ -28,11 +28,13 @@ require lance
 statement ok
 PREPARE resolved_s3_path AS SELECT * FROM __lance_show_auto_cleanup('s3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/alpha.lance');
 
+# Scope the secret to the namespace prefix with a trailing slash. ATTACH below
+# passes the prefix without one, so this also covers secret matching for #221.
 statement ok
-CREATE SECRET (
+CREATE SECRET directory_prefix_secret (
   TYPE LANCE,
   PROVIDER config,
-  SCOPE 's3://{LANCE_S3_BUCKET}/',
+  SCOPE 's3://{LANCE_S3_BUCKET}/{LANCE_S3_NS_PREFIX}/',
   ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
   SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
   REGION '{LANCE_S3_REGION}',
@@ -126,3 +128,45 @@ SELECT count(*) FROM ns2.main.alpha;
 
 statement ok
 DETACH ns2;
+
+# A bucket-root directory attach also needs to match a trailing-slash scope.
+# Before the fix, the trailing slash was only present in SCOPE, so the lookup
+# for 's3://bucket' did not find this secret.
+statement ok
+CREATE SECRET directory_bucket_secret (
+  TYPE LANCE,
+  PROVIDER config,
+  SCOPE 's3://{LANCE_S3_BUCKET}/',
+  ACCESS_KEY_ID '{LANCE_S3_ACCESS_KEY_ID}',
+  SECRET_ACCESS_KEY '{LANCE_S3_SECRET_ACCESS_KEY}',
+  REGION '{LANCE_S3_REGION}',
+  ENDPOINT '{LANCE_S3_ENDPOINT}',
+  VIRTUAL_HOSTED_STYLE_REQUEST false,
+  ALLOW_HTTP true
+);
+
+statement ok
+COPY (SELECT 42::BIGINT AS id)
+TO 's3://{LANCE_S3_BUCKET}/ns_attach_root_scope.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH 's3://{LANCE_S3_BUCKET}' AS ns_root (TYPE LANCE, READ_ONLY false);
+
+query I
+SELECT id FROM ns_root.main.ns_attach_root_scope;
+----
+42
+
+statement ok
+INSERT INTO ns_root.main.ns_attach_root_scope VALUES (43);
+
+query I
+SELECT sum(id) FROM ns_root.main.ns_attach_root_scope;
+----
+85
+
+statement ok
+DROP TABLE ns_root.main.ns_attach_root_scope;
+
+statement ok
+DETACH ns_root;
