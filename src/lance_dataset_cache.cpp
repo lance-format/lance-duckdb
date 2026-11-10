@@ -9,7 +9,9 @@
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 
+#include <algorithm>
 #include <functional>
 
 namespace duckdb {
@@ -239,9 +241,66 @@ string LanceBuildPathDatasetCacheKey(ClientContext &context,
                                                option_values);
 }
 
+static string LanceNamespaceSecretsFingerprint(ClientContext &context) {
+  // The namespace table's physical location is only known after describe, so
+  // the matching secret cannot be resolved while building the namespace cache
+  // key. Include the complete LANCE secret snapshot instead, so rotating a
+  // fallback secret gets a fresh entry. Namespace-vended options keep using
+  // the dynamic provider installed by the builder.
+  auto &secret_manager = SecretManager::Get(context);
+  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+  auto secrets = secret_manager.AllSecrets(transaction);
+
+  vector<string> secret_parts;
+  for (auto &entry : secrets) {
+    if (!entry.secret ||
+        !StringUtil::CIEquals(entry.secret->GetType().GetIdentifierName(),
+                              "lance")) {
+      continue;
+    }
+    auto *secret = dynamic_cast<const KeyValueSecret *>(entry.secret.get());
+    if (!secret) {
+      continue;
+    }
+
+    vector<pair<string, string>> options;
+    for (auto &kv : secret->secret_map) {
+      if (!kv.second.IsNull()) {
+        options.emplace_back(kv.first.GetIdentifierName(),
+                             kv.second.ToString());
+      }
+    }
+    std::sort(options.begin(), options.end());
+
+    string part;
+    AppendCacheKeyPart(part, entry.storage_mode);
+    AppendCacheKeyPart(part, secret->GetName().GetIdentifierName());
+    AppendCacheKeyPart(part, secret->GetProvider().GetIdentifierName());
+    AppendCacheKeyPart(part, secret->GetType().GetIdentifierName());
+    AppendCacheKeyPart(part, secret->GetScope().size());
+    for (auto &scope : secret->GetScope()) {
+      AppendCacheKeyPart(part, scope);
+    }
+    AppendCacheKeyPart(part, options.size());
+    for (auto &option : options) {
+      AppendCacheKeyPart(part, option.first);
+      AppendCacheKeyPart(part, option.second);
+    }
+    secret_parts.push_back(std::move(part));
+  }
+  std::sort(secret_parts.begin(), secret_parts.end());
+
+  string snapshot;
+  for (auto &part : secret_parts) {
+    AppendCacheKeyPart(snapshot, part);
+  }
+  return FingerprintCacheKeyPart(snapshot);
+}
+
 string LanceBuildNamespaceDatasetCacheKey(
-    const string &endpoint, const string &table_id, const string &bearer_token,
-    const string &api_key, const string &delimiter, const string &headers_tsv) {
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv) {
   string key = "namespace|";
   AppendCacheKeyPart(key, endpoint);
   AppendCacheKeyPart(key, table_id);
@@ -249,6 +308,7 @@ string LanceBuildNamespaceDatasetCacheKey(
   AppendCacheKeyPart(key, FingerprintCacheKeyPart(api_key));
   AppendCacheKeyPart(key, delimiter);
   AppendCacheKeyPart(key, FingerprintCacheKeyPart(headers_tsv));
+  AppendCacheKeyPart(key, LanceNamespaceSecretsFingerprint(context));
   return key;
 }
 
@@ -492,7 +552,8 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
     const string &bearer_token, const string &api_key, const string &delimiter,
     const string &headers_tsv, string &out_display_uri, bool *out_cache_hit) {
   auto cache_key = LanceBuildNamespaceDatasetCacheKey(
-      endpoint, table_id, bearer_token, api_key, delimiter, headers_tsv);
+      context, endpoint, table_id, bearer_token, api_key, delimiter,
+      headers_tsv);
   // Namespace tables are cached by endpoint/table id rather than by physical
   // URI, so cache hits must be revalidated through the namespace: an external
   // drop/re-create can re-point the table to a new location, which a checkout
@@ -632,7 +693,7 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
   string api_key;
   ResolveLanceNamespaceAuth(context, cfg.endpoint, overrides, bearer_token,
                             api_key);
-  return LanceBuildNamespaceDatasetCacheKey(cfg.endpoint, cfg.table_id,
+  return LanceBuildNamespaceDatasetCacheKey(context, cfg.endpoint, cfg.table_id,
                                             bearer_token, api_key,
                                             cfg.delimiter, cfg.headers_tsv);
 }

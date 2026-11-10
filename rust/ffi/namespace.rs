@@ -1,15 +1,20 @@
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::ffi::FFI_ArrowSchema;
+use async_trait::async_trait;
 use lance::dataset::builder::DatasetBuilder;
+use lance::session::Session;
+use lance::Dataset;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
-    CreateNamespaceRequest, DeclareTableRequest, DescribeTableRequest, DropNamespaceRequest,
-    DropTableRequest, ListNamespacesRequest, ListTablesRequest,
+    CreateNamespaceRequest, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
+    DescribeTableVersionResponse, DropNamespaceRequest, DropTableRequest, ListNamespacesRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
 };
 use lance_namespace::schema::convert_json_arrow_schema;
 use lance_namespace::{LanceNamespace, NamespaceError};
@@ -21,7 +26,10 @@ use crate::error::{
 use crate::runtime;
 
 use super::session::{record_dataset_open, record_namespace_describe};
-use super::source_resolver::activate_source_resolution_for_session;
+use super::source_resolver::{
+    activate_source_resolution_for_session, normalize_s3_uri,
+    resolve_dataset_storage_options_for_session,
+};
 use super::types::DatasetHandle;
 use super::util::{
     cstr_to_str, export_string_list, optional_session_handle, schema_to_ffi_arrow_schema,
@@ -76,6 +84,138 @@ fn build_config(
         builder = builder.header(key, value);
     }
     builder
+}
+
+#[derive(Clone, Debug)]
+struct NamespaceDescribeObservation {
+    location: Option<String>,
+    has_vended_storage_options: bool,
+}
+
+/// Observes the single describe performed by `DatasetBuilder::from_namespace`.
+/// The builder remains the owner of namespace-managed versioning and dynamic
+/// storage-option refresh, so all other namespace operations are delegated.
+#[derive(Debug)]
+struct DescribeObservingNamespace {
+    inner: Arc<dyn LanceNamespace>,
+    observation: Arc<Mutex<Option<NamespaceDescribeObservation>>>,
+}
+
+impl DescribeObservingNamespace {
+    fn new(inner: Arc<dyn LanceNamespace>) -> Self {
+        Self {
+            inner,
+            observation: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn observation_handle(&self) -> Arc<Mutex<Option<NamespaceDescribeObservation>>> {
+        self.observation.clone()
+    }
+}
+
+#[async_trait]
+impl LanceNamespace for DescribeObservingNamespace {
+    async fn describe_table(
+        &self,
+        request: DescribeTableRequest,
+    ) -> lance_core::Result<DescribeTableResponse> {
+        let mut response = self.inner.describe_table(request).await?;
+        response.location = response
+            .location
+            .map(|location| normalize_s3_uri(&location));
+        response.table_uri = response
+            .table_uri
+            .map(|table_uri| normalize_s3_uri(&table_uri));
+        *self.observation.lock().unwrap() = Some(NamespaceDescribeObservation {
+            location: response.location.clone(),
+            has_vended_storage_options: response
+                .storage_options
+                .as_ref()
+                .is_some_and(|options| !options.is_empty()),
+        });
+        Ok(response)
+    }
+
+    async fn describe_table_version(
+        &self,
+        request: DescribeTableVersionRequest,
+    ) -> lance_core::Result<DescribeTableVersionResponse> {
+        self.inner.describe_table_version(request).await
+    }
+
+    async fn list_table_versions(
+        &self,
+        request: ListTableVersionsRequest,
+    ) -> lance_core::Result<ListTableVersionsResponse> {
+        self.inner.list_table_versions(request).await
+    }
+
+    async fn create_table_version(
+        &self,
+        request: CreateTableVersionRequest,
+    ) -> lance_core::Result<CreateTableVersionResponse> {
+        self.inner.create_table_version(request).await
+    }
+
+    fn namespace_id(&self) -> String {
+        self.inner.namespace_id()
+    }
+}
+
+async fn load_dataset_from_namespace(
+    namespace: Arc<dyn LanceNamespace>,
+    table_id_segments: Vec<String>,
+    session: Option<Arc<Session>>,
+    session_ptr: *mut c_void,
+) -> FfiResult<Dataset> {
+    record_namespace_describe();
+    let namespace = Arc::new(DescribeObservingNamespace::new(namespace));
+    let observation = namespace.observation_handle();
+    let mut builder = DatasetBuilder::from_namespace(namespace, table_id_segments)
+        .await
+        .map_err(|err| {
+            FfiError::new(
+                namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
+                format!("namespace describe_table: {err}"),
+            )
+        })?;
+    if let Some(session) = session {
+        builder = builder.with_session(session);
+    }
+
+    let observation = observation.lock().unwrap().clone();
+    if let Some(observation) = observation {
+        // A non-empty namespace response is authoritative. Static DuckDB
+        // secrets only fill the gap when the namespace did not vend options.
+        if !observation.has_vended_storage_options {
+            if let Some(location) = observation.location {
+                let fallback =
+                    unsafe { resolve_dataset_storage_options_for_session(session_ptr, &location) }
+                        .map_err(|err| {
+                            FfiError::new(
+                                ErrorCode::DatasetOpen,
+                                format!("namespace dataset storage option fallback: {err}"),
+                            )
+                        })?;
+                if let Some(options) = fallback {
+                    builder = builder.with_storage_options(options);
+                }
+            }
+        }
+    }
+
+    let dataset = builder.load().await.map_err(|err| {
+        FfiError::new(
+            namespace_error_code(&err, ErrorCode::DatasetOpen),
+            format!("namespace dataset open: {err}"),
+        )
+    })?;
+    unsafe {
+        activate_source_resolution_for_session(session_ptr, &dataset);
+    }
+    record_dataset_open();
+    Ok(dataset)
 }
 
 fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, String>) -> String {
@@ -970,38 +1110,18 @@ fn open_dataset_in_namespace_inner(
         .collect();
 
     let (dataset, table_uri) = runtime::block_on(async move {
-        // `DatasetBuilder::from_namespace` performs the describe internally
-        // and, when the namespace vends storage options, installs Lance's
-        // dynamic storage-options provider so later credential rotation is
-        // refreshed from the namespace automatically — one describe per open,
-        // no snapshot to keep in sync.
-        record_namespace_describe();
-        let mut builder = DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
-            .await
-            .map_err(|err| {
-                FfiError::new(
-                    namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
-                    format!("namespace describe_table: {err}"),
-                )
-            })?;
-        if let Some(session) = session {
-            builder = builder.with_session(session);
-        }
-        let dataset = builder.load().await.map_err(|err| {
-            FfiError::new(
-                namespace_error_code(&err, ErrorCode::DatasetOpen),
-                format!("namespace dataset open: {err}"),
-            )
-        })?;
+        let dataset = load_dataset_from_namespace(
+            Arc::new(namespace),
+            table_id_segments,
+            session,
+            session_ptr,
+        )
+        .await?;
         let table_uri = dataset.uri().to_string();
         Ok::<_, FfiError>((Arc::new(dataset), table_uri))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
-    unsafe {
-        activate_source_resolution_for_session(session_ptr, &dataset);
-    }
-    record_dataset_open();
     Ok((DatasetHandle::new(dataset), table_uri))
 }
 
@@ -1223,8 +1343,12 @@ fn namespace_checkout_latest_if_stale_inner(
                 format!("namespace describe_table: {err}"),
             )
         })?;
-        let location = response.location;
-        let table_uri = response.table_uri;
+        let location = response
+            .location
+            .map(|location| normalize_s3_uri(&location));
+        let table_uri = response
+            .table_uri
+            .map(|table_uri| normalize_s3_uri(&table_uri));
         if location.is_none() && table_uri.is_none() {
             return Err(FfiError::new(
                 ErrorCode::NamespaceDescribeTable,
@@ -1246,28 +1370,13 @@ fn namespace_checkout_latest_if_stale_inner(
             // namespace path so managed versioning and namespace-provided
             // storage options are re-applied (this re-describes internally;
             // the extra round trip only happens on this path).
-            let mut builder =
-                DatasetBuilder::from_namespace(Arc::new(namespace), table_id_segments)
-                    .await
-                    .map_err(|err| {
-                        FfiError::new(
-                            namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
-                            format!("namespace describe_table: {err}"),
-                        )
-                    })?;
-            if let Some(session) = session {
-                builder = builder.with_session(session);
-            }
-            let reopened = builder.load().await.map_err(|err| {
-                FfiError::new(
-                    namespace_error_code(&err, ErrorCode::DatasetOpen),
-                    format!("namespace dataset open: {err}"),
-                )
-            })?;
-            unsafe {
-                activate_source_resolution_for_session(session_ptr, &reopened);
-            }
-            record_dataset_open();
+            let reopened = load_dataset_from_namespace(
+                Arc::new(namespace),
+                table_id_segments,
+                session,
+                session_ptr,
+            )
+            .await?;
             let uri = reopened.uri().to_string();
             return Ok::<_, FfiError>((Some(reopened), Some(uri)));
         }
@@ -1352,7 +1461,8 @@ pub unsafe extern "C" fn lance_json_arrow_schema_to_c(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::cell::RefCell;
+    use std::ffi::{CStr, CString};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -1367,6 +1477,136 @@ mod tests {
     use crate::ffi::source_resolver::{create_source_session, SourceResolverCallbacks};
     use crate::ffi::types::SessionHandle;
     use crate::runtime;
+
+    #[derive(Default)]
+    struct TestResolverBuffers {
+        keys: Vec<CString>,
+        values: Vec<CString>,
+        key_ptrs: Vec<*const c_char>,
+        value_ptrs: Vec<*const c_char>,
+    }
+
+    thread_local! {
+        static TEST_RESOLVER_BUFFERS: RefCell<TestResolverBuffers> =
+            RefCell::new(TestResolverBuffers::default());
+    }
+
+    struct TestSourceResolver {
+        options: Vec<(String, String)>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    unsafe extern "C" fn resolve_test_source(
+        resolver: *mut c_void,
+        uri: *const c_char,
+        out_keys: *mut *const *const c_char,
+        out_values: *mut *const *const c_char,
+        out_count: *mut usize,
+        _out_error: *mut *const c_char,
+    ) -> i32 {
+        if resolver.is_null() || uri.is_null() {
+            return -1;
+        }
+        let resolver = unsafe { &*(resolver as *const TestSourceResolver) };
+        let uri = unsafe { CStr::from_ptr(uri) }
+            .to_string_lossy()
+            .into_owned();
+        resolver.calls.lock().unwrap().push(uri);
+        TEST_RESOLVER_BUFFERS.with(|buffers| {
+            let mut buffers = buffers.borrow_mut();
+            *buffers = TestResolverBuffers {
+                keys: resolver
+                    .options
+                    .iter()
+                    .map(|(key, _)| CString::new(key.as_str()).unwrap())
+                    .collect(),
+                values: resolver
+                    .options
+                    .iter()
+                    .map(|(_, value)| CString::new(value.as_str()).unwrap())
+                    .collect(),
+                ..Default::default()
+            };
+            let TestResolverBuffers {
+                keys,
+                values,
+                key_ptrs,
+                value_ptrs,
+            } = &mut *buffers;
+            key_ptrs.extend(keys.iter().map(|key| key.as_ptr()));
+            value_ptrs.extend(values.iter().map(|value| value.as_ptr()));
+            unsafe {
+                *out_count = buffers.keys.len();
+                if buffers.keys.is_empty() {
+                    *out_keys = ptr::null();
+                    *out_values = ptr::null();
+                } else {
+                    *out_keys = buffers.key_ptrs.as_ptr();
+                    *out_values = buffers.value_ptrs.as_ptr();
+                }
+            }
+        });
+        0
+    }
+
+    unsafe extern "C" fn release_test_source(_: *mut c_void) {
+        TEST_RESOLVER_BUFFERS.with(|buffers| {
+            *buffers.borrow_mut() = TestResolverBuffers::default();
+        });
+    }
+
+    unsafe extern "C" fn destroy_test_source(resolver: *mut c_void) {
+        if !resolver.is_null() {
+            drop(unsafe { Box::from_raw(resolver as *mut TestSourceResolver) });
+        }
+    }
+
+    fn create_test_source_session(
+        parent: &SessionHandle,
+        options: Vec<(&str, &str)>,
+    ) -> (SessionHandle, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let resolver = Box::new(TestSourceResolver {
+            options: options
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            calls: calls.clone(),
+        });
+        let session = create_source_session(
+            parent,
+            SourceResolverCallbacks {
+                resolver: Box::into_raw(resolver) as *mut c_void,
+                resolve_source: Some(resolve_test_source),
+                release_source: Some(release_test_source),
+                destroy: Some(destroy_test_source),
+            },
+        )
+        .unwrap();
+        (session, calls)
+    }
+
+    fn dataset_storage_options(handle: *mut c_void) -> std::collections::HashMap<String, String> {
+        let handle = unsafe { &*(handle as *const DatasetHandle) };
+        handle
+            .dataset
+            .store_params()
+            .and_then(|params| params.storage_options())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn create_parent_session() -> Box<SessionHandle> {
+        unsafe {
+            Box::from_raw(crate::ffi::session::lance_create_session(0, 0) as *mut SessionHandle)
+        }
+    }
+
+    fn last_error_message() -> String {
+        unsafe { CStr::from_ptr(crate::error::lance_last_error_message()) }
+            .to_string_lossy()
+            .into_owned()
+    }
 
     /// Commit a batch to `uri` through the Lance Rust API, bypassing any FFI
     /// dataset handle (i.e. acting as an external writer).
@@ -1544,6 +1784,207 @@ mod tests {
                 -1
             );
         }
+    }
+
+    #[test]
+    fn namespace_open_falls_back_to_duckdb_secret() {
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        for (case, storage_options) in [("missing", ""), ("empty", ",\"storage_options\":{}")] {
+            let base = std::env::temp_dir().join(format!(
+                "ffi-ns-secret-fallback-{case}-{}",
+                rand::random::<u64>()
+            ));
+            let table = base.join("t.lance");
+            let uri = table.to_string_lossy().to_string();
+            external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+
+            let body = Arc::new(Mutex::new(format!(
+                "{{\"location\": \"{uri}\"{storage_options}}}"
+            )));
+            let (endpoint, stop, requests) = spawn_describe_server(body, None);
+
+            unsafe {
+                let endpoint_c = CString::new(endpoint).unwrap();
+                let table_id_c = CString::new("t").unwrap();
+                let parent = create_parent_session();
+                let (session, calls) =
+                    create_test_source_session(&parent, vec![("test_option", "from-secret")]);
+
+                let mut opened_uri: *const c_char = ptr::null();
+                let handle = lance_open_dataset_in_namespace_with_session(
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    &session as *const _ as *mut c_void,
+                    &mut opened_uri,
+                );
+                assert!(!handle.is_null(), "{case}: {}", last_error_message());
+                if !opened_uri.is_null() {
+                    crate::error::lance_free_string(opened_uri);
+                }
+                assert_eq!(lance_dataset_count_rows(handle), 3);
+                assert_eq!(
+                    dataset_storage_options(handle)
+                        .get("test_option")
+                        .map(String::as_str),
+                    Some("from-secret")
+                );
+                assert_eq!(*calls.lock().unwrap(), vec![uri.clone()]);
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    1,
+                    "fallback must reuse the open's describe"
+                );
+
+                lance_close_dataset(handle);
+            }
+
+            *stop.lock().unwrap() = true;
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn namespace_open_prefers_vended_storage_options_over_duckdb_secret() {
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        let base = std::env::temp_dir().join(format!("ffi-ns-vended-{}", rand::random::<u64>()));
+        let table = base.join("t.lance");
+        let uri = table.to_string_lossy().to_string();
+        external_write(&uri, vec![1, 2], WriteMode::Create);
+
+        let body = Arc::new(Mutex::new(format!(
+            "{{\"location\": \"{uri}\", \"storage_options\": {{\"test_option\": \"vended\"}}}}"
+        )));
+        let (endpoint, stop, requests) = spawn_describe_server(body, None);
+
+        unsafe {
+            let endpoint_c = CString::new(endpoint).unwrap();
+            let table_id_c = CString::new("t").unwrap();
+            let parent = create_parent_session();
+            let (session, calls) =
+                create_test_source_session(&parent, vec![("test_option", "from-secret")]);
+
+            let mut opened_uri: *const c_char = ptr::null();
+            let handle = lance_open_dataset_in_namespace_with_session(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &session as *const _ as *mut c_void,
+                &mut opened_uri,
+            );
+            assert!(!handle.is_null(), "{}", last_error_message());
+            if !opened_uri.is_null() {
+                crate::error::lance_free_string(opened_uri);
+            }
+            assert_eq!(lance_dataset_count_rows(handle), 2);
+            assert_eq!(
+                dataset_storage_options(handle)
+                    .get("test_option")
+                    .map(String::as_str),
+                Some("vended")
+            );
+            assert!(calls.lock().unwrap().is_empty());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+
+            lance_close_dataset(handle);
+        }
+
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn namespace_moved_reopen_uses_duckdb_secret_fallback() {
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+
+        let base =
+            std::env::temp_dir().join(format!("ffi-ns-moved-fallback-{}", rand::random::<u64>()));
+        let table_a = base.join("a.lance");
+        let table_b = base.join("b.lance");
+        let uri_a = table_a.to_string_lossy().to_string();
+        let uri_b = table_b.to_string_lossy().to_string();
+        external_write(&uri_a, vec![1, 2, 3], WriteMode::Create);
+        external_write(&uri_b, vec![10, 20], WriteMode::Create);
+
+        let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
+        let (endpoint, stop, requests) = spawn_describe_server(body.clone(), None);
+
+        unsafe {
+            let endpoint_c = CString::new(endpoint).unwrap();
+            let table_id_c = CString::new("t").unwrap();
+            let parent = create_parent_session();
+            let (initial_session, initial_calls) =
+                create_test_source_session(&parent, vec![("test_option", "from-secret")]);
+
+            let handle = lance_open_dataset_in_namespace_with_session(
+                endpoint_c.as_ptr(),
+                table_id_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                &initial_session as *const _ as *mut c_void,
+                ptr::null_mut(),
+            );
+            assert!(!handle.is_null(), "{}", last_error_message());
+            assert_eq!(
+                dataset_storage_options(handle)
+                    .get("test_option")
+                    .map(String::as_str),
+                Some("from-secret")
+            );
+
+            *body.lock().unwrap() = format!("{{\"location\": \"{uri_b}\"}}");
+            let (replacement_session, replacement_calls) =
+                create_test_source_session(&parent, vec![("test_option", "from-secret")]);
+            let mut replacement: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_namespace_checkout_latest_if_stale(
+                    handle,
+                    endpoint_c.as_ptr(),
+                    table_id_c.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null(),
+                    &replacement_session as *const _ as *mut c_void,
+                    &mut replacement,
+                    ptr::null_mut(),
+                ),
+                0,
+                "{}",
+                last_error_message()
+            );
+            assert!(!replacement.is_null());
+            assert_eq!(lance_dataset_count_rows(replacement), 2);
+            assert_eq!(
+                dataset_storage_options(replacement)
+                    .get("test_option")
+                    .map(String::as_str),
+                Some("from-secret")
+            );
+            assert_eq!(*initial_calls.lock().unwrap(), vec![uri_a]);
+            assert_eq!(*replacement_calls.lock().unwrap(), vec![uri_b]);
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                3,
+                "open, move check, and moved reopen each describe once"
+            );
+
+            lance_close_dataset(replacement);
+            lance_close_dataset(handle);
+        }
+
+        *stop.lock().unwrap() = true;
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -1815,17 +2256,38 @@ mod tests {
         let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
         let (endpoint, stop, _requests) = spawn_describe_server(body.clone(), None);
 
-        unsafe extern "C" fn deny(
-            _: *mut c_void,
-            _: *const c_char,
-            _: *mut *const *const c_char,
-            _: *mut *const *const c_char,
-            _: *mut usize,
+        unsafe extern "C" fn allow_primary_empty(
+            resolver: *mut c_void,
+            uri: *const c_char,
+            out_keys: *mut *const *const c_char,
+            out_values: *mut *const *const c_char,
+            out_count: *mut usize,
             _: *mut *const c_char,
         ) -> i32 {
-            -1
+            if resolver.is_null() || uri.is_null() {
+                return -1;
+            }
+            let allowed = unsafe { &*(resolver as *const [String; 2]) };
+            let uri = unsafe { CStr::from_ptr(uri) }.to_string_lossy();
+            if allowed.iter().any(|candidate| candidate == uri.as_ref()) {
+                unsafe {
+                    *out_keys = ptr::null();
+                    *out_values = ptr::null();
+                    *out_count = 0;
+                }
+                0
+            } else {
+                -1
+            }
         }
         unsafe extern "C" fn noop(_: *mut c_void) {}
+        unsafe extern "C" fn destroy_allowed(resolver: *mut c_void) {
+            if !resolver.is_null() {
+                unsafe {
+                    drop(Box::from_raw(resolver as *mut [String; 2]));
+                }
+            }
+        }
 
         unsafe {
             let endpoint_c = CString::new(endpoint).unwrap();
@@ -1834,10 +2296,10 @@ mod tests {
                 crate::ffi::session::lance_create_session(0, 0) as *mut SessionHandle
             );
             let callbacks = || SourceResolverCallbacks {
-                resolver: std::ptr::dangling_mut::<c_void>(),
-                resolve_source: Some(deny),
+                resolver: Box::into_raw(Box::new([uri_a.clone(), uri_b.clone()])) as *mut c_void,
+                resolve_source: Some(allow_primary_empty),
                 release_source: Some(noop),
-                destroy: Some(noop),
+                destroy: Some(destroy_allowed),
             };
             let original_session = create_source_session(&parent, callbacks()).unwrap();
             let replacement_session = create_source_session(&parent, callbacks()).unwrap();

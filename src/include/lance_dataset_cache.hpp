@@ -32,8 +32,9 @@ string LanceBuildPathDatasetCacheKey(ClientContext &context,
                                      const string &path);
 
 string LanceBuildNamespaceDatasetCacheKey(
-    const string &endpoint, const string &table_id, const string &bearer_token,
-    const string &api_key, const string &delimiter, const string &headers_tsv);
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv);
 
 string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
                                          const LanceTableEntry &table);
