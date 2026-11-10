@@ -17,6 +17,7 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::blob::{BlobWriteContext, SourceOptionsMap};
+use super::stored_type::cast_batch_to_stored;
 use super::update::{
     apply_deletions, build_row_id_index, compose_column_updates, convert_blob_batch,
     lookup_row_address, UpdateValueBatch,
@@ -442,12 +443,9 @@ fn merge_finish_uncommitted_inner(
         if !handle.insert_batches.is_empty() {
             let mut insert_batches = Vec::with_capacity(handle.insert_batches.len());
             for (batch, source_options) in handle.insert_batches.iter() {
-                insert_batches.push(convert_blob_batch(
-                    batch,
-                    &existing_schema,
-                    &blob_context,
-                    source_options,
-                )?);
+                let batch =
+                    convert_blob_batch(batch, &existing_schema, &blob_context, source_options)?;
+                insert_batches.push(cast_batch_to_stored(&batch, &existing_schema)?);
             }
 
             let mut store_params = ObjectStoreParams::default();

@@ -16,6 +16,7 @@ mod schema_evolution;
 mod search;
 mod session;
 mod source_resolver;
+mod stored_type;
 mod stream;
 mod take;
 mod types;

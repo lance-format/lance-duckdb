@@ -31,6 +31,7 @@ use super::blob::{
     BlobWriteContext, SourceOptionsMap,
 };
 use super::session::record_commit;
+use super::stored_type::{cast_to_stored, needs_stored_cast, stored_field};
 use super::util::{
     cstr_to_str, dataset_handle, optional_session_handle, slice_from_ptr, FfiError, FfiResult,
 };
@@ -764,7 +765,9 @@ fn same_lance_type(field: &Field, reference: &Field) -> bool {
 
 /// `reference` holds the destination's fields when appending; a list column
 /// converted to a fixed-size vector takes the extension the destination
-/// records for it, which `align_append_fields` could not match on the list.
+/// records for it, which `align_append_fields` could not match on the list,
+/// and a column Lance records as another type takes the stored field, which
+/// `convert_record_batch` casts it to.
 fn build_output_schema(
     input_schema: &SchemaRef,
     conversions: &[VectorConversion],
@@ -773,9 +776,6 @@ fn build_output_schema(
 ) -> Result<SchemaRef, String> {
     let blob_schema = apply_blob_output_fields(input_schema, blob_conversions);
     let mut fields = blob_schema.fields().as_ref().to_vec();
-    if conversions.is_empty() {
-        return Ok(Arc::new(Schema::new(fields)));
-    }
     for conv in conversions {
         let idx = conv.col_idx;
         if idx >= fields.len() {
@@ -802,6 +802,19 @@ fn build_output_schema(
             .and_then(|stored| align_extension_type(&converted, stored))
             .unwrap_or(converted);
     }
+    if let Some(reference) = reference {
+        for (idx, slot) in fields.iter_mut().enumerate() {
+            if blob_conversions.iter().any(|c| c.col_idx == idx) {
+                continue;
+            }
+            let Some(stored) = reference.iter().find(|f| f.name() == slot.name()) else {
+                continue;
+            };
+            if needs_stored_cast(slot, stored) {
+                *slot = Arc::new(stored_field(slot, stored));
+            }
+        }
+    }
     Ok(Arc::new(Schema::new(fields)))
 }
 
@@ -813,10 +826,6 @@ fn convert_record_batch(
     blob_context: &BlobWriteContext,
     source_options: &SourceOptionsMap,
 ) -> Result<RecordBatch, String> {
-    if conversions.is_empty() && blob_conversions.is_empty() {
-        return RecordBatch::try_new(output_schema.clone(), input_batch.columns().to_vec())
-            .map_err(|e| e.to_string());
-    }
     let mut cols = input_batch.columns().to_vec();
     // One shared ingest budget for the whole batch conversion, so N ingest
     // columns of one batch cannot accumulate N times the configured budget.
@@ -849,6 +858,11 @@ fn convert_record_batch(
         let fixed =
             convert_list_array_to_fixed_size(arr, conv.list_kind, conv.element_type, conv.dim)?;
         cols[conv.col_idx] = Arc::new(fixed);
+    }
+    for (col, field) in cols.iter_mut().zip(output_schema.fields()) {
+        if !col.data_type().equals_datatype(field.data_type()) {
+            *col = cast_to_stored(field.name(), col, field.data_type())?;
+        }
     }
     RecordBatch::try_new(output_schema.clone(), cols).map_err(|e| e.to_string())
 }
