@@ -197,6 +197,13 @@ and reads then require direct storage access):
 SET lance_namespace_query_table = false;
 ```
 
+Direct storage access prefers non-empty `storage_options` returned by the
+namespace's `describe_table` response. If that response omits the field or
+returns an empty map, the extension looks up a matching DuckDB `TYPE LANCE`
+secret by the resolved dataset location. Replacing that secret changes the
+dataset cache identity, so subsequent statements open with the new
+credentials.
+
 ```sql
 -- Select all rows
 SELECT * FROM users;

@@ -214,6 +214,16 @@ fn normalize_target_uri(uri: &str) -> String {
     uri.trim_end_matches('/').to_string()
 }
 
+pub(crate) fn normalize_s3_uri(uri: &str) -> String {
+    if let Some(rest) = uri
+        .strip_prefix("s3a://")
+        .or_else(|| uri.strip_prefix("s3n://"))
+    {
+        return format!("s3://{rest}");
+    }
+    uri.to_string()
+}
+
 fn resolved_fallback_options(params: &ObjectStoreParams) -> HashMap<String, String> {
     params
         .scoped_to_base(None)
@@ -423,6 +433,21 @@ pub(crate) unsafe fn activate_source_resolution_for_session(
     }
 }
 
+pub(crate) unsafe fn resolve_dataset_storage_options_for_session(
+    session: *mut c_void,
+    uri: &str,
+) -> Result<Option<HashMap<String, String>>, Error> {
+    if session.is_null() {
+        return Ok(None);
+    }
+    let handle = unsafe { &*(session as *const SessionHandle) };
+    let Some(state) = handle.source_resolution.as_ref() else {
+        return Ok(None);
+    };
+    let options = state.resolver.resolve(&normalize_s3_uri(uri))?;
+    Ok((!options.is_empty()).then_some(options))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +466,14 @@ mod tests {
             "s3://bucket/table.lance-other/file",
             "s3://bucket/table.lance"
         ));
+    }
+
+    #[test]
+    fn normalizes_emr_s3_schemes_for_secret_lookup() {
+        assert_eq!(normalize_s3_uri("s3a://bucket/table"), "s3://bucket/table");
+        assert_eq!(normalize_s3_uri("s3n://bucket/table"), "s3://bucket/table");
+        assert_eq!(normalize_s3_uri("s3://bucket/table"), "s3://bucket/table");
+        assert_eq!(normalize_s3_uri("gs://bucket/table"), "gs://bucket/table");
     }
 
     #[test]
