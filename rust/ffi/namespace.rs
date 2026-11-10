@@ -2256,17 +2256,38 @@ mod tests {
         let body = Arc::new(Mutex::new(format!("{{\"location\": \"{uri_a}\"}}")));
         let (endpoint, stop, _requests) = spawn_describe_server(body.clone(), None);
 
-        unsafe extern "C" fn deny(
-            _: *mut c_void,
-            _: *const c_char,
-            _: *mut *const *const c_char,
-            _: *mut *const *const c_char,
-            _: *mut usize,
+        unsafe extern "C" fn allow_primary_empty(
+            resolver: *mut c_void,
+            uri: *const c_char,
+            out_keys: *mut *const *const c_char,
+            out_values: *mut *const *const c_char,
+            out_count: *mut usize,
             _: *mut *const c_char,
         ) -> i32 {
-            -1
+            if resolver.is_null() || uri.is_null() {
+                return -1;
+            }
+            let allowed = unsafe { &*(resolver as *const [String; 2]) };
+            let uri = unsafe { CStr::from_ptr(uri) }.to_string_lossy();
+            if allowed.iter().any(|candidate| candidate == uri.as_ref()) {
+                unsafe {
+                    *out_keys = ptr::null();
+                    *out_values = ptr::null();
+                    *out_count = 0;
+                }
+                0
+            } else {
+                -1
+            }
         }
         unsafe extern "C" fn noop(_: *mut c_void) {}
+        unsafe extern "C" fn destroy_allowed(resolver: *mut c_void) {
+            if !resolver.is_null() {
+                unsafe {
+                    drop(Box::from_raw(resolver as *mut [String; 2]));
+                }
+            }
+        }
 
         unsafe {
             let endpoint_c = CString::new(endpoint).unwrap();
@@ -2275,10 +2296,10 @@ mod tests {
                 crate::ffi::session::lance_create_session(0, 0) as *mut SessionHandle
             );
             let callbacks = || SourceResolverCallbacks {
-                resolver: std::ptr::dangling_mut::<c_void>(),
-                resolve_source: Some(deny),
+                resolver: Box::into_raw(Box::new([uri_a.clone(), uri_b.clone()])) as *mut c_void,
+                resolve_source: Some(allow_primary_empty),
                 release_source: Some(noop),
-                destroy: Some(noop),
+                destroy: Some(destroy_allowed),
             };
             let original_session = create_source_session(&parent, callbacks()).unwrap();
             let replacement_session = create_source_session(&parent, callbacks()).unwrap();
