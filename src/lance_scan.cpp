@@ -569,6 +569,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
         filter_sel(STANDARD_VECTOR_SIZE) {}
 
   DataChunk scan_converted;
+  unique_ptr<LanceNamespaceResult> namespace_result;
   DataChunk deferred_converted;
   shared_ptr<ArrowArrayWrapper> deferred_arrow_owner;
   void *stream = nullptr;
@@ -1822,6 +1823,10 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   }
   result->scan_converted.Initialize(context.client,
                                     scan_global.scan_converted_types);
+  if (scan_global.use_namespace_query) {
+    result->namespace_result = make_uniq<LanceNamespaceResult>(
+        scan_global.scan_column_names, scan_global.scan_converted_types);
+  }
   if (scan_global.deferred_materialization) {
     result->deferred_converted.Initialize(context.client,
                                           scan_global.deferred_column_types);
@@ -1988,9 +1993,11 @@ static bool LanceScanLoadNextBatch(LanceScanLocalState &local_state) {
   auto &new_chunk = exported.array;
   auto &tmp_schema = exported.schema.arrow_schema;
 
-  if (local_state.global_state && tmp_schema.n_children > 0 &&
-      new_chunk->arrow_array.n_children == tmp_schema.n_children &&
-      !local_state.global_state->scan_column_names.empty()) {
+  if (local_state.namespace_result) {
+    local_state.namespace_result->SetBatch(local_state, exported);
+  } else if (local_state.global_state && tmp_schema.n_children > 0 &&
+             new_chunk->arrow_array.n_children == tmp_schema.n_children &&
+             !local_state.global_state->scan_column_names.empty()) {
     unordered_map<string, idx_t> idx_by_name;
     idx_t child_count = NumericCast<idx_t>(tmp_schema.n_children);
     idx_by_name.reserve(child_count);
@@ -2207,8 +2214,13 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
 
     local_state.scan_converted.Reset();
     local_state.scan_converted.SetChildCardinality(output_size);
-    ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
-                                      local_state.scan_converted);
+    if (local_state.namespace_result) {
+      local_state.namespace_result->Scan(local_state,
+                                         local_state.scan_converted);
+    } else {
+      ArrowTableFunction::ArrowToDuckDB(local_state, arrow_columns,
+                                        local_state.scan_converted);
+    }
 
     auto fill_output_from_converted = [&](DataChunk &target) {
       if (target.ColumnCount() !=
@@ -3805,40 +3817,14 @@ static TableFunction LanceTableScanFunction() {
   return function;
 }
 
-static void PopulateNamespaceQueryScanSchema(ClientContext &context,
-                                             const LanceTableEntry &table,
+static void PopulateNamespaceQueryScanSchema(const LanceTableEntry &table,
                                              LanceScanBindData &result) {
-  vector<string> field_names;
-  vector<LogicalType> field_types;
-  field_names.reserve(table.GetColumns().PhysicalColumnCount());
-  field_types.reserve(table.GetColumns().PhysicalColumnCount());
   for (auto &column : table.GetColumns().Physical()) {
-    field_names.push_back(column.Name().GetIdentifierName());
-    field_types.push_back(column.Type());
+    result.names.push_back(column.Name().GetIdentifierName());
+    result.types.push_back(column.Type());
   }
-
-  memset(&result.schema_root.arrow_schema, 0,
-         sizeof(result.schema_root.arrow_schema));
-  auto properties = context.GetClientProperties();
-  ArrowConverter::ToArrowSchema(&result.schema_root.arrow_schema, field_types,
-                                field_names, properties);
-  LanceCoerceArrowSchemaForDuckDB(&result.schema_root.arrow_schema);
-  ArrowTableFunction::PopulateArrowTableSchema(context, result.arrow_table,
-                                               result.schema_root.arrow_schema);
-  result.names = result.arrow_table.GetNames();
-  result.types = result.arrow_table.GetTypes();
   result.json_columns = table.JsonColumnNames();
   result.blob_columns = table.GetBlobColumns();
-
-  field_names.push_back(LANCE_ROW_ID_COLUMN_NAME);
-  field_types.push_back(LogicalType::UBIGINT);
-  memset(&result.scan_schema_root.arrow_schema, 0,
-         sizeof(result.scan_schema_root.arrow_schema));
-  ArrowConverter::ToArrowSchema(&result.scan_schema_root.arrow_schema,
-                                field_types, field_names, properties);
-  LanceCoerceArrowSchemaForDuckDB(&result.scan_schema_root.arrow_schema);
-  ArrowTableFunction::PopulateArrowTableSchema(
-      context, result.scan_arrow_table, result.scan_schema_root.arrow_schema);
 }
 
 TableFunction
@@ -3852,7 +3838,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       LanceNamespaceQueryTableEnabled(context)) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());
-    PopulateNamespaceQueryScanSchema(context, *this, *result);
+    PopulateNamespaceQueryScanSchema(*this, *result);
     bind_data = std::move(result);
     auto function = LanceTableScanFunction();
     function.sampling_pushdown = false;

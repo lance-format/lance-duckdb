@@ -180,6 +180,14 @@ reads the Arrow IPC response. Reads therefore do not require DuckDB to open the
 underlying object-store location directly. Unsupported predicates remain in
 DuckDB, and an `OFFSET` without a `LIMIT` is also evaluated by DuckDB.
 
+Results are matched by column name and decoded using the Arrow types in the
+response, including dictionary and large-offset encodings. Missing or duplicate
+columns and incompatible SQL types produce an error. Namespace searches also
+preserve catalog types such as UUID. REST descriptions represent timestamps in
+microseconds without a timezone; response timestamps preserve their epoch value
+when converted to that type, and sub-microsecond values that cannot be represented
+exactly produce an error.
+
 If the namespace server does not implement `query_table`, disable the
 `lance_namespace_query_table` setting to scan by opening the underlying
 dataset directly (table locations are still resolved through the namespace,
