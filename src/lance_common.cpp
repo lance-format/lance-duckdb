@@ -287,6 +287,27 @@ void ResolveLanceStorageOptions(ClientContext &context, const string &path,
                                      out_values);
 }
 
+void ResolveLanceDirectoryStorageOptions(ClientContext &context,
+                                         const string &path,
+                                         string &out_open_path,
+                                         vector<string> &out_option_keys,
+                                         vector<string> &out_option_values) {
+  out_open_path = LanceNormalizeS3Scheme(path);
+  out_option_keys.clear();
+  out_option_values.clear();
+
+  // A directory namespace root is itself a URI prefix. Secrets that target the
+  // root commonly end their scope with '/', so query the secret manager with a
+  // trailing separator while keeping the root passed to Lance unchanged.
+  auto secret_path = out_open_path;
+  if (!secret_path.empty() && secret_path.back() != '/' &&
+      secret_path.back() != '\\') {
+    secret_path += '/';
+  }
+  LanceFillStorageOptionsFromSecrets(context, secret_path, out_option_keys,
+                                     out_option_values);
+}
+
 void BuildStorageOptionPointerArrays(const vector<string> &option_keys,
                                      const vector<string> &option_values,
                                      vector<const char *> &out_key_ptrs,
@@ -468,8 +489,8 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   string open_root;
   vector<string> option_keys;
   vector<string> option_values;
-  ResolveLanceStorageOptions(context, root, open_root, option_keys,
-                             option_values);
+  ResolveLanceDirectoryStorageOptions(context, root, open_root, option_keys,
+                                      option_values);
 
   vector<const char *> key_ptrs;
   vector<const char *> value_ptrs;

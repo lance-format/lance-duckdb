@@ -2100,8 +2100,8 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
     vector<string> option_keys;
     vector<string> option_values;
     string open_root;
-    ResolveLanceStorageOptions(context, root, open_root, option_keys,
-                               option_values);
+    ResolveLanceDirectoryStorageOptions(context, root, open_root, option_keys,
+                                        option_values);
 
     string list_error;
     vector<string> discovered_tables;

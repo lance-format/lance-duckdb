@@ -52,6 +52,8 @@ Secrets are matched using DuckDB's Secret Manager prefix matching:
 
 - `SCOPE` should be a URI prefix (e.g. `s3://bucket/`, `gs://bucket/`, `az://container/`).
 - The best (longest) matching prefix is used when opening a dataset.
+- Directory namespace roots are matched as prefixes, so `SCOPE 's3://bucket/prefix/'` also matches
+  `ATTACH 's3://bucket/prefix' (TYPE LANCE)` without the trailing slash.
 
 ### Parameter Binding and Forwarding
 
