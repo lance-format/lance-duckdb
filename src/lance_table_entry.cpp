@@ -343,8 +343,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
           vector<unique_ptr<Expression>> bound_defaults;
           default_binder->BindDefaultValue(
               add.new_column, bound_defaults,
-              catalog.GetName().GetIdentifierName(),
-              schema.name.GetIdentifierName());
+              catalog.GetName().GetIdentifierName(), schema.GetSchemaPath());
           if (bound_defaults.size() != 1 || !bound_defaults[0]) {
             throw InternalException(
                 "DuckDB default binder returned an unexpected result");
