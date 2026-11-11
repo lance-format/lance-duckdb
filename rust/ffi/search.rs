@@ -439,51 +439,7 @@ fn create_hybrid_batch(
     let fts_rows = collect_row_f32_pairs(&mut fts_stream, ROW_ID_COLUMN, SCORE_COLUMN)
         .map_err(|err| FfiError::new(ErrorCode::HybridStreamCreate, err))?;
 
-    let alpha = alpha.clamp(0.0, 1.0);
-
-    let (dist_min, dist_max) = finite_min_max(vector_rows.iter().map(|(_, v)| *v));
-    let (score_min, score_max) = finite_min_max(fts_rows.iter().map(|(_, v)| *v));
-
-    let mut merged = std::collections::HashMap::<u64, (Option<f32>, Option<f32>)>::new();
-    for (rowid, dist) in vector_rows {
-        merged
-            .entry(rowid)
-            .and_modify(|e| {
-                e.0 = match e.0 {
-                    Some(old) => Some(old.min(dist)),
-                    None => Some(dist),
-                }
-            })
-            .or_insert((Some(dist), None));
-    }
-    for (rowid, score) in fts_rows {
-        merged
-            .entry(rowid)
-            .and_modify(|e| {
-                e.1 = match e.1 {
-                    Some(old) => Some(old.max(score)),
-                    None => Some(score),
-                }
-            })
-            .or_insert((None, Some(score)));
-    }
-
-    let mut ranked: Vec<(u64, Option<f32>, Option<f32>, f32)> = merged
-        .into_iter()
-        .map(|(rowid, (dist, score))| {
-            let mut hybrid = 0.0_f32;
-            if let Some(d) = dist {
-                hybrid += alpha * distance_similarity(d, dist_min, dist_max);
-            }
-            if let Some(s) = score {
-                hybrid += (1.0 - alpha) * normalize_value(s, score_min, score_max);
-            }
-            (rowid, dist, score, hybrid)
-        })
-        .collect();
-
-    ranked.sort_by(|a, b| cmp_desc_f32(b.3, a.3));
-    ranked.truncate(k);
+    let ranked = rank_hybrid(vector_rows, fts_rows, alpha, k);
 
     let row_ids: Vec<u64> = ranked.iter().map(|(rowid, _, _, _)| *rowid).collect();
     let base_columns = requested_columns
@@ -607,6 +563,65 @@ fn create_hybrid_batch(
     })
 }
 
+type HybridRow = (u64, Option<f32>, Option<f32>, f32);
+
+/// Merges the vector and FTS candidates and returns the top `k` by hybrid score.
+/// Rows with equal scores are ordered by row id, so the same candidates always give the same top k.
+fn rank_hybrid(
+    vector_rows: Vec<(u64, f32)>,
+    fts_rows: Vec<(u64, f32)>,
+    alpha: f32,
+    k: usize,
+) -> Vec<HybridRow> {
+    let alpha = alpha.clamp(0.0, 1.0);
+
+    let (dist_min, dist_max) = finite_min_max(vector_rows.iter().map(|(_, v)| *v));
+    let (score_min, score_max) = finite_min_max(fts_rows.iter().map(|(_, v)| *v));
+
+    // Ordered by row id, so the stable sort below breaks score ties by row id.
+    let mut merged = std::collections::BTreeMap::<u64, (Option<f32>, Option<f32>)>::new();
+    for (rowid, dist) in vector_rows {
+        merged
+            .entry(rowid)
+            .and_modify(|e| {
+                e.0 = match e.0 {
+                    Some(old) => Some(old.min(dist)),
+                    None => Some(dist),
+                }
+            })
+            .or_insert((Some(dist), None));
+    }
+    for (rowid, score) in fts_rows {
+        merged
+            .entry(rowid)
+            .and_modify(|e| {
+                e.1 = match e.1 {
+                    Some(old) => Some(old.max(score)),
+                    None => Some(score),
+                }
+            })
+            .or_insert((None, Some(score)));
+    }
+
+    let mut ranked: Vec<HybridRow> = merged
+        .into_iter()
+        .map(|(rowid, (dist, score))| {
+            let mut hybrid = 0.0_f32;
+            if let Some(d) = dist {
+                hybrid += alpha * distance_similarity(d, dist_min, dist_max);
+            }
+            if let Some(s) = score {
+                hybrid += (1.0 - alpha) * normalize_value(s, score_min, score_max);
+            }
+            (rowid, dist, score, hybrid)
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| cmp_desc_f32(b.3, a.3));
+    ranked.truncate(k);
+    ranked
+}
+
 fn collect_row_f32_pairs(
     stream: &mut LanceStream,
     rowid_col: &str,
@@ -697,5 +712,38 @@ fn cmp_desc_f32(a: f32, b: f32) -> std::cmp::Ordering {
                 std::cmp::Ordering::Greater
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rank_hybrid;
+
+    #[test]
+    fn hybrid_ties_are_ordered_by_row_id() {
+        // alpha = 0 ignores distances: every vector-only row scores 0, and so does the lowest FTS hit.
+        let vector_rows: Vec<(u64, f32)> = (0..8).map(|id| (id, id as f32)).collect();
+        let fts_rows = vec![(7, 2.0), (6, 1.0)];
+        let expected: Vec<u64> = vec![7, 0, 1, 2];
+        // Each call builds its maps afresh, so an order that depends on hashing differs between calls.
+        for _ in 0..50 {
+            let ranked = rank_hybrid(vector_rows.clone(), fts_rows.clone(), 0.0, 4);
+            let ids: Vec<u64> = ranked.iter().map(|row| row.0).collect();
+            assert_eq!(ids, expected);
+        }
+        let mut reversed = vector_rows.clone();
+        reversed.reverse();
+        let ranked = rank_hybrid(reversed, fts_rows, 0.0, 4);
+        assert_eq!(ranked.iter().map(|row| row.0).collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn hybrid_scores_still_decide_before_row_id() {
+        let vector_rows = vec![(1, 0.0), (2, 1.0), (3, 2.0)];
+        let ranked = rank_hybrid(vector_rows, Vec::new(), 1.0, 3);
+        assert_eq!(
+            ranked.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
