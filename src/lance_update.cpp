@@ -73,15 +73,12 @@ public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
-  PhysicalLanceUpdateValue(PhysicalPlan &physical_plan,
-                           vector<LogicalType> types_p,
-                           LanceTableEntry &table_p,
-                           shared_ptr<LanceDatasetCacheEntry> dataset_p,
-                           vector<string> set_columns_p,
-                           vector<LogicalType> set_types_p,
-                           vector<idx_t> set_chunk_indices_p,
-                           idx_t rowid_chunk_index_p, LogicalType rowid_type_p,
-                           idx_t estimated_cardinality)
+  PhysicalLanceUpdateValue(
+      PhysicalPlan &physical_plan, vector<LogicalType> types_p,
+      LanceTableEntry &table_p, shared_ptr<LanceDatasetCacheEntry> dataset_p,
+      vector<string> set_columns_p, vector<LogicalType> set_types_p,
+      vector<idx_t> set_chunk_indices_p, idx_t rowid_chunk_index_p,
+      LogicalType rowid_type_p, idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         table(table_p), dataset(std::move(dataset_p)),
@@ -206,8 +203,7 @@ public:
     gstate.update_handle = nullptr;
     if (rc != 0) {
       throw IOException("Failed to finish Lance UPDATE transaction for '" +
-                        dataset->DisplayUri() + "'" +
-                        LanceFormatErrorSuffix());
+                        dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
     }
     if (!txn) {
       return SinkFinalizeType::READY;
