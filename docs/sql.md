@@ -469,6 +469,10 @@ Notes:
 - `mode` accepts `create` (the default), `overwrite`, or `append`.
   `create` fails if the dataset already exists.
 - `data_storage_version` defaults to `2.2` when `COPY` creates or overwrites a dataset. Appends preserve the existing storage version.
+- `enable_stable_row_ids` (BOOLEAN) creates the dataset with stable row ids, so `_rowid` stays the same
+  across compaction; without them `_rowid` is the physical row address and changes when rows move. The
+  setting takes effect when the dataset is created. Appending to or overwriting a dataset with a
+  different setting is an error, and omitting the option keeps the dataset's setting.
 - `write_empty_file` defaults to `true` and controls whether an empty dataset is materialized when the input produces zero rows.
 - Floating-point list columns with consistent, nonzero dimensions are written as
   fixed-size vectors. Prefer explicit `FLOAT[N]` / `DOUBLE[N]` types when writing
@@ -496,6 +500,17 @@ DETACH ns;
 
 `CREATE TABLE` and CTAS default to data storage version `2.2`. Override it with
 `WITH (data_storage_version = '<version>')` when another version is required.
+
+`WITH (enable_stable_row_ids = true)` creates the table with stable row ids, as for `COPY`, including for
+tables created through a REST namespace. In a directory namespace, `CREATE OR REPLACE TABLE` keeps the
+existing table's setting and fails when the option asks for another one; in a REST namespace it drops and
+recreates the table, so the option (default off) applies to the new table. `CREATE TABLE` and CTAS reject
+any other `WITH` option.
+
+```sql
+CREATE TABLE ns.main.my_stable WITH (enable_stable_row_ids = true) AS
+  SELECT 1::BIGINT AS id, 'a'::VARCHAR AS s;
+```
 
 ## DML on attached tables
 

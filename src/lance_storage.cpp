@@ -652,6 +652,44 @@ GetCreateTableDataStorageVersionOption(const CreateTableInfo &create_info) {
   return value;
 }
 
+// `WITH (enable_stable_row_ids = <bool>)`; without it the setting is left to
+// the dataset.
+static int8_t
+GetCreateTableStableRowIdsOption(const CreateTableInfo &create_info) {
+  auto it = create_info.options.find("enable_stable_row_ids");
+  if (it == create_info.options.end()) {
+    return LANCE_STABLE_ROW_IDS_UNSPECIFIED;
+  }
+  if (!it->second ||
+      it->second->GetExpressionClass() != ExpressionClass::CONSTANT) {
+    throw BinderException(
+        "enable_stable_row_ids option must be a constant boolean");
+  }
+  auto value = it->second->Cast<ConstantExpression>().GetLiteral().ToValue();
+  if (value.IsNull()) {
+    throw BinderException("enable_stable_row_ids option cannot be NULL");
+  }
+  try {
+    return value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>() ? 1 : 0;
+  } catch (std::exception &) {
+    throw BinderException("enable_stable_row_ids option must be a boolean");
+  }
+}
+
+// CREATE TABLE options Lance applies. CREATE TABLE AS plans without
+// SupportsCreateTable, so both paths check them: an ignored option such as a
+// misspelled `enable_stable_row_ids` must fail, not create the wrong table.
+static void CheckCreateTableOptions(const CreateTableInfo &create_info) {
+  for (auto &entry : create_info.options) {
+    if (!StringUtil::CIEquals(entry.first, "data_storage_version") &&
+        !StringUtil::CIEquals(entry.first, "enable_stable_row_ids")) {
+      throw CatalogException("Only data_storage_version and "
+                             "enable_stable_row_ids are supported in WITH "
+                             "clause for Lance tables");
+    }
+  }
+}
+
 // The namespace is authoritative; these entries are an in-memory metadata
 // cache, not DuckDB native storage. Queries pin every generation they bind so a
 // refresh, ALTER or DROP cannot destroy an entry still used by another
@@ -960,6 +998,7 @@ public:
     }
     auto data_storage_version =
         GetCreateTableDataStorageVersionOption(create_info);
+    auto enable_stable_row_ids = GetCreateTableStableRowIdsOption(create_info);
     string dataset_path;
     vector<string> option_keys;
     vector<string> option_values;
@@ -1091,7 +1130,8 @@ public:
         value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
         LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
         LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-        LanceGetSessionHandle(context), &schema_root.arrow_schema,
+        enable_stable_row_ids, LanceGetSessionHandle(context),
+        &schema_root.arrow_schema,
         blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
         LanceBlobIngestBatchBudget(context));
     if (!writer) {
@@ -1566,12 +1606,10 @@ public:
                              "catalog",
                              GetCatalogType()));
     }
-    for (auto &entry : base.options) {
-      if (!StringUtil::CIEquals(entry.first, "data_storage_version")) {
-        return ErrorData(ExceptionType::CATALOG,
-                         "Only data_storage_version is supported in WITH "
-                         "clause for Lance tables");
-      }
+    try {
+      CheckCreateTableOptions(base);
+    } catch (CatalogException &ex) {
+      return ErrorData(ex);
     }
     return ErrorData();
   }
@@ -1620,8 +1658,10 @@ public:
       throw NotImplementedException(
           "Lance table DDL does not support explicit transactions");
     }
+    CheckCreateTableOptions(create_info);
     auto data_storage_version =
         GetCreateTableDataStorageVersionOption(create_info);
+    auto enable_stable_row_ids = GetCreateTableStableRowIdsOption(create_info);
     if (create_info.temporary) {
       throw NotImplementedException(
           "Lance ATTACH TYPE LANCE does not support TEMPORARY tables");
@@ -1639,8 +1679,9 @@ public:
             string endpoint, string namespace_id, string delimiter,
             string bearer_token_override, string api_key_override,
             string headers_tsv, string table_name, string writer_mode,
-            string data_storage_version, vector<string> column_names_p,
-            vector<LogicalType> column_types_p, idx_t estimated_cardinality)
+            string data_storage_version, int8_t enable_stable_row_ids_p,
+            vector<string> column_names_p, vector<LogicalType> column_types_p,
+            idx_t estimated_cardinality)
             : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                                std::move(types_p), estimated_cardinality),
               endpoint(std::move(endpoint)),
@@ -1652,6 +1693,7 @@ public:
               table_name(std::move(table_name)),
               writer_mode(std::move(writer_mode)),
               data_storage_version(std::move(data_storage_version)),
+              enable_stable_row_ids(enable_stable_row_ids_p),
               column_names(std::move(column_names_p)),
               column_types(std::move(column_types_p)) {}
 
@@ -1672,6 +1714,7 @@ public:
           string table_name;
           string writer_mode;
           string data_storage_version;
+          int8_t enable_stable_row_ids = LANCE_STABLE_ROW_IDS_UNSPECIFIED;
 
           string table_id;
           string open_path;
@@ -1690,6 +1733,7 @@ public:
                                string api_override_p, string headers_tsv_p,
                                string table_name_p, string writer_mode_p,
                                string data_storage_version_p,
+                               int8_t enable_stable_row_ids_p,
                                vector<string> col_names_p,
                                vector<LogicalType> col_types_p)
               : endpoint(std::move(endpoint_p)),
@@ -1701,6 +1745,7 @@ public:
                 table_name(std::move(table_name_p)),
                 writer_mode(std::move(writer_mode_p)),
                 data_storage_version(std::move(data_storage_version_p)),
+                enable_stable_row_ids(enable_stable_row_ids_p),
                 column_names(std::move(col_names_p)),
                 column_types(std::move(col_types_p)) {}
 
@@ -1717,7 +1762,8 @@ public:
           auto state = make_uniq<GlobalState>(
               endpoint, namespace_id, delimiter, bearer_token_override,
               api_key_override, headers_tsv, table_name, writer_mode,
-              data_storage_version, column_names, column_types);
+              data_storage_version, enable_stable_row_ids, column_names,
+              column_types);
 
           auto props = context.GetClientProperties();
           memset(&state->schema_root.arrow_schema, 0,
@@ -1805,7 +1851,8 @@ public:
               state->option_keys.size(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
               LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
               LANCE_DEFAULT_MAX_BYTES_PER_FILE, data_storage_version_ptr,
-              LanceGetSessionHandle(context), &state->schema_root.arrow_schema,
+              state->enable_stable_row_ids, LanceGetSessionHandle(context),
+              &state->schema_root.arrow_schema,
               blob_flags.empty() ? nullptr : blob_flags.data(),
               blob_flags.size(), LanceBlobIngestBatchBudget(context));
           if (!state->writer) {
@@ -1920,6 +1967,7 @@ public:
         string table_name;
         string writer_mode;
         string data_storage_version;
+        int8_t enable_stable_row_ids;
         vector<string> column_names;
         vector<LogicalType> column_types;
       };
@@ -1972,8 +2020,8 @@ public:
           target_ns->delimiter, target_ns->bearer_token_override,
           target_ns->api_key_override, target_ns->headers_tsv,
           create_info.GetTableName().GetIdentifierName(), mode,
-          data_storage_version, std::move(names), std::move(types),
-          op.estimated_cardinality);
+          data_storage_version, enable_stable_row_ids, std::move(names),
+          std::move(types), op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }
@@ -2016,6 +2064,10 @@ public:
     copy_info.options["mode"] = {Value(mode)};
     if (!data_storage_version.empty()) {
       copy_info.options["data_storage_version"] = {Value(data_storage_version)};
+    }
+    if (enable_stable_row_ids != LANCE_STABLE_ROW_IDS_UNSPECIFIED) {
+      copy_info.options["enable_stable_row_ids"] = {
+          Value::BOOLEAN(enable_stable_row_ids == 1)};
     }
 
     return PlanLanceCopy(

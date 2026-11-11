@@ -556,17 +556,56 @@ fn convert_list_array_to_fixed_size(
 fn existing_dataset_context(
     path: &str,
     storage_options: &HashMap<String, String>,
-) -> Option<(Schema, String)> {
+    must_resolve: bool,
+) -> FfiResult<Option<(Schema, String, bool)>> {
     let builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
         .with_storage_options(storage_options.clone());
-    let dataset = runtime::block_on(builder.load()).ok()?.ok()?;
+    let loaded = runtime::block_on(builder.load());
+    let dataset = match loaded {
+        Ok(Ok(dataset)) => dataset,
+        Ok(Err(lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. })) => {
+            return Ok(None)
+        }
+        // A write that depends on the dataset's setting must not proceed on a
+        // load failure; one that does not keeps writing, as before.
+        Ok(Err(err)) if must_resolve => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetWriteOpen,
+                format!("open existing dataset: {err}"),
+            ))
+        }
+        Err(err) if must_resolve => {
+            return Err(FfiError::new(
+                ErrorCode::DatasetWriteOpen,
+                format!("runtime: {err}"),
+            ))
+        }
+        _ => return Ok(None),
+    };
     let version = dataset
         .manifest
         .data_storage_format
         .lance_file_format()
         .to_manifest_string()
         .to_string();
-    Some((Schema::from(dataset.schema()), version))
+    Ok(Some((
+        Schema::from(dataset.schema()),
+        version,
+        dataset.manifest.uses_stable_row_ids(),
+    )))
+}
+
+/// The stable row id request of a write: `-1` leaves it unspecified.
+fn stable_row_ids_request(value: i8) -> FfiResult<Option<bool>> {
+    match value {
+        -1 => Ok(None),
+        0 => Ok(Some(false)),
+        1 => Ok(Some(true)),
+        other => Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid enable_stable_row_ids {other}"),
+        )),
+    }
 }
 
 /// Rewrites list child field names in `schema` to match `reference`.
@@ -908,6 +947,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    enable_stable_row_ids: i8,
     session: *mut c_void,
     schema: *const c_void,
     blob_columns: *const u8,
@@ -925,6 +965,7 @@ pub unsafe extern "C" fn lance_open_writer_with_storage_options(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        enable_stable_row_ids,
         session,
         schema,
         blob_columns,
@@ -953,6 +994,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    enable_stable_row_ids: i8,
     session: *mut c_void,
     schema: *const c_void,
     blob_columns: *const u8,
@@ -970,6 +1012,7 @@ pub unsafe extern "C" fn lance_open_uncommitted_writer_with_storage_options(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        enable_stable_row_ids,
         session,
         schema,
         blob_columns,
@@ -1025,6 +1068,7 @@ fn open_writer_inner(
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     data_storage_version: *const c_char,
+    enable_stable_row_ids: i8,
     session: *mut c_void,
     schema: *const c_void,
     blob_columns: *const u8,
@@ -1095,18 +1139,43 @@ fn open_writer_inner(
     // The incoming Arrow arrays are imported against `data_type`, so realigning
     // the schema without it would fail RecordBatch validation.
     let mut data_type = data_type.clone();
+    let stable_row_ids = stable_row_ids_request(enable_stable_row_ids)?;
     let mut append_reference = None;
     let mut existing_schema = None;
     let mut existing_version = None;
-    if matches!(write_mode, WriteMode::Append) {
-        if let Some((existing, version)) = existing_dataset_context(&path, &storage_options) {
-            if let Some(fields) = align_append_fields(schema.fields(), existing.fields()) {
-                data_type = DataType::Struct(fields.clone());
-                schema = Arc::new(Schema::new(fields));
+    let mut existing_stable_row_ids = None;
+    let appends = matches!(write_mode, WriteMode::Append);
+    // An existing dataset keeps its stable row id setting, so an append
+    // resolves it and an overwrite that requests one checks it. An overwrite
+    // without a request leaves the setting to Lance and needs no load.
+    if appends || (stable_row_ids.is_some() && matches!(write_mode, WriteMode::Overwrite)) {
+        if let Some((existing, version, stable)) =
+            existing_dataset_context(&path, &storage_options, stable_row_ids.is_some())?
+        {
+            existing_stable_row_ids = Some(stable);
+            if appends {
+                if let Some(fields) = align_append_fields(schema.fields(), existing.fields()) {
+                    data_type = DataType::Struct(fields.clone());
+                    schema = Arc::new(Schema::new(fields));
+                }
+                append_reference = Some(existing.fields().clone());
+                existing_version = Some(version);
+                existing_schema = Some(existing);
             }
-            append_reference = Some(existing.fields().clone());
-            existing_version = Some(version);
-            existing_schema = Some(existing);
+        }
+    }
+    if let (Some(requested), Some(existing)) = (stable_row_ids, existing_stable_row_ids) {
+        if requested != existing {
+            // Lance applies the setting only when it creates a dataset and
+            // would otherwise ignore the request.
+            return Err(FfiError::new(
+                ErrorCode::DatasetWriteOpen,
+                format!(
+                    "enable_stable_row_ids = {requested} conflicts with the existing dataset, \
+                     which {} stable row ids",
+                    if existing { "uses" } else { "does not use" }
+                ),
+            ));
         }
     }
 
@@ -1175,6 +1244,7 @@ fn open_writer_inner(
         max_rows_per_group,
         max_bytes_per_file,
         data_storage_version,
+        enable_stable_row_ids: existing_stable_row_ids.or(stable_row_ids).unwrap_or(false),
         session: session.clone(),
         store_params: Some(store_params),
         // Absolute external URIs are part of the SQL reference contract:
@@ -1559,7 +1629,7 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
         .finish()
         .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinish, e))?
         .0;
-    let (path, store_params, session) = {
+    let (path, store_params, session, stable_row_ids) = {
         let guard = handle
             .state
             .lock()
@@ -1568,9 +1638,12 @@ fn writer_finish_inner(writer: *mut c_void) -> FfiResult<()> {
             guard.path.clone(),
             guard.params.store_params.clone().unwrap_or_default(),
             guard.params.session.clone(),
+            guard.params.enable_stable_row_ids,
         )
     };
-    let mut builder = CommitBuilder::new(path.as_str()).with_store_params(store_params);
+    let mut builder = CommitBuilder::new(path.as_str())
+        .with_store_params(store_params)
+        .use_stable_row_ids(stable_row_ids);
     if let Some(session) = session {
         builder = builder.with_session(session);
     }
@@ -1627,8 +1700,16 @@ fn writer_finish_uncommitted_inner(
         .map_err(|e| FfiError::new(ErrorCode::DatasetWriteFinishUncommitted, e))?
         .0;
 
+    let stable_row_ids = handle
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .params
+        .enable_stable_row_ids;
     unsafe {
-        *out_transaction = UncommittedTransaction::new(*txn).into_raw();
+        *out_transaction = UncommittedTransaction::new(*txn)
+            .with_stable_row_ids(stable_row_ids)
+            .into_raw();
     }
 
     Ok(())
@@ -1641,6 +1722,9 @@ fn writer_finish_uncommitted_inner(
 pub(super) struct UncommittedTransaction {
     pub(super) transaction: Transaction,
     pub(super) affected_rows: Option<RowAddrTreeMap>,
+    /// Whether a commit that creates the dataset enables stable row ids; the
+    /// transaction does not carry it. An existing dataset keeps its setting.
+    stable_row_ids: bool,
 }
 
 impl UncommittedTransaction {
@@ -1648,7 +1732,13 @@ impl UncommittedTransaction {
         Self {
             transaction,
             affected_rows: None,
+            stable_row_ids: false,
         }
+    }
+
+    fn with_stable_row_ids(mut self, stable_row_ids: bool) -> Self {
+        self.stable_row_ids = stable_row_ids;
+        self
     }
 
     pub(super) fn into_raw(self) -> *mut c_void {
@@ -1664,6 +1754,7 @@ impl UncommittedTransaction {
     }
 
     fn execute(self, builder: CommitBuilder<'_>) -> FfiResult<()> {
+        let builder = builder.use_stable_row_ids(self.stable_row_ids);
         let builder = match self.affected_rows {
             Some(affected_rows) => builder.with_affected_rows(affected_rows),
             None => builder,
@@ -2198,6 +2289,7 @@ mod lifecycle_tests {
                 1024,
                 1024 * 1024,
                 ptr::null(),
+                -1,
                 ptr::null_mut(),
                 &schema as *const _ as *const c_void,
                 ptr::null(),
@@ -2285,6 +2377,7 @@ mod lifecycle_tests {
             1024,
             1024 * 1024,
             ptr::null(),
+            -1,
             ptr::null_mut(),
             &schema as *const _ as *const c_void,
             ptr::null(),
@@ -2335,6 +2428,7 @@ mod lifecycle_tests {
             1024,
             1024 * 1024,
             ptr::null(),
+            -1,
             ptr::null_mut(),
             &schema as *const _ as *const c_void,
             [0u8, 1u8].as_ptr(),
@@ -2451,6 +2545,7 @@ mod lifecycle_tests {
             1024,
             1024 * 1024,
             ptr::null(),
+            -1,
             ptr::null_mut(),
             &schema as *const _ as *const c_void,
             [0u8, 1u8].as_ptr(),
@@ -2494,5 +2589,137 @@ mod lifecycle_tests {
     #[test]
     fn finish_joins_started_vector_writer() {
         check_publication(vector_batch(vec![Some(vec![Some(1.0), Some(2.0)])]), true);
+    }
+
+    /// Writes three rows to `path` with a writer of `kind` and commits them.
+    fn write_ids(
+        kind: WriterKind,
+        path: &CString,
+        mode: &std::ffi::CStr,
+        stable_row_ids: i8,
+    ) -> FfiResult<()> {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let schema =
+            super::super::util::schema_to_ffi_arrow_schema(batch.schema().as_ref()).unwrap();
+        let mut writer = open_writer_inner(
+            kind,
+            path.as_ptr(),
+            mode.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            1024,
+            1024,
+            1024 * 1024,
+            ptr::null(),
+            stable_row_ids,
+            ptr::null_mut(),
+            &schema as *const _ as *const c_void,
+            ptr::null(),
+            0,
+            0,
+        )?;
+        let writer_ptr = &mut writer as *mut WriterHandle as *mut c_void;
+        let array = StructArray::from(batch);
+        let mut exported = arrow::ffi::FFI_ArrowArray::new(&array.to_data());
+        writer_write_batch_inner(
+            writer_ptr,
+            &mut exported as *mut _ as *mut c_void,
+            &HashMap::new(),
+        )?;
+        match kind {
+            WriterKind::Committed => writer_finish_inner(writer_ptr),
+            WriterKind::Uncommitted => {
+                let mut transaction = ptr::null_mut();
+                writer_finish_uncommitted_inner(writer_ptr, &mut transaction)?;
+                commit_transaction_inner(
+                    path.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    transaction,
+                )
+            }
+        }
+    }
+
+    fn uses_stable_row_ids(path: &CString) -> bool {
+        runtime::block_on(Dataset::open(path.to_str().unwrap()))
+            .unwrap()
+            .unwrap()
+            .manifest
+            .uses_stable_row_ids()
+    }
+
+    #[test]
+    fn stable_row_ids_apply_when_a_writer_creates_a_dataset() {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        for kind in [WriterKind::Committed, WriterKind::Uncommitted] {
+            for (request, expected) in [(1, true), (0, false), (-1, false)] {
+                let directory = TestDirectory(
+                    std::env::temp_dir().join(format!("ffi-stable-{}", rand::random::<u64>())),
+                );
+                let path = CString::new(directory.0.to_str().unwrap()).unwrap();
+                write_ids(kind, &path, c"create", request).unwrap();
+                assert_eq!(uses_stable_row_ids(&path), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn stable_row_ids_follow_the_existing_dataset() {
+        let _counter_guard = super::super::session::debug_counter_test_lock();
+        for kind in [WriterKind::Committed, WriterKind::Uncommitted] {
+            for stable in [true, false] {
+                let directory = TestDirectory(
+                    std::env::temp_dir().join(format!("ffi-stable-{}", rand::random::<u64>())),
+                );
+                let path = CString::new(directory.0.to_str().unwrap()).unwrap();
+                write_ids(kind, &path, c"create", i8::from(stable)).unwrap();
+                let opposite = i8::from(!stable);
+
+                // Lance would ignore a setting that contradicts the dataset.
+                for mode in [c"append", c"overwrite"] {
+                    let err = write_ids(kind, &path, mode, opposite).err().unwrap();
+                    assert!(err.message.contains("conflicts with the existing dataset"));
+                    assert!(err
+                        .message
+                        .contains(if stable { "uses" } else { "does not use" }));
+                }
+                assert_eq!(
+                    runtime::block_on(Dataset::open(path.to_str().unwrap()))
+                        .unwrap()
+                        .unwrap()
+                        .version()
+                        .version,
+                    1
+                );
+
+                // The same or no setting keeps it, for appends and overwrites.
+                for mode in [c"append", c"overwrite"] {
+                    for request in [i8::from(stable), -1] {
+                        write_ids(kind, &path, mode, request).unwrap();
+                        assert_eq!(uses_stable_row_ids(&path), stable);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_row_ids_reject_an_unknown_request() {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("ffi-stable-{}", rand::random::<u64>())),
+        );
+        let path = CString::new(directory.0.to_str().unwrap()).unwrap();
+        let err = write_ids(WriterKind::Committed, &path, c"create", 2)
+            .err()
+            .unwrap();
+        assert!(err.message.contains("invalid enable_stable_row_ids"));
     }
 }

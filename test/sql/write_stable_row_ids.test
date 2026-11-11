@@ -1,0 +1,227 @@
+# name: test/sql/write_stable_row_ids.test
+# description: COPY, CREATE TABLE and CTAS create datasets with stable row ids; the setting follows the existing dataset
+# group: [sql]
+
+require lance
+
+# A second fragment tells the two row id kinds apart: stable ids count rows,
+# addresses carry the fragment id in the high 32 bits.
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(0, 4) r(i)) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, enable_stable_row_ids true);
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(4, 8) r(i)) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'append');
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(0, 4) r(i)) TO '{TEST_DIR}/plain_copy.lance' (FORMAT lance);
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(4, 8) r(i)) TO '{TEST_DIR}/plain_copy.lance' (FORMAT lance, mode 'append');
+
+query II
+SELECT id, _rowid FROM '{TEST_DIR}/stable_copy.lance' WHERE id IN (1, 5) ORDER BY id;
+----
+1	1
+5	5
+
+query II
+SELECT id, _rowid FROM '{TEST_DIR}/plain_copy.lance' WHERE id IN (1, 5) ORDER BY id;
+----
+1	1
+5	4294967297
+
+# The setting cannot change once the dataset exists.
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/plain_copy.lance' (FORMAT lance, mode 'append', enable_stable_row_ids true);
+----
+conflicts with the existing dataset, which does not use stable row ids
+
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/plain_copy.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+----
+conflicts with the existing dataset, which does not use stable row ids
+
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'append', enable_stable_row_ids false);
+----
+conflicts with the existing dataset, which uses stable row ids
+
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids false);
+----
+conflicts with the existing dataset, which uses stable row ids
+
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'create', enable_stable_row_ids 'maybe');
+----
+Copy option "enable_stable_row_ids" expected an argument of type BOOLEAN
+
+statement error
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'create', enable_stable_row_ids NULL);
+----
+NULL is not supported as a valid option for COPY option "enable_stable_row_ids"
+
+# The same setting, or none, keeps it. Overwriting keeps the row id sequence.
+statement ok
+COPY (SELECT 8::BIGINT AS id) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'append', enable_stable_row_ids true);
+
+statement ok
+COPY (SELECT 100::BIGINT AS id UNION ALL SELECT 101::BIGINT) TO '{TEST_DIR}/stable_copy.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+SELECT id, _rowid FROM '{TEST_DIR}/stable_copy.lance' ORDER BY id;
+----
+100	9
+101	10
+
+statement ok
+COPY (SELECT 100::BIGINT AS id UNION ALL SELECT 101::BIGINT) TO '{TEST_DIR}/plain_copy.lance' (FORMAT lance, mode 'overwrite');
+
+# Without stable ids the overwritten rows get a new fragment, hence a new address.
+query II
+SELECT id, _rowid >> 32 AS fragment FROM '{TEST_DIR}/plain_copy.lance' ORDER BY id;
+----
+100	2
+101	2
+
+# CTAS and CREATE TABLE in a directory namespace, with the setting on and off.
+statement ok
+ATTACH '{TEST_DIR}/stable_row_ids_ns' AS sr (TYPE LANCE);
+
+statement ok
+CREATE TABLE sr.main.stable WITH (enable_stable_row_ids = true) AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(0, 4) r(i);
+
+statement ok
+CREATE TABLE sr.main.plain WITH (enable_stable_row_ids = false) AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(0, 4) r(i);
+
+statement ok
+CREATE TABLE sr.main.empty_stable (id BIGINT, v BIGINT) WITH (enable_stable_row_ids = true);
+
+statement ok
+CREATE TABLE sr.main.empty_plain (id BIGINT, v BIGINT) WITH (enable_stable_row_ids = false);
+
+statement ok
+INSERT INTO sr.main.empty_plain SELECT i::BIGINT, i::BIGINT FROM range(0, 4) r(i);
+
+statement ok
+INSERT INTO sr.main.empty_plain SELECT i::BIGINT, i::BIGINT FROM range(4, 8) r(i);
+
+query III
+SELECT 'empty_plain', id, rowid FROM sr.main.empty_plain WHERE id IN (1, 5) ORDER BY id;
+----
+empty_plain	1	1
+empty_plain	5	4294967297
+
+statement ok
+INSERT INTO sr.main.stable SELECT i::BIGINT, i::BIGINT FROM range(4, 8) r(i);
+
+statement ok
+INSERT INTO sr.main.plain SELECT i::BIGINT, i::BIGINT FROM range(4, 8) r(i);
+
+statement ok
+INSERT INTO sr.main.empty_stable SELECT i::BIGINT, i::BIGINT FROM range(0, 4) r(i);
+
+statement ok
+INSERT INTO sr.main.empty_stable SELECT i::BIGINT, i::BIGINT FROM range(4, 8) r(i);
+
+query III
+SELECT 'stable', id, rowid FROM sr.main.stable WHERE id IN (1, 5) ORDER BY id;
+----
+stable	1	1
+stable	5	5
+
+query III
+SELECT 'plain', id, rowid FROM sr.main.plain WHERE id IN (1, 5) ORDER BY id;
+----
+plain	1	1
+plain	5	4294967297
+
+query III
+SELECT 'empty_stable', id, rowid FROM sr.main.empty_stable WHERE id IN (1, 5) ORDER BY id;
+----
+empty_stable	1	1
+empty_stable	5	5
+
+# DML on the stable and the plain table: UPDATE and MERGE keep the row id of the
+# rows they change, and DELETE by row id removes the row that has it.
+statement ok
+UPDATE sr.main.stable SET v = 50 WHERE id = 5;
+
+statement ok
+UPDATE sr.main.plain SET v = 50 WHERE id = 5;
+
+statement ok
+MERGE INTO sr.main.stable AS t USING (VALUES (2, 20)) s(id, v) ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement ok
+MERGE INTO sr.main.plain AS t USING (VALUES (2, 20)) s(id, v) ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement ok
+DELETE FROM sr.main.stable WHERE rowid = 6;
+
+statement ok
+DELETE FROM sr.main.plain WHERE rowid = 4294967298;
+
+query IIII
+SELECT 'stable', id, v, rowid FROM sr.main.stable WHERE id IN (2, 5, 6) ORDER BY id;
+----
+stable	2	20	2
+stable	5	50	5
+
+query IIII
+SELECT 'plain', id, v, rowid FROM sr.main.plain WHERE id IN (2, 5, 6) ORDER BY id;
+----
+plain	2	20	2
+plain	5	50	4294967297
+
+# Compaction moves rows, so only stable row ids survive it.
+statement ok
+OPTIMIZE sr.main.stable;
+
+statement ok
+OPTIMIZE sr.main.plain;
+
+query III
+SELECT 'stable', id, rowid FROM sr.main.stable WHERE id IN (2, 5) ORDER BY id;
+----
+stable	2	2
+stable	5	5
+
+# Without them the compacted rows move to a new fragment and get new addresses.
+query III
+SELECT 'plain', id, rowid >> 32 FROM sr.main.plain WHERE id IN (2, 5) ORDER BY id;
+----
+plain	2	2
+plain	5	2
+
+# CREATE OR REPLACE keeps the setting of an existing table; a request to change it fails.
+statement ok
+CREATE OR REPLACE TABLE sr.main.stable AS SELECT 1::BIGINT AS id, 1::BIGINT AS v;
+
+statement error
+CREATE OR REPLACE TABLE sr.main.stable WITH (enable_stable_row_ids = false) AS SELECT 1::BIGINT AS id, 1::BIGINT AS v;
+----
+conflicts with the existing dataset, which uses stable row ids
+
+statement error
+CREATE OR REPLACE TABLE sr.main.plain WITH (enable_stable_row_ids = true) AS SELECT 1::BIGINT AS id, 1::BIGINT AS v;
+----
+conflicts with the existing dataset, which does not use stable row ids
+
+statement error
+CREATE TABLE sr.main.bad WITH (enable_stable_row_ids = 'maybe') AS SELECT 1::BIGINT AS id;
+----
+enable_stable_row_ids option must be a boolean
+
+statement error
+CREATE TABLE sr.main.bad WITH (enable_stable_row_ids = NULL) AS SELECT 1::BIGINT AS id;
+----
+enable_stable_row_ids option cannot be NULL
+
+statement error
+CREATE TABLE sr.main.bad WITH (max_rows = 1) AS SELECT 1::BIGINT AS id;
+----
+Only data_storage_version and enable_stable_row_ids are supported
+
+statement ok
+DETACH sr;
