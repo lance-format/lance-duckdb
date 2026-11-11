@@ -1630,8 +1630,9 @@ mod tests {
         );
     }
 
-    /// Two fragments of four rows: `id` 0..8 and `v` equal to `id`.
-    fn write_two_fragments(tag: &str) -> (String, Arc<lance::Dataset>) {
+    /// Two fragments of four rows: `id` 0..8 and `v` equal to `id`. With
+    /// stable row ids, `_rowid` equals `id`; without, it is the row address.
+    fn write_two_fragments(tag: &str, stable_row_ids: bool) -> (String, Arc<lance::Dataset>) {
         let uri = temp_uri(tag).to_string_lossy().to_string();
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int64, false),
@@ -1648,6 +1649,7 @@ mod tests {
         let params = WriteParams {
             mode: WriteMode::Create,
             max_rows_per_file: 4,
+            enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let dataset = runtime::block_on(lance::Dataset::write(
@@ -1745,65 +1747,93 @@ mod tests {
         unsafe { crate::ffi::write::lance_commit_transaction_to_dataset(handle_ptr(dataset), txn) }
     }
 
-    // Row addresses: fragment 0 offset 1, and fragment 1 offset 1.
-    const ROW_1: u64 = 1;
-    const ROW_5: u64 = (1 << 32) | 1;
+    // `_rowid` of ids 1, 2 and 5: ids 1 and 2 are in fragment 0 and id 5 is at
+    // offset 1 of fragment 1, whose address differs from its stable row id.
+    fn row_id(id: u64, stable_row_ids: bool) -> u64 {
+        if stable_row_ids || id < 4 {
+            id
+        } else {
+            (1 << 32) | (id - 4)
+        }
+    }
 
     #[test]
     fn update_is_built_on_the_version_its_scan_read() {
-        let (uri, dataset) = write_two_fragments("update-pinned");
-        let pinned_version = dataset.version().version;
-        let pinned = DatasetHandle::new(dataset);
+        for stable in [false, true] {
+            let (uri, dataset) = write_two_fragments("update-pinned", stable);
+            let pinned_version = dataset.version().version;
+            let pinned = DatasetHandle::new(dataset);
 
-        // Another writer commits to the same fragment after the statement
-        // pinned its version.
-        let other = open_handle(&uri);
-        assert_eq!(commit_to(&other, stage_update(&other, 100, ROW_1)), 0);
+            // Another writer commits to the same fragment after the statement
+            // pinned its version.
+            let other = open_handle(&uri);
+            assert_eq!(
+                commit_to(&other, stage_update(&other, 100, row_id(1, stable))),
+                0
+            );
 
-        let txn = stage_update(&pinned, 11, ROW_1);
-        assert_eq!(read_version(txn), pinned_version);
-        // Lance rejects the stale write instead of overwriting row 1.
-        assert_ne!(commit_to(&pinned, txn), 0);
-        assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+            let txn = stage_update(&pinned, 11, row_id(1, stable));
+            assert_eq!(read_version(txn), pinned_version);
+            // Lance rejects the stale write instead of overwriting row 1.
+            assert_ne!(commit_to(&pinned, txn), 0);
+            assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+        }
     }
 
     #[test]
     fn update_commits_over_a_concurrent_update_of_another_fragment() {
-        let (uri, dataset) = write_two_fragments("update-other-fragment");
-        let pinned = DatasetHandle::new(dataset);
+        for stable in [false, true] {
+            let (uri, dataset) = write_two_fragments("update-other-fragment", stable);
+            let pinned = DatasetHandle::new(dataset);
 
-        let other = open_handle(&uri);
-        assert_eq!(commit_to(&other, stage_update(&other, 500, ROW_5)), 0);
+            let other = open_handle(&uri);
+            assert_eq!(
+                commit_to(&other, stage_update(&other, 500, row_id(5, stable))),
+                0
+            );
 
-        assert_eq!(commit_to(&pinned, stage_update(&pinned, 11, ROW_1)), 0);
-        assert_eq!(values_by_id(&uri), vec![0, 11, 2, 3, 4, 500, 6, 7]);
+            let txn = stage_update(&pinned, 11, row_id(1, stable));
+            assert_eq!(commit_to(&pinned, txn), 0);
+            assert_eq!(values_by_id(&uri), vec![0, 11, 2, 3, 4, 500, 6, 7]);
+        }
     }
 
     #[test]
     fn merge_is_built_on_the_version_its_scan_read() {
-        let (uri, dataset) = write_two_fragments("merge-pinned");
-        let pinned_version = dataset.version().version;
-        let pinned = DatasetHandle::new(dataset);
+        for stable in [false, true] {
+            let (uri, dataset) = write_two_fragments("merge-pinned", stable);
+            let pinned_version = dataset.version().version;
+            let pinned = DatasetHandle::new(dataset);
 
-        let other = open_handle(&uri);
-        assert_eq!(commit_to(&other, stage_update(&other, 100, ROW_1)), 0);
+            let other = open_handle(&uri);
+            assert_eq!(
+                commit_to(&other, stage_update(&other, 100, row_id(1, stable))),
+                0
+            );
 
-        let txn = stage_merge_delete(&pinned, ROW_1 + 1);
-        assert_eq!(read_version(txn), pinned_version);
-        assert_ne!(commit_to(&pinned, txn), 0);
-        assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+            let txn = stage_merge_delete(&pinned, row_id(2, stable));
+            assert_eq!(read_version(txn), pinned_version);
+            assert_ne!(commit_to(&pinned, txn), 0);
+            assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+        }
     }
 
     #[test]
     fn merge_commits_over_a_concurrent_update_of_another_fragment() {
-        let (uri, dataset) = write_two_fragments("merge-other-fragment");
-        let pinned = DatasetHandle::new(dataset);
+        for stable in [false, true] {
+            let (uri, dataset) = write_two_fragments("merge-other-fragment", stable);
+            let pinned = DatasetHandle::new(dataset);
 
-        let other = open_handle(&uri);
-        assert_eq!(commit_to(&other, stage_update(&other, 500, ROW_5)), 0);
+            let other = open_handle(&uri);
+            assert_eq!(
+                commit_to(&other, stage_update(&other, 500, row_id(5, stable))),
+                0
+            );
 
-        assert_eq!(commit_to(&pinned, stage_merge_delete(&pinned, ROW_1)), 0);
-        assert_eq!(values_by_id(&uri), vec![0, 2, 3, 4, 500, 6, 7]);
+            let txn = stage_merge_delete(&pinned, row_id(1, stable));
+            assert_eq!(commit_to(&pinned, txn), 0);
+            assert_eq!(values_by_id(&uri), vec![0, 2, 3, 4, 500, 6, 7]);
+        }
     }
 }
 
