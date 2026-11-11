@@ -28,6 +28,7 @@ struct LanceWriteBindData {
   string mode = "create";
   bool write_empty_file = true;
   string data_storage_version = LANCE_DEFAULT_DATA_STORAGE_VERSION;
+  int8_t enable_stable_row_ids = LANCE_STABLE_ROW_IDS_UNSPECIFIED;
   uint64_t max_rows_per_file = LANCE_DEFAULT_MAX_ROWS_PER_FILE;
   uint64_t max_rows_per_group = LANCE_DEFAULT_MAX_ROWS_PER_GROUP;
   uint64_t max_bytes_per_file = LANCE_DEFAULT_MAX_BYTES_PER_FILE;
@@ -62,6 +63,8 @@ static void LanceWriteCopyOptions(ClientContext &, CopyOptionsInput &input) {
       CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
   options["data_storage_version"] =
       CopyOption(LogicalType::VARCHAR, CopyOptionMode::WRITE_ONLY);
+  options["enable_stable_row_ids"] =
+      CopyOption(LogicalType::BOOLEAN, CopyOptionMode::WRITE_ONLY);
   options["max_rows_per_file"] =
       CopyOption(LogicalType::UBIGINT, CopyOptionMode::WRITE_ONLY);
   options["max_rows_per_group"] =
@@ -107,6 +110,9 @@ static LanceWriteBindData LanceWriteBind(ClientContext &context,
       if (bind_data.data_storage_version.empty()) {
         throw BinderException("data_storage_version cannot be empty");
       }
+    } else if (key == "enable_stable_row_ids") {
+      bind_data.enable_stable_row_ids =
+          value.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? 1 : 0;
     } else if (key == "max_rows_per_file") {
       bind_data.max_rows_per_file =
           value.CastAs(context, LogicalType::UBIGINT).GetValue<uint64_t>();
@@ -171,7 +177,8 @@ LanceWriteInitGlobal(ClientContext &context,
       key_ptrs.empty() ? nullptr : key_ptrs.data(),
       value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
       bind_data.max_rows_per_file, bind_data.max_rows_per_group,
-      bind_data.max_bytes_per_file, data_storage_version_ptr, session,
+      bind_data.max_bytes_per_file, data_storage_version_ptr,
+      bind_data.enable_stable_row_ids, session,
       &state->schema_root.arrow_schema,
       blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size(),
       LanceBlobIngestBatchBudget(context));

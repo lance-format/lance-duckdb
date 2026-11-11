@@ -265,16 +265,16 @@ void *lance_open_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, void *session, const ArrowSchema *schema,
-    const uint8_t *blob_columns, size_t blob_columns_len,
-    uint64_t ingest_batch_budget);
+    const char *data_storage_version, int8_t enable_stable_row_ids,
+    void *session, const ArrowSchema *schema, const uint8_t *blob_columns,
+    size_t blob_columns_len, uint64_t ingest_batch_budget);
 void *lance_open_uncommitted_writer_with_storage_options(
     const char *path, const char *mode, const char **option_keys,
     const char **option_values, size_t options_len, uint64_t max_rows_per_file,
     uint64_t max_rows_per_group, uint64_t max_bytes_per_file,
-    const char *data_storage_version, void *session, const ArrowSchema *schema,
-    const uint8_t *blob_columns, size_t blob_columns_len,
-    uint64_t ingest_batch_budget);
+    const char *data_storage_version, int8_t enable_stable_row_ids,
+    void *session, const ArrowSchema *schema, const uint8_t *blob_columns,
+    size_t blob_columns_len, uint64_t ingest_batch_budget);
 int32_t lance_writer_write_batch(void *writer, ArrowArray *array);
 int32_t lance_writer_write_batch_with_source_options(
     void *writer, ArrowArray *array, const char **source_uris,

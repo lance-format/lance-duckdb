@@ -44,6 +44,9 @@ static constexpr uint64_t LANCE_DEFAULT_MAX_ROWS_PER_GROUP = 1024ULL;
 static constexpr uint64_t LANCE_DEFAULT_MAX_BYTES_PER_FILE =
     90ULL * 1024ULL * 1024ULL * 1024ULL;
 static constexpr const char *LANCE_DEFAULT_DATA_STORAGE_VERSION = "2.2";
+// A write that does not request stable row ids leaves the setting to the
+// dataset: false for a new one, unchanged for an existing one.
+static constexpr int8_t LANCE_STABLE_ROW_IDS_UNSPECIFIED = -1;
 
 // Lance's row id, which table scans and search functions expose as the
 // virtual column `_rowid`.

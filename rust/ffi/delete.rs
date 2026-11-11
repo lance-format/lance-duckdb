@@ -203,10 +203,8 @@ async fn row_id_delete_transaction(
     let txn = Transaction::new(dataset.manifest.version, operation, None);
     // Lance rebases the commit over concurrent deletes of other rows only
     // when it knows the rows this delete removes.
-    let txn = UncommittedTransaction {
-        transaction: txn,
-        affected_rows: Some(RowAddrTreeMap::from(row_addrs)),
-    };
+    let mut txn = UncommittedTransaction::new(txn);
+    txn.affected_rows = Some(RowAddrTreeMap::from(row_addrs));
     Ok((Some(txn), deleted_rows))
 }
 
