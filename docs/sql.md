@@ -375,6 +375,7 @@ Named parameters:
 Output:
 - Dataset columns plus `_hybrid_score` (larger is better), `_distance`, and `_score`.
 - `_rowid`, a virtual column, as for `lance_vector_search`.
+- Among the candidates, rows that tie on `_hybrid_score` at the `k` boundary are ranked by `_rowid` (smaller first). Ties in the vector or text score at the `k * oversample_factor` candidate cut are decided by Lance.
 
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.

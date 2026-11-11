@@ -359,6 +359,32 @@ ORDER BY _hybrid_score DESC
 3
 2
 
+# Candidates with equal hybrid scores are ranked by row id, so the kept rows do not vary between runs
+# (alpha = 0: the two puppy rows score by text, the other candidates tie at 0)
+loop i 0 5
+
+query I
+SELECT id
+FROM lance_hybrid_search(
+  'test/data/search_test_data.lance',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  'text',
+  'puppy',
+  k = 4,
+  prefilter = false,
+  alpha = 0.0,
+  oversample_factor = 4
+)
+ORDER BY id
+----
+1
+2
+3
+4
+
+endloop
+
 # Hybrid search accepts vector search controls in flat mode
 query I
 SELECT id
