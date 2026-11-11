@@ -8,6 +8,8 @@ configure/
 duckdb_unittest_tempdir/
 /test/bin
 /test/**/__manifest/
+# clangd compile_commands cache DuckDB writes to the repository root
+.cache/
 
 # Python
 __pycache__/
