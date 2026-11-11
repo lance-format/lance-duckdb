@@ -524,6 +524,11 @@ UPDATE ns.main.my_table SET s = DEFAULT WHERE id = 2;
 DETACH ns;
 ```
 
+An `UPDATE` commits against the table version its scan read. `COMMIT` fails with a retryable
+conflict when another writer, or an earlier statement of the same transaction, updated or deleted
+rows of a fragment it updates; changes to other fragments do not conflict. `COMMIT` publishes a
+transaction's statements one at a time, so the statements before the failing one stay committed.
+
 ### `DELETE`
 
 ```sql
@@ -575,7 +580,8 @@ DETACH ns;
 
 Notes:
 - Mutating the same target row more than once in a single `MERGE` raises a constraint error.
-- `MERGE` uses a single Lance transaction per statement.
+- `MERGE` uses a single Lance transaction per statement, committed against the table version its
+  scan read, with the same conflicts as `UPDATE`.
 
 ### `TRUNCATE TABLE`
 

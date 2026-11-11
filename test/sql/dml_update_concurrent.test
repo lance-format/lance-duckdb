@@ -1,0 +1,181 @@
+# name: test/sql/dml_update_concurrent.test
+# description: UPDATE and MERGE conflict at COMMIT with another commit to a fragment they rewrite, and not with one to another fragment
+# group: [sql]
+
+require lance
+
+statement ok con1
+ATTACH '{TEST_DIR}/update_concurrent' AS upd_con1 (TYPE LANCE);
+
+statement ok con2
+ATTACH '{TEST_DIR}/update_concurrent' AS upd_con2 (TYPE LANCE);
+
+statement ok con1
+CREATE TABLE upd_con1.main.t AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 7) r(i);
+
+# The second UPDATE rewrites the column the first one committed meanwhile; the
+# stale one is rejected instead of overwriting it.
+statement ok con1
+BEGIN;
+
+query I con1
+UPDATE upd_con1.main.t SET v = v + 1 WHERE id = 1;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+UPDATE upd_con2.main.t SET v = 100 WHERE id = 1;
+----
+1
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:2,3:3,4:4,5:5,6:6
+
+# The same holds for MERGE.
+statement ok con1
+BEGIN;
+
+query I con1
+MERGE INTO upd_con1.main.t USING (SELECT 2 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = -2;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+UPDATE upd_con2.main.t SET v = 200 WHERE id = 2;
+----
+1
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:200,3:3,4:4,5:5,6:6
+
+# MERGE delete and insert actions stage on the same handle.
+statement ok con1
+BEGIN;
+
+query I con1
+MERGE INTO upd_con1.main.t USING (VALUES (3), (7)) s(id) ON t.id = s.id
+WHEN MATCHED THEN DELETE
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.id * 10);
+----
+2
+
+statement ok con2
+BEGIN;
+
+query I con2
+UPDATE upd_con2.main.t SET v = 300 WHERE id = 3;
+----
+1
+
+statement ok con2
+COMMIT;
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:200,3:300,4:4,5:5,6:6
+
+statement ok con1
+MERGE INTO upd_con1.main.t USING (VALUES (3), (7)) s(id) ON t.id = s.id
+WHEN MATCHED THEN DELETE
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.id * 10);
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:200,4:4,5:5,6:6,7:70
+
+# Fragments the statement does not touch do not conflict: INSERT adds a second
+# fragment, and the two connections update one row in each.
+statement ok con1
+INSERT INTO upd_con1.main.t VALUES (8, 8), (9, 9);
+
+statement ok con1
+BEGIN;
+
+query I con1
+UPDATE upd_con1.main.t SET v = -1 WHERE id = 8;
+----
+1
+
+statement ok con2
+BEGIN;
+
+query I con2
+UPDATE upd_con2.main.t SET v = -2 WHERE id = 5;
+----
+1
+
+statement ok con2
+COMMIT;
+
+statement ok con1
+COMMIT;
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:200,4:4,5:-2,6:6,7:70,8:-1,9:9
+
+# Two UPDATEs of one fragment in one transaction stage on the same version, so
+# the second conflicts at COMMIT. COMMIT publishes the statements one at a
+# time, so the first stays committed.
+statement ok con1
+BEGIN;
+
+query I con1
+UPDATE upd_con1.main.t SET v = 41 WHERE id = 4;
+----
+1
+
+query I con1
+UPDATE upd_con1.main.t SET v = 61 WHERE id = 6;
+----
+1
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query T con1
+SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
+----
+1:100,2:200,4:41,5:-2,6:6,7:70,8:-1,9:9
+
+statement ok con1
+DETACH upd_con1;
+
+statement ok con2
+DETACH upd_con2;

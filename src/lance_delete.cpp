@@ -47,21 +47,6 @@ bool IsUnfilteredLanceScan(LogicalOperator &node) {
          !bind.limit_offset_pushed_down;
 }
 
-// Hands a staged Lance transaction to the DuckDB transaction, which commits
-// or frees it.
-void RegisterLanceDeleteTransaction(ClientContext &context,
-                                    LanceTableEntry &table,
-                                    shared_ptr<LanceDatasetCacheEntry> dataset,
-                                    void *txn) {
-  // Keep the dataset's store, credentials and commit handler until commit or
-  // rollback. Resolving the namespace again could target a replacement table.
-  auto display_uri = dataset->DisplayUri();
-  RegisterLancePendingAppend(context, table.catalog, std::move(display_uri), {},
-                             {},
-                             LanceBuildDatasetCacheKeyForTable(context, table),
-                             txn, std::move(dataset));
-}
-
 class LanceDeleteGlobalState : public GlobalSinkState {
 public:
   ~LanceDeleteGlobalState() override {
@@ -165,7 +150,7 @@ public:
     }
     gstate.rows_deleted = NumericCast<idx_t>(deleted_rows);
     if (txn) {
-      RegisterLanceDeleteTransaction(context, table, dataset, txn);
+      RegisterLancePinnedTransaction(context, table, dataset, txn);
     }
     return SinkFinalizeType::READY;
   }
@@ -235,7 +220,7 @@ public:
                         dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
     }
     if (txn) {
-      RegisterLanceDeleteTransaction(context.client, table, dataset, txn);
+      RegisterLancePinnedTransaction(context.client, table, dataset, txn);
     }
     chunk.data[0].Append(Value::BIGINT(deleted_rows));
     return SourceResultType::FINISHED;
