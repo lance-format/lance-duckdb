@@ -2021,8 +2021,7 @@ public:
           target_ns->api_key_override, target_ns->headers_tsv,
           create_info.GetTableName().GetIdentifierName(), mode,
           data_storage_version, enable_stable_row_ids, std::move(names),
-          std::move(types),
-          op.estimated_cardinality);
+          std::move(types), op.estimated_cardinality);
       create_as.children.push_back(plan);
       return create_as;
     }

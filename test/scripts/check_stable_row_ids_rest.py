@@ -111,8 +111,7 @@ def main() -> None:
                 expected = "0" if stable == "true" else ("2" if "AS SELECT" in sql else "1")
                 if created.returncode or appended.returncode or fragment != expected:
                     failures.append(
-                        f"{name}: expected {expected}, got {fragment!r}: "
-                        f"{created.stderr}{appended.stderr}"
+                        f"{name}: expected {expected}, got {fragment!r}: " f"{created.stderr}{appended.stderr}"
                     )
         finally:
             server.shutdown()
