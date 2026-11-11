@@ -54,10 +54,6 @@ public:
       : table(&table_p) {}
 
   const LanceTableEntry *table = nullptr;
-  string display_uri;
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
   void *update_handle = nullptr;
   idx_t rows_updated = 0;
   mutex lock;
@@ -80,6 +76,7 @@ public:
   PhysicalLanceUpdateValue(PhysicalPlan &physical_plan,
                            vector<LogicalType> types_p,
                            LanceTableEntry &table_p,
+                           shared_ptr<LanceDatasetCacheEntry> dataset_p,
                            vector<string> set_columns_p,
                            vector<LogicalType> set_types_p,
                            vector<idx_t> set_chunk_indices_p,
@@ -87,7 +84,8 @@ public:
                            idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), set_columns(std::move(set_columns_p)),
+        table(table_p), dataset(std::move(dataset_p)),
+        set_columns(std::move(set_columns_p)),
         set_types(std::move(set_types_p)),
         set_chunk_indices(std::move(set_chunk_indices_p)),
         rowid_chunk_index(rowid_chunk_index_p) {
@@ -125,25 +123,14 @@ public:
     lock_guard<mutex> guard(gstate.lock);
 
     if (!gstate.update_handle) {
-      ResolveLanceStorageOptionsForTable(
-          context.client, table, gstate.open_path, gstate.option_keys,
-          gstate.option_values, gstate.display_uri);
-
-      vector<const char *> key_ptrs;
-      vector<const char *> value_ptrs;
-      BuildStorageOptionPointerArrays(gstate.option_keys, gstate.option_values,
-                                      key_ptrs, value_ptrs);
-
-      auto rc = lance_update_begin_with_storage_options(
-          gstate.open_path.c_str(),
-          key_ptrs.empty() ? nullptr : key_ptrs.data(),
-          value_ptrs.empty() ? nullptr : value_ptrs.data(),
-          gstate.option_keys.size(),
+      auto rc = lance_update_begin(
+          dataset->Handle(),
           NumericCast<uint64_t>(LanceBlobIngestBatchBudget(context.client)),
-          LanceGetSessionHandle(context.client), &gstate.update_handle);
+          &gstate.update_handle);
       if (rc != 0 || !gstate.update_handle) {
         throw IOException("Failed to start Lance UPDATE transaction for '" +
-                          gstate.open_path + "'" + LanceFormatErrorSuffix());
+                          dataset->DisplayUri() + "'" +
+                          LanceFormatErrorSuffix());
       }
     }
 
@@ -219,16 +206,14 @@ public:
     gstate.update_handle = nullptr;
     if (rc != 0) {
       throw IOException("Failed to finish Lance UPDATE transaction for '" +
-                        gstate.open_path + "'" + LanceFormatErrorSuffix());
+                        dataset->DisplayUri() + "'" +
+                        LanceFormatErrorSuffix());
     }
     if (!txn) {
       return SinkFinalizeType::READY;
     }
 
-    RegisterLancePendingAppend(
-        context, table.catalog, std::move(gstate.open_path),
-        std::move(gstate.option_keys), std::move(gstate.option_values),
-        LanceBuildDatasetCacheKeyForTable(context, table), txn);
+    RegisterLancePinnedTransaction(context, table, dataset, txn);
     return SinkFinalizeType::READY;
   }
 
@@ -270,6 +255,7 @@ public:
 
 private:
   LanceTableEntry &table;
+  shared_ptr<LanceDatasetCacheEntry> dataset;
   vector<string> set_columns;
   vector<LogicalType> set_types;
   vector<idx_t> set_chunk_indices;
@@ -347,12 +333,23 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     set_chunk_indices.push_back(chunk_index);
   }
 
+  // The statement-scoped dataset cache returns the handle that native scans of
+  // the target bound, so their row ids and the Lance transaction share one
+  // version.
+  string display_uri;
+  auto dataset =
+      LanceGetOrOpenDatasetEntryForTable(context, *lance_table, display_uri);
+  if (!dataset || !dataset->Handle()) {
+    throw IOException("Failed to open Lance dataset for UPDATE: " +
+                      display_uri + LanceFormatErrorSuffix());
+  }
+  LancePinDatasetForWrite(context, *lance_table, dataset);
+
   auto &update = planner.Make<PhysicalLanceUpdateValue>(
-      op.types, *lance_table, std::move(set_columns), std::move(set_types),
-      std::move(set_chunk_indices), rowid_chunk_index,
+      op.types, *lance_table, std::move(dataset), std::move(set_columns),
+      std::move(set_types), std::move(set_chunk_indices), rowid_chunk_index,
       plan.types[rowid_chunk_index], op.estimated_cardinality);
   update.children.push_back(plan);
-  (void)context;
   return update;
 }
 

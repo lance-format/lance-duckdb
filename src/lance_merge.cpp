@@ -363,7 +363,6 @@ public:
   ~LanceMergeGlobalState() override;
 
   void EnsureMergeHandle(ClientContext &context);
-  void EnsureTakeDataset(ClientContext &context);
   void AddDeleteRowIds(const vector<uint64_t> &row_ids);
 
   template <class FUNC>
@@ -380,13 +379,7 @@ public:
   idx_t changed_rows = 0;
   unordered_set<uint64_t> mutated_target_rowids;
 
-  string display_uri;
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-
   void *merge_handle = nullptr;
-  void *take_dataset = nullptr;
 
   ColumnDataCollection return_collection;
 };
@@ -442,6 +435,7 @@ public:
 
   PhysicalLanceMergeInto(PhysicalPlan &physical_plan,
                          vector<LogicalType> types_p, LanceTableEntry &table_p,
+                         shared_ptr<LanceDatasetCacheEntry> dataset_p,
                          vector<string> table_column_names_p,
                          vector<LogicalType> table_column_types_p,
                          vector<unique_ptr<LanceMergeAction>> actions_p,
@@ -451,7 +445,8 @@ public:
                          idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
-        table(table_p), table_column_names(std::move(table_column_names_p)),
+        table(table_p), dataset(std::move(dataset_p)),
+        table_column_names(std::move(table_column_names_p)),
         table_column_types(std::move(table_column_types_p)),
         actions(std::move(actions_p)),
         action_ranges(std::move(action_ranges_p)), row_id_index(row_id_index_p),
@@ -547,6 +542,9 @@ private:
 
 public:
   LanceTableEntry &table;
+  // The dataset version the statement's scans read; the MERGE transaction,
+  // its row fetches and its commit all use it.
+  shared_ptr<LanceDatasetCacheEntry> dataset;
   vector<string> table_column_names;
   vector<LogicalType> table_column_types;
   vector<unique_ptr<LanceMergeAction>> actions;
@@ -572,10 +570,6 @@ LanceMergeGlobalState::~LanceMergeGlobalState() {
     lance_merge_abort(merge_handle);
     merge_handle = nullptr;
   }
-  if (take_dataset) {
-    lance_close_dataset(take_dataset);
-    take_dataset = nullptr;
-  }
 }
 
 void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
@@ -583,36 +577,15 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
     return;
   }
 
-  ResolveLanceStorageOptionsForTable(context, op.table, open_path, option_keys,
-                                     option_values, display_uri);
-
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-
-  auto rc = lance_merge_begin_with_storage_options(
-      open_path.c_str(), key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      LANCE_DEFAULT_MAX_ROWS_PER_FILE, LANCE_DEFAULT_MAX_ROWS_PER_GROUP,
-      LANCE_DEFAULT_MAX_BYTES_PER_FILE,
+  auto rc = lance_merge_begin(
+      op.dataset->Handle(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
+      LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
       NumericCast<uint64_t>(LanceBlobIngestBatchBudget(context)),
-      LanceGetSessionHandle(context), &merge_handle);
+      &merge_handle);
   if (rc != 0 || !merge_handle) {
     throw IOException("Failed to start Lance MERGE transaction for '" +
-                      open_path + "'" + LanceFormatErrorSuffix());
-  }
-}
-
-void LanceMergeGlobalState::EnsureTakeDataset(ClientContext &context) {
-  if (take_dataset) {
-    return;
-  }
-
-  take_dataset = LanceOpenDatasetForTable(context, op.table, display_uri);
-  if (!take_dataset) {
-    throw IOException("Failed to open Lance dataset for MERGE row fetch: " +
-                      display_uri + LanceFormatErrorSuffix());
+                      op.dataset->DisplayUri() + "'" +
+                      LanceFormatErrorSuffix());
   }
 }
 
@@ -623,8 +596,9 @@ void LanceMergeGlobalState::AddDeleteRowIds(const vector<uint64_t> &row_ids) {
   auto rc = lance_merge_add_delete_rowids(merge_handle, row_ids.data(),
                                           row_ids.size());
   if (rc != 0) {
-    throw IOException("Failed to add MERGE delete rowids for '" + open_path +
-                      "'" + LanceFormatErrorSuffix());
+    throw IOException("Failed to add MERGE delete rowids for '" +
+                      op.dataset->DisplayUri() + "'" +
+                      LanceFormatErrorSuffix());
   }
 }
 
@@ -642,8 +616,6 @@ void LanceMergeGlobalState::ForEachTakenChunkSubset(
     return;
   }
 
-  EnsureTakeDataset(context);
-
   vector<const char *> column_ptrs;
   column_ptrs.reserve(column_names.size());
   for (auto &name : column_names) {
@@ -651,7 +623,7 @@ void LanceMergeGlobalState::ForEachTakenChunkSubset(
   }
 
   auto *stream = lance_create_dataset_take_stream_unfiltered(
-      take_dataset, row_ids.data(), row_ids.size(),
+      op.dataset->Handle(), row_ids.data(), row_ids.size(),
       column_ptrs.empty() ? nullptr : column_ptrs.data(), column_ptrs.size());
   if (!stream) {
     throw IOException("Failed to create Lance take stream for MERGE" +
@@ -1226,17 +1198,14 @@ PhysicalLanceMergeInto::Finalize(Pipeline &, Event &, ClientContext &context,
 
   if (rc != 0) {
     throw IOException("Failed to finish Lance MERGE transaction for '" +
-                      gstate.open_path + "'" + LanceFormatErrorSuffix());
+                      dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
   }
 
   if (!txn) {
     return SinkFinalizeType::READY;
   }
 
-  RegisterLancePendingAppend(
-      context, table.catalog, std::move(gstate.open_path),
-      std::move(gstate.option_keys), std::move(gstate.option_values),
-      LanceBuildDatasetCacheKeyForTable(context, table), txn);
+  RegisterLancePinnedTransaction(context, table, dataset, txn);
   return SinkFinalizeType::READY;
 }
 
@@ -1647,13 +1616,24 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
   // state is created; without one every column is available.
   vector<bool> returning_needed(table_column_names.size(), true);
 
+  // The statement-scoped dataset cache returns the handle that native scans of
+  // the target bound, so their row ids and the Lance transaction share one
+  // version.
+  string display_uri;
+  auto dataset =
+      LanceGetOrOpenDatasetEntryForTable(context, *lance_table, display_uri);
+  if (!dataset || !dataset->Handle()) {
+    throw IOException("Failed to open Lance dataset for MERGE: " + display_uri +
+                      LanceFormatErrorSuffix());
+  }
+  LancePinDatasetForWrite(context, *lance_table, dataset);
+
   auto &merge = planner.Make<PhysicalLanceMergeInto>(
-      op.types, *lance_table, std::move(table_column_names),
+      op.types, *lance_table, std::move(dataset), std::move(table_column_names),
       std::move(table_column_types), std::move(flat_actions),
       std::move(action_ranges), op.row_id_start, op.source_marker,
       op.return_chunk, std::move(returning_needed), op.estimated_cardinality);
   merge.children.push_back(plan);
-  (void)context;
   return merge;
 }
 

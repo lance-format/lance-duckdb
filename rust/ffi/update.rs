@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use super::blob::{
 };
 
 use super::stored_type::cast_to_stored;
-use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::util::{dataset_handle, optional_session_handle, FfiError, FfiResult};
 use super::write::UncommittedTransaction;
 
 pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
@@ -122,9 +122,9 @@ pub(super) struct UpdateValueBatch {
 }
 
 struct UpdateHandle {
-    path: String,
-    session: Option<Arc<lance::session::Session>>,
-    storage_options: HashMap<String, String>,
+    // The dataset version the statement's scans read. The transaction is built
+    // on it, so Lance detects any commit made since.
+    dataset: Arc<lance::Dataset>,
     ingest_batch_budget: usize,
     batches: Vec<UpdateValueBatch>,
 }
@@ -223,24 +223,12 @@ pub(super) fn take_update_batch_fields(batch: &RecordBatch) -> FfiResult<Vec<Str
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_update_begin_with_storage_options(
-    path: *const c_char,
-    option_keys: *const *const c_char,
-    option_values: *const *const c_char,
-    options_len: usize,
+pub unsafe extern "C" fn lance_update_begin(
+    dataset: *mut c_void,
     ingest_batch_budget: u64,
-    session: *mut c_void,
     out_update_handle: *mut *mut c_void,
 ) -> i32 {
-    match update_begin_with_storage_options_inner(
-        path,
-        option_keys,
-        option_values,
-        options_len,
-        ingest_batch_budget,
-        session,
-        out_update_handle,
-    ) {
+    match update_begin_inner(dataset, ingest_batch_budget, out_update_handle) {
         Ok(()) => {
             clear_last_error();
             0
@@ -252,13 +240,9 @@ pub unsafe extern "C" fn lance_update_begin_with_storage_options(
     }
 }
 
-fn update_begin_with_storage_options_inner(
-    path: *const c_char,
-    option_keys: *const *const c_char,
-    option_values: *const *const c_char,
-    options_len: usize,
+fn update_begin_inner(
+    dataset: *mut c_void,
     ingest_batch_budget: u64,
-    session: *mut c_void,
     out_update_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
     if out_update_handle.is_null() {
@@ -267,41 +251,7 @@ fn update_begin_with_storage_options_inner(
             "out_update_handle is null",
         ));
     }
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-
-    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "option_keys/option_values is null with non-zero length",
-        ));
-    }
-    let keys = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
-    };
-    let values = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
-    };
-    let mut storage_options = HashMap::<String, String>::new();
-    for (idx, (&key_ptr, &val_ptr)) in keys.iter().zip(values.iter()).enumerate() {
-        if key_ptr.is_null() || val_ptr.is_null() {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                format!("option key/value is null at index {idx}"),
-            ));
-        }
-        let key = unsafe { CStr::from_ptr(key_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
-        })?;
-        let value = unsafe { CStr::from_ptr(val_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
-        })?;
-        storage_options.insert(key.to_string(), value.to_string());
-    }
-    let session = unsafe { optional_session_handle(session)? };
+    let dataset = unsafe { dataset_handle(dataset)? }.dataset.clone();
     let ingest_batch_budget = if ingest_batch_budget == 0 {
         super::blob::DEFAULT_INGEST_BATCH_BUDGET
     } else {
@@ -314,9 +264,7 @@ fn update_begin_with_storage_options_inner(
     };
 
     let handle = Box::new(UpdateHandle {
-        path,
-        session,
-        storage_options,
+        dataset,
         ingest_batch_budget,
         batches: Vec::new(),
     });
@@ -439,21 +387,11 @@ fn update_finish_uncommitted_inner(
 
     let handle = unsafe { Box::from_raw(update_handle as *mut UpdateHandle) };
     let maybe_txn = match runtime::block_on(async move {
-        let dataset = build_dataset(
-            &handle.path,
-            &handle.storage_options,
-            handle.session.clone(),
-        )
-        .await?;
-        let dataset = Arc::new(dataset);
+        let dataset = handle.dataset.clone();
 
         let existing_schema: ArrowSchema = dataset.schema().into();
         let blob_context = BlobWriteContext {
-            registry: handle
-                .session
-                .as_ref()
-                .map(|session| session.store_registry())
-                .unwrap_or_default(),
+            registry: dataset.session().store_registry(),
             ingest_batch_budget: handle.ingest_batch_budget,
         };
         let mut batches = Vec::with_capacity(handle.batches.len());
@@ -511,19 +449,6 @@ fn update_finish_uncommitted_inner(
         }
     }
     Ok(())
-}
-
-async fn build_dataset(
-    path: &str,
-    storage_options: &HashMap<String, String>,
-    session: Option<Arc<lance::session::Session>>,
-) -> Result<lance::Dataset, String> {
-    let mut builder = lance::dataset::builder::DatasetBuilder::from_uri(path)
-        .with_storage_options(storage_options.clone());
-    if let Some(session) = session {
-        builder = builder.with_session(session);
-    }
-    builder.load().await.map_err(|e| e.to_string())
 }
 
 /// Convert one DuckDB-exported write batch into the Lance logical value form
@@ -1128,6 +1053,7 @@ pub(super) async fn compose_column_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi::types::DatasetHandle;
     use arrow_array::builder::LargeBinaryBuilder;
     use arrow_array::{Int64Array, RecordBatchIterator, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -1702,6 +1628,182 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0]
         );
+    }
+
+    /// Two fragments of four rows: `id` 0..8 and `v` equal to `id`.
+    fn write_two_fragments(tag: &str) -> (String, Arc<lance::Dataset>) {
+        let uri = temp_uri(tag).to_string_lossy().to_string();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..8)),
+                Arc::new(Int64Array::from_iter_values(0..8)),
+            ],
+        )
+        .unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let dataset = runtime::block_on(lance::Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+            &uri,
+            Some(params),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        (uri, Arc::new(dataset))
+    }
+
+    fn open_handle(uri: &str) -> DatasetHandle {
+        let dataset = runtime::block_on(lance::Dataset::open(uri))
+            .unwrap()
+            .unwrap();
+        DatasetHandle::new(Arc::new(dataset))
+    }
+
+    fn handle_ptr(dataset: &DatasetHandle) -> *mut c_void {
+        dataset as *const DatasetHandle as *mut c_void
+    }
+
+    /// `v` of every row, ordered by `id`.
+    fn values_by_id(uri: &str) -> Vec<i64> {
+        let dataset = runtime::block_on(lance::Dataset::open(uri))
+            .unwrap()
+            .unwrap();
+        let batches: Vec<RecordBatch> = runtime::block_on(async move {
+            futures::TryStreamExt::try_collect(dataset.scan().try_into_stream().await?).await
+        })
+        .unwrap()
+        .unwrap();
+        let mut rows: Vec<(i64, i64)> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch.column(0).as_primitive::<Int64Type>().values();
+                let values = batch.column(1).as_primitive::<Int64Type>().values();
+                ids.iter()
+                    .copied()
+                    .zip(values.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Stages an UPDATE of `v` for the row at `address` on `dataset` through
+    /// the FFI.
+    fn stage_update(dataset: &DatasetHandle, value: i64, address: u64) -> *mut c_void {
+        let mut update = std::ptr::null_mut();
+        let mut txn = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(lance_update_begin(handle_ptr(dataset), 0, &mut update), 0);
+            (*(update as *mut UpdateHandle))
+                .batches
+                .push(UpdateValueBatch {
+                    columns: vec!["v".to_string()],
+                    batch: value_batch(vec![value], vec![address]),
+                    source_options: HashMap::new(),
+                });
+            assert_eq!(lance_update_finish_uncommitted(update, &mut txn), 0);
+        }
+        txn
+    }
+
+    /// Stages a MERGE that deletes the row at `address` on `dataset`.
+    fn stage_merge_delete(dataset: &DatasetHandle, address: u64) -> *mut c_void {
+        use crate::ffi::merge::{
+            lance_merge_add_delete_rowids, lance_merge_begin, lance_merge_finish_uncommitted,
+        };
+        let mut merge = std::ptr::null_mut();
+        let mut txn = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                lance_merge_begin(handle_ptr(dataset), 0, 0, 0, 0, &mut merge),
+                0
+            );
+            assert_eq!(lance_merge_add_delete_rowids(merge, &address, 1), 0);
+            assert_eq!(lance_merge_finish_uncommitted(merge, &mut txn), 0);
+        }
+        txn
+    }
+
+    fn read_version(txn: *mut c_void) -> u64 {
+        unsafe { &*(txn as *const UncommittedTransaction) }
+            .transaction
+            .read_version
+    }
+
+    /// Commits a staged transaction to `dataset`, as DuckDB's COMMIT does.
+    fn commit_to(dataset: &DatasetHandle, txn: *mut c_void) -> i32 {
+        unsafe { crate::ffi::write::lance_commit_transaction_to_dataset(handle_ptr(dataset), txn) }
+    }
+
+    // Row addresses: fragment 0 offset 1, and fragment 1 offset 1.
+    const ROW_1: u64 = 1;
+    const ROW_5: u64 = (1 << 32) | 1;
+
+    #[test]
+    fn update_is_built_on_the_version_its_scan_read() {
+        let (uri, dataset) = write_two_fragments("update-pinned");
+        let pinned_version = dataset.version().version;
+        let pinned = DatasetHandle::new(dataset);
+
+        // Another writer commits to the same fragment after the statement
+        // pinned its version.
+        let other = open_handle(&uri);
+        assert_eq!(commit_to(&other, stage_update(&other, 100, ROW_1)), 0);
+
+        let txn = stage_update(&pinned, 11, ROW_1);
+        assert_eq!(read_version(txn), pinned_version);
+        // Lance rejects the stale write instead of overwriting row 1.
+        assert_ne!(commit_to(&pinned, txn), 0);
+        assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn update_commits_over_a_concurrent_update_of_another_fragment() {
+        let (uri, dataset) = write_two_fragments("update-other-fragment");
+        let pinned = DatasetHandle::new(dataset);
+
+        let other = open_handle(&uri);
+        assert_eq!(commit_to(&other, stage_update(&other, 500, ROW_5)), 0);
+
+        assert_eq!(commit_to(&pinned, stage_update(&pinned, 11, ROW_1)), 0);
+        assert_eq!(values_by_id(&uri), vec![0, 11, 2, 3, 4, 500, 6, 7]);
+    }
+
+    #[test]
+    fn merge_is_built_on_the_version_its_scan_read() {
+        let (uri, dataset) = write_two_fragments("merge-pinned");
+        let pinned_version = dataset.version().version;
+        let pinned = DatasetHandle::new(dataset);
+
+        let other = open_handle(&uri);
+        assert_eq!(commit_to(&other, stage_update(&other, 100, ROW_1)), 0);
+
+        let txn = stage_merge_delete(&pinned, ROW_1 + 1);
+        assert_eq!(read_version(txn), pinned_version);
+        assert_ne!(commit_to(&pinned, txn), 0);
+        assert_eq!(values_by_id(&uri), vec![0, 100, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn merge_commits_over_a_concurrent_update_of_another_fragment() {
+        let (uri, dataset) = write_two_fragments("merge-other-fragment");
+        let pinned = DatasetHandle::new(dataset);
+
+        let other = open_handle(&uri);
+        assert_eq!(commit_to(&other, stage_update(&other, 500, ROW_5)), 0);
+
+        assert_eq!(commit_to(&pinned, stage_merge_delete(&pinned, ROW_1)), 0);
+        assert_eq!(values_by_id(&uri), vec![0, 2, 3, 4, 500, 6, 7]);
     }
 }
 

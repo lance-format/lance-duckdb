@@ -2286,6 +2286,19 @@ void RegisterLancePendingAppend(
   tm->RegisterPendingAppend(txn, std::move(pending));
 }
 
+void RegisterLancePinnedTransaction(ClientContext &context,
+                                    LanceTableEntry &table,
+                                    shared_ptr<LanceDatasetCacheEntry> dataset,
+                                    void *lance_transaction) {
+  // Keep the dataset's store, credentials and commit handler until commit or
+  // rollback. Resolving the namespace again could target a replacement table.
+  auto display_uri = dataset->DisplayUri();
+  RegisterLancePendingAppend(context, table.catalog, std::move(display_uri), {},
+                             {},
+                             LanceBuildDatasetCacheKeyForTable(context, table),
+                             lance_transaction, std::move(dataset));
+}
+
 // Checks every attached Lance catalog, not only the one a caller targets: the
 // same dataset can be reached through a catalog name and through a path, so a
 // match on the dataset URI could miss it.

@@ -290,10 +290,8 @@ int32_t lance_commit_transaction_with_storage_options(
 int32_t lance_commit_transaction_to_dataset(void *dataset, void *transaction);
 void lance_free_transaction(void *transaction);
 
-int32_t lance_update_begin_with_storage_options(
-    const char *path, const char **option_keys, const char **option_values,
-    size_t options_len, uint64_t ingest_batch_budget, void *session,
-    void **out_update_handle);
+int32_t lance_update_begin(void *dataset, uint64_t ingest_batch_budget,
+                           void **out_update_handle);
 int32_t lance_update_add_value_batch(
     void *update_handle, const ArrowSchema *schema, ArrowArray *array,
     const char **source_uris, const char ***source_uri_keys,
@@ -319,11 +317,11 @@ int32_t lance_blob_inputs_to_binary(
     uint64_t ingest_batch_budget, void *session, ArrowSchema *out_schema,
     ArrowArray *out_array);
 
-int32_t lance_merge_begin_with_storage_options(
-    const char *path, const char **option_keys, const char **option_values,
-    size_t options_len, uint64_t max_rows_per_file, uint64_t max_rows_per_group,
-    uint64_t max_bytes_per_file, uint64_t ingest_batch_budget, void *session,
-    void **out_merge_handle);
+int32_t lance_merge_begin(void *dataset, uint64_t max_rows_per_file,
+                          uint64_t max_rows_per_group,
+                          uint64_t max_bytes_per_file,
+                          uint64_t ingest_batch_budget,
+                          void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,
                                       size_t row_ids_len);

@@ -1,15 +1,13 @@
-use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{ExternalBlobMode, InsertBuilder, WriteMode, WriteParams};
-use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance::io::ObjectStoreParams;
 use lance_table::transaction::UpdatedFragmentOffsets;
 use roaring::RoaringTreemap;
 
@@ -22,14 +20,14 @@ use super::update::{
     apply_deletions, build_row_id_index, compose_column_updates, convert_blob_batch,
     lookup_row_address, UpdateValueBatch,
 };
-use super::util::{cstr_to_str, optional_session_handle, slice_from_ptr, FfiError, FfiResult};
+use super::util::{dataset_handle, slice_from_ptr, FfiError, FfiResult};
 use super::write::UncommittedTransaction;
 
 struct MergeHandle {
+    // The dataset version the statement's scans read. The transaction is built
+    // on it, so Lance detects any commit made since.
+    dataset: Arc<lance::Dataset>,
     input_schema: Arc<arrow_schema::Schema>,
-    path: String,
-    session: Option<Arc<lance::session::Session>>,
-    storage_options: HashMap<String, String>,
     max_rows_per_file: usize,
     max_rows_per_group: usize,
     max_bytes_per_file: usize,
@@ -40,28 +38,20 @@ struct MergeHandle {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
-    path: *const c_char,
-    option_keys: *const *const c_char,
-    option_values: *const *const c_char,
-    options_len: usize,
+pub unsafe extern "C" fn lance_merge_begin(
+    dataset: *mut c_void,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     ingest_batch_budget: u64,
-    session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> i32 {
-    match merge_begin_with_storage_options_inner(
-        path,
-        option_keys,
-        option_values,
-        options_len,
+    match merge_begin_inner(
+        dataset,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
         ingest_batch_budget,
-        session,
         out_merge_handle,
     ) {
         Ok(()) => {
@@ -75,17 +65,12 @@ pub unsafe extern "C" fn lance_merge_begin_with_storage_options(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn merge_begin_with_storage_options_inner(
-    path: *const c_char,
-    option_keys: *const *const c_char,
-    option_values: *const *const c_char,
-    options_len: usize,
+fn merge_begin_inner(
+    dataset: *mut c_void,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     ingest_batch_budget: u64,
-    session: *mut c_void,
     out_merge_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
     if out_merge_handle.is_null() {
@@ -94,43 +79,7 @@ fn merge_begin_with_storage_options_inner(
             "out_merge_handle is null",
         ));
     }
-
-    let path = unsafe { cstr_to_str(path, "path")? }.to_string();
-
-    if options_len > 0 && (option_keys.is_null() || option_values.is_null()) {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "option_keys/option_values is null with non-zero length",
-        ));
-    }
-
-    let keys = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_keys, options_len, "option_keys")? }
-    };
-    let values = if options_len == 0 {
-        &[][..]
-    } else {
-        unsafe { slice_from_ptr(option_values, options_len, "option_values")? }
-    };
-
-    let mut storage_options = HashMap::<String, String>::new();
-    for (idx, (&key_ptr, &val_ptr)) in keys.iter().zip(values.iter()).enumerate() {
-        if key_ptr.is_null() || val_ptr.is_null() {
-            return Err(FfiError::new(
-                ErrorCode::InvalidArgument,
-                format!("option key/value is null at index {idx}"),
-            ));
-        }
-        let key = unsafe { CStr::from_ptr(key_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_keys[{idx}] utf8: {err}"))
-        })?;
-        let value = unsafe { CStr::from_ptr(val_ptr) }.to_str().map_err(|err| {
-            FfiError::new(ErrorCode::Utf8, format!("option_values[{idx}] utf8: {err}"))
-        })?;
-        storage_options.insert(key.to_string(), value.to_string());
-    }
+    let dataset = unsafe { dataset_handle(dataset)? }.dataset.clone();
 
     let max_rows_per_file = usize::try_from(max_rows_per_file).map_err(|err| {
         FfiError::new(
@@ -150,7 +99,6 @@ fn merge_begin_with_storage_options_inner(
             format!("invalid max_bytes_per_file: {err}"),
         )
     })?;
-    let session = unsafe { optional_session_handle(session)? };
     let ingest_batch_budget = if ingest_batch_budget == 0 {
         super::blob::DEFAULT_INGEST_BATCH_BUDGET
     } else {
@@ -162,34 +110,10 @@ fn merge_begin_with_storage_options_inner(
         })?
     };
 
-    let input_schema: Arc<arrow_schema::Schema> = match runtime::block_on(async {
-        let mut builder =
-            DatasetBuilder::from_uri(path.as_str()).with_storage_options(storage_options.clone());
-        if let Some(session) = session.clone() {
-            builder = builder.with_session(session);
-        }
-        builder.load().await.map_err(|e| e.to_string())
-    }) {
-        Ok(Ok(dataset)) => Arc::new(dataset.schema().into()),
-        Ok(Err(message)) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetMerge,
-                format!("open dataset: {message}"),
-            ))
-        }
-        Err(err) => {
-            return Err(FfiError::new(
-                ErrorCode::DatasetMerge,
-                format!("runtime: {err}"),
-            ))
-        }
-    };
-
+    let input_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
     let handle = Box::new(MergeHandle {
+        dataset,
         input_schema,
-        path,
-        session,
-        storage_options,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
@@ -421,21 +345,11 @@ fn merge_finish_uncommitted_inner(
     let handle = unsafe { Box::from_raw(merge_handle as *mut MergeHandle) };
 
     let maybe_txn = match runtime::block_on(async move {
-        let mut builder = DatasetBuilder::from_uri(handle.path.as_str())
-            .with_storage_options(handle.storage_options.clone());
-        if let Some(session) = handle.session.clone() {
-            builder = builder.with_session(session);
-        }
-        let dataset = builder.load().await.map_err(|e| e.to_string())?;
-        let dataset = Arc::new(dataset);
+        let dataset = handle.dataset.clone();
 
         let existing_schema: arrow_schema::Schema = dataset.schema().into();
         let blob_context = BlobWriteContext {
-            registry: handle
-                .session
-                .as_ref()
-                .map(|session| session.store_registry())
-                .unwrap_or_default(),
+            registry: dataset.session().store_registry(),
             ingest_batch_budget: handle.ingest_batch_budget,
         };
 
@@ -448,19 +362,19 @@ fn merge_finish_uncommitted_inner(
                 insert_batches.push(cast_batch_to_stored(&batch, &existing_schema)?);
             }
 
-            let mut store_params = ObjectStoreParams::default();
-            if !handle.storage_options.is_empty() {
-                store_params.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(handle.storage_options.clone()),
-                ));
-            }
+            // The writer resolves external blob sources with the dataset's own
+            // storage options.
+            let store_params = ObjectStoreParams {
+                storage_options_accessor: dataset.storage_options_accessor(),
+                ..Default::default()
+            };
 
             let write_params = WriteParams {
                 mode: WriteMode::Append,
                 max_rows_per_file: handle.max_rows_per_file,
                 max_rows_per_group: handle.max_rows_per_group,
                 max_bytes_per_file: handle.max_bytes_per_file,
-                session: handle.session.clone(),
+                session: Some(dataset.session()),
                 store_params: Some(store_params),
                 // SQL reference values keep Lance ownership semantics: matching
                 // registered bases reuse them, other absolute URIs are stored
