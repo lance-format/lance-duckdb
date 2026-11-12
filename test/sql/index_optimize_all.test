@@ -1,0 +1,316 @@
+# name: test/sql/index_optimize_all.test
+# description: ALTER TABLE ... OPTIMIZE INDEXES and the Lance optimize modes
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX opt_all_label ON '{TEST_DIR}/index_optimize_all.lance' (label) USING BTREE;
+
+statement ok
+CREATE INDEX opt_all_vec ON '{TEST_DIR}/index_optimize_all.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+# New rows are not indexed until the indices are optimized.
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	2048	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	2048	<REGEX>:.*
+
+# OPTIMIZE INDEXES optimizes every index of the table in one statement.
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES;
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null,"mode":"auto".*\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	4096	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	4096	<REGEX>:.*
+
+# Each option below runs against new unindexed rows.
+# mode 'auto' keeps Lance's default merge count so partitions may rebalance.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (mode = 'auto');
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null,"mode":"auto","retrain":false,"num_indices_to_merge":null\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	6144	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	6144	<REGEX>:.*
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (mode = 'merge', num_indices_to_merge = 2, enable_partition_rebalancing = true);
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null,"mode":"merge".*"num_indices_to_merge":2\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	8192	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	8192	<REGEX>:.*
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+query TTT
+ALTER INDEX opt_all_vec ON '{TEST_DIR}/index_optimize_all.lance'
+OPTIMIZE WITH (mode = 'append');
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":"opt_all_vec","mode":"append".*\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	8192	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	10240	<REGEX>:.*
+
+# A named optimize leaves the other index alone; OPTIMIZE INDEXES catches it up.
+statement ok
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES;
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	10240	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	10240	<REGEX>:.*
+
+# A table-wide run with no mode.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+# Without a mode a table-wide run uses Lance's default merge count (auto).
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES;
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null,"mode":"auto".*"num_indices_to_merge":null\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	12288	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	12288	<REGEX>:.*
+
+# retrain and merge also work table-wide over a scalar and a vector index, each
+# with new unindexed rows pending.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (mode = 'retrain');
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null,"mode":"retrain","retrain":true.*\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	14336	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	14336	<REGEX>:.*
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+statement ok
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (mode = 'merge');
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all.lance';
+----
+opt_all_label	BTree	label	16384	<REGEX>:.*
+opt_all_vec	IVF_FLAT	vec	16384	<REGEX>:.*
+
+# Invalid option combinations fail closed.
+statement error
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (enable_partition_rebalancing = true);
+----
+enable_partition_rebalancing is only valid for mode='merge'
+
+statement error
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (max_rows_per_task = 1000);
+----
+unknown field
+
+statement error
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE;
+----
+ALTER TABLE ... OPTIMIZE INDEXES is required
+
+statement error
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES extra;
+----
+WITH clause must be a parenthesized key=value list
+
+statement error
+ALTER TABLE '{TEST_DIR}/index_optimize_all.lance' OPTIMIZE INDEXES WITH (mode = 'auto', num_indices_to_merge = 2);
+----
+num_indices_to_merge is only valid for mode='merge'
+
+# DELETE and UPDATE, then a table-wide optimize (stable row ids on): indexed
+# answers must match the table contents exactly.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE INDEX stable_label ON '{TEST_DIR}/index_optimize_all_stable.lance' (label) USING BTREE;
+
+statement ok
+CREATE INDEX stable_vec ON '{TEST_DIR}/index_optimize_all_stable.lance' (vec) USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
+
+statement ok
+ATTACH '{TEST_DIR}' AS opt_stable_ns (TYPE LANCE);
+
+statement ok
+DELETE FROM opt_stable_ns.main.index_optimize_all_stable WHERE label = 1;
+
+statement ok
+UPDATE opt_stable_ns.main.index_optimize_all_stable SET label = 1 WHERE id < 100;
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all_stable.lance' (FORMAT lance, mode 'append');
+
+statement ok
+ALTER TABLE opt_stable_ns.main.index_optimize_all_stable OPTIMIZE INDEXES;
+
+statement ok
+ALTER TABLE opt_stable_ns.main.index_optimize_all_stable OPTIMIZE INDEXES WITH (mode = 'merge');
+
+query II
+SELECT label, count(*) FROM opt_stable_ns.main.index_optimize_all_stable WHERE label IN (0, 1) GROUP BY label ORDER BY label;
+----
+0	3497
+1	343
+
+query II
+SELECT label, count(*) FROM opt_stable_ns.main.index_optimize_all_stable WHERE label + 0 IN (0, 1) GROUP BY label ORDER BY label;
+----
+0	3497
+1	343
+
+# The vector index returns the same rows as an exact scan after the rewrite.
+query I
+SELECT (SELECT list(id ORDER BY id) FROM lance_vector_search('opt_stable_ns.main.index_optimize_all_stable', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = true))
+     = (SELECT list(id ORDER BY id) FROM lance_vector_search('opt_stable_ns.main.index_optimize_all_stable', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = false));
+----
+true
+
+query I
+SELECT count(*) FROM lance_vector_search('opt_stable_ns.main.index_optimize_all_stable', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = true);
+----
+10
+
+statement ok
+DETACH opt_stable_ns;
+
+# DELETE and UPDATE, then a table-wide optimize (stable row ids off): indexed
+# answers must match the table contents exactly.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX plain_label ON '{TEST_DIR}/index_optimize_all_plain.lance' (label) USING BTREE;
+
+statement ok
+CREATE INDEX plain_vec ON '{TEST_DIR}/index_optimize_all_plain.lance' (vec) USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
+
+statement ok
+ATTACH '{TEST_DIR}' AS opt_plain_ns (TYPE LANCE);
+
+statement ok
+DELETE FROM opt_plain_ns.main.index_optimize_all_plain WHERE label = 1;
+
+statement ok
+UPDATE opt_plain_ns.main.index_optimize_all_plain SET label = 1 WHERE id < 100;
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all_plain.lance' (FORMAT lance, mode 'append');
+
+statement ok
+ALTER TABLE opt_plain_ns.main.index_optimize_all_plain OPTIMIZE INDEXES;
+
+statement ok
+ALTER TABLE opt_plain_ns.main.index_optimize_all_plain OPTIMIZE INDEXES WITH (mode = 'merge');
+
+query II
+SELECT label, count(*) FROM opt_plain_ns.main.index_optimize_all_plain WHERE label IN (0, 1) GROUP BY label ORDER BY label;
+----
+0	3497
+1	343
+
+query II
+SELECT label, count(*) FROM opt_plain_ns.main.index_optimize_all_plain WHERE label + 0 IN (0, 1) GROUP BY label ORDER BY label;
+----
+0	3497
+1	343
+
+# The vector index returns the same rows as an exact scan after the rewrite.
+query I
+SELECT (SELECT list(id ORDER BY id) FROM lance_vector_search('opt_plain_ns.main.index_optimize_all_plain', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = true))
+     = (SELECT list(id ORDER BY id) FROM lance_vector_search('opt_plain_ns.main.index_optimize_all_plain', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = false));
+----
+true
+
+query I
+SELECT count(*) FROM lance_vector_search('opt_plain_ns.main.index_optimize_all_plain', 'vec', [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[16], k = 10, use_index = true);
+----
+10
+
+statement ok
+DETACH opt_plain_ns;
+
+# An attached table name works as the target.
+statement ok
+ATTACH '{TEST_DIR}' AS opt_all_ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all.lance' (FORMAT lance, mode 'append');
+
+query TTT
+ALTER TABLE opt_all_ns.main.index_optimize_all OPTIMIZE INDEXES;
+----
+optimize_index	{TEST_DIR}/index_optimize_all.lance	<REGEX>:\{"index_name":null.*\}
+
+statement ok
+DETACH opt_all_ns;
+
+# A table without indices is a no-op.
+statement ok
+COPY (SELECT * FROM 'test/data/bigann_tiny/base.lance')
+TO '{TEST_DIR}/index_optimize_all_none.lance' (FORMAT lance, mode 'overwrite');
+
+query TTT
+ALTER TABLE '{TEST_DIR}/index_optimize_all_none.lance' OPTIMIZE INDEXES;
+----
+optimize_index	{TEST_DIR}/index_optimize_all_none.lance	<REGEX>:\{"index_name":null.*\}
+
+query TTTIT
+SHOW INDEXES ON '{TEST_DIR}/index_optimize_all_none.lance';
+----

@@ -29,11 +29,13 @@ struct OptimizeIndexOptionsInput {
     mode: Option<String>,
     retrain: Option<bool>,
     num_indices_to_merge: Option<usize>,
+    enable_partition_rebalancing: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 struct OptimizeIndexMetricsOutput {
-    index_name: String,
+    /// `None` when every index of the table was optimized.
+    index_name: Option<String>,
     mode: String,
     retrain: bool,
     num_indices_to_merge: Option<usize>,
@@ -441,6 +443,13 @@ pub unsafe extern "C" fn lance_dataset_optimize_index(
     index_name: *const c_char,
     retrain: u8,
 ) -> i32 {
+    if index_name.is_null() {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "index_name must be non-null".to_string(),
+        );
+        return -1;
+    }
     match dataset_optimize_index_with_options_inner(
         dataset,
         index_name,
@@ -492,6 +501,7 @@ pub unsafe extern "C" fn lance_dataset_optimize_index_with_options(
 fn parse_optimize_index_options_json(
     options_json: *const c_char,
     legacy_retrain: bool,
+    table_wide: bool,
 ) -> FfiResult<(OptimizeOptions, String, bool, Option<usize>)> {
     let input = if options_json.is_null() {
         OptimizeIndexOptionsInput::default()
@@ -515,9 +525,21 @@ fn parse_optimize_index_options_json(
         mode.trim().to_ascii_lowercase()
     } else if input.retrain.unwrap_or(false) || legacy_retrain {
         String::from("retrain")
+    } else if table_wide {
+        // Repeated append-only runs would leave one more segment per run and
+        // never rebalance, so a table-wide run defaults to Lance's own choice.
+        String::from("auto")
     } else {
         String::from("append")
     };
+
+    let rebalancing = input.enable_partition_rebalancing.unwrap_or(false);
+    if rebalancing && mode != "merge" {
+        return Err(FfiError::new(
+            ErrorCode::InvalidArgument,
+            "enable_partition_rebalancing is only valid for mode='merge'",
+        ));
+    }
 
     let (options, retrain, num_indices_to_merge) = match mode.as_str() {
         "append" => {
@@ -529,6 +551,15 @@ fn parse_optimize_index_options_json(
             }
             (OptimizeOptions::append(), false, Some(0))
         }
+        "auto" => {
+            if input.num_indices_to_merge.is_some() {
+                return Err(FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "num_indices_to_merge is only valid for mode='merge'",
+                ));
+            }
+            (OptimizeOptions::new(), false, None)
+        }
         "merge" => {
             let num = input.num_indices_to_merge.unwrap_or(1);
             if num == 0 {
@@ -537,7 +568,11 @@ fn parse_optimize_index_options_json(
                     "num_indices_to_merge must be > 0 for mode='merge'",
                 ));
             }
-            (OptimizeOptions::merge(num), false, Some(num))
+            let mut options = OptimizeOptions::merge(num);
+            if rebalancing {
+                options = options.with_partition_rebalancing();
+            }
+            (options, false, Some(num))
         }
         "retrain" => {
             if input.num_indices_to_merge.is_some() {
@@ -567,18 +602,28 @@ fn dataset_optimize_index_with_options_inner(
     legacy_retrain: bool,
 ) -> FfiResult<()> {
     let handle = unsafe { dataset_handle(dataset)? };
-    let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
-    if index_name.is_empty() {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "index_name must be non-empty",
-        ));
-    }
-    let index_name_owned = index_name.to_string();
+    // A null index_name optimizes every index of the table.
+    let index_name_owned = if index_name.is_null() {
+        None
+    } else {
+        let index_name = unsafe { cstr_to_str(index_name, "index_name")? };
+        if index_name.is_empty() {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "index_name must be non-empty",
+            ));
+        }
+        Some(index_name.to_string())
+    };
 
-    let (mut options, mode, retrain, num_indices_to_merge) =
-        parse_optimize_index_options_json(options_json, legacy_retrain)?;
-    options = options.index_names(vec![index_name_owned.clone()]);
+    let (mut options, mode, retrain, num_indices_to_merge) = parse_optimize_index_options_json(
+        options_json,
+        legacy_retrain,
+        index_name_owned.is_none(),
+    )?;
+    if let Some(name) = index_name_owned.as_ref() {
+        options = options.index_names(vec![name.clone()]);
+    }
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
     let metrics = run_with_large_stack(move || {
@@ -1132,6 +1177,68 @@ mod tests {
                 "{index_type} {json}: {}",
                 err.message
             );
+        }
+    }
+
+    fn parse_optimize(json: &str) -> FfiResult<(OptimizeOptions, String, bool, Option<usize>)> {
+        let json = std::ffi::CString::new(json).unwrap();
+        parse_optimize_index_options_json(json.as_ptr(), false, false)
+    }
+
+    fn parse_optimize_table_wide(
+        json: &str,
+    ) -> FfiResult<(OptimizeOptions, String, bool, Option<usize>)> {
+        let json = std::ffi::CString::new(json).unwrap();
+        parse_optimize_index_options_json(json.as_ptr(), false, true)
+    }
+
+    #[test]
+    fn optimize_modes_map_to_lance_merge_counts() {
+        let (opts, mode, _, merge) = parse_optimize("").unwrap();
+        assert_eq!((mode.as_str(), merge), ("append", Some(0)));
+        assert_eq!(opts.num_indices_to_merge, Some(0));
+
+        // A table-wide run defaults to auto; an explicit mode still wins.
+        let (_, mode, _, merge) = parse_optimize_table_wide("").unwrap();
+        assert_eq!((mode.as_str(), merge), ("auto", None));
+        let (_, mode, _, merge) = parse_optimize_table_wide(r#"{"mode":"append"}"#).unwrap();
+        assert_eq!((mode.as_str(), merge), ("append", Some(0)));
+        let (_, mode, _, _) = parse_optimize_table_wide(r#"{"retrain":true}"#).unwrap();
+        assert_eq!(mode.as_str(), "retrain");
+
+        // `auto` keeps Lance's default so partitions can rebalance.
+        let (opts, mode, _, merge) = parse_optimize(r#"{"mode":"auto"}"#).unwrap();
+        assert_eq!((mode.as_str(), merge), ("auto", None));
+        assert_eq!(opts.num_indices_to_merge, None);
+        assert!(opts.index_names.is_none());
+
+        let (opts, _, _, merge) = parse_optimize(
+            r#"{"mode":"merge","num_indices_to_merge":3,"enable_partition_rebalancing":true}"#,
+        )
+        .unwrap();
+        assert_eq!(merge, Some(3));
+        assert!(opts.enable_partition_rebalancing);
+    }
+
+    #[test]
+    fn optimize_rejects_invalid_combinations() {
+        for (json, expected) in [
+            (
+                r#"{"enable_partition_rebalancing":true}"#,
+                "only valid for mode='merge'",
+            ),
+            (
+                r#"{"mode":"auto","enable_partition_rebalancing":true}"#,
+                "only valid for mode='merge'",
+            ),
+            (r#"{"max_rows_per_segment":10}"#, "unknown field"),
+            (
+                r#"{"mode":"auto","num_indices_to_merge":2}"#,
+                "only valid for mode='merge'",
+            ),
+        ] {
+            let err = parse_optimize(json).unwrap_err();
+            assert!(err.message.contains(expected), "{json}: {}", err.message);
         }
     }
 }

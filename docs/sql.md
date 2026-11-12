@@ -626,6 +626,8 @@ Notes:
 
 ### `ALTER TABLE`
 
+`ALTER TABLE ... OPTIMIZE INDEXES` is described in the Maintenance SQL section.
+
 Schema evolution:
 
 ```sql
@@ -735,10 +737,7 @@ ON 'path/to/dataset.lance'
 OPTIMIZE WITH (mode = 'append');
 ```
 
-Supported `mode` values:
-- `append`
-- `merge` (`num_indices_to_merge` is supported)
-- `retrain`
+Use `ALTER TABLE ... OPTIMIZE INDEXES` for every index; see the Maintenance SQL section for the modes.
 
 ## Maintenance SQL
 
@@ -786,7 +785,7 @@ Notes:
 - Cleanup is best-effort: a file that cannot be deleted is counted in `failed_deletes` and left in place for a later run instead of failing the statement.
 - `delete_unverified = true` removes unreferenced data and index files regardless of age, including those of writes that have not committed, so use it only when nothing else is writing to the dataset. It is rejected while a transaction in this database holds Lance writes it has not committed, though a write or `COMMIT` that is still running is not detected. The rejection aborts the transaction it runs in, so a following `COMMIT` rolls that transaction back.
 
-### `ALTER INDEX ... OPTIMIZE`
+### `ALTER INDEX ... OPTIMIZE` and `ALTER TABLE ... OPTIMIZE INDEXES`
 
 ```sql
 ALTER INDEX vec_idx
@@ -797,10 +796,19 @@ OPTIMIZE WITH (
 );
 ```
 
+```sql
+ALTER TABLE 'path/to/dataset.lance' OPTIMIZE INDEXES [WITH (...)];
+```
+
+`ALTER TABLE ... OPTIMIZE INDEXES` optimizes every index of the table in one statement and accepts the same options (`index_name` is `null` in the metrics; a table without indices is a no-op). Lance may skip an index it cannot rewrite (for example one of an unknown type or a newer segment version) and only logs a warning that this extension does not surface; the metrics do not list skipped indices, so check `SHOW INDEXES` when it matters.
+
 Supported `mode` values:
-- `append`
-- `merge` (`num_indices_to_merge` is supported)
-- `retrain`
+- `append` (default for `ALTER INDEX`): index new rows as one more segment; IVF partitions are never rebalanced
+- `auto` (default for `ALTER TABLE ... OPTIMIZE INDEXES`; it also rewrites the newest segment of scalar indices, which `append` never does): Lance's default merge count. A vector index appends a segment (always, if its segments use different IVF models), or merges all segments when a partition splits or joins, and with no new rows it may rebalance one segment or do nothing; scalar indices (BTree, Bitmap, NGram, INVERTED and the others) replace their newest segment with a merge of it and the new rows instead of adding one; with stable row ids, older segments that cover fragments with deletions are rewritten too
+- `merge` (`num_indices_to_merge` defaults to 1; `enable_partition_rebalancing = true` also splits or joins partitions inside the merged segments)
+- `retrain`: retrain vector indices over all rows (Lance supports it for v3 vector indices only; scalar indices only merge their newest segment, as under `auto`); rejects `num_indices_to_merge`
+
+`enable_partition_rebalancing` is only valid with `mode = 'merge'`.
 
 Returns:
 - `Operation` (`optimize_index`)
