@@ -209,7 +209,8 @@ public:
       return SinkFinalizeType::READY;
     }
 
-    RegisterLancePinnedTransaction(context, table, dataset, txn);
+    RegisterLancePinnedTransaction(context, table, dataset, txn,
+                                   LanceWriteKind::REWRITE);
     return SinkFinalizeType::READY;
   }
 
@@ -339,6 +340,8 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw IOException("Failed to open Lance dataset for UPDATE: " +
                       display_uri + LanceFormatErrorSuffix());
   }
+  LanceRejectWriteAfterPendingWrite(context, *lance_table,
+                                    LanceWriteKind::REWRITE);
   LancePinDatasetForWrite(context, *lance_table, dataset);
 
   auto &update = planner.Make<PhysicalLanceUpdateValue>(

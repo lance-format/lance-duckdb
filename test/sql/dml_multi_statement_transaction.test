@@ -1,0 +1,842 @@
+# name: test/sql/dml_multi_statement_transaction.test
+# description: A write that cannot follow an earlier write to the same Lance table in one transaction fails closed
+# group: [sql]
+
+# Lance commits each DML statement's transaction separately, against the
+# version the statement read, and a statement cannot read the uncommitted
+# writes of an earlier one. Besides INSERT, only DELETE after DELETE can follow
+# an earlier write to the same table; any other combination used to fail
+# part-way through COMMIT (the first write stayed published) or silently lose a
+# change.
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}' AS txg (TYPE LANCE);
+
+# ---- plain: combinations that stay supported ----
+
+# plain: INSERT then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (12, 12);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+12	78
+
+# plain: DELETE then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 1;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	65
+
+# plain: UPDATE then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_plain SET v = -1 WHERE id = 1;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+11	64
+
+# plain: DELETE then DELETE of other rows
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 1;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+8	52
+
+# ---- plain: combinations that are rejected without publishing anything ----
+
+# plain: UPDATE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_plain SET v = -1 WHERE id = 1;
+
+statement error
+UPDATE txg.main.tx_plain SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: UPDATE then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_plain SET v = -1 WHERE id = 1;
+
+statement error
+DELETE FROM txg.main.tx_plain WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: DELETE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 1;
+
+statement error
+UPDATE txg.main.tx_plain SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: MERGE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+MERGE INTO txg.main.tx_plain AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement error
+UPDATE txg.main.tx_plain SET v = -1 WHERE id = 1;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: DELETE then MERGE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 1;
+
+statement error
+MERGE INTO txg.main.tx_plain AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: DELETE then DELETE all
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain WHERE id = 1;
+
+statement error
+DELETE FROM txg.main.tx_plain;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: DELETE all then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_plain;
+
+statement error
+DELETE FROM txg.main.tx_plain WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: INSERT then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement error
+DELETE FROM txg.main.tx_plain WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: INSERT then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement error
+UPDATE txg.main.tx_plain SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# plain: INSERT then MERGE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_plain AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_plain VALUES (11, 11);
+
+statement error
+MERGE INTO txg.main.tx_plain AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_plain) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_plain.lance/_versions/*'));
+----
+true
+
+# ---- stable: combinations that stay supported ----
+
+# stable: INSERT then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (12, 12);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+12	78
+
+# stable: DELETE then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 1;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	65
+
+# stable: UPDATE then INSERT
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_stable SET v = -1 WHERE id = 1;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+11	64
+
+# stable: DELETE then DELETE of other rows
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 1;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+8	52
+
+# ---- stable: combinations that are rejected without publishing anything ----
+
+# stable: UPDATE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_stable SET v = -1 WHERE id = 1;
+
+statement error
+UPDATE txg.main.tx_stable SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: UPDATE then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_stable SET v = -1 WHERE id = 1;
+
+statement error
+DELETE FROM txg.main.tx_stable WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: DELETE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 1;
+
+statement error
+UPDATE txg.main.tx_stable SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: MERGE then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+MERGE INTO txg.main.tx_stable AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+
+statement error
+UPDATE txg.main.tx_stable SET v = -1 WHERE id = 1;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: DELETE then MERGE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 1;
+
+statement error
+MERGE INTO txg.main.tx_stable AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: DELETE then DELETE all
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable WHERE id = 1;
+
+statement error
+DELETE FROM txg.main.tx_stable;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: DELETE all then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM txg.main.tx_stable;
+
+statement error
+DELETE FROM txg.main.tx_stable WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: INSERT then DELETE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement error
+DELETE FROM txg.main.tx_stable WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: INSERT then UPDATE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement error
+UPDATE txg.main.tx_stable SET v = -2 WHERE id = 2;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# stable: INSERT then MERGE
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+CREATE OR REPLACE TEMP TABLE tx_versions_stable AS SELECT count(*)::BIGINT AS c FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO txg.main.tx_stable VALUES (11, 11);
+
+statement error
+MERGE INTO txg.main.tx_stable AS t USING (SELECT 2::BIGINT AS id, -5::BIGINT AS v) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v;
+----
+<REGEX>:.*already has an uncommitted write in this transaction.*
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	55
+
+query T
+SELECT (SELECT c FROM tx_versions_stable) = (SELECT count(*)::BIGINT FROM glob('{TEST_DIR}/tx_stable.lance/_versions/*'));
+----
+true
+
+# ---- one write per table in different tables is unaffected ----
+
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_plain.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 11) r(i)) TO '{TEST_DIR}/tx_stable.lance' (FORMAT lance, mode 'overwrite', enable_stable_row_ids true);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+UPDATE txg.main.tx_plain SET v = -1 WHERE id = 1;
+
+statement ok
+UPDATE txg.main.tx_stable SET v = -1 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_plain;
+----
+10	53
+
+query II
+SELECT count(*), sum(v) FROM txg.main.tx_stable;
+----
+10	53
+

@@ -541,8 +541,8 @@ DETACH ns;
 
 An `UPDATE` commits against the table version its scan read. `COMMIT` fails with a retryable
 conflict when another writer, or an earlier statement of the same transaction, updated or deleted
-rows of a fragment it updates; changes to other fragments do not conflict. `COMMIT` publishes a
-transaction's statements one at a time, so the statements before the failing one stay committed.
+rows of a fragment it updates; changes to other fragments do not conflict. See
+[Transactions](#transactions) for what one transaction may contain.
 
 ### `DELETE`
 
@@ -557,11 +557,10 @@ DELETE FROM ns.main.my_table; -- delete all rows
 DETACH ns;
 ```
 
-DELETEs of different rows both commit, in one transaction or in concurrent connections, even when
-the rows share a fragment. `COMMIT` still fails with a retryable conflict when another writer, or
-an earlier statement of the same transaction, deleted one of the same rows or rewrote one of the
-fragments (`UPDATE`, `MERGE`, compaction). `COMMIT` publishes a transaction's statements one at a
-time, so the statements before the failing one stay committed.
+DELETEs of different rows both commit in concurrent connections, even when the rows share a
+fragment. `COMMIT` still fails with a retryable conflict when another writer deleted one of the same
+rows or rewrote one of the fragments (`UPDATE`, `MERGE`, compaction). See
+[Transactions](#transactions) for what one transaction may contain.
 
 ### `MERGE INTO`
 
@@ -607,6 +606,34 @@ TRUNCATE TABLE ns.main.my_table;
 
 DETACH ns;
 ```
+
+### Transactions
+
+Every `INSERT`, `UPDATE`, `DELETE` and `MERGE` on an attached Lance table builds its own Lance
+transaction against the table version its scan read. `COMMIT` publishes them one at a time, each
+as its own Lance commit. Lance has no commit that spans several statements or several datasets, and
+a statement cannot read the uncommitted writes of an earlier statement of the same transaction.
+
+Two such commits on the same table conflict unless they are appends or deletes of different rows.
+To keep `COMMIT` from failing half-way, with the earlier statements already published, or from
+silently dropping a change, a `DELETE`, `UPDATE` or `MERGE` that cannot follow the table's earlier
+write in the transaction fails with a `Not implemented Error`. The statement is not executed;
+`ROLLBACK` discards the transaction's earlier writes.
+
+| Statements on one table in one transaction | Supported |
+|---|---|
+| `INSERT` after any write | yes |
+| `DELETE` after `DELETE` | yes, if they delete different rows; a shared row still fails `COMMIT` with a retryable conflict |
+| `UPDATE` or `MERGE` after any write | no |
+| `DELETE` after `INSERT`, `UPDATE` or `MERGE` | no |
+| `DELETE FROM t` without a filter, or any `DELETE` after it | no |
+
+Limits that remain:
+- Reads inside the transaction see the table as of the start of each statement, not the
+  transaction's own earlier writes. `INSERT ... SELECT` from the table being written does not see
+  the transaction's earlier `INSERT`.
+- A transaction that writes several Lance tables commits them one after another. If a later commit
+  fails (for example because of a concurrent writer), the earlier tables stay committed.
 
 ## DDL on attached tables
 

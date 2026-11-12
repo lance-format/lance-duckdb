@@ -2207,6 +2207,7 @@ struct LancePendingAppend {
   string cache_key;
   void *transaction = nullptr;
   shared_ptr<LanceDatasetCacheEntry> pinned_dataset;
+  LanceWriteKind kind = LanceWriteKind::APPEND;
 };
 
 class LanceTransactionManager final : public DuckTransactionManager {
@@ -2225,6 +2226,26 @@ public:
   bool HasPendingAppends() {
     lock_guard<mutex> guard(pending_lock);
     return !pending_appends.empty();
+  }
+
+  bool HasConflictingWrite(Transaction &transaction_p, const string &cache_key,
+                           LanceWriteKind kind) {
+    auto &transaction = transaction_p.Cast<DuckTransaction>();
+    lock_guard<mutex> guard(pending_lock);
+    auto it = pending_appends.find(transaction.GetTransactionId());
+    if (it == pending_appends.end()) {
+      return false;
+    }
+    for (auto &pending : it->second) {
+      if (pending.cache_key != cache_key) {
+        continue;
+      }
+      if (kind == LanceWriteKind::REWRITE ||
+          pending.kind != LanceWriteKind::DELETE) {
+        return true;
+      }
+    }
+    return false;
   }
 
   ErrorData CommitTransaction(ClientContext &context,
@@ -2319,8 +2340,8 @@ void RegisterLanceStorage(DBConfig &config) {
 void RegisterLancePendingAppend(
     ClientContext &context, Catalog &catalog, string dataset_uri,
     vector<string> option_keys, vector<string> option_values, string cache_key,
-    void *lance_transaction,
-    shared_ptr<LanceDatasetCacheEntry> pinned_dataset) {
+    void *lance_transaction, shared_ptr<LanceDatasetCacheEntry> pinned_dataset,
+    LanceWriteKind kind) {
   auto &txn = Transaction::Get(context, catalog);
   auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
   if (!tm) {
@@ -2335,20 +2356,43 @@ void RegisterLancePendingAppend(
   pending.cache_key = std::move(cache_key);
   pending.transaction = lance_transaction;
   pending.pinned_dataset = std::move(pinned_dataset);
+  pending.kind = kind;
   tm->RegisterPendingAppend(txn, std::move(pending));
 }
 
 void RegisterLancePinnedTransaction(ClientContext &context,
                                     LanceTableEntry &table,
                                     shared_ptr<LanceDatasetCacheEntry> dataset,
-                                    void *lance_transaction) {
+                                    void *lance_transaction,
+                                    LanceWriteKind kind) {
   // Keep the dataset's store, credentials and commit handler until commit or
   // rollback. Resolving the namespace again could target a replacement table.
   auto display_uri = dataset->DisplayUri();
   RegisterLancePendingAppend(context, table.catalog, std::move(display_uri), {},
                              {},
                              LanceBuildDatasetCacheKeyForTable(context, table),
-                             lance_transaction, std::move(dataset));
+                             lance_transaction, std::move(dataset), kind);
+}
+
+void LanceRejectWriteAfterPendingWrite(ClientContext &context,
+                                       LanceTableEntry &table,
+                                       LanceWriteKind kind) {
+  auto &txn = Transaction::Get(context, table.catalog);
+  auto *tm = dynamic_cast<LanceTransactionManager *>(&txn.manager);
+  if (!tm ||
+      !tm->HasConflictingWrite(
+          txn, LanceBuildDatasetCacheKeyForTable(context, table), kind)) {
+    return;
+  }
+  throw NotImplementedException(
+      "Lance table '" + table.name +
+      "' already has an uncommitted write in this transaction. This "
+      "statement cannot follow it: each statement reads the last committed "
+      "version, so it cannot see the earlier write, and the transaction would "
+      "lose a change or fail part-way through COMMIT. Only INSERT, and DELETE "
+      "after DELETE, may follow an earlier write to the same Lance table. "
+      "Commit the transaction first, or run this statement in its own "
+      "transaction");
 }
 
 // Checks every attached Lance catalog, not only the one a caller targets: the
