@@ -56,6 +56,7 @@ pub struct LanceNamespaceVectorSearchOptions {
     query_len: usize,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     use_index: u8,
     with_row_id: u8,
 }
@@ -762,20 +763,34 @@ unsafe fn create_namespace_vector_search_stream_inner(
     apply_base_request(&config, &mut request);
     apply_filter_expr(&mut request, filter_expr.as_ref())?;
     request.vector_column = Some(vector_column.to_string());
-    if options.nprobes != 0 {
-        request.nprobes =
-            Some(options.nprobes.try_into().map_err(|_| {
-                FfiError::new(ErrorCode::InvalidArgument, "nprobes must fit in i32")
-            })?);
-    }
-    if options.refine_factor != 0 {
-        request.refine_factor = Some(options.refine_factor.try_into().map_err(|_| {
-            FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in i32")
-        })?);
-    }
-    request.bypass_vector_index = Some(options.use_index == 0);
+    apply_vector_search_options(&mut request, options)?;
 
     execute_search_to_stream(config, request, options.with_row_id != 0)
+}
+
+fn apply_vector_search_options(
+    request: &mut QueryTableRequest,
+    options: &LanceNamespaceVectorSearchOptions,
+) -> Result<(), FfiError> {
+    let to_i32 = |value: u64, name: &str| {
+        i32::try_from(value).map_err(|_| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                format!("{name} must fit in i32"),
+            )
+        })
+    };
+    if options.nprobes != 0 {
+        request.nprobes = Some(to_i32(options.nprobes, "nprobes")?);
+    }
+    if options.refine_factor != 0 {
+        request.refine_factor = Some(to_i32(options.refine_factor, "refine_factor")?);
+    }
+    if options.ef != 0 {
+        request.ef = Some(to_i32(options.ef, "ef")?);
+    }
+    request.bypass_vector_index = Some(options.use_index == 0);
+    Ok(())
 }
 
 #[no_mangle]
@@ -892,6 +907,41 @@ mod tests {
         let filter = request.filter.unwrap();
         assert!(filter.contains("age"));
         assert!(filter.contains("21"));
+    }
+
+    fn vector_options(ef: u64) -> LanceNamespaceVectorSearchOptions {
+        LanceNamespaceVectorSearchOptions {
+            vector_column: std::ptr::null(),
+            query_values: std::ptr::null(),
+            query_len: 0,
+            nprobes: 3,
+            refine_factor: 2,
+            ef,
+            use_index: 1,
+            with_row_id: 0,
+        }
+    }
+
+    #[test]
+    fn namespace_vector_request_forwards_ef() {
+        let mut request = QueryTableRequest::new(5, QueryTableRequestVector::new());
+        apply_vector_search_options(&mut request, &vector_options(64)).unwrap();
+        assert_eq!(request.ef, Some(64));
+        assert_eq!(request.nprobes, Some(3));
+        assert_eq!(request.refine_factor, Some(2));
+        assert_eq!(request.bypass_vector_index, Some(false));
+
+        let mut request = QueryTableRequest::new(5, QueryTableRequestVector::new());
+        apply_vector_search_options(&mut request, &vector_options(0)).unwrap();
+        assert_eq!(request.ef, None);
+    }
+
+    #[test]
+    fn namespace_vector_request_rejects_oversized_ef() {
+        let mut request = QueryTableRequest::new(5, QueryTableRequestVector::new());
+        let error =
+            apply_vector_search_options(&mut request, &vector_options(u64::MAX)).unwrap_err();
+        assert!(error.message.contains("ef must fit in i32"));
     }
 
     #[test]

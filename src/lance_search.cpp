@@ -43,9 +43,9 @@ namespace duckdb {
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
                                const vector<float> &query, uint64_t k,
                                uint64_t nprobes, uint64_t refine_factor,
-                               const string *filter_ir, bool prefilter,
-                               bool use_index, bool verbose, string &out_plan,
-                               string &out_error) {
+                               uint64_t ef, const string *filter_ir,
+                               bool prefilter, bool use_index, bool verbose,
+                               string &out_plan, string &out_error) {
   out_plan.clear();
   out_error.clear();
 
@@ -67,7 +67,7 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
 
   auto *plan_ptr = lance_explain_knn_scan_ir(
       dataset, vector_column.c_str(), query.data(), query.size(), k, nprobes,
-      refine_factor, filter_ptr, NumericCast<size_t>(filter_len),
+      refine_factor, ef, filter_ptr, NumericCast<size_t>(filter_len),
       prefilter ? 1 : 0, use_index ? 1 : 0, verbose ? 1 : 0);
   if (!plan_ptr) {
     out_error = LanceConsumeLastError();
@@ -320,6 +320,7 @@ struct LanceKnnBindData : public TableFunctionData {
   uint64_t k = 0;
   uint64_t nprobes = 0;
   uint64_t refine_factor = 0;
+  uint64_t ef = 0;
   bool prefilter = true;
   bool use_index = true;
   bool explain_verbose = false;
@@ -616,6 +617,16 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   result->refine_factor =
       has_refine_factor ? NumericCast<uint64_t>(refine_factor_val) : 0;
 
+  auto ef_named = input.named_parameters.find("ef");
+  if (ef_named != input.named_parameters.end() && !ef_named->second.IsNull()) {
+    auto ef_val =
+        ef_named->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+    if (ef_val <= 0) {
+      throw InvalidInputException("lance_vector_search requires ef > 0");
+    }
+    result->ef = NumericCast<uint64_t>(ef_val);
+  }
+
   auto prefilter_named = input.named_parameters.find("prefilter");
   if (prefilter_named != input.named_parameters.end() &&
       !prefilter_named->second.IsNull()) {
@@ -672,7 +683,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   auto *schema_handle = lance_get_knn_schema(
       result->dataset, result->vector_column.c_str(), result->query.data(),
       result->query.size(), result->k, result->nprobes, result->refine_factor,
-      result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
+      result->ef, result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
   if (!schema_handle) {
     throw IOException("Failed to get Lance KNN schema: " + result->file_path +
                       LanceFormatErrorSuffix());
@@ -717,7 +728,7 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         lance_get_knn_schema(
             global.pinned_dataset->Handle(), bind_data.vector_column.c_str(),
             bind_data.query.data(), bind_data.query.size(), bind_data.k,
-            bind_data.nprobes, bind_data.refine_factor,
+            bind_data.nprobes, bind_data.refine_factor, bind_data.ef,
             bind_data.prefilter ? 1 : 0, bind_data.use_index ? 1 : 0),
         "lance_vector_search", bind_data.target.identifier, bind_data.names,
         bind_data.types, global.column_ids, global.pinned_schema_root,
@@ -818,6 +829,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     options.query_len = bind_data.query.size();
     options.nprobes = bind_data.nprobes;
     options.refine_factor = bind_data.refine_factor;
+    options.ef = bind_data.ef;
     options.use_index = bind_data.use_index ? 1 : 0;
     options.with_row_id = global.with_row_id ? 1 : 0;
     result->stream = CreateLanceSearchStreamWithFallback(
@@ -847,7 +859,7 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
         return lance_create_knn_stream_ir(
             dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
             bind_data.query.size(), bind_data.k, bind_data.nprobes,
-            bind_data.refine_factor,
+            bind_data.refine_factor, bind_data.ef,
             native_column_ptrs.empty() ? nullptr : native_column_ptrs.data(),
             native_column_ptrs.size(), ir, ir_len,
             bind_data.namespace_filter.empty()
@@ -977,6 +989,7 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   result["Lance K"] = to_string(bind_data.k);
   result["Lance Nprobes"] = to_string(bind_data.nprobes);
   result["Lance Refine Factor"] = to_string(bind_data.refine_factor);
+  result["Lance Ef"] = to_string(bind_data.ef);
   result["Lance Query Dim"] = to_string(bind_data.query.size());
   result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
@@ -1007,7 +1020,7 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   string error;
   if (TryLanceExplainKnn(
           bind_data.dataset, bind_data.vector_column, bind_data.query,
-          bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+          bind_data.k, bind_data.nprobes, bind_data.refine_factor, bind_data.ef,
           filter_ir_msg.empty() ? nullptr : &filter_ir_msg, bind_data.prefilter,
           bind_data.use_index, bind_data.explain_verbose, plan, error)) {
     result["Lance Plan (Bind)"] = plan;
@@ -1033,6 +1046,7 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
   result["Lance K"] = to_string(bind_data.k);
   result["Lance Nprobes"] = to_string(bind_data.nprobes);
   result["Lance Refine Factor"] = to_string(bind_data.refine_factor);
+  result["Lance Ef"] = to_string(bind_data.ef);
   result["Lance Query Dim"] = to_string(bind_data.query.size());
   result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
@@ -1071,7 +1085,7 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
       string error;
       auto ok = TryLanceExplainKnn(
           dataset, bind_data.vector_column, bind_data.query, bind_data.k,
-          bind_data.nprobes, bind_data.refine_factor,
+          bind_data.nprobes, bind_data.refine_factor, bind_data.ef,
           global_state.lance_filter_ir.empty() ? nullptr
                                                : &global_state.lance_filter_ir,
           bind_data.prefilter, bind_data.use_index, bind_data.explain_verbose,
@@ -1100,6 +1114,7 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
       options.Add("k", LogicalType::BIGINT);
       options.Add("nprobs", LogicalType::BIGINT);
       options.Add("refine_factor", LogicalType::BIGINT);
+      options.Add("ef", LogicalType::BIGINT);
       options.Add("prefilter", LogicalType::BOOLEAN);
       options.Add("use_index", LogicalType::BOOLEAN);
       options.Add("explain_verbose", LogicalType::BOOLEAN);
@@ -1157,6 +1172,7 @@ struct LanceSearchBindData : public TableFunctionData {
   string text_query;
   uint64_t nprobes = 0;
   uint64_t refine_factor = 0;
+  uint64_t ef = 0;
   bool use_index = true;
   float alpha = 0.5F;
   uint32_t oversample_factor = 4;
@@ -1282,6 +1298,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
                 bind_data.vector_query.data(), bind_data.vector_query.size(),
                 bind_data.text_column.c_str(), bind_data.text_query.c_str(),
                 bind_data.k, bind_data.nprobes, bind_data.refine_factor,
+                bind_data.ef,
                 native_column_ptrs.empty() ? nullptr
                                            : native_column_ptrs.data(),
                 native_column_ptrs.size(), ir, ir_len,
@@ -1518,6 +1535,16 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   }
   result->refine_factor =
       has_refine_factor ? NumericCast<uint64_t>(refine_factor_val) : 0;
+
+  auto ef_named = input.named_parameters.find("ef");
+  if (ef_named != input.named_parameters.end() && !ef_named->second.IsNull()) {
+    auto ef_val =
+        ef_named->second.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+    if (ef_val <= 0) {
+      throw InvalidInputException("lance_hybrid_search requires ef > 0");
+    }
+    result->ef = NumericCast<uint64_t>(ef_val);
+  }
 
   auto prefilter_named = input.named_parameters.find("prefilter");
   if (prefilter_named != input.named_parameters.end() &&
@@ -1810,6 +1837,7 @@ LanceSearchBindToString(const LanceSearchBindData &bind_data) {
     result["Lance Text Query"] = bind_data.text_query;
     result["Lance Nprobes"] = to_string(bind_data.nprobes);
     result["Lance Refine Factor"] = to_string(bind_data.refine_factor);
+    result["Lance Ef"] = to_string(bind_data.ef);
     result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
     result["Lance Alpha"] = to_string(bind_data.alpha);
     result["Lance Oversample Factor"] = to_string(bind_data.oversample_factor);
@@ -1876,6 +1904,7 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
       options.Add("k", LogicalType::BIGINT);
       options.Add("nprobs", LogicalType::BIGINT);
       options.Add("refine_factor", LogicalType::BIGINT);
+      options.Add("ef", LogicalType::BIGINT);
       options.Add("prefilter", LogicalType::BOOLEAN);
       options.Add("use_index", LogicalType::BOOLEAN);
       options.Add("alpha", LogicalType::FLOAT);
