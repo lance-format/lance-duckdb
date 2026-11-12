@@ -804,11 +804,11 @@ ALTER TABLE 'path/to/dataset.lance' OPTIMIZE INDEXES [WITH (...)];
 
 Supported `mode` values:
 - `append` (default for `ALTER INDEX`): index new rows as one more segment; IVF partitions are never rebalanced
-- `auto` (default for `ALTER TABLE ... OPTIMIZE INDEXES`; it also rewrites the newest segment of scalar indices, which `append` never does): Lance's default merge count. A vector index appends a segment (always, if its segments use different IVF models), or merges all segments when a partition splits or joins, and with no new rows it may rebalance one segment or do nothing; scalar indices (BTree, Bitmap, NGram, INVERTED and the others) replace their newest segment with a merge of it and the new rows instead of adding one; with stable row ids, older segments that cover fragments with deletions are rewritten too
+- `auto` (default for `ALTER TABLE ... OPTIMIZE INDEXES`): Lance's default merge count. A vector index appends a segment (always, if its segments use different IVF models), or merges all segments when a partition splits or joins, and with no new rows it may rebalance one segment or do nothing; scalar indices (BTree, Bitmap, NGram, INVERTED and the others) replace their newest segment with a merge of it and the new rows instead of adding one; with stable row ids, older segments that cover fragments with deletions are rewritten too
 - `merge` (`num_indices_to_merge` defaults to 1; `enable_partition_rebalancing = true` also splits or joins partitions inside the merged segments)
 - `retrain`: retrain vector indices over all rows (Lance supports it for v3 vector indices only; scalar indices only merge their newest segment, as under `auto`); rejects `num_indices_to_merge`
 
-`enable_partition_rebalancing` is only valid with `mode = 'merge'`.
+`enable_partition_rebalancing` is only valid with `mode = 'merge'`. Under `auto` a vector index gains one segment per run unless a partition splits or joins. A scheduled job that must keep the segment count flat should use `mode = 'merge', num_indices_to_merge = 1, enable_partition_rebalancing = true`; a larger `num_indices_to_merge` consolidates segments that have already accumulated.
 
 Returns:
 - `Operation` (`optimize_index`)
