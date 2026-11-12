@@ -148,9 +148,9 @@ SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_co
 ----
 1:100,2:200,4:4,5:-2,6:6,7:70,8:-1,9:9
 
-# Two UPDATEs of one fragment in one transaction stage on the same version, so
-# the second conflicts at COMMIT. COMMIT publishes the statements one at a
-# time, so the first stays committed.
+# A second UPDATE of the table in one transaction is rejected: it would stage
+# on the same version as the first, conflict at COMMIT, and leave the first
+# committed.
 statement ok con1
 BEGIN;
 
@@ -159,20 +159,18 @@ UPDATE upd_con1.main.t SET v = 41 WHERE id = 4;
 ----
 1
 
-query I con1
+statement error con1
 UPDATE upd_con1.main.t SET v = 61 WHERE id = 6;
 ----
-1
+<REGEX>:.*already has an uncommitted write in this transaction.*
 
-statement error con1
-COMMIT;
-----
-Retryable commit conflict
+statement ok con1
+ROLLBACK;
 
 query T con1
 SELECT string_agg(id::VARCHAR || ':' || v::VARCHAR, ',' ORDER BY id) FROM upd_con1.main.t;
 ----
-1:100,2:200,4:41,5:-2,6:6,7:70,8:-1,9:9
+1:100,2:200,4:4,5:-2,6:6,7:70,8:-1,9:9
 
 statement ok con1
 DETACH upd_con1;

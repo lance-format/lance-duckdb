@@ -150,7 +150,8 @@ public:
     }
     gstate.rows_deleted = NumericCast<idx_t>(deleted_rows);
     if (txn) {
-      RegisterLancePinnedTransaction(context, table, dataset, txn);
+      RegisterLancePinnedTransaction(context, table, dataset, txn,
+                                     LanceWriteKind::DELETE);
     }
     return SinkFinalizeType::READY;
   }
@@ -220,7 +221,8 @@ public:
                         dataset->DisplayUri() + "'" + LanceFormatErrorSuffix());
     }
     if (txn) {
-      RegisterLancePinnedTransaction(context.client, table, dataset, txn);
+      RegisterLancePinnedTransaction(context.client, table, dataset, txn,
+                                     LanceWriteKind::REWRITE);
     }
     chunk.data[0].Append(Value::BIGINT(deleted_rows));
     return SourceResultType::FINISHED;
@@ -263,9 +265,15 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
     throw IOException("Failed to open Lance dataset for DELETE: " +
                       display_uri + LanceFormatErrorSuffix());
   }
+  // A plain `DELETE FROM t` drops whole fragments, which later deletes of the
+  // same table conflict with.
+  const bool delete_all = !plan && IsUnfilteredLanceScan(*op.children[0]);
+  LanceRejectWriteAfterPendingWrite(context, *lance_table,
+                                    delete_all ? LanceWriteKind::REWRITE
+                                               : LanceWriteKind::DELETE);
   LancePinDatasetForWrite(context, *lance_table, dataset);
 
-  if (!plan && IsUnfilteredLanceScan(*op.children[0])) {
+  if (delete_all) {
     return planner.Make<PhysicalLanceDeleteAll>(
         op.types, *lance_table, std::move(dataset), op.estimated_cardinality);
   }

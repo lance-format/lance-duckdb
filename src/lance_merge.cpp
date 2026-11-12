@@ -1205,7 +1205,8 @@ PhysicalLanceMergeInto::Finalize(Pipeline &, Event &, ClientContext &context,
     return SinkFinalizeType::READY;
   }
 
-  RegisterLancePinnedTransaction(context, table, dataset, txn);
+  RegisterLancePinnedTransaction(context, table, dataset, txn,
+                                 LanceWriteKind::REWRITE);
   return SinkFinalizeType::READY;
 }
 
@@ -1626,6 +1627,8 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
     throw IOException("Failed to open Lance dataset for MERGE: " + display_uri +
                       LanceFormatErrorSuffix());
   }
+  LanceRejectWriteAfterPendingWrite(context, *lance_table,
+                                    LanceWriteKind::REWRITE);
   LancePinDatasetForWrite(context, *lance_table, dataset);
 
   auto &merge = planner.Make<PhysicalLanceMergeInto>(
