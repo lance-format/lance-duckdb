@@ -341,6 +341,149 @@ FROM lance_vector_search(
 ----
 3
 
+# distance_type: the dataset has a cosine index, but an exact search ranks by
+# Lance's default for the column type (l2) unless distance_type is set
+statement ok
+COPY (
+  SELECT
+    i::BIGINT AS id,
+    [cos(i * 0.1) * (1 + i % 13), sin(i * 0.1) * (1 + i % 13), 0.3]::FLOAT[3] AS vec,
+    'doc' AS text
+  FROM range(600) t(i)
+) TO '{TEST_DIR}/search_knn_cosine.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX vec_idx ON '{TEST_DIR}/search_knn_cosine.lance' (vec)
+USING IVF_FLAT WITH (num_partitions=1, metric_type='cosine');
+
+statement ok
+CREATE INDEX text_idx ON '{TEST_DIR}/search_knn_cosine.lance' (text) USING INVERTED;
+
+# Exact cosine top 5, computed by DuckDB
+query I
+SELECT id
+FROM '{TEST_DIR}/search_knn_cosine.lance'
+ORDER BY array_cosine_distance(vec, [1.0, 0.2, 0.3]::FLOAT[3]), id
+LIMIT 5;
+----
+65
+442
+378
+1
+66
+
+# The index ranks by its metric
+query I
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5)
+ORDER BY _distance, id;
+----
+65
+442
+378
+1
+66
+
+# An exact search without distance_type ranks by l2
+query I
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, use_index = false)
+ORDER BY _distance, id;
+----
+65
+442
+377
+0
+130
+
+query I
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, use_index = false, distance_type = 'cosine')
+ORDER BY _distance, id;
+----
+65
+442
+378
+1
+66
+
+query I
+SELECT bool_and(abs(_distance - array_cosine_distance(vec, [1.0, 0.2, 0.3]::FLOAT[3])) < 1e-5)
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, use_index = false, distance_type = 'cosine');
+----
+true
+
+# Lance does not use an index built with another metric; it searches exactly
+query I
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, distance_type = 'l2')
+ORDER BY _distance, id;
+----
+65
+442
+377
+0
+130
+
+# Names are case-insensitive; EXPLAIN shows Lance's name
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, use_index = false, distance_type = 'COSINE');
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Distance Type": "cosine"[\s\S]*KNNVectorDistance: metric=cosine[\s\S]*
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], distance_type = 'manhattan');
+----
+<REGEX>:Invalid Input Error: lance_vector_search: invalid distance_type 'manhattan'.*Metric type 'manhattan' is not supported.*
+
+# Hybrid search: distance_type sets the vector branch's metric
+query II
+SELECT count(*) > 0, bool_and(abs(_distance - array_cosine_distance(vec, [1.0, 0.2, 0.3]::FLOAT[3])) < 1e-5)
+FROM lance_hybrid_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], 'text', 'doc', k = 5, use_index = false, distance_type = 'cosine')
+WHERE _distance IS NOT NULL;
+----
+true	true
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id
+FROM lance_hybrid_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], 'text', 'doc', k = 5, distance_type = 'Dot');
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Distance Type": "dot"[\s\S]*
+
+statement error
+SELECT * FROM lance_hybrid_search('{TEST_DIR}/search_knn_cosine.lance', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], 'text', 'doc', distance_type = 'manhattan');
+----
+<REGEX>:Invalid Input Error: lance_hybrid_search: invalid distance_type 'manhattan'.*Metric type 'manhattan' is not supported.*
+
+# Namespace tables forward distance_type to query_table
+statement ok
+ATTACH '{TEST_DIR}/search_distance_type_ns' AS distance_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE distance_ns.main.vectors AS SELECT * FROM '{TEST_DIR}/search_knn_cosine.lance';
+
+query I
+SELECT id
+FROM lance_vector_search('distance_ns.main.vectors', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], k = 5, use_index = false, distance_type = 'cosine')
+ORDER BY _distance, id;
+----
+65
+442
+378
+1
+66
+
+statement error
+SELECT * FROM lance_vector_search('distance_ns.main.vectors', 'vec', [1.0, 0.2, 0.3]::FLOAT[3], distance_type = 'manhattan');
+----
+<REGEX>:Invalid Input Error: lance_vector_search: invalid distance_type 'manhattan'.*Metric type 'manhattan' is not supported.*
+
+statement ok
+DETACH distance_ns;
+
 # Vector search over ARRAY vectors written by DuckDB (preferred usage)
 statement ok
 COPY (

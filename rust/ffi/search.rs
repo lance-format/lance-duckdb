@@ -7,6 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_linalg::distance::DistanceType;
 
 use crate::constants::{DISTANCE_COLUMN, HYBRID_SCORE_COLUMN, ROW_ID_COLUMN, SCORE_COLUMN};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -17,8 +18,8 @@ use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize,
-    optional_cstr_array, optional_cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError,
-    FfiResult,
+    optional_cstr_array, optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir,
+    slice_from_ptr, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -222,6 +223,7 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -242,6 +244,7 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         nprobes,
         refine_factor,
         ef,
+        distance_type,
         columns,
         columns_len,
         filter_ir,
@@ -274,6 +277,7 @@ fn create_hybrid_stream_ir_inner(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -303,6 +307,7 @@ fn create_hybrid_stream_ir_inner(
         )?
     };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
+    let distance_type = unsafe { optional_distance_type(distance_type)? };
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let rows = create_hybrid_batch(
@@ -315,6 +320,7 @@ fn create_hybrid_stream_ir_inner(
         nprobes,
         refine_factor,
         ef,
+        distance_type,
         filter,
         prefilter,
         use_index,
@@ -337,6 +343,7 @@ fn create_hybrid_batch(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: Option<DistanceType>,
     filter: Option<datafusion_expr::Expr>,
     prefilter: u8,
     use_index: u8,
@@ -373,6 +380,9 @@ fn create_hybrid_batch(
     }
     if ef != 0 {
         vector_scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
+    if let Some(distance_type) = distance_type {
+        vector_scan.distance_metric(distance_type);
     }
     vector_scan.use_index(use_index != 0);
     vector_scan.with_row_id();

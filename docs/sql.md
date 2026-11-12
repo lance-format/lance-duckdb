@@ -286,6 +286,7 @@ Named parameters:
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
 - `refine_factor` (BIGINT, optional): Over-fetch factor for re-ranking using original vectors. Must be > 0. A value of `1` still enables re-ranking.
 - `ef` (BIGINT, optional): Search-time candidate list size for HNSW sub-indexes (for example `IVF_HNSW_SQ`). Must be > 0 and at least `k * refine_factor`, otherwise Lance fails the query with `ef must be greater than or equal to k`. The Lance default is `1.5 * k * refine_factor`, which can give poor recall on large partitions; raise it (for example `ef = 200`) to trade latency for recall. Ignored by index types without an HNSW graph.
+- `distance_type` (VARCHAR, optional): Distance metric of `_distance`: `l2` (or `euclidean`), `cosine`, `dot`, or `hamming`, case-insensitive. If unset, a search that uses a vector index ranks by the index's metric, while an exact search (`use_index = false`, or no index) uses Lance's default for the column type (`l2` for floating-point vectors). Set it to the index's `metric_type` to compare ANN results with exact ones. Lance does not use an index built with a different metric; it runs an exact search instead.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
 - `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
@@ -369,6 +370,7 @@ Named parameters:
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
 - `refine_factor` (BIGINT, optional): Refine factor for the vector branch. Must be > 0.
 - `ef` (BIGINT, optional): HNSW search-time candidate list size for the vector branch. Must be > 0 and at least `k * oversample_factor` (times `refine_factor` if set), otherwise Lance fails the query with `ef must be greater than or equal to k`.
+- `distance_type` (VARCHAR, optional): Distance metric of the vector branch, as for `lance_vector_search`.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage for the vector branch when available. If `false`, the vector branch runs exact KNN.
 - `alpha` (FLOAT, default `0.5`): Vector/text mixing weight. Larger values weigh vector similarity more heavily.
