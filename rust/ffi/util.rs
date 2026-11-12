@@ -10,6 +10,7 @@ use lance::dataset::scanner::Scanner;
 use lance::session::Session;
 use lance_arrow::json::lance_json_to_arrow_json;
 use lance_core::datatypes::Schema as LanceSchema;
+use lance_linalg::distance::DistanceType;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 
@@ -214,6 +215,17 @@ pub(crate) unsafe fn optional_cstr_to_str<'a>(
     } else {
         unsafe { cstr_to_str(ptr, what) }.map(Some)
     }
+}
+
+/// Parses an optional vector search distance type with Lance's parser, so it
+/// accepts the names `CREATE INDEX ... metric_type` does.
+pub(crate) unsafe fn optional_distance_type(ptr: *const c_char) -> FfiResult<Option<DistanceType>> {
+    let Some(value) = (unsafe { optional_cstr_to_str(ptr, "distance_type")? }) else {
+        return Ok(None);
+    };
+    DistanceType::try_from(value)
+        .map(Some)
+        .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, format!("distance_type: {err}")))
 }
 
 pub(crate) unsafe fn slice_from_ptr<'a, T>(

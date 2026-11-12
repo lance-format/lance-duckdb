@@ -11,9 +11,33 @@ use super::projection;
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_usize, optional_cstr_array,
-    optional_cstr_to_str, parse_optional_filter_ir, slice_from_ptr, to_c_string, FfiError,
-    FfiResult,
+    optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir, slice_from_ptr,
+    to_c_string, FfiError, FfiResult,
 };
+
+/// Returns Lance's name for a vector search distance type, or null with the
+/// last error set when Lance does not support it. The search table functions
+/// call this at bind time, so every search path rejects such a value the same
+/// way.
+#[no_mangle]
+pub unsafe extern "C" fn lance_normalize_distance_type(
+    distance_type: *const c_char,
+) -> *const c_char {
+    match unsafe { optional_distance_type(distance_type) } {
+        Ok(Some(distance_type)) => {
+            clear_last_error();
+            to_c_string(distance_type.to_string()).into_raw()
+        }
+        Ok(None) => {
+            set_last_error(ErrorCode::InvalidArgument, "distance_type is null");
+            ptr::null()
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null()
+        }
+    }
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_get_knn_schema(
@@ -25,6 +49,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -37,6 +62,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
         nprobes,
         refine_factor,
         ef,
+        distance_type,
         prefilter,
         use_index,
     ) {
@@ -61,6 +87,7 @@ fn get_knn_schema_inner(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<SchemaHandle> {
@@ -73,6 +100,7 @@ fn get_knn_schema_inner(
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
+    let distance_type = unsafe { optional_distance_type(distance_type)? };
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let projection = projection::build_knn_projection(&handle.base_projection);
@@ -95,6 +123,9 @@ fn get_knn_schema_inner(
     }
     if ef != 0 {
         scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
+    if let Some(distance_type) = distance_type {
+        scan.distance_metric(distance_type);
     }
     scan.use_index(use_index != 0);
     scan.with_row_id();
@@ -119,6 +150,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -136,6 +168,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         nprobes,
         refine_factor,
         ef,
+        distance_type,
         columns,
         columns_len,
         filter_ir,
@@ -165,6 +198,7 @@ fn create_knn_stream_ir_inner(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -191,6 +225,7 @@ fn create_knn_stream_ir_inner(
         )?
     };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
+    let distance_type = unsafe { optional_distance_type(distance_type)? };
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
@@ -221,6 +256,9 @@ fn create_knn_stream_ir_inner(
     }
     if ef != 0 {
         scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
+    if let Some(distance_type) = distance_type {
+        scan.distance_metric(distance_type);
     }
     scan.use_index(use_index != 0);
     scan.with_row_id();
@@ -265,6 +303,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -280,6 +319,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
         nprobes,
         refine_factor,
         ef,
+        distance_type,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -307,6 +347,7 @@ fn explain_knn_scan_ir_inner(
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -330,6 +371,7 @@ fn explain_knn_scan_ir_inner(
         )?
     };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
+    let distance_type = unsafe { optional_distance_type(distance_type)? };
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let projection = projection::build_knn_projection(&handle.base_projection);
@@ -355,6 +397,9 @@ fn explain_knn_scan_ir_inner(
     }
     if ef != 0 {
         scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
+    if let Some(distance_type) = distance_type {
+        scan.distance_metric(distance_type);
     }
     scan.use_index(use_index != 0);
     scan.with_row_id();

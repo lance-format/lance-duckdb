@@ -24,7 +24,10 @@ use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
 use super::types::StreamHandle;
-use super::util::{cstr_to_str, parse_optional_filter_ir, slice_from_ptr, FfiError, FfiResult};
+use super::util::{
+    cstr_to_str, optional_distance_type, parse_optional_filter_ir, slice_from_ptr, FfiError,
+    FfiResult,
+};
 
 const NAMESPACE_KIND_DIRECTORY: u8 = 0;
 const NAMESPACE_KIND_REST: u8 = 1;
@@ -57,6 +60,7 @@ pub struct LanceNamespaceVectorSearchOptions {
     nprobes: u64,
     refine_factor: u64,
     ef: u64,
+    distance_type: *const c_char,
     use_index: u8,
     with_row_id: u8,
 }
@@ -789,6 +793,9 @@ fn apply_vector_search_options(
     if options.ef != 0 {
         request.ef = Some(to_i32(options.ef, "ef")?);
     }
+    if let Some(distance_type) = unsafe { optional_distance_type(options.distance_type)? } {
+        request.distance_type = Some(distance_type.to_string());
+    }
     request.bypass_vector_index = Some(options.use_index == 0);
     Ok(())
 }
@@ -917,6 +924,7 @@ mod tests {
             nprobes: 3,
             refine_factor: 2,
             ef,
+            distance_type: std::ptr::null(),
             use_index: 1,
             with_row_id: 0,
         }
@@ -934,6 +942,26 @@ mod tests {
         let mut request = QueryTableRequest::new(5, QueryTableRequestVector::new());
         apply_vector_search_options(&mut request, &vector_options(0)).unwrap();
         assert_eq!(request.ef, None);
+    }
+
+    #[test]
+    fn namespace_vector_request_forwards_distance_type() {
+        let mut request = QueryTableRequest::new(5, QueryTableRequestVector::new());
+        apply_vector_search_options(&mut request, &vector_options(0)).unwrap();
+        assert_eq!(request.distance_type, None);
+
+        let cosine = std::ffi::CString::new("COSINE").unwrap();
+        let mut options = vector_options(0);
+        options.distance_type = cosine.as_ptr();
+        apply_vector_search_options(&mut request, &options).unwrap();
+        assert_eq!(request.distance_type.as_deref(), Some("cosine"));
+
+        let unknown = std::ffi::CString::new("manhattan").unwrap();
+        options.distance_type = unknown.as_ptr();
+        let error = apply_vector_search_options(&mut request, &options).unwrap_err();
+        assert!(error
+            .message
+            .contains("Metric type 'manhattan' is not supported"));
     }
 
     #[test]
