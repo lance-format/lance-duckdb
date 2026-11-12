@@ -438,6 +438,7 @@ int32_t lance_dataset_create_index(void *dataset, const char *index_name,
 int32_t lance_dataset_drop_index(void *dataset, const char *index_name);
 int32_t lance_dataset_optimize_index(void *dataset, const char *index_name,
                                      uint8_t retrain);
+// A null index_name optimizes every index of the table.
 int32_t
 lance_dataset_optimize_index_with_options(void *dataset, const char *index_name,
                                           const char *options_json,

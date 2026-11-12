@@ -118,11 +118,13 @@ LanceMaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
     }
     break;
   case LanceMaintenanceOp::OPTIMIZE_INDEX:
-    if (input.inputs[1].IsNull() ||
-        input.inputs[1].GetValue<string>().empty()) {
-      throw BinderException("index_name must be non-empty");
+    // A NULL index name optimizes every index of the table.
+    if (!input.inputs[1].IsNull()) {
+      index_name = input.inputs[1].GetValue<string>();
+      if (index_name.empty()) {
+        throw BinderException("index_name must be non-empty");
+      }
     }
-    index_name = input.inputs[1].GetValue<string>();
     if (!input.inputs[2].IsNull()) {
       options_json = input.inputs[2].GetValue<string>();
     }
@@ -221,7 +223,9 @@ static void LanceMaintenanceFunc(ClientContext &context,
     break;
   case LanceMaintenanceOp::OPTIMIZE_INDEX:
     rc = lance_dataset_optimize_index_with_options(
-        dataset, bind_data.index_name.c_str(), options_ptr, &metrics_ptr);
+        dataset,
+        bind_data.index_name.empty() ? nullptr : bind_data.index_name.c_str(),
+        options_ptr, &metrics_ptr);
     op_name = "optimize_index";
     break;
   default:
@@ -1008,6 +1012,9 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
     case LanceMaintenanceStmtKind::CLEANUP:
       return "VACUUM LANCE " + target_sql;
     case LanceMaintenanceStmtKind::OPTIMIZE_INDEX:
+      if (index_name.empty()) {
+        return "ALTER TABLE " + target_sql + " OPTIMIZE INDEXES";
+      }
       return "ALTER INDEX " + index_name + " ON " + target_sql + " OPTIMIZE";
     case LanceMaintenanceStmtKind::SET_AUTO_CLEANUP:
       return "ALTER TABLE " + target_sql + " SET AUTO_CLEANUP";
@@ -1243,8 +1250,28 @@ static ParserExtensionParseResult LanceMaintenanceParse(ParserExtensionInfo *,
       return ParserExtensionParseResult(std::move(out));
     }
 
+    if (ConsumeKeyword(rest, "optimize")) {
+      if (!ConsumeKeyword(rest, "indexes")) {
+        return ParserExtensionParseResult(
+            "ALTER TABLE ... OPTIMIZE INDEXES is required");
+      }
+      string options_json;
+      if (!TryBuildOptionsJsonFromWithClause(rest, options_json, parse_error)) {
+        return ParserExtensionParseResult(parse_error);
+      }
+      // An empty index name optimizes every index of the table.
+      auto out = make_uniq<LanceMaintenanceParseData>(
+          LanceMaintenanceStmtKind::OPTIMIZE_INDEX);
+      out->target_is_path = target_is_path;
+      out->dataset_uri = dataset_uri;
+      out->target_sql = target_sql;
+      out->options_json = options_json;
+      return ParserExtensionParseResult(std::move(out));
+    }
+
     return ParserExtensionParseResult(
-        "ALTER TABLE maintenance syntax must be SET/UNSET AUTO_CLEANUP");
+        "ALTER TABLE maintenance syntax must be SET/UNSET AUTO_CLEANUP or "
+        "OPTIMIZE INDEXES");
   }
 
   return ParserExtensionParseResult();
@@ -1285,7 +1312,10 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     break;
   case LanceMaintenanceStmtKind::OPTIMIZE_INDEX:
     result.function = LanceInternalOptimizeIndexTableFunction();
-    result.parameters = {Value(target), Value(parse_data->index_name),
+    result.parameters = {Value(target),
+                         parse_data->index_name.empty()
+                             ? Value(LogicalType::VARCHAR)
+                             : Value(parse_data->index_name),
                          Value(parse_data->options_json)};
     result.return_type = StatementReturnType::QUERY_RESULT;
     break;
