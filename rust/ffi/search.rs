@@ -221,6 +221,7 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -240,6 +241,7 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         k,
         nprobes,
         refine_factor,
+        ef,
         columns,
         columns_len,
         filter_ir,
@@ -271,6 +273,7 @@ fn create_hybrid_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -311,6 +314,7 @@ fn create_hybrid_stream_ir_inner(
         k_usize,
         nprobes,
         refine_factor,
+        ef,
         filter,
         prefilter,
         use_index,
@@ -332,6 +336,7 @@ fn create_hybrid_batch(
     k: usize,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     filter: Option<datafusion_expr::Expr>,
     prefilter: u8,
     use_index: u8,
@@ -365,6 +370,9 @@ fn create_hybrid_batch(
             FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
         })?;
         vector_scan.refine(refine_factor_u32);
+    }
+    if ef != 0 {
+        vector_scan.ef(nonzero_u64_to_usize(ef, "ef")?);
     }
     vector_scan.use_index(use_index != 0);
     vector_scan.with_row_id();

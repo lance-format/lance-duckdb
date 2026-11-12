@@ -348,20 +348,21 @@ const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
 void *lance_get_knn_schema(void *dataset, const char *vector_column,
                            const float *query_values, size_t query_len,
                            uint64_t k, uint64_t nprobes, uint64_t refine_factor,
-                           uint8_t prefilter, uint8_t use_index);
+                           uint64_t ef, uint8_t prefilter, uint8_t use_index);
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  const float *query_values, size_t query_len,
                                  uint64_t k, uint64_t nprobes,
-                                 uint64_t refine_factor, const char **columns,
-                                 size_t columns_len, const uint8_t *filter_ir,
-                                 size_t filter_ir_len, const char *filter_sql,
-                                 uint8_t prefilter, uint8_t use_index);
+                                 uint64_t refine_factor, uint64_t ef,
+                                 const char **columns, size_t columns_len,
+                                 const uint8_t *filter_ir, size_t filter_ir_len,
+                                 const char *filter_sql, uint8_t prefilter,
+                                 uint8_t use_index);
 
 const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       const float *query_values,
                                       size_t query_len, uint64_t k,
                                       uint64_t nprobes, uint64_t refine_factor,
-                                      const uint8_t *filter_ir,
+                                      uint64_t ef, const uint8_t *filter_ir,
                                       size_t filter_ir_len, uint8_t prefilter,
                                       uint8_t use_index, uint8_t verbose);
 
@@ -398,6 +399,7 @@ typedef struct LanceNamespaceVectorSearchOptions {
   size_t query_len;
   uint64_t nprobes;
   uint64_t refine_factor;
+  uint64_t ef;
   uint8_t use_index;
   uint8_t with_row_id;
 } LanceNamespaceVectorSearchOptions;
@@ -424,9 +426,9 @@ void *lance_get_hybrid_schema(void *dataset);
 void *lance_create_hybrid_stream_ir(
     void *dataset, const char *vector_column, const float *query_values,
     size_t query_len, const char *text_column, const char *text_query,
-    uint64_t k, uint64_t nprobes, uint64_t refine_factor, const char **columns,
-    size_t columns_len, const uint8_t *filter_ir, size_t filter_ir_len,
-    uint8_t prefilter, uint8_t use_index, float alpha,
+    uint64_t k, uint64_t nprobes, uint64_t refine_factor, uint64_t ef,
+    const char **columns, size_t columns_len, const uint8_t *filter_ir,
+    size_t filter_ir_len, uint8_t prefilter, uint8_t use_index, float alpha,
     uint32_t oversample_factor);
 
 // Index DDL / metadata

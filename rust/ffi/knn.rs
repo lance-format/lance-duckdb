@@ -24,6 +24,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     prefilter: u8,
     use_index: u8,
 ) -> *mut c_void {
@@ -35,6 +36,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
         k,
         nprobes,
         refine_factor,
+        ef,
         prefilter,
         use_index,
     ) {
@@ -58,6 +60,7 @@ fn get_knn_schema_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<SchemaHandle> {
@@ -90,6 +93,9 @@ fn get_knn_schema_inner(
         })?;
         scan.refine(refine_factor_u32);
     }
+    if ef != 0 {
+        scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
     scan.use_index(use_index != 0);
     scan.with_row_id();
     scan.disable_scoring_autoprojection();
@@ -112,6 +118,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -128,6 +135,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         k,
         nprobes,
         refine_factor,
+        ef,
         columns,
         columns_len,
         filter_ir,
@@ -156,6 +164,7 @@ fn create_knn_stream_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -210,6 +219,9 @@ fn create_knn_stream_ir_inner(
         })?;
         scan.refine(refine_factor_u32);
     }
+    if ef != 0 {
+        scan.ef(nonzero_u64_to_usize(ef, "ef")?);
+    }
     scan.use_index(use_index != 0);
     scan.with_row_id();
     let filter = apply_scanner_filter(
@@ -252,6 +264,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -266,6 +279,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
         k,
         nprobes,
         refine_factor,
+        ef,
         filter_ir,
         filter_ir_len,
         prefilter,
@@ -292,6 +306,7 @@ fn explain_knn_scan_ir_inner(
     k: u64,
     nprobes: u64,
     refine_factor: u64,
+    ef: u64,
     filter_ir: *const u8,
     filter_ir_len: usize,
     prefilter: u8,
@@ -337,6 +352,9 @@ fn explain_knn_scan_ir_inner(
             FfiError::new(ErrorCode::InvalidArgument, "refine_factor must fit in u32")
         })?;
         scan.refine(refine_factor_u32);
+    }
+    if ef != 0 {
+        scan.ef(nonzero_u64_to_usize(ef, "ef")?);
     }
     scan.use_index(use_index != 0);
     scan.with_row_id();
