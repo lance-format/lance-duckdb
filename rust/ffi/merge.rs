@@ -1,49 +1,114 @@
 use std::ffi::{c_char, c_void};
+use std::path::PathBuf;
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
-use arrow_array::RecordBatch;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::StreamExt;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::SchemaRef;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance::dataset::{ExternalBlobMode, InsertBuilder, WriteMode, WriteParams};
 use lance::io::ObjectStoreParams;
+use lance_table::format::Fragment;
 use lance_table::transaction::UpdatedFragmentOffsets;
 use roaring::RoaringTreemap;
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::blob::{BlobWriteContext, SourceOptionsMap};
+use super::blob::BlobWriteContext;
 use super::stored_type::cast_batch_to_stored;
 use super::update::{
-    apply_deletions, build_row_id_index, compose_column_updates, convert_blob_batch,
-    lookup_row_address, UpdateValueBatch,
+    apply_deletions, build_row_id_index, convert_blob_batch, lookup_row_address,
+    ColumnUpdateWriter, UpdateValueBatch,
 };
-use super::util::{dataset_handle, slice_from_ptr, FfiError, FfiResult};
-use super::write::UncommittedTransaction;
+use super::util::{dataset_handle, optional_cstr_to_str, slice_from_ptr, FfiError, FfiResult};
+use super::write::{ReceiverRecordBatchReader, UncommittedTransaction};
 
 struct MergeHandle {
     // The dataset version the statement's scans read. The transaction is built
     // on it, so Lance detects any commit made since.
     dataset: Arc<lance::Dataset>,
-    input_schema: Arc<arrow_schema::Schema>,
-    max_rows_per_file: usize,
-    max_rows_per_group: usize,
-    max_bytes_per_file: usize,
-    ingest_batch_budget: usize,
+    existing_schema: arrow_schema::Schema,
+    blob_context: BlobWriteContext,
+    write_params: WriteParams,
     delete_row_ids: RoaringTreemap,
-    update_batches: Vec<UpdateValueBatch>,
-    insert_batches: Vec<(RecordBatch, SourceOptionsMap)>,
+    updates: ColumnUpdateWriter,
+    inserts: Option<InsertStream>,
+}
+
+/// MERGE inserts streamed to Lance's writer on a background thread through a
+/// bounded channel, as INSERT does, instead of buffered until the statement
+/// finishes.
+struct InsertStream {
+    sender: Option<SyncSender<RecordBatch>>,
+    join: Option<JoinHandle<Result<Vec<Fragment>, String>>>,
+}
+
+impl InsertStream {
+    fn start(dataset: Arc<lance::Dataset>, params: WriteParams, schema: SchemaRef) -> Self {
+        let (sender, receiver) = sync_channel::<RecordBatch>(2);
+        let join = std::thread::spawn(move || -> Result<Vec<Fragment>, String> {
+            let source: Box<dyn RecordBatchReader + Send> =
+                Box::new(ReceiverRecordBatchReader::new(schema, receiver));
+            let builder = InsertBuilder::new(dataset).with_params(&params);
+            let txn = runtime::block_on(builder.execute_uncommitted_stream(source))
+                .map_err(|err| format!("runtime: {err}"))?
+                .map_err(|err| err.to_string())?;
+            let Operation::Append { fragments } = txn.operation else {
+                return Err("unexpected transaction operation for merge insert write".to_string());
+            };
+            Ok(fragments)
+        });
+        Self {
+            sender: Some(sender),
+            join: Some(join),
+        }
+    }
+
+    fn send(&mut self, batch: RecordBatch) -> Result<(), String> {
+        if let Some(sender) = self.sender.as_ref() {
+            if sender.send(batch).is_ok() {
+                return Ok(());
+            }
+        }
+        // The writer stopped taking input; report why.
+        match self.finish() {
+            Err(err) => Err(err),
+            Ok(_) => Err("merge insert writer exited".to_string()),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<Fragment>, String> {
+        drop(self.sender.take());
+        let join = self
+            .join
+            .take()
+            .ok_or("merge insert writer is already finished")?;
+        join.join()
+            .map_err(|_| "merge insert writer panicked".to_string())?
+    }
+}
+
+impl Drop for InsertStream {
+    fn drop(&mut self) {
+        // An aborted statement drops the uncommitted append.
+        if self.join.is_some() {
+            let _ = self.finish();
+        }
+    }
 }
 
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn lance_merge_begin(
     dataset: *mut c_void,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     ingest_batch_budget: u64,
+    spill_directory: *const c_char,
+    spill_limit: u64,
     out_merge_handle: *mut *mut c_void,
 ) -> i32 {
     match merge_begin_inner(
@@ -52,6 +117,8 @@ pub unsafe extern "C" fn lance_merge_begin(
         max_rows_per_group,
         max_bytes_per_file,
         ingest_batch_budget,
+        spill_directory,
+        spill_limit,
         out_merge_handle,
     ) {
         Ok(()) => {
@@ -65,12 +132,15 @@ pub unsafe extern "C" fn lance_merge_begin(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_begin_inner(
     dataset: *mut c_void,
     max_rows_per_file: u64,
     max_rows_per_group: u64,
     max_bytes_per_file: u64,
     ingest_batch_budget: u64,
+    spill_directory: *const c_char,
+    spill_limit: u64,
     out_merge_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
     if out_merge_handle.is_null() {
@@ -110,17 +180,45 @@ fn merge_begin_inner(
         })?
     };
 
-    let input_schema: Arc<arrow_schema::Schema> = Arc::new(dataset.schema().into());
-    let handle = Box::new(MergeHandle {
-        dataset,
-        input_schema,
+    let spill_root =
+        unsafe { optional_cstr_to_str(spill_directory, "spill_directory")? }.map(PathBuf::from);
+
+    // The writer resolves external blob sources with the dataset's own
+    // storage options.
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: dataset.storage_options_accessor(),
+        ..Default::default()
+    };
+    let write_params = WriteParams {
+        mode: WriteMode::Append,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
-        ingest_batch_budget,
+        session: Some(dataset.session()),
+        store_params: Some(store_params),
+        // SQL reference values keep Lance ownership semantics: matching
+        // registered bases reuse them, other absolute URIs are stored as-is.
+        // Ingest values are materialized before they reach the writer.
+        allow_external_blob_outside_bases: true,
+        external_blob_mode: ExternalBlobMode::Reference,
+        ..Default::default()
+    };
+    let handle = Box::new(MergeHandle {
+        existing_schema: dataset.schema().into(),
+        blob_context: BlobWriteContext {
+            registry: dataset.session().store_registry(),
+            ingest_batch_budget,
+        },
+        write_params,
         delete_row_ids: RoaringTreemap::new(),
-        update_batches: Vec::new(),
-        insert_batches: Vec::new(),
+        updates: ColumnUpdateWriter::new(
+            dataset.clone(),
+            ingest_batch_budget,
+            spill_root,
+            spill_limit,
+        ),
+        inserts: None,
+        dataset,
     });
 
     unsafe {
@@ -238,12 +336,13 @@ fn merge_add_update_batch_inner(
         source_uri_counts,
         source_uri_count,
     )?;
-    handle.update_batches.push(UpdateValueBatch {
+    runtime::block_on(handle.updates.add(UpdateValueBatch {
         columns,
         batch,
         source_options,
-    });
-    Ok(())
+    }))
+    .map_err(|err| FfiError::new(ErrorCode::DatasetMerge, format!("runtime: {err}")))?
+    .map_err(|message| FfiError::new(ErrorCode::DatasetMerge, message))
 }
 
 #[no_mangle]
@@ -304,7 +403,26 @@ fn merge_add_insert_batch_inner(
         source_uri_counts,
         source_uri_count,
     )?;
-    handle.insert_batches.push((batch, source_options));
+    let batch = convert_blob_batch(
+        &batch,
+        &handle.existing_schema,
+        &handle.blob_context,
+        &source_options,
+    )
+    .and_then(|batch| cast_batch_to_stored(&batch, &handle.existing_schema))
+    .map_err(|message| FfiError::new(ErrorCode::DatasetMerge, message))?;
+    if handle.inserts.is_none() {
+        handle.inserts = Some(InsertStream::start(
+            handle.dataset.clone(),
+            handle.write_params.clone(),
+            batch.schema(),
+        ));
+    }
+    if let Some(inserts) = handle.inserts.as_mut() {
+        inserts
+            .send(batch)
+            .map_err(|message| FfiError::new(ErrorCode::DatasetMerge, message))?;
+    }
     Ok(())
 }
 
@@ -342,103 +460,38 @@ fn merge_finish_uncommitted_inner(
         ));
     }
 
-    let handle = unsafe { Box::from_raw(merge_handle as *mut MergeHandle) };
+    let MergeHandle {
+        dataset,
+        delete_row_ids,
+        updates,
+        inserts,
+        ..
+    } = *unsafe { Box::from_raw(merge_handle as *mut MergeHandle) };
+
+    let new_fragments = match inserts {
+        Some(mut inserts) => inserts
+            .finish()
+            .map_err(|message| FfiError::new(ErrorCode::DatasetMerge, message))?,
+        None => Vec::new(),
+    };
 
     let maybe_txn = match runtime::block_on(async move {
-        let dataset = handle.dataset.clone();
-
-        let existing_schema: arrow_schema::Schema = dataset.schema().into();
-        let blob_context = BlobWriteContext {
-            registry: dataset.session().store_registry(),
-            ingest_batch_budget: handle.ingest_batch_budget,
-        };
-
-        let mut new_fragments = Vec::new();
-        if !handle.insert_batches.is_empty() {
-            let mut insert_batches = Vec::with_capacity(handle.insert_batches.len());
-            for (batch, source_options) in handle.insert_batches.iter() {
-                let batch =
-                    convert_blob_batch(batch, &existing_schema, &blob_context, source_options)?;
-                insert_batches.push(cast_batch_to_stored(&batch, &existing_schema)?);
-            }
-
-            // The writer resolves external blob sources with the dataset's own
-            // storage options.
-            let store_params = ObjectStoreParams {
-                storage_options_accessor: dataset.storage_options_accessor(),
-                ..Default::default()
-            };
-
-            let write_params = WriteParams {
-                mode: WriteMode::Append,
-                max_rows_per_file: handle.max_rows_per_file,
-                max_rows_per_group: handle.max_rows_per_group,
-                max_bytes_per_file: handle.max_bytes_per_file,
-                session: Some(dataset.session()),
-                store_params: Some(store_params),
-                // SQL reference values keep Lance ownership semantics: matching
-                // registered bases reuse them, other absolute URIs are stored
-                // as-is. Ingest values were materialized above.
-                allow_external_blob_outside_bases: true,
-                external_blob_mode: ExternalBlobMode::Reference,
-                ..Default::default()
-            };
-
-            let insert_schema = insert_batches
-                .first()
-                .map(|batch| batch.schema())
-                .unwrap_or_else(|| handle.input_schema.clone());
-            let stream = futures::stream::iter(insert_batches.into_iter().map(Ok)).boxed();
-            let stream: SendableRecordBatchStream =
-                Box::pin(RecordBatchStreamAdapter::new(insert_schema, stream));
-
-            let append_txn = InsertBuilder::new(dataset.clone())
-                .with_params(&write_params)
-                .execute_uncommitted_stream(stream)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let Operation::Append { fragments } = append_txn.operation else {
-                return Err("unexpected transaction operation for merge insert write".to_string());
-            };
-            new_fragments = fragments;
-        }
-
         let mut row_addrs = RoaringTreemap::new();
-        if !handle.delete_row_ids.is_empty() {
+        if !delete_row_ids.is_empty() {
             if dataset.manifest.uses_stable_row_ids() {
                 let row_id_index = build_row_id_index(dataset.as_ref())
                     .await
                     .map_err(|e| e.to_string())?;
-                for row_id in handle.delete_row_ids.iter() {
+                for row_id in delete_row_ids.iter() {
                     row_addrs.insert(lookup_row_address(&row_id_index, row_id)?);
                 }
             } else {
-                row_addrs = handle.delete_row_ids;
+                row_addrs = delete_row_ids;
             }
         }
 
-        let mut update_batches = Vec::with_capacity(handle.update_batches.len());
-        for mut item in handle.update_batches {
-            item.batch = convert_blob_batch(
-                &item.batch,
-                &existing_schema,
-                &blob_context,
-                &item.source_options,
-            )?;
-            update_batches.push(item);
-        }
-
-        let compose_result = compose_column_updates(
-            &dataset,
-            &update_batches,
-            &row_addrs,
-            handle.ingest_batch_budget,
-        )
-        .await?;
-        let mut updated_fragments = compose_result.0;
-        let fields_modified = compose_result.1;
-        let fragment_offsets = compose_result.2;
+        let (mut updated_fragments, fields_modified, fragment_offsets) =
+            updates.finish(&row_addrs).await?;
 
         let (deleted_fragments, removed_fragment_ids) = if row_addrs.is_empty() {
             (Vec::new(), Vec::new())

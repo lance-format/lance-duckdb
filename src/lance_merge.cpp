@@ -577,10 +577,12 @@ void LanceMergeGlobalState::EnsureMergeHandle(ClientContext &context) {
     return;
   }
 
+  auto spill = LanceGetDmlSpillTarget(context);
   auto rc = lance_merge_begin(
       op.dataset->Handle(), LANCE_DEFAULT_MAX_ROWS_PER_FILE,
       LANCE_DEFAULT_MAX_ROWS_PER_GROUP, LANCE_DEFAULT_MAX_BYTES_PER_FILE,
       NumericCast<uint64_t>(LanceBlobIngestBatchBudget(context)),
+      spill.directory.empty() ? nullptr : spill.directory.c_str(), spill.limit,
       &merge_handle);
   if (rc != 0 || !merge_handle) {
     throw IOException("Failed to start Lance MERGE transaction for '" +
