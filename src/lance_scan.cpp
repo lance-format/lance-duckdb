@@ -1111,7 +1111,6 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
                                               TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types,
                                               vector<Identifier> &names) {
-  input.table_function.late_materialization = LanceCanLateMaterialize(context);
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
     throw InvalidInputException("Lance scan requires a dataset root path");
   }
@@ -1190,7 +1189,6 @@ static unique_ptr<FunctionData>
 LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
                        vector<LogicalType> &return_types,
                        vector<Identifier> &names) {
-  input.table_function.late_materialization = LanceCanLateMaterialize(context);
   if (input.inputs.size() < 2 || input.inputs[0].IsNull() ||
       input.inputs[1].IsNull()) {
     throw InvalidInputException(
@@ -3594,6 +3592,43 @@ static void LanceCardinalityFixupOptimizer(OptimizerExtensionInput &input,
   plan = LanceCardinalityFixup(input.context, std::move(plan));
 }
 
+static bool LanceHasUnorderedLimit(const LogicalOperator &op) {
+  if (op.type == LogicalOperatorType::LOGICAL_LIMIT) {
+    auto *node = &op;
+    do {
+      if (node->children.size() != 1) {
+        return true;
+      }
+      node = node->children[0].get();
+    } while (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+             node->type == LogicalOperatorType::LOGICAL_FILTER);
+    if (node->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
+      return true;
+    }
+  }
+  for (const auto &child : op.children) {
+    if (LanceHasUnorderedLimit(*child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void LanceSetLateMaterialization(LogicalOperator &op, bool enabled) {
+  for (auto &child : op.children) {
+    LanceSetLateMaterialization(*child, enabled);
+  }
+  if (op.type == LogicalOperatorType::LOGICAL_GET) {
+    auto &get = op.Cast<LogicalGet>();
+    if (IsLanceScanTableFunction(get.function) && get.bind_data) {
+      auto &bind = get.bind_data->Cast<LanceScanBindData>();
+      get.function.late_materialization =
+          enabled && bind.dataset && !bind.UsesNamespaceQuery() &&
+          bind.take_row_ids.empty() && !bind.limit_offset_pushed_down;
+    }
+  }
+}
+
 void RegisterLanceScanOptimizer(DBConfig &config) {
   OptimizerExtension exec_ext;
   // Preserve native AVG before DuckDB rewrites it into SUM/COUNT. Retain
@@ -3601,6 +3636,11 @@ void RegisterLanceScanOptimizer(DBConfig &config) {
   // rewrites.
   exec_ext.pre_optimize_function = [](OptimizerExtensionInput &input,
                                       unique_ptr<LogicalOperator> &plan) {
+    // Plain LIMIT already uses a bounded Lance scan. CTE inlining and other
+    // later rewrites can expose that scan, so retain the original path for the
+    // whole statement instead of moving filters, limits or optimizer passes.
+    LanceSetLateMaterialization(*plan, LanceCanLateMaterialize(input.context) &&
+                                           !LanceHasUnorderedLimit(*plan));
     plan->ResolveOperatorTypes();
     plan = LanceExecPushdown(input.context, input.optimizer, std::move(plan),
                              true);
@@ -3897,7 +3937,7 @@ static TableFunction LanceTableScanFunction() {
   function.pushdown_complex_filter = LancePushdownComplexFilter;
   function.pushdown_expression = LancePushdownExpression;
   function.get_virtual_columns = LanceGetVirtualColumns;
-  function.late_materialization = true;
+  function.late_materialization = false;
   function.get_row_id_columns = LanceGetRowIdColumns;
   function.to_string = LanceScanToString;
   function.get_metrics = LanceScanGetMetrics;
@@ -3997,9 +4037,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 
   bind_data = std::move(result);
-  auto function = LanceTableScanFunction();
-  function.late_materialization = LanceCanLateMaterialize(context);
-  return function;
+  return LanceTableScanFunction();
 }
 
 void RegisterLanceScan(ExtensionLoader &loader) {
@@ -4023,7 +4061,9 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_scan.pushdown_expression = LancePushdownExpression;
   internal_scan.get_virtual_columns = LanceGetVirtualColumns;
-  internal_scan.late_materialization = true;
+  // Enable per plan above. Late CTE copies can rebind after that check, and
+  // must retain this conservative default rather than re-enable plain LIMIT.
+  internal_scan.late_materialization = false;
   internal_scan.get_row_id_columns = LanceGetRowIdColumns;
   internal_scan.to_string = LanceScanToString;
   internal_scan.get_metrics = LanceScanGetMetrics;
@@ -4057,7 +4097,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_namespace_scan.pushdown_expression = LancePushdownExpression;
   internal_namespace_scan.get_virtual_columns = LanceGetVirtualColumns;
-  internal_namespace_scan.late_materialization = true;
+  internal_namespace_scan.late_materialization = false;
   internal_namespace_scan.get_row_id_columns = LanceGetRowIdColumns;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.get_metrics = LanceScanGetMetrics;

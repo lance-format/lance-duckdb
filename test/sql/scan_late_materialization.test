@@ -289,8 +289,101 @@ SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (
 ----
 0
 
-# LIMIT/OFFSET and row-count sampling also use the native rewrite. Validate
-# membership/cardinality, since their SQL has no explicit ordering.
+# Plain LIMIT/OFFSET already has a bounded Lance scan. Reconstructing its rows
+# would add another scan and read payloads outside that range.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 1000;
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 10 OFFSET 3000;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Record Batch Rows": "10"[\s\S]*"Lance Rows Out": "10"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id + 1 AS next_id, vec, payload FROM '{TEST_DIR}/late_materialization.lance'
+WHERE id::VARCHAR LIKE '%3%' LIMIT 3 OFFSET 10;
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+# Later inlining must not recreate an ordinary LIMIT reconstruction.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+WITH c AS (SELECT * FROM '{TEST_DIR}/late_materialization.lance')
+SELECT * FROM c LIMIT 1000;
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+# Filter simplification can make a CTE eligible for later inlining.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+WITH c AS (SELECT * FROM '{TEST_DIR}/late_materialization.lance')
+(SELECT * FROM c LIMIT 1000) UNION ALL (SELECT * FROM c WHERE FALSE);
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+# Mixed statements conservatively retain their existing paths, including an
+# unordered LIMIT hidden behind a join or another CTE reference.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+WITH c AS NOT MATERIALIZED (SELECT * FROM '{TEST_DIR}/late_materialization.lance')
+(SELECT * FROM c LIMIT 1000) UNION ALL (SELECT * FROM c ORDER BY score, id LIMIT 10);
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT t.* FROM '{TEST_DIR}/late_materialization.lance' t CROSS JOIN (SELECT 1) d LIMIT 1000;
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+statement ok
+ATTACH '{TEST_DIR}' AS lm_limit (TYPE LANCE);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+WITH c AS (SELECT * FROM lm_limit.main.late_materialization)
+SELECT * FROM c LIMIT 10 OFFSET 3000;
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+statement ok
+DETACH lm_limit;
+
+# An outer TopN must not reconstruct from an unbounded copy of an inner LIMIT.
+statement ok
+SET disabled_optimizers = 'late_materialization';
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS
+SELECT * FROM (SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 1000 OFFSET 500) s
+ORDER BY score, id LIMIT 10;
+
+statement ok
+SET disabled_optimizers = '';
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS
+SELECT * FROM (SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 1000 OFFSET 500) s
+ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+# Nested limits retain DuckDB's own limit composition.
+query II
+SELECT count(*), count(DISTINCT id)
+FROM (SELECT * FROM (SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 30 OFFSET 20) s LIMIT 10 OFFSET 5);
+----
+10	10
+
+# Validate membership/cardinality without imposing an unspecified SQL order.
 statement ok
 CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 10 OFFSET 3000;
 
