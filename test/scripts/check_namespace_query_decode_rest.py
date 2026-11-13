@@ -377,6 +377,70 @@ def main() -> None:
             )
 
         try:
+            # Direct dataset reads through REST discovery still pin a dataset
+            # snapshot and can use the native late-materialization rewrite.
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+            for source in ("ns.main.fallback", f"__lance_namespace_scan('{endpoint}', 'fallback', '$')"):
+                start = len(requests)
+                sql = f"SELECT id, txt FROM {source} ORDER BY id DESC LIMIT 1;"
+                for explain in (False, True):
+                    result = subprocess.run(
+                        [
+                            str(args.duckdb),
+                            "-unsigned",
+                            "-no-agent",
+                            "-json",
+                            "-c",
+                            prefix
+                            + "SET lance_namespace_query_table = false; "
+                            + ("EXPLAIN (ANALYZE, FORMAT JSON) " if explain else "")
+                            + sql,
+                        ],
+                        cwd=REPO_ROOT,
+                        text=True,
+                        capture_output=True,
+                        timeout=60,
+                        env={**os.environ, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+                    )
+                    assert result.returncode == 0, result.stderr
+                    if explain:
+                        assert '"Join Type": "SEMI"' in result.stdout, result.stdout
+                        assert '"Lance Rows Out": "1"' in result.stdout, result.stdout
+                    else:
+                        assert json.loads(result.stdout) == [{"id": 1, "txt": "row-1"}], result.stdout
+                result = subprocess.run(
+                    [
+                        str(args.duckdb),
+                        "-unsigned",
+                        "-no-agent",
+                        "-json",
+                        "-c",
+                        prefix
+                        + "SET lance_namespace_query_table = false; SET disabled_optimizers = 'filter_pushdown'; "
+                        + f"SELECT id, txt FROM {source} WHERE rowid IN (0, 0, 1) ORDER BY id LIMIT 2;",
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    env={**os.environ, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+                )
+                assert result.returncode == 0, result.stderr
+                assert json.loads(result.stdout) == [{"id": 0, "txt": "row-0"}] * 2, result.stdout
+                assert len(requests) == start, "direct reads must not call query_table"
+            # query_table does not pin a dataset snapshot across requests. TopN
+            # must remain one remote scan, with ordering and limiting in DuckDB.
+            for mode in ("normal", "file"):
+                start = len(requests)
+                check(
+                    mode,
+                    "scan",
+                    "id, txt",
+                    [{"id": 1, "txt": "row-1"}],
+                    suffix="ORDER BY id DESC LIMIT 1",
+                )
+                assert len(requests) == start + 1, "TopN must use one query_table snapshot"
+                assert not requests[-1].get("with_row_id"), "remote TopN must not request materialization row ids"
             for kind in ("scan", "fts", "knn"):
                 for mode in ("normal", "file", "reordered", "extra", "fallback", "leading_empty"):
                     check(

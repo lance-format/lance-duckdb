@@ -342,6 +342,42 @@ LanceScanGetPartitionStats(ClientContext &context,
 
 LanceScanBindData::~LanceScanBindData() {}
 
+unique_ptr<FunctionData> LanceScanBindData::Copy() const {
+  auto result = make_uniq<LanceScanBindData>();
+  result->column_ids = column_ids;
+  result->file_path = file_path;
+  result->explain_verbose = explain_verbose;
+  // Both sides of late materialization must read the same immutable snapshot.
+  result->dataset_entry = dataset_entry;
+  result->dataset = dataset;
+  result->dataset_cache_hit = dataset_cache_hit;
+  // ArrowTableSchema owns its conversion types. Share those, not the Arrow C
+  // schema release callbacks used to populate them during binding.
+  result->arrow_table = arrow_table;
+  result->scan_arrow_table = scan_arrow_table;
+  result->names = names;
+  result->types = types;
+  result->json_columns = json_columns;
+  result->blob_columns = blob_columns;
+  result->forced_null_columns = forced_null_columns;
+  result->lance_pushed_filter_ir_parts = lance_pushed_filter_ir_parts;
+  result->duckdb_pushed_filter_sql_parts = duckdb_pushed_filter_sql_parts;
+  result->table_entry = table_entry;
+  if (namespace_query_config) {
+    result->namespace_query_config =
+        make_uniq<LanceNamespaceTableConfig>(*namespace_query_config);
+  }
+  result->sampling_pushed_down = sampling_pushed_down;
+  result->sample_percentage = sample_percentage;
+  result->sample_seed = sample_seed;
+  result->sample_repeatable = sample_repeatable;
+  result->take_row_ids = take_row_ids;
+  result->limit_offset_pushed_down = limit_offset_pushed_down;
+  result->pushed_limit = pushed_limit;
+  result->pushed_offset = pushed_offset;
+  return std::move(result);
+}
+
 static constexpr const char *LANCE_DEFERRED_SETTING =
     "lance_deferred_materialization";
 static constexpr const char *LANCE_NAMESPACE_QUERY_TABLE_SETTING =
@@ -429,6 +465,18 @@ static virtual_column_map_t LanceGetVirtualColumns(ClientContext &,
   result.emplace(LANCE_COLUMN_IDENTIFIER_ROW_ID,
                  TableColumn(LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT));
   return result;
+}
+
+static vector<column_t> LanceGetRowIdColumns(ClientContext &,
+                                             optional_ptr<FunctionData>) {
+  return {LANCE_COLUMN_IDENTIFIER_ROW_ID};
+}
+
+static bool LanceCanLateMaterialize(ClientContext &context) {
+  // Complex filter pushdown opts static point selections out before DuckDB
+  // rewrites TopN. Without that pass, a later duplicate-id take could make
+  // reconstruction lose rows selected by LIMIT.
+  return !Optimizer::OptimizerDisabled(context, OptimizerType::FILTER_PUSHDOWN);
 }
 
 static bool TryLanceExplainDatasetScan(void *dataset,
@@ -713,12 +761,11 @@ static void CastRowIdToDuckDBRowType(Vector &src, Vector &dst, idx_t count) {
   }
 }
 
-static bool TryExtractTakeRowIdsFromExpression(const Expression &expr,
-                                               vector<uint64_t> &out_row_ids) {
+static bool TryExtractRowIdValues(const Expression &expr,
+                                  vector<Value> &values) {
   if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
-    return TryExtractTakeRowIdsFromExpression(*child, out_row_ids);
+    return TryExtractRowIdValues(*child, values);
   }
-  vector<Value> values;
   if (BoundComparisonExpression::IsComparison(expr)) {
     auto &comparison_expr = expr.Cast<BoundFunctionExpression>();
     auto comparison = expr.GetExpressionType();
@@ -727,9 +774,13 @@ static bool TryExtractTakeRowIdsFromExpression(const Expression &expr,
       return false;
     }
     Value value;
-    if (TryGetRowIdConstant(*comparison_expr.GetChildren()[1], value)) {
+    if (ExpressionFilter::IsSimpleFilterColumnRef(
+            *comparison_expr.GetChildren()[0]) &&
+        TryGetRowIdConstant(*comparison_expr.GetChildren()[1], value)) {
       values.push_back(std::move(value));
-    } else if (TryGetRowIdConstant(*comparison_expr.GetChildren()[0], value)) {
+    } else if (ExpressionFilter::IsSimpleFilterColumnRef(
+                   *comparison_expr.GetChildren()[1]) &&
+               TryGetRowIdConstant(*comparison_expr.GetChildren()[0], value)) {
       values.push_back(std::move(value));
     } else {
       return false;
@@ -749,6 +800,15 @@ static bool TryExtractTakeRowIdsFromExpression(const Expression &expr,
       values.push_back(std::move(value));
     }
   } else {
+    return false;
+  }
+  return true;
+}
+
+static bool TryExtractTakeRowIdsFromExpression(const Expression &expr,
+                                               vector<uint64_t> &out_row_ids) {
+  vector<Value> values;
+  if (!TryExtractRowIdValues(expr, values)) {
     return false;
   }
   for (const auto &value : values) {
@@ -780,12 +840,41 @@ static bool IsTakeRowIdFilter(const TableFilter &filter) {
   return TryExtractTakeRowIdsFromFilter(filter, row_ids);
 }
 
-static bool TryExtractTakeRowIdsFromFilters(const TableFilterSet &filters,
-                                            const idx_t row_id_col_idx,
-                                            vector<uint64_t> &out_row_ids) {
-  auto filter =
-      filters.TryGetFilterByColumnIndex(ProjectionIndex(row_id_col_idx));
-  return filter && TryExtractTakeRowIdsFromFilter(*filter, out_row_ids);
+static bool TryExtractRuntimeTakeRowIds(const Expression &expr,
+                                        vector<uint64_t> &out_row_ids) {
+  if (auto child = ExpressionFilter::GetOptionalFilterChild(expr)) {
+    return TryExtractRuntimeTakeRowIds(*child, out_row_ids);
+  }
+  if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+      expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+    // One finite candidate set is enough: all predicates, including the
+    // remaining conjuncts and optional bloom/range filters, still run locally.
+    for (const auto &child :
+         expr.Cast<BoundConjunctionExpression>().GetChildren()) {
+      if (TryExtractRuntimeTakeRowIds(*child, out_row_ids)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  vector<Value> values;
+  if (!TryExtractRowIdValues(expr, values)) {
+    return false;
+  }
+  vector<uint64_t> row_ids;
+  for (const auto &value : values) {
+    uint64_t row_id;
+    if (!TryParseRowIdValue(value, row_id)) {
+      // Runtime join keys need not be valid Lance ids. Keep the scan fallback
+      // instead of turning an optional filter into a query error.
+      return false;
+    }
+    row_ids.push_back(row_id);
+  }
+  std::sort(row_ids.begin(), row_ids.end());
+  row_ids.erase(std::unique(row_ids.begin(), row_ids.end()), row_ids.end());
+  out_row_ids = std::move(row_ids);
+  return true;
 }
 
 static void
@@ -940,6 +1029,9 @@ LancePushdownComplexFilter(ClientContext &context, LogicalGet &get,
       vector<uint64_t> take_row_ids;
       if (try_extract_rowids(*expr, take_row_ids) && !take_row_ids.empty()) {
         scan_bind.take_row_ids = std::move(take_row_ids);
+        // Point selections are already narrow and may contain repeated ids.
+        // A SEMI join on those ids would not preserve LIMIT cardinality.
+        get.function.late_materialization = false;
       }
     }
     if (BoundComparisonExpression::IsComparison(*expr)) {
@@ -1019,6 +1111,7 @@ static unique_ptr<FunctionData> LanceScanBind(ClientContext &context,
                                               TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types,
                                               vector<Identifier> &names) {
+  input.table_function.late_materialization = LanceCanLateMaterialize(context);
   if (input.inputs.empty() || input.inputs[0].IsNull()) {
     throw InvalidInputException("Lance scan requires a dataset root path");
   }
@@ -1097,6 +1190,7 @@ static unique_ptr<FunctionData>
 LanceNamespaceScanBind(ClientContext &context, TableFunctionBindInput &input,
                        vector<LogicalType> &return_types,
                        vector<Identifier> &names) {
+  input.table_function.late_materialization = LanceCanLateMaterialize(context);
   if (input.inputs.size() < 2 || input.inputs[0].IsNull() ||
       input.inputs[1].IsNull()) {
     throw InvalidInputException(
@@ -1501,24 +1595,22 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     return state;
   }
 
-  idx_t row_id_col_idx = DConstants::INVALID_INDEX;
-  for (idx_t i = 0; i < bind_data.names.size(); i++) {
-    if (bind_data.names[i] == "_rowid") {
-      row_id_col_idx = i;
-      break;
-    }
-  }
-  if (row_id_col_idx != DConstants::INVALID_INDEX && input.filters &&
-      TryExtractTakeRowIdsFromFilters(*input.filters, row_id_col_idx,
-                                      scan_state.take_row_ids)) {
-    if (scan_state.sampling_pushed_down) {
-      // Sampling is applied before filtering, so do not combine it with point
-      // lookup pushdown (which would filter first).
-      scan_state.take_row_ids.clear();
-    } else {
-      if (bind_data.limit_offset_pushed_down) {
-        throw IOException(
-            "Lance point lookup does not support limit/offset pushdown");
+  if (input.filters && !scan_state.sampling_pushed_down &&
+      !scan_state.limit_offset_pushed_down) {
+    for (idx_t i = 0; i < input.column_ids.size(); i++) {
+      auto col_id = input.column_ids[i];
+      if (col_id != COLUMN_IDENTIFIER_ROW_ID &&
+          !IsLanceVirtualRowIdColumnId(col_id)) {
+        continue;
+      }
+      auto filter =
+          input.filters->TryGetFilterByColumnIndex(ProjectionIndex(i));
+      if (!filter ||
+          !TryExtractRuntimeTakeRowIds(*ExpressionFilter::GetExpressionFilter(
+                                            *filter, "Lance rowid lookup")
+                                            .expr,
+                                       scan_state.take_row_ids)) {
+        continue;
       }
       scan_state.lance_filter_ir.clear();
       scan_state.filter_pushed_down = false;
@@ -3805,6 +3897,8 @@ static TableFunction LanceTableScanFunction() {
   function.pushdown_complex_filter = LancePushdownComplexFilter;
   function.pushdown_expression = LancePushdownExpression;
   function.get_virtual_columns = LanceGetVirtualColumns;
+  function.late_materialization = true;
+  function.get_row_id_columns = LanceGetRowIdColumns;
   function.to_string = LanceScanToString;
   function.get_metrics = LanceScanGetMetrics;
   function.get_table_entry = [](optional_ptr<const FunctionData> bind_data)
@@ -3842,6 +3936,8 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
     bind_data = std::move(result);
     auto function = LanceTableScanFunction();
     function.sampling_pushdown = false;
+    // query_table cannot pin both requests to one dataset version or take ids.
+    function.late_materialization = false;
     return function;
   }
 
@@ -3901,7 +3997,9 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
       context, result->scan_arrow_table, result->scan_schema_root.arrow_schema);
 
   bind_data = std::move(result);
-  return LanceTableScanFunction();
+  auto function = LanceTableScanFunction();
+  function.late_materialization = LanceCanLateMaterialize(context);
+  return function;
 }
 
 void RegisterLanceScan(ExtensionLoader &loader) {
@@ -3925,6 +4023,8 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_scan.pushdown_expression = LancePushdownExpression;
   internal_scan.get_virtual_columns = LanceGetVirtualColumns;
+  internal_scan.late_materialization = true;
+  internal_scan.get_row_id_columns = LanceGetRowIdColumns;
   internal_scan.to_string = LanceScanToString;
   internal_scan.get_metrics = LanceScanGetMetrics;
 
@@ -3957,6 +4057,8 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
   internal_namespace_scan.pushdown_expression = LancePushdownExpression;
   internal_namespace_scan.get_virtual_columns = LanceGetVirtualColumns;
+  internal_namespace_scan.late_materialization = true;
+  internal_namespace_scan.get_row_id_columns = LanceGetRowIdColumns;
   internal_namespace_scan.to_string = LanceScanToString;
   internal_namespace_scan.get_metrics = LanceScanGetMetrics;
 

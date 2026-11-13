@@ -48,6 +48,8 @@ struct LanceScanBindData : public TableFunctionData {
 
   bool UsesNamespaceQuery() const { return namespace_query_config != nullptr; }
 
+  unique_ptr<FunctionData> Copy() const override;
+
   // The bind data pins a dataset handle checked out at bind time. Cached
   // prepared statements would keep scanning that version forever, bypassing
   // the cache revalidation that runs at bind; force a rebind per execution so

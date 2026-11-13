@@ -1,0 +1,422 @@
+# name: test/sql/scan_late_materialization.test
+# description: Native late materialization reads wide payloads only for exact TopN winners
+# group: [sql]
+
+require lance
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE lm_reference AS
+SELECT i::BIGINT AS id, ((i * 7919) % 4096)::BIGINT AS score,
+       (i % 128)::BIGINT AS grp,
+       list_transform(range(32), lambda x: (i + x)::FLOAT)::FLOAT[32] AS vec,
+       {'label': 'row-' || i::VARCHAR, 'values': [i, NULL, i + 1]} AS payload,
+       repeat((i % 10)::VARCHAR, 1024)::BLOB AS bytes
+FROM range(4096) r(i);
+
+statement ok
+COPY lm_reference TO '{TEST_DIR}/late_materialization.lance'
+  (FORMAT lance, max_rows_per_file 512);
+
+# The materializing scan must use the runtime row-id filter, not scan all
+# payloads and discard them at the join. The other scan reads ranking keys.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY score, id LIMIT 10;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*"Lance Rows Out": "10"[\s\S]*
+
+statement ok
+CREATE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY score, id LIMIT 10;
+
+statement ok
+CREATE TABLE lm_expected AS SELECT * FROM lm_reference ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+# A single winner uses equality instead of an IN-list dynamic filter.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY score DESC, id LIMIT 1;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*"Lance Rows Out": "1"[\s\S]*
+
+query I
+SELECT count(*) FROM (SELECT * FROM '{TEST_DIR}/late_materialization.lance' WHERE id < 0 ORDER BY score LIMIT 10);
+----
+0
+
+# Runtime filtering remains correct with residual predicates and OFFSET.
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' WHERE id::VARCHAR LIKE '%3%' ORDER BY score, id LIMIT 10 OFFSET 7;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference WHERE id::VARCHAR LIKE '%3%' ORDER BY score, id LIMIT 10 OFFSET 7;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+# Dense ids and disabled IN generation may use a prefix-range or bloom filter.
+# These filters must retain a correct scan fallback.
+statement ok
+SET dynamic_or_filter_threshold = 0;
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference ORDER BY id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
+# Static point selections already avoid a full payload scan. They preserve the
+# extension's duplicate-id behavior and must not be multiplied by a SEMI join.
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid IN (1, 1, 3) ORDER BY id LIMIT 1;
+----
+1	1
+
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid IN (1, 1, 3) ORDER BY id LIMIT 2;
+----
+1	1
+1	1
+
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid = 1 OR _rowid = 1 OR _rowid = 3 ORDER BY id LIMIT 1;
+----
+1	1
+
+# The extension's later point-selection rewrite must remain safe when the
+# built-in filter-pushdown pass (and its early opt-out) is disabled.
+statement ok
+SET disabled_optimizers = 'filter_pushdown';
+
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid IN (1, 1, 3) ORDER BY id LIMIT 2;
+----
+1	1
+1	1
+
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid = 1 OR _rowid = 1 OR _rowid = 3 ORDER BY id LIMIT 2;
+----
+1	1
+1	1
+
+statement ok
+SET disabled_optimizers = '';
+
+# Missing row ids never materialize a row.
+query II
+SELECT id, vec[1] FROM '{TEST_DIR}/late_materialization.lance' WHERE _rowid IN (1, 999999, 3) ORDER BY id DESC LIMIT 1;
+----
+3	3
+
+statement ok
+ATTACH '{TEST_DIR}' AS lm (TYPE LANCE);
+
+statement ok
+SET disabled_optimizers = 'filter_pushdown';
+
+query II
+SELECT id, vec[1] FROM lm.main.late_materialization WHERE rowid IN (1, 1, 3) ORDER BY id LIMIT 2;
+----
+1	1
+1	1
+
+statement ok
+SET disabled_optimizers = '';
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM lm.main.late_materialization ORDER BY score, id LIMIT 10;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*"Lance Rows Out": "10"[\s\S]*
+
+# Stable ids differ from addresses in all fragments after the first one.
+statement ok
+COPY lm_reference TO '{TEST_DIR}/late_materialization_stable.lance'
+  (FORMAT lance, max_rows_per_file 512, enable_stable_row_ids true);
+
+statement ok
+DELETE FROM lm.main.late_materialization_stable WHERE id % 3 = 0;
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM lm.main.late_materialization_stable ORDER BY score, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference WHERE id % 3 <> 0 ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT * FROM lm.main.late_materialization_stable ORDER BY score, id LIMIT 10;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*"Lance Rows Out": "10"[\s\S]*
+
+statement ok
+OPTIMIZE lm.main.late_materialization_stable;
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM lm.main.late_materialization_stable ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+DETACH lm;
+
+# NULL ordering, ties, and projection expressions survive both scans.
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS
+SELECT id, vec, payload FROM '{TEST_DIR}/late_materialization.lance'
+ORDER BY CASE WHEN id % 7 = 0 THEN NULL ELSE score % 5 END NULLS FIRST, id DESC LIMIT 17;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS
+SELECT id, vec, payload FROM lm_reference
+ORDER BY CASE WHEN id % 7 = 0 THEN NULL ELSE score % 5 END NULLS FIRST, id DESC LIMIT 17;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+SET disabled_optimizers = 'join_filter_pushdown';
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY score, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+SET disabled_optimizers = '';
+
+# Above the default dynamic IN threshold, correctness does not depend on take.
+statement ok
+SET late_materialization_max_rows = 200;
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' ORDER BY score, id LIMIT 120;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference ORDER BY score, id LIMIT 120;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+RESET late_materialization_max_rows;
+
+# Partitioned TopN can also reconstruct wide rows after window elimination.
+# Projecting row_number and joining duplicate rows exercises its INNER path.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id, vec, payload FROM '{TEST_DIR}/late_materialization.lance'
+QUALIFY row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) <= 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "SEMI"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM '{TEST_DIR}/late_materialization.lance' t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+QUALIFY rn <= 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "INNER"[\s\S]*"Join Type": "INNER"[\s\S]*
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM '{TEST_DIR}/late_materialization.lance' t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+QUALIFY rn <= 3;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM lm_reference t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+QUALIFY rn <= 3;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS
+SELECT id, vec, payload FROM '{TEST_DIR}/late_materialization.lance'
+QUALIFY row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) <= 3;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS
+SELECT id, vec, payload FROM lm_reference
+QUALIFY row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) <= 3;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+# LIMIT/OFFSET and row-count sampling also use the native rewrite. Validate
+# membership/cardinality, since their SQL has no explicit ordering.
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' LIMIT 10 OFFSET 3000;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM lm_actual;
+----
+10	10
+
+query I
+SELECT count(*) FROM (TABLE lm_actual EXCEPT ALL TABLE lm_reference);
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' USING SAMPLE reservoir(10 ROWS) REPEATABLE(42);
+
+query II
+SELECT count(*), count(DISTINCT id) FROM lm_actual;
+----
+10	10
+
+query I
+SELECT count(*) FROM (TABLE lm_actual EXCEPT ALL TABLE lm_reference);
+----
+0
+
+# System sampling must not accidentally be applied to the materializing scan.
+statement ok
+SET disabled_optimizers = 'late_materialization';
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' TABLESAMPLE SYSTEM(50 PERCENT) REPEATABLE(42) ORDER BY score, id LIMIT 10;
+
+statement ok
+SET disabled_optimizers = '';
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' TABLESAMPLE SYSTEM(50 PERCENT) REPEATABLE(42) ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS SELECT * FROM '{TEST_DIR}/late_materialization.lance' TABLESAMPLE SYSTEM(100 PERCENT) ORDER BY score, id LIMIT 10;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS SELECT * FROM lm_reference ORDER BY score, id LIMIT 10;
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
+# Blob descriptors must still be materialized as bytes by the take path.
+query II
+SELECT id, octet_length(payload) FROM 'test/data/blob_v2_reads.lance' ORDER BY id DESC LIMIT 3;
+----
+4	0
+3	NULL
+2	256
+
+query II
+SELECT id, octet_length(payload) FROM 'test/data/blob_v1_reads.lance' ORDER BY id LIMIT 1;
+----
+0	13
+
+# Repeated prepared executions bind a fresh snapshot after external commits.
+statement ok con1
+COPY (SELECT 1::BIGINT AS id, 'first' AS payload)
+TO '{TEST_DIR}/late_materialization_prepared.lance' (FORMAT lance);
+
+statement ok con1
+PREPARE lm_prepared AS SELECT * FROM '{TEST_DIR}/late_materialization_prepared.lance' ORDER BY id DESC LIMIT 1;
+
+query IT con1
+EXECUTE lm_prepared;
+----
+1	first
+
+statement ok con2
+COPY (SELECT 2::BIGINT AS id, 'second' AS payload)
+TO '{TEST_DIR}/late_materialization_prepared.lance' (FORMAT lance, mode 'append');
+
+query IT con1
+EXECUTE lm_prepared;
+----
+2	second
+
+statement ok con1
+ATTACH '{TEST_DIR}' AS lm_reader (TYPE LANCE);
+
+statement ok con1
+PREPARE lm_attached AS SELECT * FROM lm_reader.main.late_materialization_prepared ORDER BY id DESC LIMIT 1;
+
+query IT con1
+EXECUTE lm_attached;
+----
+2	second
+
+statement ok con2
+COPY (SELECT 3::BIGINT AS id, 'third' AS payload)
+TO '{TEST_DIR}/late_materialization_prepared.lance' (FORMAT lance, mode 'append');
+
+query IT con1
+EXECUTE lm_attached;
+----
+3	third
+
+statement ok con2
+ATTACH '{TEST_DIR}' AS lm_writer (TYPE LANCE);
+
+statement ok con1
+PREPARE lm_schema AS SELECT payload FROM lm_reader.main.late_materialization_prepared ORDER BY id DESC LIMIT 1;
+
+statement ok con2
+ALTER TABLE lm_writer.main.late_materialization_prepared DROP COLUMN payload;
+
+statement error con1
+EXECUTE lm_schema;
+----
+<REGEX>:.*(changed externally|does not exist|not found).*
+
+statement ok con1
+DETACH lm_reader;
+
+statement ok con2
+DETACH lm_writer;
