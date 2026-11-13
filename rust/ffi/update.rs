@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, c_void};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::NullBufferBuilder;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::transaction::{Operation, Transaction, UpdateMode};
 use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
@@ -30,7 +36,9 @@ use super::blob::{
 };
 
 use super::stored_type::cast_to_stored;
-use super::util::{dataset_handle, optional_session_handle, FfiError, FfiResult};
+use super::util::{
+    dataset_handle, optional_cstr_to_str, optional_session_handle, FfiError, FfiResult,
+};
 use super::write::UncommittedTransaction;
 
 pub(super) async fn build_row_id_index(dataset: &lance::Dataset) -> Result<RowIdIndex, String> {
@@ -125,8 +133,7 @@ struct UpdateHandle {
     // The dataset version the statement's scans read. The transaction is built
     // on it, so Lance detects any commit made since.
     dataset: Arc<lance::Dataset>,
-    ingest_batch_budget: usize,
-    batches: Vec<UpdateValueBatch>,
+    writer: ColumnUpdateWriter,
 }
 
 #[repr(C)]
@@ -226,9 +233,17 @@ pub(super) fn take_update_batch_fields(batch: &RecordBatch) -> FfiResult<Vec<Str
 pub unsafe extern "C" fn lance_update_begin(
     dataset: *mut c_void,
     ingest_batch_budget: u64,
+    spill_directory: *const c_char,
+    spill_limit: u64,
     out_update_handle: *mut *mut c_void,
 ) -> i32 {
-    match update_begin_inner(dataset, ingest_batch_budget, out_update_handle) {
+    match update_begin_inner(
+        dataset,
+        ingest_batch_budget,
+        spill_directory,
+        spill_limit,
+        out_update_handle,
+    ) {
         Ok(()) => {
             clear_last_error();
             0
@@ -243,6 +258,8 @@ pub unsafe extern "C" fn lance_update_begin(
 fn update_begin_inner(
     dataset: *mut c_void,
     ingest_batch_budget: u64,
+    spill_directory: *const c_char,
+    spill_limit: u64,
     out_update_handle: *mut *mut c_void,
 ) -> FfiResult<()> {
     if out_update_handle.is_null() {
@@ -263,10 +280,17 @@ fn update_begin_inner(
         })?
     };
 
+    let spill_root =
+        unsafe { optional_cstr_to_str(spill_directory, "spill_directory")? }.map(PathBuf::from);
+
     let handle = Box::new(UpdateHandle {
+        writer: ColumnUpdateWriter::new(
+            dataset.clone(),
+            ingest_batch_budget,
+            spill_root,
+            spill_limit,
+        ),
         dataset,
-        ingest_batch_budget,
-        batches: Vec::new(),
     });
     unsafe {
         *out_update_handle = Box::into_raw(handle) as *mut c_void;
@@ -333,12 +357,13 @@ fn update_add_value_batch_inner(
         source_uri_counts,
         source_uri_count,
     )?;
-    handle.batches.push(UpdateValueBatch {
+    runtime::block_on(handle.writer.add(UpdateValueBatch {
         columns,
         batch,
         source_options,
-    });
-    Ok(())
+    }))
+    .map_err(|err| FfiError::new(ErrorCode::DatasetUpdateOverwrite, format!("runtime: {err}")))?
+    .map_err(|message| FfiError::new(ErrorCode::DatasetUpdateOverwrite, message))
 }
 
 #[no_mangle]
@@ -386,32 +411,10 @@ fn update_finish_uncommitted_inner(
     }
 
     let handle = unsafe { Box::from_raw(update_handle as *mut UpdateHandle) };
+    let UpdateHandle { dataset, writer } = *handle;
     let maybe_txn = match runtime::block_on(async move {
-        let dataset = handle.dataset.clone();
-
-        let existing_schema: ArrowSchema = dataset.schema().into();
-        let blob_context = BlobWriteContext {
-            registry: dataset.session().store_registry(),
-            ingest_batch_budget: handle.ingest_batch_budget,
-        };
-        let mut batches = Vec::with_capacity(handle.batches.len());
-        for mut item in handle.batches {
-            item.batch = convert_blob_batch(
-                &item.batch,
-                &existing_schema,
-                &blob_context,
-                &item.source_options,
-            )?;
-            batches.push(item);
-        }
-
-        let (updated_fragments, fields_modified, fragment_offsets) = compose_column_updates(
-            &dataset,
-            &batches,
-            &RoaringTreemap::new(),
-            handle.ingest_batch_budget,
-        )
-        .await?;
+        let (updated_fragments, fields_modified, fragment_offsets) =
+            writer.finish(&RoaringTreemap::new()).await?;
         if updated_fragments.is_empty() {
             return Ok::<_, String>(None);
         }
@@ -761,22 +764,16 @@ fn normalize_value_column(
     }
 }
 
-/// Group a single column's selected rows per fragment.
-///
-/// Returns fragment id -> (row ids, values) for the fragments actually touched
-/// by this column, with duplicate row ids collapsed (first occurrence wins).
-fn group_column_rows(
-    column_name: &str,
-    batch: &RecordBatch,
-    row_id_index: Option<&RowIdIndex>,
-    deleted_addrs: &RoaringTreemap,
-) -> Result<HashMap<u32, (Vec<u64>, ArrayRef)>, String> {
-    let value_column = &batch.columns()[0];
-    let rowid_column = &batch.columns()[1];
-    let row_ids = read_row_ids(rowid_column)?;
+/// Fragment id -> (row ids, positions of their values in the batch).
+type FragmentRows = BTreeMap<u32, (Vec<u64>, Vec<u32>)>;
 
-    // Fragment id -> (row ids, positions of their values in the batch).
-    let mut groups: HashMap<u32, (Vec<u64>, Vec<u32>)> = HashMap::new();
+/// Group one batch's rows per fragment, with duplicate row ids collapsed
+/// (first occurrence wins).
+fn group_rows_by_fragment(
+    row_ids: &[u64],
+    row_id_index: Option<&RowIdIndex>,
+) -> Result<FragmentRows, String> {
+    let mut groups = FragmentRows::new();
     let mut seen: HashSet<u64> = HashSet::new();
     for (position, &row_id) in row_ids.iter().enumerate() {
         if !seen.insert(row_id) {
@@ -786,168 +783,444 @@ fn group_column_rows(
             Some(index) => lookup_row_address(index, row_id)?,
             None => row_id,
         };
-        if deleted_addrs.contains(addr) {
-            continue;
-        }
-        let position = u32::try_from(position)
-            .map_err(|_| format!("update batch for column '{column_name}' is too large"))?;
-        let fragment_id = RowAddress::from(addr).fragment_id();
-        let entry = groups.entry(fragment_id).or_default();
+        let position =
+            u32::try_from(position).map_err(|_| "update batch is too large".to_string())?;
+        let entry = groups
+            .entry(RowAddress::from(addr).fragment_id())
+            .or_default();
         entry.0.push(row_id);
         entry.1.push(position);
     }
-
-    let mut result = HashMap::with_capacity(groups.len());
-    for (fragment_id, (ids, positions)) in groups {
-        let indices = arrow_array::UInt32Array::from(positions);
-        let values = arrow::compute::take(value_column, &indices, None)
-            .map_err(|err| format!("failed to slice update column '{column_name}': {err}"))?;
-        result.insert(fragment_id, (ids, values));
-    }
-    Ok(result)
+    Ok(groups)
 }
 
-/// Rewrite the assigned columns of the touched fragments using Lance's native
-/// fragment updater and return the composed update metadata.
-#[allow(clippy::type_complexity)]
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn compose_column_updates(
-    dataset: &Arc<lance::Dataset>,
-    batches: &[UpdateValueBatch],
-    deleted_addrs: &RoaringTreemap,
-    ingest_batch_budget: usize,
-) -> Result<(Vec<Fragment>, Vec<u32>, HashMap<u64, RoaringBitmap>), String> {
-    if batches.is_empty() {
-        return Ok((Vec::new(), Vec::new(), HashMap::new()));
+/// The new values of one assigned column of one fragment as (`_rowid`, value)
+/// batches, held in memory or spilled to Arrow IPC streams.
+#[derive(Default)]
+struct BufferedColumn {
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    spills: Vec<PathBuf>,
+}
+
+impl BufferedColumn {
+    /// The spilled batches in spill order, then the in-memory ones.
+    fn into_rows(self) -> BufferedRows {
+        BufferedRows {
+            spills: self.spills.into_iter(),
+            current: None,
+            batches: self.batches.into_iter(),
+        }
     }
+}
 
-    let arrow_schema: Arc<ArrowSchema> = Arc::new(dataset.schema().into());
-    let stable_row_ids = dataset.manifest.uses_stable_row_ids();
-    let row_id_index = if stable_row_ids {
-        Some(build_row_id_index(dataset).await?)
-    } else {
-        None
-    };
+struct BufferedRows {
+    spills: std::vec::IntoIter<PathBuf>,
+    current: Option<StreamReader<BufReader<File>>>,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
 
-    // Per (fragment, column): concat all value rows across statement batches.
-    let mut groups: HashMap<u32, HashMap<String, Vec<RecordBatch>>> = HashMap::new();
-    for item in batches {
-        for (column_idx, column_name) in item.columns.iter().enumerate() {
-            let projected = item
-                .batch
-                .project(&[column_idx, item.batch.num_columns() - 1])
-                .map_err(|err| format!("failed to project update column '{column_name}': {err}"))?;
-            let per_fragment = group_column_rows(
-                column_name,
-                &projected,
-                row_id_index.as_ref(),
-                deleted_addrs,
-            )?;
-            for (fragment_id, (row_ids, values)) in per_fragment {
-                // The intermediate batch is typed by the DuckDB-exported value
-                // array; normalization to the target field happens per column
-                // after concatenation.
-                let value_schema = ArrowSchema::new(vec![
-                    ArrowField::new("_rowid", DataType::UInt64, false),
-                    ArrowField::new(column_name.as_str(), values.data_type().clone(), true),
-                ]);
-                let batch = RecordBatch::try_new(
-                    Arc::new(value_schema),
-                    vec![Arc::new(arrow_array::UInt64Array::from(row_ids)), values],
-                )
-                .map_err(|err| {
-                    format!("failed to build update batch for column '{column_name}': {err}")
-                })?;
-                groups
-                    .entry(fragment_id)
-                    .or_default()
-                    .entry(column_name.clone())
-                    .or_default()
-                    .push(batch);
+impl Iterator for BufferedRows {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(batch) = self.current.as_mut().and_then(Iterator::next) {
+                return Some(batch);
+            }
+            let Some(path) = self.spills.next() else {
+                return self.batches.next().map(Ok);
+            };
+            match File::open(&path)
+                .map_err(ArrowError::from)
+                .and_then(|file| StreamReader::try_new(BufReader::new(file), None))
+            {
+                Ok(reader) => self.current = Some(reader),
+                Err(err) => return Some(Err(err)),
             }
         }
     }
+}
 
-    if groups.is_empty() {
-        return Ok((Vec::new(), Vec::new(), HashMap::new()));
+/// A private directory for one statement's spilled values under DuckDB's temp
+/// directory, removed with its files when the statement ends. The temp
+/// directory itself stays: DuckDB may have started using it meanwhile, and it
+/// does not recreate a directory that disappears.
+struct SpillDir {
+    path: PathBuf,
+}
+
+impl SpillDir {
+    fn create(root: &Path) -> Result<Self, String> {
+        let path = root.join(format!(
+            "lance_dml_{}_{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&path).map_err(|err| {
+            format!(
+                "failed to create spill directory '{}': {err}",
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Collects the new values of an UPDATE or MERGE per (fragment, column) as
+/// they arrive, then rewrites the assigned columns of each touched fragment
+/// once with Lance's fragment updater.
+///
+/// Each imported batch is split per fragment on arrival and released. When the
+/// buffered values exceed `budget`, the largest columns are spilled to
+/// DuckDB's temp directory until half the budget is free, and are read back
+/// when their fragment is rewritten. Memory stays near the budget plus the one
+/// fragment column the updater joins at a time; without a temp directory the
+/// values stay in memory.
+///
+/// The spill files are Arrow IPC streams written here rather than DuckDB
+/// temporary buffers: the values are Arrow batches grouped by Lance fragment
+/// on this side of the FFI boundary, and DuckDB's temporary file manager only
+/// serves its own buffer pool. They count against `spill_limit`, the room
+/// left under DuckDB's `max_temp_directory_size`.
+pub(super) struct ColumnUpdateWriter {
+    dataset: Arc<lance::Dataset>,
+    existing_schema: ArrowSchema,
+    blob_context: BlobWriteContext,
+    row_id_index: Option<RowIdIndex>,
+    budget: usize,
+    spill_root: Option<PathBuf>,
+    spill_limit: u64,
+    spill_dir: Option<SpillDir>,
+    spill_count: usize,
+    spilled: u64,
+    columns: BTreeMap<u32, BTreeMap<String, BufferedColumn>>,
+    buffered: usize,
+}
+
+impl ColumnUpdateWriter {
+    /// `budget` bounds both the buffered values and the ingest values
+    /// materialized per batch; `spill_limit` bounds the bytes spilled under
+    /// `spill_root`.
+    pub(super) fn new(
+        dataset: Arc<lance::Dataset>,
+        budget: usize,
+        spill_root: Option<PathBuf>,
+        spill_limit: u64,
+    ) -> Self {
+        let existing_schema = dataset.schema().into();
+        let blob_context = BlobWriteContext {
+            registry: dataset.session().store_registry(),
+            ingest_batch_budget: budget,
+        };
+        Self {
+            dataset,
+            existing_schema,
+            blob_context,
+            row_id_index: None,
+            budget,
+            spill_root,
+            spill_limit,
+            spill_dir: None,
+            spill_count: 0,
+            spilled: 0,
+            columns: BTreeMap::new(),
+            buffered: 0,
+        }
     }
 
-    let fragments = dataset.get_fragments();
-    let mut fragment_map: HashMap<u32, lance::dataset::fragment::FileFragment> = fragments
-        .into_iter()
-        .map(|fragment| (fragment.id() as u32, fragment))
-        .collect();
+    /// Buffers one batch of assigned values followed by `_rowid`.
+    pub(super) async fn add(&mut self, item: UpdateValueBatch) -> Result<(), String> {
+        let batch = convert_blob_batch(
+            &item.batch,
+            &self.existing_schema,
+            &self.blob_context,
+            &item.source_options,
+        )?;
+        if self.row_id_index.is_none() && self.dataset.manifest.uses_stable_row_ids() {
+            self.row_id_index = Some(build_row_id_index(&self.dataset).await?);
+        }
+        let row_ids = read_row_ids(batch.column(batch.num_columns() - 1))?;
+        for (fragment_id, (ids, positions)) in
+            group_rows_by_fragment(&row_ids, self.row_id_index.as_ref())?
+        {
+            let ids: ArrayRef = Arc::new(arrow_array::UInt64Array::from(ids));
+            let positions = arrow_array::UInt32Array::from(positions);
+            for (column_idx, column_name) in item.columns.iter().enumerate() {
+                let values = arrow::compute::take(batch.column(column_idx), &positions, None)
+                    .map_err(|err| {
+                        format!("failed to slice update column '{column_name}': {err}")
+                    })?;
+                // Typed by the DuckDB-exported value array; normalized to the
+                // target field when the fragment is rewritten.
+                let schema = ArrowSchema::new(vec![
+                    ArrowField::new("_rowid", DataType::UInt64, false),
+                    ArrowField::new(column_name.as_str(), values.data_type().clone(), true),
+                ]);
+                let rows = RecordBatch::try_new(Arc::new(schema), vec![ids.clone(), values])
+                    .map_err(|err| {
+                        format!("failed to build update batch for column '{column_name}': {err}")
+                    })?;
+                let bytes = rows.get_array_memory_size();
+                let column = self
+                    .columns
+                    .entry(fragment_id)
+                    .or_default()
+                    .entry(column_name.clone())
+                    .or_default();
+                column.batches.push(rows);
+                column.bytes += bytes;
+                self.buffered += bytes;
+            }
+        }
+        self.spill_over_budget()
+    }
 
-    let mut updated_fragments = Vec::new();
-    let mut fields_modified = BTreeSet::<u32>::new();
-    let mut fragment_offsets = HashMap::<u64, RoaringBitmap>::new();
+    fn spill_over_budget(&mut self) -> Result<(), String> {
+        if self.buffered <= self.budget {
+            return Ok(());
+        }
+        let Some(root) = self.spill_root.as_deref() else {
+            return Ok(());
+        };
+        if self.spill_dir.is_none() {
+            self.spill_dir = Some(SpillDir::create(root)?);
+        }
+        let mut sizes: Vec<(usize, u32, String)> = self
+            .columns
+            .iter()
+            .flat_map(|(fragment_id, columns)| {
+                columns
+                    .iter()
+                    .filter(|(_, column)| column.bytes > 0)
+                    .map(move |(name, column)| (column.bytes, *fragment_id, name.clone()))
+            })
+            .collect();
+        sizes.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(*bytes));
+        for (_, fragment_id, column_name) in sizes {
+            if self.buffered <= self.budget / 2 {
+                break;
+            }
+            self.spill(fragment_id, &column_name)?;
+        }
+        Ok(())
+    }
 
-    for (fragment_id, column_batches) in groups {
-        let mut fragment = fragment_map
-            .remove(&fragment_id)
-            .ok_or_else(|| format!("fragment {fragment_id} disappeared while preparing update"))?;
-        let base_metadata = fragment.metadata().clone();
+    fn spill(&mut self, fragment_id: u32, column_name: &str) -> Result<(), String> {
+        let Some(dir) = self.spill_dir.as_ref() else {
+            return Err("spill directory is not open".to_string());
+        };
+        let path = dir.path.join(format!("{}.arrow", self.spill_count));
+        self.spill_count += 1;
+        let Some(column) = self
+            .columns
+            .get_mut(&fragment_id)
+            .and_then(|columns| columns.get_mut(column_name))
+        else {
+            return Ok(());
+        };
+        let Some(first) = column.batches.first() else {
+            return Ok(());
+        };
+        if self.spilled.saturating_add(column.bytes as u64) > self.spill_limit {
+            return Err(format!(
+                "update values need more temporary space than the {} bytes left under max_temp_directory_size; increase max_temp_directory_size or memory_limit",
+                self.spill_limit.saturating_sub(self.spilled)
+            ));
+        }
+        let spill_err = |err: &dyn std::fmt::Display| {
+            format!(
+                "failed to spill update values to '{}': {err}",
+                path.display()
+            )
+        };
+        let file = File::create(&path).map_err(|err| spill_err(&err))?;
+        let mut writer = StreamWriter::try_new(BufWriter::new(file), first.schema().as_ref())
+            .map_err(|err| spill_err(&err))?;
+        for batch in &column.batches {
+            writer.write(batch).map_err(|err| spill_err(&err))?;
+        }
+        let file = writer
+            .into_inner()
+            .map_err(|err| spill_err(&err))?
+            .into_inner()
+            .map_err(|err| spill_err(err.error()))?;
+        self.spilled += file.metadata().map_err(|err| spill_err(&err))?.len();
+        column.batches.clear();
+        column.spills.push(path);
+        self.buffered -= column.bytes;
+        column.bytes = 0;
+        Ok(())
+    }
 
-        let mut changed_fields: BTreeSet<i32> = BTreeSet::new();
-        let mut matched = RoaringBitmap::new();
-        let mut new_files = Vec::new();
-
-        for (column_name, batches) in &column_batches {
-            let target_field = arrow_schema.field_with_name(column_name).map_err(|err| {
-                format!("column '{column_name}' missing from dataset schema: {err}")
+    /// Rewrites the assigned columns of the touched fragments using Lance's
+    /// native fragment updater and returns the composed update metadata.
+    /// `deleted_addrs` are the rows the same statement deletes; MERGE never
+    /// assigns values to a row it deletes.
+    #[allow(clippy::type_complexity)]
+    pub(super) async fn finish(
+        self,
+        deleted_addrs: &RoaringTreemap,
+    ) -> Result<(Vec<Fragment>, Vec<u32>, HashMap<u64, RoaringBitmap>), String> {
+        let ColumnUpdateWriter {
+            dataset,
+            existing_schema: arrow_schema,
+            row_id_index,
+            budget: ingest_batch_budget,
+            spill_dir,
+            columns,
+            ..
+        } = self;
+        // Spilled values are read back while their fragment is rewritten.
+        let _spill_dir = spill_dir;
+        if columns.is_empty() {
+            return Ok((Vec::new(), Vec::new(), HashMap::new()));
+        }
+        let fragments = dataset.get_fragments();
+        let mut fragment_map: HashMap<u32, lance::dataset::fragment::FileFragment> = fragments
+            .into_iter()
+            .map(|fragment| (fragment.id() as u32, fragment))
+            .collect();
+        let mut updated_fragments = Vec::new();
+        let mut fields_modified = BTreeSet::<u32>::new();
+        let mut fragment_offsets = HashMap::<u64, RoaringBitmap>::new();
+        for (fragment_id, fragment_columns) in columns {
+            let mut fragment = fragment_map.remove(&fragment_id).ok_or_else(|| {
+                format!("fragment {fragment_id} disappeared while preparing update")
             })?;
-            let input_schema = batches[0].schema();
-            let concat = arrow::compute::concat_batches(&input_schema, batches)
-                .map_err(|err| format!("failed to concat update batches: {err}"))?;
-
-            let value_array = normalize_value_column(column_name, concat.column(1), target_field)?;
-            let blob_rows = if is_blob_v2_field(target_field) {
-                blob_struct_rows(&value_array)?
-            } else {
-                Vec::new()
-            };
-            let original_paths: HashSet<&str> = base_metadata
-                .files
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect();
-
-            if is_blob_v2_field(target_field) && contains_blob_reference(&blob_rows) {
-                // Brand-new absolute external URIs cannot pass the native column
-                // updater's registered-base check. Rewrite the complete column
-                // through Lance's update writer instead, deriving the fallback
-                // rows from stored descriptors.
-                let rowids = read_row_ids(concat.column(0))?;
-                if rowids.len() != blob_rows.len() {
-                    return Err(format!(
-                        "UPDATE value/row-id length mismatch for column '{column_name}'"
-                    ));
-                }
-                let mut assigned_rows = HashMap::with_capacity(rowids.len());
-                for (row, row_id) in rowids.iter().enumerate() {
-                    let address = match row_id_index.as_ref() {
-                        Some(index) => lookup_row_address(index, *row_id)?,
-                        None => *row_id,
+            let base_metadata = fragment.metadata().clone();
+            let mut changed_fields: BTreeSet<i32> = BTreeSet::new();
+            let mut matched = RoaringBitmap::new();
+            let mut new_files = Vec::new();
+            for (column_name, column) in fragment_columns {
+                let target_field = arrow_schema
+                    .field_with_name(&column_name)
+                    .map_err(|err| {
+                        format!("column '{column_name}' missing from dataset schema: {err}")
+                    })?
+                    .clone();
+                let original_paths: HashSet<&str> = base_metadata
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect();
+                let value_schema = Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("_rowid", DataType::UInt64, false),
+                    update_value_field(&column_name, &target_field),
+                ]));
+                let result = if is_blob_v2_field(&target_field) {
+                    // Blob v2 values are joined as one batch: an external
+                    // reference among them takes the full-column path.
+                    let batches =
+                        column
+                            .into_rows()
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|err| {
+                                format!("failed to read update values for '{column_name}': {err}")
+                            })?;
+                    let Some(first) = batches.first() else {
+                        continue;
                     };
-                    assigned_rows.insert(address, blob_rows[row].clone());
+                    let concat = arrow::compute::concat_batches(&first.schema(), &batches)
+                        .map_err(|err| format!("failed to concat update batches: {err}"))?;
+                    drop(batches);
+                    let value_array =
+                        normalize_value_column(&column_name, concat.column(1), &target_field)?;
+                    let blob_rows = blob_struct_rows(&value_array)?;
+                    if contains_blob_reference(&blob_rows) {
+                        // Brand-new absolute external URIs cannot pass the native column
+                        // updater's registered-base check. Rewrite the complete column
+                        // through Lance's update writer instead, deriving the fallback
+                        // rows from stored descriptors.
+                        let rowids = read_row_ids(concat.column(0))?;
+                        if rowids.len() != blob_rows.len() {
+                            return Err(format!(
+                                "UPDATE value/row-id length mismatch for column '{column_name}'"
+                            ));
+                        }
+                        let mut assigned_rows = HashMap::with_capacity(rowids.len());
+                        for (row, row_id) in rowids.iter().enumerate() {
+                            let address = match row_id_index.as_ref() {
+                                Some(index) => lookup_row_address(index, *row_id)?,
+                                None => *row_id,
+                            };
+                            assigned_rows.insert(address, blob_rows[row].clone());
+                        }
+                        let field =
+                            dataset
+                                .schema()
+                                .field(column_name.as_str())
+                                .ok_or_else(|| {
+                                    format!("column '{column_name}' missing from dataset schema")
+                                })?;
+                        let (combined, field_id, offsets) = write_full_blob_column(
+                            &dataset,
+                            &fragment,
+                            &column_name,
+                            field.id,
+                            &assigned_rows,
+                            deleted_addrs,
+                            ingest_batch_budget,
+                        )
+                        .await?;
+                        changed_fields.insert(field_id as i32);
+                        matched |= offsets;
+                        for file in combined.files.iter() {
+                            if !original_paths.contains(file.path.as_str())
+                                && !new_files.iter().any(
+                                    |existing: &lance_table::format::DataFile| {
+                                        existing.path == file.path
+                                    },
+                                )
+                            {
+                                new_files.push(file.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    let update_batch = RecordBatch::try_new(
+                        value_schema.clone(),
+                        vec![concat.column(0).clone(), value_array],
+                    )
+                    .map_err(|err| {
+                        format!("failed to build update batch for column '{column_name}': {err}")
+                    })?;
+                    let reader = arrow_array::RecordBatchIterator::new(
+                        vec![Ok(update_batch)].into_iter(),
+                        value_schema.clone(),
+                    );
+                    fragment
+                        .update_columns_with_offsets(reader, "_rowid", "_rowid")
+                        .await
+                } else {
+                    let name = column_name.clone();
+                    let schema = value_schema.clone();
+                    let rows = column.into_rows().map(move |batch| {
+                        let batch = batch?;
+                        let values = normalize_value_column(&name, batch.column(1), &target_field)
+                            .map_err(ArrowError::InvalidArgumentError)?;
+                        RecordBatch::try_new(schema.clone(), vec![batch.column(0).clone(), values])
+                    });
+                    let reader = arrow_array::RecordBatchIterator::new(rows, value_schema.clone());
+                    fragment
+                        .update_columns_with_offsets(reader, "_rowid", "_rowid")
+                        .await
                 }
-                let field = dataset
-                    .schema()
-                    .field(column_name.as_str())
-                    .ok_or_else(|| format!("column '{column_name}' missing from dataset schema"))?;
-                let (combined, field_id, offsets) = write_full_blob_column(
-                    dataset,
-                    &fragment,
-                    column_name,
-                    field.id,
-                    &assigned_rows,
-                    deleted_addrs,
-                    ingest_batch_budget,
-                )
-                .await?;
-                changed_fields.insert(field_id as i32);
-                matched |= offsets;
-                for file in combined.files.iter() {
+                .map_err(|err| format!("fragment {fragment_id} update '{column_name}': {err}"))?;
+                changed_fields.extend(
+                    result
+                        .fields_modified
+                        .iter()
+                        .map(|field_id| *field_id as i32),
+                );
+                matched |= result.matched_offsets.clone();
+                for file in result.fragment.files.iter() {
                     if !original_paths.contains(file.path.as_str())
                         && !new_files
                             .iter()
@@ -958,96 +1231,53 @@ pub(super) async fn compose_column_updates(
                         new_files.push(file.clone());
                     }
                 }
-                continue;
             }
-
-            let value_schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("_rowid", DataType::UInt64, false),
-                update_value_field(column_name, target_field),
-            ]));
-            let update_batch = RecordBatch::try_new(
-                value_schema.clone(),
-                vec![concat.column(0).clone(), value_array],
-            )
-            .map_err(|err| {
-                format!("failed to build update batch for column '{column_name}': {err}")
-            })?;
-
-            let reader = arrow_array::RecordBatchIterator::new(
-                vec![Ok(update_batch)].into_iter(),
-                value_schema.clone(),
-            );
-            let result = fragment
-                .update_columns_with_offsets(reader, "_rowid", "_rowid")
-                .await
-                .map_err(|err| format!("fragment {fragment_id} update '{column_name}': {err}"))?;
-
-            changed_fields.extend(
-                result
-                    .fields_modified
+            let mut combined = base_metadata.clone();
+            for file in combined.files.iter_mut() {
+                let new_fields: Vec<i32> = file
+                    .fields
                     .iter()
-                    .map(|field_id| *field_id as i32),
-            );
-            matched |= result.matched_offsets.clone();
-            for file in result.fragment.files.iter() {
-                if !original_paths.contains(file.path.as_str())
-                    && !new_files
-                        .iter()
-                        .any(|existing: &lance_table::format::DataFile| existing.path == file.path)
-                {
-                    new_files.push(file.clone());
-                }
+                    .map(|field_id| {
+                        if changed_fields.contains(field_id) {
+                            -2 // Tombstone: superseded by the rewrite below
+                        } else {
+                            *field_id
+                        }
+                    })
+                    .collect();
+                file.fields = Arc::from(new_fields);
             }
-        }
-
-        let mut combined = base_metadata.clone();
-        for file in combined.files.iter_mut() {
-            let new_fields: Vec<i32> = file
-                .fields
+            combined
+                .files
+                .retain(|file| file.fields.iter().any(|field_id| *field_id != -2));
+            combined.files.extend(new_files);
+            let mut active: Vec<i32> = combined
+                .files
                 .iter()
-                .map(|field_id| {
-                    if changed_fields.contains(field_id) {
-                        -2 // Tombstone: superseded by the rewrite below
-                    } else {
-                        *field_id
-                    }
-                })
+                .flat_map(|file| file.fields.iter().copied())
+                .filter(|field_id| *field_id >= 0)
                 .collect();
-            file.fields = Arc::from(new_fields);
+            let unique_active: std::collections::HashSet<i32> = active.iter().copied().collect();
+            if active.len() != unique_active.len() {
+                return Err(format!(
+                    "internal error: conflicting column update files for fragment {fragment_id}"
+                ));
+            }
+            active.sort_unstable();
+            fields_modified.extend(
+                changed_fields
+                    .into_iter()
+                    .filter_map(|field_id| u32::try_from(field_id).ok()),
+            );
+            fragment_offsets.insert(fragment_id as u64, matched);
+            updated_fragments.push(combined);
         }
-        combined
-            .files
-            .retain(|file| file.fields.iter().any(|field_id| *field_id != -2));
-        combined.files.extend(new_files);
-
-        let mut active: Vec<i32> = combined
-            .files
-            .iter()
-            .flat_map(|file| file.fields.iter().copied())
-            .filter(|field_id| *field_id >= 0)
-            .collect();
-        let unique_active: std::collections::HashSet<i32> = active.iter().copied().collect();
-        if active.len() != unique_active.len() {
-            return Err(format!(
-                "internal error: conflicting column update files for fragment {fragment_id}"
-            ));
-        }
-        active.sort_unstable();
-
-        fields_modified.extend(
-            changed_fields
-                .into_iter()
-                .filter_map(|field_id| u32::try_from(field_id).ok()),
-        );
-        fragment_offsets.insert(fragment_id as u64, matched);
-        updated_fragments.push(combined);
+        Ok((
+            updated_fragments,
+            fields_modified.into_iter().collect(),
+            fragment_offsets,
+        ))
     }
-
-    Ok((
-        updated_fragments,
-        fields_modified.into_iter().collect(),
-        fragment_offsets,
-    ))
 }
 
 #[cfg(test)]
@@ -1082,52 +1312,33 @@ mod tests {
         .unwrap()
     }
 
-    fn grouped_values(
-        groups: &HashMap<u32, (Vec<u64>, ArrayRef)>,
-        fragment_id: u32,
-    ) -> (Vec<u64>, Vec<i64>) {
-        let (ids, values) = &groups[&fragment_id];
-        (
-            ids.clone(),
-            values.as_primitive::<Int64Type>().values().to_vec(),
-        )
-    }
-
     #[test]
-    fn group_column_rows_keeps_each_rows_value() {
+    fn group_rows_by_fragment_keeps_each_rows_position() {
         let addr =
             |fragment: u32, offset: u32| u64::from(RowAddress::new_from_parts(fragment, offset));
-        // One batch interleaves two fragments, repeats a row (the first value
-        // wins) and includes a deleted row, so values must follow their rows.
-        let batch = value_batch(
-            vec![10, 20, 30, 40, 50, 60],
-            vec![
-                addr(0, 0),
-                addr(1, 0),
-                addr(0, 1),
-                addr(0, 2),
-                addr(1, 0),
-                addr(1, 1),
-            ],
-        );
-        let mut deleted = RoaringTreemap::new();
-        deleted.insert(addr(0, 1));
+        // One batch interleaves two fragments and repeats a row (the first
+        // value wins), so positions must follow their rows.
+        let row_ids = vec![
+            addr(0, 0),
+            addr(1, 0),
+            addr(0, 1),
+            addr(0, 2),
+            addr(1, 0),
+            addr(1, 1),
+        ];
 
-        let groups = group_column_rows("v", &batch, None, &deleted).unwrap();
+        let groups = group_rows_by_fragment(&row_ids, None).unwrap();
 
         assert_eq!(groups.len(), 2);
         assert_eq!(
-            grouped_values(&groups, 0),
-            (vec![addr(0, 0), addr(0, 2)], vec![10, 40])
+            groups[&0],
+            (vec![addr(0, 0), addr(0, 1), addr(0, 2)], vec![0, 2, 3])
         );
-        assert_eq!(
-            grouped_values(&groups, 1),
-            (vec![addr(1, 0), addr(1, 1)], vec![20, 60])
-        );
+        assert_eq!(groups[&1], (vec![addr(1, 0), addr(1, 1)], vec![1, 5]));
     }
 
     #[test]
-    fn group_column_rows_keeps_each_rows_value_with_stable_row_ids() {
+    fn group_rows_by_fragment_keeps_each_rows_position_with_stable_row_ids() {
         let dir = temp_uri("group-stable");
         let uri = dir.to_string_lossy().to_string();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1185,26 +1396,61 @@ mod tests {
             .unwrap()
             .unwrap();
         // Ids 1 and 3 live in the first fragment, id 4 in the second.
-        let batch = value_batch(
-            vec![100, 300, 400],
-            vec![row_id_of[&1], row_id_of[&3], row_id_of[&4]],
-        );
-        let groups = group_column_rows("v", &batch, Some(&index), &RoaringTreemap::new()).unwrap();
+        let row_ids = vec![row_id_of[&1], row_id_of[&3], row_id_of[&4]];
+        let groups = group_rows_by_fragment(&row_ids, Some(&index)).unwrap();
 
         let first = dataset.get_fragments()[0].id() as u32;
         let second = dataset.get_fragments()[1].id() as u32;
         assert_eq!(
-            grouped_values(&groups, first),
-            (vec![row_id_of[&1], row_id_of[&3]], vec![100, 300])
+            groups[&first],
+            (vec![row_id_of[&1], row_id_of[&3]], vec![0, 1])
         );
-        assert_eq!(
-            grouped_values(&groups, second),
-            (vec![row_id_of[&4]], vec![400])
+        assert_eq!(groups[&second], (vec![row_id_of[&4]], vec![2]));
+    }
+
+    /// Runs `batches` through a `ColumnUpdateWriter` that spills every value
+    /// it buffers, so the rewrite reads all of them back from Arrow IPC.
+    #[allow(clippy::type_complexity)]
+    fn write_column_updates(
+        dataset: &Arc<lance::Dataset>,
+        batches: Vec<UpdateValueBatch>,
+        deleted_addrs: &RoaringTreemap,
+    ) -> Result<(Vec<Fragment>, Vec<u32>, HashMap<u64, RoaringBitmap>), String> {
+        let spill_root = temp_uri("column-update-spill");
+        let mut writer = ColumnUpdateWriter::new(
+            dataset.clone(),
+            crate::ffi::blob::DEFAULT_INGEST_BATCH_BUDGET,
+            Some(spill_root.clone()),
+            u64::MAX,
         );
+        let root = spill_root.clone();
+        let result = runtime::block_on(async move {
+            for batch in batches {
+                writer.add(batch).await?;
+                if writer.spill_dir.is_none() {
+                    writer.spill_dir = Some(SpillDir::create(&root)?);
+                }
+                let buffered: Vec<(u32, String)> = writer
+                    .columns
+                    .iter()
+                    .flat_map(|(fragment_id, columns)| {
+                        columns.keys().map(move |name| (*fragment_id, name.clone()))
+                    })
+                    .collect();
+                for (fragment_id, column_name) in buffered {
+                    writer.spill(fragment_id, &column_name)?;
+                }
+                assert_eq!(writer.buffered, 0);
+            }
+            writer.finish(deleted_addrs).await
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_dir(&spill_root).unwrap().count(), 0);
+        result
     }
 
     #[test]
-    fn compose_column_updates_rewrites_blob_v2_payload() {
+    fn column_update_writer_rewrites_blob_v2_payload() {
         let dir = temp_uri("blobv2");
         let uri = dir.to_string_lossy().to_string();
         let external = dir.join("external.bin");
@@ -1300,14 +1546,7 @@ mod tests {
         }];
 
         let (fragments, fields_modified, fragment_offsets) =
-            runtime::block_on(compose_column_updates(
-                &dataset,
-                &batches,
-                &RoaringTreemap::new(),
-                crate::ffi::blob::DEFAULT_INGEST_BATCH_BUDGET,
-            ))
-            .unwrap()
-            .unwrap();
+            write_column_updates(&dataset, batches, &RoaringTreemap::new()).unwrap();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fields_modified.len(), 1);
         assert_eq!(fragment_offsets.len(), 1);
@@ -1492,14 +1731,7 @@ mod tests {
         }];
 
         let (fragments, fields_modified, fragment_offsets) =
-            runtime::block_on(compose_column_updates(
-                &dataset,
-                &batches,
-                &RoaringTreemap::new(),
-                crate::ffi::blob::DEFAULT_INGEST_BATCH_BUDGET,
-            ))
-            .unwrap()
-            .unwrap();
+            write_column_updates(&dataset, batches, &RoaringTreemap::new()).unwrap();
         let offsets = fragment_offsets.values().next().unwrap();
         assert_eq!(
             offsets.iter().collect::<Vec<_>>(),
@@ -1610,14 +1842,8 @@ mod tests {
 
         let mut deleted_addrs = RoaringTreemap::new();
         deleted_addrs.insert(1);
-        let (fragments, _, fragment_offsets) = runtime::block_on(compose_column_updates(
-            &dataset,
-            &batches,
-            &deleted_addrs,
-            crate::ffi::blob::DEFAULT_INGEST_BATCH_BUDGET,
-        ))
-        .unwrap()
-        .unwrap();
+        let (fragments, _, fragment_offsets) =
+            write_column_updates(&dataset, batches, &deleted_addrs).unwrap();
         assert_eq!(fragments.len(), 1);
         assert_eq!(
             fragment_offsets
@@ -1705,14 +1931,27 @@ mod tests {
         let mut update = std::ptr::null_mut();
         let mut txn = std::ptr::null_mut();
         unsafe {
-            assert_eq!(lance_update_begin(handle_ptr(dataset), 0, &mut update), 0);
-            (*(update as *mut UpdateHandle))
-                .batches
-                .push(UpdateValueBatch {
-                    columns: vec!["v".to_string()],
-                    batch: value_batch(vec![value], vec![address]),
-                    source_options: HashMap::new(),
-                });
+            assert_eq!(
+                lance_update_begin(
+                    handle_ptr(dataset),
+                    0,
+                    std::ptr::null(),
+                    u64::MAX,
+                    &mut update
+                ),
+                0
+            );
+            runtime::block_on(
+                (*(update as *mut UpdateHandle))
+                    .writer
+                    .add(UpdateValueBatch {
+                        columns: vec!["v".to_string()],
+                        batch: value_batch(vec![value], vec![address]),
+                        source_options: HashMap::new(),
+                    }),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(lance_update_finish_uncommitted(update, &mut txn), 0);
         }
         txn
@@ -1727,7 +1966,16 @@ mod tests {
         let mut txn = std::ptr::null_mut();
         unsafe {
             assert_eq!(
-                lance_merge_begin(handle_ptr(dataset), 0, 0, 0, 0, &mut merge),
+                lance_merge_begin(
+                    handle_ptr(dataset),
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    u64::MAX,
+                    &mut merge
+                ),
                 0
             );
             assert_eq!(lance_merge_add_delete_rowids(merge, &address, 1), 0);
@@ -1834,6 +2082,104 @@ mod tests {
             assert_eq!(commit_to(&pinned, txn), 0);
             assert_eq!(values_by_id(&uri), vec![0, 2, 3, 4, 500, 6, 7]);
         }
+    }
+
+    #[test]
+    fn update_spills_values_over_budget_and_rewrites_each_fragment_once() {
+        for stable in [false, true] {
+            let (uri, dataset) = write_two_fragments("update-spill", stable);
+            let pinned = DatasetHandle::new(dataset);
+            // DuckDB creates its temp directory lazily; the statement creates
+            // it when missing and leaves it, removing only its own files.
+            let spill_root = temp_uri("update-spill-root").join("tmp");
+            let spill_root_c =
+                std::ffi::CString::new(spill_root.to_string_lossy().as_bytes()).unwrap();
+            let mut update = std::ptr::null_mut();
+            let mut txn = std::ptr::null_mut();
+            unsafe {
+                // A one-byte budget spills every batch.
+                assert_eq!(
+                    lance_update_begin(
+                        handle_ptr(&pinned),
+                        1,
+                        spill_root_c.as_ptr(),
+                        u64::MAX,
+                        &mut update
+                    ),
+                    0
+                );
+                let writer = &mut (*(update as *mut UpdateHandle)).writer;
+                // The batches interleave both fragments.
+                for ids in [vec![0u64, 5], vec![4, 1], vec![7, 2]] {
+                    let values = ids.iter().map(|id| 100 + *id as i64).collect();
+                    let row_ids = ids.iter().map(|id| row_id(*id, stable)).collect();
+                    runtime::block_on(writer.add(UpdateValueBatch {
+                        columns: vec!["v".to_string()],
+                        batch: value_batch(values, row_ids),
+                        source_options: HashMap::new(),
+                    }))
+                    .unwrap()
+                    .unwrap();
+                }
+                assert!(writer.spill_count >= 4);
+                assert_eq!(writer.buffered, 0);
+                assert_eq!(std::fs::read_dir(&spill_root).unwrap().count(), 1);
+                assert_eq!(lance_update_finish_uncommitted(update, &mut txn), 0);
+            }
+            assert_eq!(std::fs::read_dir(&spill_root).unwrap().count(), 0);
+            assert_eq!(commit_to(&pinned, txn), 0);
+            assert_eq!(values_by_id(&uri), vec![100, 101, 102, 3, 104, 105, 6, 107]);
+            // One new data file per fragment: each was rewritten once.
+            let after = runtime::block_on(lance::Dataset::open(&uri))
+                .unwrap()
+                .unwrap();
+            for fragment in after.get_fragments() {
+                assert_eq!(fragment.metadata().files.len(), 2);
+            }
+
+            // An aborted statement removes its spilled values too.
+            let mut update = std::ptr::null_mut();
+            unsafe {
+                assert_eq!(
+                    lance_update_begin(
+                        handle_ptr(&pinned),
+                        1,
+                        spill_root_c.as_ptr(),
+                        u64::MAX,
+                        &mut update
+                    ),
+                    0
+                );
+                let writer = &mut (*(update as *mut UpdateHandle)).writer;
+                runtime::block_on(writer.add(UpdateValueBatch {
+                    columns: vec!["v".to_string()],
+                    batch: value_batch(vec![9], vec![row_id(3, stable)]),
+                    source_options: HashMap::new(),
+                }))
+                .unwrap()
+                .unwrap();
+                assert_eq!(writer.spill_count, 1);
+                lance_update_abort(update);
+            }
+            assert_eq!(std::fs::read_dir(&spill_root).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn update_spill_stops_at_the_temp_directory_limit() {
+        let (_, dataset) = write_two_fragments("update-spill-limit", false);
+        let spill_root = temp_uri("update-spill-limit-root");
+        let mut writer = ColumnUpdateWriter::new(dataset, 1, Some(spill_root.clone()), 1);
+        let err = runtime::block_on(writer.add(UpdateValueBatch {
+            columns: vec!["v".to_string()],
+            batch: value_batch(vec![9], vec![row_id(3, false)]),
+            source_options: HashMap::new(),
+        }))
+        .unwrap()
+        .unwrap_err();
+        assert!(err.contains("max_temp_directory_size"), "{err}");
+        drop(writer);
+        assert_eq!(std::fs::read_dir(&spill_root).unwrap().count(), 0);
     }
 }
 

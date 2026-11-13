@@ -125,4 +125,13 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         vector<string> &out_option_values,
                                         string &out_display_uri);
 
+// Where UPDATE and MERGE spill buffered new values: DuckDB's temp directory
+// (empty when it has none) and the bytes they may write there, which is what
+// max_temp_directory_size leaves (UINT64_MAX when it is unset).
+struct LanceDmlSpillTarget {
+  string directory;
+  uint64_t limit;
+};
+LanceDmlSpillTarget LanceGetDmlSpillTarget(ClientContext &context);
+
 } // namespace duckdb

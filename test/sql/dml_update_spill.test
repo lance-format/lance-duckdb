@@ -1,0 +1,108 @@
+# name: test/sql/dml_update_spill.test
+# description: UPDATE and MERGE whose new values exceed the memory budget spill them to DuckDB's temp directory, write every value, keep stable row ids, and leave no spill files
+# group: [sql]
+
+require lance
+
+# The new values (60000 rows of FLOAT[64], about 15 MB) exceed the eighth of
+# memory_limit that UPDATE and MERGE keep in memory.
+statement ok
+SET memory_limit='64MB';
+
+statement ok
+SET temp_directory='{TEST_DIR}/dml_spill_tmp';
+
+foreach stable false true
+
+statement ok
+COPY (SELECT i::BIGINT AS id, list_transform(range(64), lambda j: (i + j)::FLOAT)::FLOAT[64] AS vec FROM range(0, 60000) r(i)) TO '{TEST_DIR}/dml_spill_${stable}/t.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 10000, enable_stable_row_ids ${stable});
+
+statement ok
+ATTACH '{TEST_DIR}/dml_spill_${stable}' AS sp (TYPE LANCE);
+
+statement ok
+CREATE TEMP TABLE before_rowids AS SELECT id, rowid AS rid FROM sp.main.t;
+
+# Spilled values count against max_temp_directory_size.
+statement ok
+SET max_temp_directory_size='1MB';
+
+statement error
+UPDATE sp.main.t SET vec = list_transform(range(64), lambda j: (id * 7 + j)::FLOAT)::FLOAT[64];
+----
+max_temp_directory_size
+
+statement ok
+RESET max_temp_directory_size;
+
+query I
+UPDATE sp.main.t SET vec = list_transform(range(64), lambda j: (id * 2 + j)::FLOAT)::FLOAT[64];
+----
+60000
+
+query II
+SELECT count(*), count(*) FILTER (WHERE vec <> list_transform(range(64), lambda j: (id * 2 + j)::FLOAT)::FLOAT[64]) FROM sp.main.t;
+----
+60000	0
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/dml_spill_tmp/**');
+----
+0
+
+# MERGE deletes a third of the matched rows, updates the rest and inserts the
+# unmatched source rows.
+query I
+MERGE INTO sp.main.t AS t
+USING (SELECT i::BIGINT AS id FROM range(0, 90000) r(i)) AS s
+ON t.id = s.id
+WHEN MATCHED AND s.id % 3 = 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET vec = list_transform(range(64), lambda j: (s.id * 3 + j)::FLOAT)::FLOAT[64]
+WHEN NOT MATCHED THEN INSERT (id, vec) VALUES (s.id, list_transform(range(64), lambda j: (s.id * 3 + j)::FLOAT)::FLOAT[64]);
+----
+90000
+
+query III
+SELECT count(*), count(*) FILTER (WHERE id < 60000 AND id % 3 = 0), count(*) FILTER (WHERE vec <> list_transform(range(64), lambda j: (id * 3 + j)::FLOAT)::FLOAT[64]) FROM sp.main.t;
+----
+70000	0	0
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/dml_spill_tmp/**');
+----
+0
+
+# A MERGE that fails after it started buffering updates and writing inserts
+# leaves the table unchanged and no spill files behind.
+statement error
+MERGE INTO sp.main.t AS t
+USING (SELECT i::BIGINT AS id FROM range(0, 90000) r(i) UNION ALL SELECT 1::BIGINT) AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET vec = list_transform(range(64), lambda j: (s.id * 5 + j)::FLOAT)::FLOAT[64]
+WHEN NOT MATCHED THEN INSERT (id, vec) VALUES (s.id, list_transform(range(64), lambda j: (s.id * 5 + j)::FLOAT)::FLOAT[64]);
+----
+cannot affect the same target row more than once
+
+query III
+SELECT count(*), count(*) FILTER (WHERE id < 60000 AND id % 3 = 0), count(*) FILTER (WHERE vec <> list_transform(range(64), lambda j: (id * 3 + j)::FLOAT)::FLOAT[64]) FROM sp.main.t;
+----
+70000	0	0
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/dml_spill_tmp/**');
+----
+0
+
+# Rows that were rewritten keep their row id when row ids are stable.
+query I
+SELECT count(*) FROM sp.main.t AS t JOIN before_rowids AS b USING (id) WHERE t.rowid <> b.rid AND ${stable};
+----
+0
+
+statement ok
+DROP TABLE before_rowids;
+
+statement ok
+DETACH sp;
+
+endloop

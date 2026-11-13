@@ -50,13 +50,13 @@ struct RawArrowArray {
     private_data: *mut c_void,
 }
 
-struct ReceiverRecordBatchReader {
+pub(super) struct ReceiverRecordBatchReader {
     schema: SchemaRef,
     receiver: Receiver<RecordBatch>,
 }
 
 impl ReceiverRecordBatchReader {
-    fn new(schema: SchemaRef, receiver: Receiver<RecordBatch>) -> Self {
+    pub(super) fn new(schema: SchemaRef, receiver: Receiver<RecordBatch>) -> Self {
         Self { schema, receiver }
     }
 }

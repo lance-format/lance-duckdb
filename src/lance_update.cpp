@@ -120,10 +120,12 @@ public:
     lock_guard<mutex> guard(gstate.lock);
 
     if (!gstate.update_handle) {
+      auto spill = LanceGetDmlSpillTarget(context.client);
       auto rc = lance_update_begin(
           dataset->Handle(),
           NumericCast<uint64_t>(LanceBlobIngestBatchBudget(context.client)),
-          &gstate.update_handle);
+          spill.directory.empty() ? nullptr : spill.directory.c_str(),
+          spill.limit, &gstate.update_handle);
       if (rc != 0 || !gstate.update_handle) {
         throw IOException("Failed to start Lance UPDATE transaction for '" +
                           dataset->DisplayUri() + "'" +

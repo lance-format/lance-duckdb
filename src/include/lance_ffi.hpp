@@ -290,7 +290,11 @@ int32_t lance_commit_transaction_with_storage_options(
 int32_t lance_commit_transaction_to_dataset(void *dataset, void *transaction);
 void lance_free_transaction(void *transaction);
 
+// `spill_directory` is DuckDB's temp directory, where buffered new values
+// spill beyond `ingest_batch_budget`, up to `spill_limit` bytes; NULL keeps
+// them in memory.
 int32_t lance_update_begin(void *dataset, uint64_t ingest_batch_budget,
+                           const char *spill_directory, uint64_t spill_limit,
                            void **out_update_handle);
 int32_t lance_update_add_value_batch(
     void *update_handle, const ArrowSchema *schema, ArrowArray *array,
@@ -321,6 +325,7 @@ int32_t lance_merge_begin(void *dataset, uint64_t max_rows_per_file,
                           uint64_t max_rows_per_group,
                           uint64_t max_bytes_per_file,
                           uint64_t ingest_batch_budget,
+                          const char *spill_directory, uint64_t spill_limit,
                           void **out_merge_handle);
 int32_t lance_merge_add_delete_rowids(void *merge_handle,
                                       const uint64_t *row_ids,

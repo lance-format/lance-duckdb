@@ -10,11 +10,14 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include <cstring>
+#include <limits>
 #include <memory>
 
 namespace duckdb {
@@ -776,6 +779,20 @@ void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,
   if (selected != chunk.size()) {
     chunk.Slice(sel, selected);
   }
+}
+
+LanceDmlSpillTarget LanceGetDmlSpillTarget(ClientContext &context) {
+  auto &buffer_manager = BufferManager::GetBufferManager(context);
+  LanceDmlSpillTarget target{string(), std::numeric_limits<uint64_t>::max()};
+  if (buffer_manager.HasTemporaryDirectory()) {
+    target.directory = buffer_manager.GetTemporaryDirectory();
+  }
+  auto max_swap = DBConfig::GetConfig(context).options.maximum_swap_space;
+  if (max_swap != DConstants::INVALID_INDEX) {
+    auto used = buffer_manager.GetUsedSwap();
+    target.limit = max_swap > used ? max_swap - used : 0;
+  }
+  return target;
 }
 
 } // namespace duckdb
