@@ -289,6 +289,44 @@ SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (
 ----
 0
 
+# Fewer partitions keep duplicate winners below the dynamic IN threshold.
+# Take fetches eight distinct rows; INNER reconstruction restores 12 winners.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM '{TEST_DIR}/late_materialization.lance' t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+WHERE grp < 4
+QUALIFY rn <= 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Join Type": "INNER"[\s\S]*"Lance Record Batch Rows": "8"[\s\S]*"Lance Rows Out": "8"[\s\S]*"Join Type": "INNER"[\s\S]*
+
+statement ok
+CREATE OR REPLACE TABLE lm_actual AS
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM '{TEST_DIR}/late_materialization.lance' t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+WHERE grp < 4
+QUALIFY rn <= 3;
+
+statement ok
+CREATE OR REPLACE TABLE lm_expected AS
+SELECT t.id, vec, payload, row_number() OVER (PARTITION BY grp ORDER BY score NULLS LAST) AS rn
+FROM lm_reference t
+JOIN (SELECT (range // 2)::BIGINT AS id FROM range(8192)) d ON t.id = d.id
+WHERE grp < 4
+QUALIFY rn <= 3;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM lm_actual;
+----
+12	8
+
+query I
+SELECT count(*) FROM ((TABLE lm_actual EXCEPT ALL TABLE lm_expected) UNION ALL (TABLE lm_expected EXCEPT ALL TABLE lm_actual));
+----
+0
+
 # Plain LIMIT/OFFSET already has a bounded Lance scan. Reconstructing its rows
 # would add another scan and read payloads outside that range.
 query II
