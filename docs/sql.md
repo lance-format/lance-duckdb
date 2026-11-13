@@ -352,7 +352,8 @@ FROM lance_fts('path/to/dataset.lance',
   '{"match": {"column": "text", "terms": "lazy dgo", "operator": "And", "fuzziness": 1}}');
 ```
 
-- A structured query is a Lance `FtsQuery` in its JSON form, the format of LanceDB's `fts` table function: `match` (`terms`, `operator` `"And"` or `"Or"`, `fuzziness`, `max_expansions`, `prefix_length`, `boost`), `phrase` (`terms`, `slop`), `multi_match` (`match_queries`), `boolean` (`should`, `must`, `must_not`), `boost` (`positive`, `negative`, `negative_boost`) and `combined_fields`. Defaults are Lance's; an omitted `fuzziness` is chosen by term length.
+- A structured query is a Lance `FtsQuery` in its JSON form, the format of LanceDB's `fts` table function: `match` (`terms`, `operator` `"And"` or `"Or"`, `fuzziness`, `max_expansions`, `prefix_length`, `boost`), `phrase` (`terms`, `slop`), `multi_match` (`match_queries`), `boolean` (`should`, `must`, `must_not`), `boost` (`positive`, `negative`, `negative_boost`) and `combined_fields`. Defaults are Lance's; Lance currently treats an omitted `fuzziness` as `0` (exact terms), so set a positive `fuzziness` to match misspellings.
+- Fuzzy terms are expanded from the INVERTED index, so rows appended after the index was built match them only once the index covers those rows (`ALTER INDEX ... OPTIMIZE`).
 - A query without `column` searches every column with an INVERTED index.
 - Invalid JSON, an unknown column, or a phrase query on an index without positions fails the query.
 - On attached namespace tables the query is sent as the `query_table` `structured_query`. That API cannot express `combined_fields`, `document_granularity`, or a `match` without `fuzziness`, so these fail; set `fuzziness` (`0` for exact terms).

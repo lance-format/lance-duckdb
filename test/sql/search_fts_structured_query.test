@@ -56,6 +56,12 @@ SELECT count(*) FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"c
 ----
 0
 
+# Lance treats an omitted fuzziness as exact
+query I
+SELECT count(*) FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "brwn"}}');
+----
+0
+
 # A leaf without a column searches every column with an INVERTED index
 query I
 SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"terms": "colors"}}') ORDER BY id;
