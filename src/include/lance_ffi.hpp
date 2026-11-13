@@ -367,6 +367,8 @@ const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
                                       size_t filter_ir_len, uint8_t prefilter,
                                       uint8_t use_index, uint8_t verbose);
 
+// In the FTS and hybrid calls, a null text_column means the query is a Lance
+// FtsQuery in its JSON form.
 void *lance_get_fts_schema(void *dataset, const char *text_column,
                            const char *query, uint64_t k, uint8_t prefilter);
 void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
@@ -407,6 +409,7 @@ typedef struct LanceNamespaceVectorSearchOptions {
 } LanceNamespaceVectorSearchOptions;
 
 typedef struct LanceNamespaceFtsSearchOptions {
+  // Null when query is a Lance FtsQuery in its JSON form.
   const char *text_column;
   const char *query;
   uint8_t with_row_id;

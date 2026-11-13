@@ -12,9 +12,10 @@ use arrow::record_batch::RecordBatchReader;
 use datafusion_expr::Expr;
 use datafusion_sql::unparser::dialect::CustomDialectBuilder;
 use datafusion_sql::unparser::Unparser;
+use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery};
 use lance_namespace::models::{
-    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestFullTextQuery,
-    QueryTableRequestVector, StringFtsQuery,
+    self, QueryTableRequest, QueryTableRequestColumns, QueryTableRequestFullTextQuery,
+    QueryTableRequestVector, StringFtsQuery, StructuredFtsQuery,
 };
 use lance_namespace::LanceNamespace;
 use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
@@ -23,10 +24,11 @@ use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::search::parse_fts_query_json;
 use super::types::StreamHandle;
 use super::util::{
-    cstr_to_str, optional_distance_type, parse_optional_filter_ir, slice_from_ptr, FfiError,
-    FfiResult,
+    cstr_to_str, optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir,
+    slice_from_ptr, FfiError, FfiResult,
 };
 
 const NAMESPACE_KIND_DIRECTORY: u8 = 0;
@@ -841,7 +843,7 @@ unsafe fn create_namespace_fts_search_stream_inner(
         ));
     }
     let options = unsafe { &*options };
-    let text_column = unsafe { cstr_to_str(options.text_column, "text_column")? };
+    let text_column = unsafe { optional_cstr_to_str(options.text_column, "text_column")? };
     let query = unsafe { cstr_to_str(options.query, "query")? };
 
     let filter_expr = unsafe {
@@ -857,13 +859,127 @@ unsafe fn create_namespace_fts_search_stream_inner(
     apply_base_request(&config, &mut request);
     apply_filter_expr(&mut request, filter_expr.as_ref())?;
 
-    let mut string_query = StringFtsQuery::new(query.to_string());
-    string_query.columns = Some(vec![text_column.to_string()]);
-    let mut fts_query = QueryTableRequestFullTextQuery::new();
-    fts_query.string_query = Some(Box::new(string_query));
-    request.full_text_query = Some(Box::new(fts_query));
+    request.full_text_query = Some(Box::new(namespace_full_text_query(text_column, query)?));
 
     execute_search_to_stream(config, request, options.with_row_id != 0)
+}
+
+/// The full-text query of a namespace search: `query` matched against
+/// `text_column`, or, without a column, a Lance `FtsQuery` in its JSON form,
+/// sent as `structured_query`.
+fn namespace_full_text_query(
+    text_column: Option<&str>,
+    query: &str,
+) -> FfiResult<QueryTableRequestFullTextQuery> {
+    let mut fts_query = QueryTableRequestFullTextQuery::new();
+    match text_column {
+        Some(text_column) => {
+            let mut string_query = StringFtsQuery::new(query.to_string());
+            string_query.columns = Some(vec![text_column.to_string()]);
+            fts_query.string_query = Some(Box::new(string_query));
+        }
+        None => {
+            let query = parse_fts_query_json(query)
+                .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err))?;
+            fts_query.structured_query = Some(Box::new(StructuredFtsQuery::new(
+                namespace_fts_query(&query)?,
+            )));
+        }
+    }
+    Ok(fts_query)
+}
+
+/// Converts a Lance `FtsQuery` into the namespace query model with every option
+/// explicit, and fails on what the model cannot carry instead of leaving it to
+/// the namespace's defaults.
+fn namespace_fts_query(query: &FtsQuery) -> FfiResult<models::FtsQuery> {
+    let mut out = models::FtsQuery::new();
+    match query {
+        FtsQuery::Match(query) => out.r#match = Some(Box::new(namespace_match_query(query)?)),
+        FtsQuery::Phrase(query) => {
+            if query.document_granularity.is_some() {
+                return Err(unsupported_namespace_fts("document_granularity"));
+            }
+            let mut phrase = models::PhraseQuery::new(query.terms.clone());
+            phrase.column = query.column.clone();
+            phrase.slop = Some(namespace_fts_i32(query.slop, "slop")?);
+            out.phrase = Some(Box::new(phrase));
+        }
+        FtsQuery::Boost(query) => {
+            let mut boost = models::BoostQuery::new(
+                namespace_fts_query(&query.positive)?,
+                namespace_fts_query(&query.negative)?,
+            );
+            boost.negative_boost = Some(query.negative_boost);
+            out.boost = Some(Box::new(boost));
+        }
+        FtsQuery::MultiMatch(query) => {
+            let match_queries = query
+                .match_queries
+                .iter()
+                .map(namespace_match_query)
+                .collect::<FfiResult<_>>()?;
+            out.multi_match = Some(Box::new(models::MultiMatchQuery::new(match_queries)));
+        }
+        FtsQuery::Boolean(query) => {
+            let clauses = |clauses: &[FtsQuery]| {
+                clauses
+                    .iter()
+                    .map(namespace_fts_query)
+                    .collect::<FfiResult<Vec<_>>>()
+            };
+            out.boolean = Some(Box::new(models::BooleanQuery::new(
+                clauses(&query.must)?,
+                clauses(&query.must_not)?,
+                clauses(&query.should)?,
+            )));
+        }
+        FtsQuery::CombinedFields(_) => return Err(unsupported_namespace_fts("combined_fields")),
+    }
+    Ok(out)
+}
+
+fn namespace_match_query(query: &MatchQuery) -> FfiResult<models::MatchQuery> {
+    if query.document_granularity.is_some() {
+        return Err(unsupported_namespace_fts("document_granularity"));
+    }
+    // Lance reads an absent fuzziness as automatic (by term length). The
+    // namespace model has no value for that, and DirectoryNamespace reads an
+    // absent fuzziness as 0.
+    let fuzziness = query.fuzziness.ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "a match query on a namespace table must set fuzziness (0 for exact terms): \
+             the namespace query_table API cannot express automatic fuzziness",
+        )
+    })?;
+    let mut out = models::MatchQuery::new(query.terms.clone());
+    out.column = query.column.clone();
+    out.boost = Some(query.boost);
+    out.fuzziness = Some(namespace_fts_i32(fuzziness, "fuzziness")?);
+    out.max_expansions = Some(namespace_fts_i32(query.max_expansions, "max_expansions")?);
+    out.operator = Some(<&'static str>::from(query.operator).to_string());
+    out.prefix_length = Some(namespace_fts_i32(query.prefix_length, "prefix_length")?);
+    Ok(out)
+}
+
+fn namespace_fts_i32(value: impl TryInto<i32>, name: &str) -> FfiResult<i32> {
+    value.try_into().map_err(|_| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            format!("full-text query {name} must fit in i32"),
+        )
+    })
+}
+
+fn unsupported_namespace_fts(what: &str) -> FfiError {
+    FfiError::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "{what} is not supported in full-text queries on namespace tables: the namespace \
+             query_table API cannot express it"
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -977,6 +1093,56 @@ mod tests {
         let config = rest_config(&["name"]);
         let error = build_namespace_scan_request(&config, None, -1, 1, false).unwrap_err();
         assert!(error.message.contains("cannot apply OFFSET without LIMIT"));
+    }
+
+    #[test]
+    fn namespace_fts_request_sends_structured_query_with_explicit_options() {
+        let query = namespace_full_text_query(
+            None,
+            r#"{"boolean": {"should": [], "must": [{"match": {"column": "txt", "terms": "brwn", "operator": "And", "fuzziness": 1}}], "must_not": [{"phrase": {"column": "txt", "terms": "quick brown", "slop": 2}}]}}"#,
+        )
+        .unwrap();
+        assert!(query.string_query.is_none());
+        let boolean = query.structured_query.unwrap().query.boolean.unwrap();
+        let leaf = boolean.must[0].r#match.as_deref().unwrap();
+        assert_eq!(leaf.column.as_deref(), Some("txt"));
+        assert_eq!(leaf.terms, "brwn");
+        assert_eq!(leaf.fuzziness, Some(1));
+        assert_eq!(leaf.operator.as_deref(), Some("AND"));
+        assert_eq!(leaf.max_expansions, Some(50));
+        assert_eq!(leaf.prefix_length, Some(0));
+        assert_eq!(leaf.boost, Some(1.0));
+        let phrase = boolean.must_not[0].phrase.as_deref().unwrap();
+        assert_eq!(phrase.terms, "quick brown");
+        assert_eq!(phrase.slop, Some(2));
+
+        let query = namespace_full_text_query(Some("txt"), "quick brown").unwrap();
+        assert!(query.structured_query.is_none());
+        let string_query = query.string_query.unwrap();
+        assert_eq!(string_query.query, "quick brown");
+        assert_eq!(string_query.columns, Some(vec!["txt".to_string()]));
+    }
+
+    #[test]
+    fn namespace_fts_request_rejects_what_the_model_cannot_carry() {
+        for (query, message) in [
+            (
+                r#"{"match": {"column": "txt", "terms": "fox"}}"#,
+                "must set fuzziness",
+            ),
+            (
+                r#"{"combined_fields": {"query": "fox", "columns": ["txt"]}}"#,
+                "combined_fields is not supported",
+            ),
+            (
+                r#"{"phrase": {"column": "txt", "terms": "fox", "document_granularity": "row"}}"#,
+                "document_granularity is not supported",
+            ),
+            ("fox", "invalid full-text query JSON"),
+        ] {
+            let error = namespace_full_text_query(None, query).unwrap_err();
+            assert!(error.message.contains(message), "{}", error.message);
+        }
     }
 
     fn batch(columns: &[&str]) -> RecordBatch {
