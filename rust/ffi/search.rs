@@ -6,6 +6,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
+use lance_index::scalar::inverted::query::FtsQuery;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 
@@ -49,15 +50,14 @@ fn get_fts_schema_inner(
     k: u64,
     prefilter: u8,
 ) -> FfiResult<SchemaHandle> {
-    let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
+    let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
     let k_i64 = nonzero_u64_to_i64(k, "k")?;
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let projection = handle.fts_projection.clone();
 
-    let fts_query = FullTextSearchQuery::new(query.to_string())
-        .with_column(text_column.to_string())
+    let fts_query = build_fts_query(text_column, query)
         .map_err(|err| FfiError::new(ErrorCode::FtsSchema, format!("fts query: {err}")))?
         .limit(Some(k_i64));
 
@@ -127,7 +127,7 @@ fn create_fts_stream_ir_inner(
     filter_sql: *const c_char,
     prefilter: u8,
 ) -> FfiResult<StreamHandle> {
-    let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
+    let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
     let query = unsafe { cstr_to_str(query, "query")? };
     let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
@@ -142,14 +142,12 @@ fn create_fts_stream_ir_inner(
 
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
-    projection_columns.push(text_column.to_string());
-    projection_columns.push(SCORE_COLUMN.to_string());
-    projection_columns.push(ROW_ID_COLUMN.to_string());
-
-    let fts_query = FullTextSearchQuery::new(query.to_string())
-        .with_column(text_column.to_string())
+    let fts_query = build_fts_query(text_column, query)
         .map_err(|err| FfiError::new(ErrorCode::FtsStreamCreate, format!("fts query: {err}")))?
         .limit(Some(k_i64));
+    projection_columns.extend(fts_query.columns());
+    projection_columns.push(SCORE_COLUMN.to_string());
+    projection_columns.push(ROW_ID_COLUMN.to_string());
 
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
@@ -294,7 +292,7 @@ fn create_hybrid_stream_ir_inner(
         ));
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let text_column = unsafe { cstr_to_str(text_column, "text_column")? };
+    let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
     let text_query = unsafe { cstr_to_str(text_query, "text_query")? };
     let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
     let requested_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
@@ -332,12 +330,34 @@ fn create_hybrid_stream_ir_inner(
     Ok(StreamHandle::Batches(vec![rows].into_iter()))
 }
 
+/// Parses a Lance `FtsQuery` from its JSON form, the format lancedb's `fts` SQL
+/// table function takes.
+pub(super) fn parse_fts_query_json(query: &str) -> Result<FtsQuery, String> {
+    serde_json::from_str(query).map_err(|err| {
+        format!(
+            "invalid full-text query JSON: {err}; expected a Lance FtsQuery such as \
+             {{\"match\": {{\"column\": \"text\", \"terms\": \"puppy\"}}}}"
+        )
+    })
+}
+
+/// The full-text query of a search: `query` matched against `text_column`, or,
+/// without a column, a Lance `FtsQuery` in its JSON form.
+fn build_fts_query(text_column: Option<&str>, query: &str) -> Result<FullTextSearchQuery, String> {
+    match text_column {
+        Some(column) => FullTextSearchQuery::new(query.to_string())
+            .with_column(column.to_string())
+            .map_err(|err| err.to_string()),
+        None => parse_fts_query_json(query).map(FullTextSearchQuery::new_query),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_hybrid_batch(
     handle: &super::types::DatasetHandle,
     vector_column: &str,
     query_values: &[f32],
-    text_column: &str,
+    text_column: Option<&str>,
     text_query: &str,
     k: usize,
     nprobes: u64,
@@ -414,8 +434,7 @@ fn create_hybrid_batch(
         )
     })?;
 
-    let fts_query = FullTextSearchQuery::new(text_query.to_string())
-        .with_column(text_column.to_string())
+    let fts_query = build_fts_query(text_column, text_query)
         .map_err(|err| {
             FfiError::new(
                 ErrorCode::HybridStreamCreate,

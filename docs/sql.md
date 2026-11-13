@@ -316,12 +316,14 @@ FROM lance_fts('path/to/dataset.lance', 'text', 'puppy', k = 10, prefilter = tru
 ORDER BY _score DESC;
 ```
 
-Signature: `lance_fts(uri, text_column, query, ...)`
+Signatures:
+- `lance_fts(uri, text_column, query, ...)`: matches any term of `query` against `text_column`.
+- `lance_fts(uri, query, ...)`: `query` is a structured query (see below).
 
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `text_column` (VARCHAR): Text column name.
-- `query` (VARCHAR): Query string.
+- `query` (VARCHAR): Query string, or a structured query in the two-argument form.
 
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
@@ -336,6 +338,25 @@ Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
 - `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
+
+Structured queries:
+
+```sql
+-- Exact phrase; the INVERTED index must be built WITH (with_position = true)
+SELECT id, text, _score
+FROM lance_fts('path/to/dataset.lance', '{"phrase": {"column": "text", "terms": "lazy dog"}}');
+
+-- Every term, allowing one edit per term
+SELECT id, text, _score
+FROM lance_fts('path/to/dataset.lance',
+  '{"match": {"column": "text", "terms": "lazy dgo", "operator": "And", "fuzziness": 1}}');
+```
+
+- A structured query is a Lance `FtsQuery` in its JSON form, the format of LanceDB's `fts` table function: `match` (`terms`, `operator` `"And"` or `"Or"`, `fuzziness`, `max_expansions`, `prefix_length`, `boost`), `phrase` (`terms`, `slop`), `multi_match` (`match_queries`), `boolean` (`should`, `must`, `must_not`), `boost` (`positive`, `negative`, `negative_boost`) and `combined_fields`. Defaults are Lance's; Lance currently treats an omitted `fuzziness` as `0` (exact terms), so set a positive `fuzziness` to match misspellings.
+- Fuzzy terms are expanded from the INVERTED index, so rows appended after the index was built match them only once the index covers those rows (`ALTER INDEX ... OPTIMIZE`).
+- A query without `column` searches every column with an INVERTED index.
+- Invalid JSON, an unknown column, or a phrase query on an index without positions fails the query.
+- On attached namespace tables the query is sent as the `query_table` `structured_query`. That API cannot express `combined_fields`, `document_granularity`, or a `match` without `fuzziness`, so these fail; set `fuzziness` (`0` for exact terms).
 
 ### Hybrid search: `lance_hybrid_search`
 
@@ -356,14 +377,16 @@ FROM lance_hybrid_search(
 ORDER BY _hybrid_score DESC;
 ```
 
-Signature: `lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)`
+Signatures:
+- `lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)`
+- `lance_hybrid_search(uri, vector_column, query_vector, query, ...)`: `query` is a structured query, as for `lance_fts`.
 
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
 - `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
 - `text_column` (VARCHAR): Text column name.
-- `query` (VARCHAR): Query string.
+- `query` (VARCHAR): Query string, or a structured query in the four-argument form.
 
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.

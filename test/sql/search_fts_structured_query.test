@@ -1,0 +1,187 @@
+# name: test/sql/search_fts_structured_query.test
+# description: lance_fts and lance_hybrid_search accept a Lance FtsQuery in its JSON form
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT i::BIGINT AS id,
+         ['the quick brown fox', 'brown quick the fox', 'quick fox', 'lazy dog'][i + 1] AS txt,
+         ['animals', 'colors', 'fox', 'dog'][i + 1] AS title,
+         [i::FLOAT, 0.0]::FLOAT[2] AS vec
+  FROM range(4) r(i)
+) TO '{TEST_DIR}/fts_structured.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX txt_idx ON '{TEST_DIR}/fts_structured.lance' (txt) USING INVERTED WITH (with_position = true);
+
+statement ok
+CREATE INDEX title_idx ON '{TEST_DIR}/fts_structured.lance' (title) USING INVERTED;
+
+# The string form matches any term
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', 'txt', 'quick brown') ORDER BY id;
+----
+0
+1
+2
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"phrase": {"column": "txt", "terms": "quick brown"}}') ORDER BY id;
+----
+0
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"phrase": {"column": "txt", "terms": "quick fox", "slop": 1}}') ORDER BY id;
+----
+0
+1
+2
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "quick brown", "operator": "And"}}') ORDER BY id;
+----
+0
+1
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "brwn", "fuzziness": 1}}') ORDER BY id;
+----
+0
+1
+
+query I
+SELECT count(*) FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "brwn", "fuzziness": 0}}');
+----
+0
+
+# Lance treats an omitted fuzziness as exact
+query I
+SELECT count(*) FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "brwn"}}');
+----
+0
+
+# A leaf without a column searches every column with an INVERTED index
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"terms": "colors"}}') ORDER BY id;
+----
+1
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"multi_match": {"match_queries": [{"column": "txt", "terms": "lazy"}, {"column": "title", "terms": "fox"}]}}') ORDER BY id;
+----
+2
+3
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"boolean": {"should": [], "must": [{"match": {"column": "txt", "terms": "fox"}}], "must_not": [{"match": {"column": "txt", "terms": "brown"}}]}}') ORDER BY id;
+----
+2
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "fox"}}', prefilter = true) WHERE id > 0 ORDER BY id;
+----
+1
+2
+
+# Rows appended after the index was built are searched flat
+statement ok
+COPY (SELECT 4::BIGINT AS id, 'quick brown bear' AS txt, 'bear' AS title, [4.0, 0.0]::FLOAT[2] AS vec)
+TO '{TEST_DIR}/fts_structured.lance' (FORMAT lance, mode 'append');
+
+query IT
+SELECT id, txt FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"terms": "bear"}}') ORDER BY id;
+----
+4	quick brown bear
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "txt", "terms": "quick brown", "operator": "And"}}') ORDER BY id;
+----
+0
+1
+4
+
+# The text branch of a hybrid search
+query I
+SELECT id FROM lance_hybrid_search('{TEST_DIR}/fts_structured.lance', 'vec', [0.0, 0.0]::FLOAT[2], '{"phrase": {"column": "txt", "terms": "quick brown"}}', k = 5) WHERE _score > 0 ORDER BY id;
+----
+0
+4
+
+query I
+SELECT id FROM lance_hybrid_search('{TEST_DIR}/fts_structured.lance', 'vec', [0.0, 0.0]::DOUBLE[2], '{"phrase": {"column": "txt", "terms": "quick brown"}}', k = 5) WHERE _score > 0 ORDER BY id;
+----
+0
+4
+
+statement error
+SELECT * FROM lance_fts('{TEST_DIR}/fts_structured.lance', 'quick brown');
+----
+invalid full-text query JSON
+
+statement error
+SELECT * FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"match": {"column": "nope", "terms": "fox"}}');
+----
+nope
+
+statement error
+SELECT * FROM lance_fts('{TEST_DIR}/fts_structured.lance', '{"phrase": {"column": "title", "terms": "red fox"}}');
+----
+position
+
+statement error
+SELECT * FROM lance_hybrid_search('{TEST_DIR}/fts_structured.lance', 'vec', [0.0, 0.0]::FLOAT[2], 'quick brown');
+----
+invalid full-text query JSON
+
+# Attached directory namespace: the query is sent as query_table's structured_query
+statement ok
+ATTACH '{TEST_DIR}/fts_structured_ns' AS fts_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE fts_ns.main.t AS
+SELECT i::BIGINT AS id,
+       ['the quick brown fox', 'brown quick the fox', 'quick fox', 'lazy dog'][i + 1] AS txt
+FROM range(4) r(i);
+
+statement ok
+CREATE INDEX txt_idx ON fts_ns.main.t (txt) USING INVERTED WITH (with_position = true);
+
+query I
+SELECT id FROM lance_fts('fts_ns.main.t', '{"phrase": {"column": "txt", "terms": "quick brown"}}') ORDER BY id;
+----
+0
+
+query I
+SELECT id FROM lance_fts('fts_ns.main.t', '{"match": {"column": "txt", "terms": "brwn quick", "operator": "And", "fuzziness": 1}}') ORDER BY id;
+----
+0
+1
+
+query I
+SELECT id FROM lance_fts('fts_ns.main.t', '{"boolean": {"should": [], "must": [{"match": {"column": "txt", "terms": "fox", "fuzziness": 0}}], "must_not": [{"phrase": {"column": "txt", "terms": "quick brown"}}]}}') ORDER BY id;
+----
+1
+2
+
+statement error
+SELECT * FROM lance_fts('fts_ns.main.t', '{"match": {"column": "txt", "terms": "fox"}}');
+----
+must set fuzziness
+
+statement error
+SELECT * FROM lance_fts('fts_ns.main.t', '{"combined_fields": {"query": "fox", "columns": ["txt"]}}');
+----
+combined_fields is not supported
+
+# The statement's pinned dataset serves a search inside DML
+statement ok
+DELETE FROM fts_ns.main.t WHERE rowid IN (SELECT _rowid FROM lance_fts('fts_ns.main.t', '{"phrase": {"column": "txt", "terms": "quick brown"}}'));
+
+query I
+SELECT id FROM fts_ns.main.t ORDER BY id;
+----
+1
+2
+3

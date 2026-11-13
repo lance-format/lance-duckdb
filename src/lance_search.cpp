@@ -1209,6 +1209,9 @@ struct LanceSearchBindData : public TableFunctionData {
   // FTS mode
   string text_column;
   string query;
+  //! `query` (FTS) or `text_query` (hybrid) is a Lance FtsQuery in its JSON
+  //! form, and `text_column` is unused
+  bool structured_query = false;
 
   // Hybrid mode
   string vector_column;
@@ -1241,6 +1244,11 @@ struct LanceSearchBindData : public TableFunctionData {
   // execution so prepared statements observe external commits (see
   // LanceScanBindData::SupportStatementCache).
   bool SupportStatementCache() const override { return false; }
+
+  //! The text_column argument of the FFI search calls
+  const char *TextColumnArg() const {
+    return structured_query ? nullptr : text_column.c_str();
+  }
 };
 
 struct LanceSearchGlobalState : public GlobalTableFunctionState {
@@ -1302,7 +1310,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
           bind_data.namespace_filter, global.native_columns, option_key_ptrs,
           option_value_ptrs, column_ptrs, bearer_token, api_key, config);
       LanceNamespaceFtsSearchOptions options;
-      options.text_column = bind_data.text_column.c_str();
+      options.text_column = bind_data.TextColumnArg();
       options.query = bind_data.query.c_str();
       options.with_row_id = global.with_row_id ? 1 : 0;
       local_state.stream = CreateLanceSearchStreamWithFallback(
@@ -1328,8 +1336,8 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
           [&](const uint8_t *ir, size_t ir_len) -> void * {
             if (bind_data.mode == LanceSearchMode::Fts) {
               return lance_create_fts_stream_ir(
-                  dataset, bind_data.text_column.c_str(),
-                  bind_data.query.c_str(), bind_data.k,
+                  dataset, bind_data.TextColumnArg(), bind_data.query.c_str(),
+                  bind_data.k,
                   native_column_ptrs.empty() ? nullptr
                                              : native_column_ptrs.data(),
                   native_column_ptrs.size(), ir, ir_len,
@@ -1341,7 +1349,7 @@ static bool LanceSearchLoadNextBatch(ClientContext &context,
             return lance_create_hybrid_stream_ir(
                 dataset, bind_data.vector_column.c_str(),
                 bind_data.vector_query.data(), bind_data.vector_query.size(),
-                bind_data.text_column.c_str(), bind_data.text_query.c_str(),
+                bind_data.TextColumnArg(), bind_data.text_query.c_str(),
                 bind_data.k, bind_data.nprobes, bind_data.refine_factor,
                 bind_data.ef,
                 bind_data.distance_type.empty()
@@ -1392,24 +1400,26 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
                                              TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types,
                                              vector<Identifier> &names) {
-  if (input.inputs.size() < 3) {
-    throw InvalidInputException(
-        "lance_fts requires (path, text_column, query)");
-  }
+  // lance_fts(path, text_column, query), or lance_fts(path, query) with query
+  // a Lance FtsQuery in its JSON form.
+  const bool structured_query = input.inputs.size() == 2;
   if (input.inputs[0].IsNull()) {
     throw InvalidInputException("lance_fts requires a dataset root path");
   }
-  if (input.inputs[1].IsNull()) {
+  if (!structured_query && input.inputs[1].IsNull()) {
     throw InvalidInputException("lance_fts requires a non-null text_column");
   }
-  if (input.inputs[2].IsNull()) {
+  if (input.inputs.back().IsNull()) {
     throw InvalidInputException("lance_fts requires a non-null query");
   }
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Fts;
-  result->text_column = input.inputs[1].GetValue<string>();
-  result->query = input.inputs[2].GetValue<string>();
+  result->structured_query = structured_query;
+  if (!structured_query) {
+    result->text_column = input.inputs[1].GetValue<string>();
+  }
+  result->query = input.inputs.back().GetValue<string>();
   result->namespace_filter = ParseOptionalNamedString(input, "filter");
 
   int64_t k_val = 10;
@@ -1436,8 +1446,10 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
                           LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    result->text_column = RequireNamespaceSearchColumn(
-        *table, result->text_column, "lance_fts", "text_column");
+    if (!structured_query) {
+      result->text_column = RequireNamespaceSearchColumn(
+          *table, result->text_column, "lance_fts", "text_column");
+    }
     if (!table->HasBlobColumns()) {
       result->namespace_backed = true;
       result->namespace_config = table->NamespaceConfig();
@@ -1469,7 +1481,7 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
   }
 
   auto *schema_handle = lance_get_fts_schema(
-      result->dataset, result->text_column.c_str(), result->query.c_str(),
+      result->dataset, result->TextColumnArg(), result->query.c_str(),
       result->k, result->prefilter ? 1 : 0);
   if (!schema_handle) {
     throw IOException("Failed to get Lance FTS schema: " + result->file_path +
@@ -1501,10 +1513,10 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
 static unique_ptr<FunctionData>
 LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
                 vector<LogicalType> &return_types, vector<Identifier> &names) {
-  if (input.inputs.size() < 5) {
-    throw InvalidInputException("lance_hybrid_search requires (path, "
-                                "vector_column, vector, text_column, text)");
-  }
+  // lance_hybrid_search(path, vector_column, vector, text_column, text), or
+  // lance_hybrid_search(path, vector_column, vector, text) with text a Lance
+  // FtsQuery in its JSON form.
+  const bool structured_query = input.inputs.size() == 4;
   if (input.inputs[0].IsNull()) {
     throw InvalidInputException(
         "lance_hybrid_search requires a dataset root path");
@@ -1517,11 +1529,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
     throw InvalidInputException(
         "lance_hybrid_search requires a non-null query vector");
   }
-  if (input.inputs[3].IsNull()) {
+  if (!structured_query && input.inputs[3].IsNull()) {
     throw InvalidInputException(
         "lance_hybrid_search requires a non-null text_column");
   }
-  if (input.inputs[4].IsNull()) {
+  if (input.inputs.back().IsNull()) {
     throw InvalidInputException(
         "lance_hybrid_search requires a non-null query");
   }
@@ -1539,8 +1551,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
   result->vector_column = input.inputs[1].GetValue<string>();
   result->vector_query =
       ParseQueryVector(input.inputs[2], "lance_hybrid_search");
-  result->text_column = input.inputs[3].GetValue<string>();
-  result->text_query = input.inputs[4].GetValue<string>();
+  result->structured_query = structured_query;
+  if (!structured_query) {
+    result->text_column = input.inputs[3].GetValue<string>();
+  }
+  result->text_query = input.inputs.back().GetValue<string>();
 
   int64_t k_val = 10;
   auto k_named = input.named_parameters.find("k");
@@ -1700,9 +1715,9 @@ LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   if (global.pinned_dataset) {
     PopulatePinnedSearchSchema(
         context,
-        lance_get_fts_schema(
-            global.pinned_dataset->Handle(), bind_data.text_column.c_str(),
-            bind_data.query.c_str(), bind_data.k, bind_data.prefilter ? 1 : 0),
+        lance_get_fts_schema(global.pinned_dataset->Handle(),
+                             bind_data.TextColumnArg(), bind_data.query.c_str(),
+                             bind_data.k, bind_data.prefilter ? 1 : 0),
         "lance_fts", bind_data.target.identifier, bind_data.names,
         bind_data.types, global.column_ids, global.pinned_schema_root,
         global.pinned_arrow_table);
@@ -1877,11 +1892,15 @@ LanceSearchBindToString(const LanceSearchBindData &bind_data) {
   }
 
   if (bind_data.mode == LanceSearchMode::Fts) {
-    result["Lance Text Column"] = bind_data.text_column;
+    if (!bind_data.structured_query) {
+      result["Lance Text Column"] = bind_data.text_column;
+    }
     result["Lance Query"] = bind_data.query;
   } else {
     result["Lance Vector Column"] = bind_data.vector_column;
-    result["Lance Text Column"] = bind_data.text_column;
+    if (!bind_data.structured_query) {
+      result["Lance Text Column"] = bind_data.text_column;
+    }
     result["Lance Vector Query Dim"] = to_string(bind_data.vector_query.size());
     result["Lance Text Query"] = bind_data.text_query;
     result["Lance Nprobes"] = to_string(bind_data.nprobes);
@@ -1928,26 +1947,36 @@ static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
 }
 
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
+  auto configure = [](TableFunction &fun) {
+    fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("k", LogicalType::BIGINT);
+      options.Add("prefilter", LogicalType::BOOLEAN);
+      options.Add("filter", LogicalType::VARCHAR);
+    });
+    fun.projection_pushdown = true;
+    fun.filter_pushdown = true;
+    fun.filter_prune = true;
+    fun.pushdown_expression = LancePushdownExpression;
+    fun.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
+    fun.get_virtual_columns = LanceSearchGetVirtualColumns;
+    fun.to_string = LanceSearchToString;
+    fun.get_metrics = LanceSearchGetMetrics;
+  };
+
   TableFunction fts(
       "lance_fts",
       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
       LanceSearchFunc, LanceFtsBind, LanceSearchInitGlobal,
       LanceSearchLocalInit);
-
-  fts.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
-    options.Add("k", LogicalType::BIGINT);
-    options.Add("prefilter", LogicalType::BOOLEAN);
-    options.Add("filter", LogicalType::VARCHAR);
-  });
-  fts.projection_pushdown = true;
-  fts.filter_pushdown = true;
-  fts.filter_prune = true;
-  fts.pushdown_expression = LancePushdownExpression;
-  fts.pushdown_complex_filter = LanceSearchPushdownComplexFilter;
-  fts.get_virtual_columns = LanceSearchGetVirtualColumns;
-  fts.to_string = LanceSearchToString;
-  fts.get_metrics = LanceSearchGetMetrics;
+  configure(fts);
   loader.RegisterFunction(fts);
+
+  TableFunction fts_structured("lance_fts",
+                               {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                               LanceSearchFunc, LanceFtsBind,
+                               LanceSearchInitGlobal, LanceSearchLocalInit);
+  configure(fts_structured);
+  loader.RegisterFunction(fts_structured);
 }
 
 static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
@@ -1990,6 +2019,24 @@ static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
                            LanceSearchInitGlobal, LanceSearchLocalInit);
   configure(hybrid_f64);
   loader.RegisterFunction(hybrid_f64);
+
+  TableFunction hybrid_structured_f32(
+      "lance_hybrid_search",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::LIST(LogicalType::FLOAT), LogicalType::VARCHAR},
+      LanceSearchFunc, LanceHybridBind, LanceSearchInitGlobal,
+      LanceSearchLocalInit);
+  configure(hybrid_structured_f32);
+  loader.RegisterFunction(hybrid_structured_f32);
+
+  TableFunction hybrid_structured_f64(
+      "lance_hybrid_search",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR,
+       LogicalType::LIST(LogicalType::DOUBLE), LogicalType::VARCHAR},
+      LanceSearchFunc, LanceHybridBind, LanceSearchInitGlobal,
+      LanceSearchLocalInit);
+  configure(hybrid_structured_f64);
+  loader.RegisterFunction(hybrid_structured_f64);
 }
 
 void RegisterLanceSearch(ExtensionLoader &loader) {
