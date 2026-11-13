@@ -126,8 +126,11 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         string &out_display_uri);
 
 // Where UPDATE and MERGE spill buffered new values: DuckDB's temp directory
-// (empty when it has none) and the bytes they may write there, which is what
-// max_temp_directory_size leaves (UINT64_MAX when it is unset).
+// (empty when it has none, or when temp_file_encryption is on, since the spill
+// files are plain Arrow IPC) and the bytes they may write there, which is what
+// max_temp_directory_size leaves when the statement starts (UINT64_MAX when it
+// is unset). The limit is not a reservation: concurrent statements and
+// DuckDB's own spills do not see these bytes.
 struct LanceDmlSpillTarget {
   string directory;
   uint64_t limit;

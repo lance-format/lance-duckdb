@@ -881,14 +881,15 @@ impl Drop for SpillDir {
 /// buffered values exceed `budget`, the largest columns are spilled to
 /// DuckDB's temp directory until half the budget is free, and are read back
 /// when their fragment is rewritten. Memory stays near the budget plus the one
-/// fragment column the updater joins at a time; without a temp directory the
-/// values stay in memory.
+/// fragment column the updater joins at a time; without a temp directory
+/// (DuckDB passes none when temp_file_encryption is on) the values stay in
+/// memory.
 ///
 /// The spill files are Arrow IPC streams written here rather than DuckDB
 /// temporary buffers: the values are Arrow batches grouped by Lance fragment
 /// on this side of the FFI boundary, and DuckDB's temporary file manager only
 /// serves its own buffer pool. They count against `spill_limit`, the room
-/// left under DuckDB's `max_temp_directory_size`.
+/// left under DuckDB's `max_temp_directory_size` when the statement starts.
 pub(super) struct ColumnUpdateWriter {
     dataset: Arc<lance::Dataset>,
     existing_schema: ArrowSchema,

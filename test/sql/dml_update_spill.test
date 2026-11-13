@@ -15,10 +15,10 @@ SET temp_directory='{TEST_DIR}/dml_spill_tmp';
 foreach stable false true
 
 statement ok
-COPY (SELECT i::BIGINT AS id, list_transform(range(64), lambda j: (i + j)::FLOAT)::FLOAT[64] AS vec FROM range(0, 60000) r(i)) TO '{TEST_DIR}/dml_spill_${stable}/t.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 10000, enable_stable_row_ids ${stable});
+COPY (SELECT i::BIGINT AS id, list_transform(range(64), lambda j: (i + j)::FLOAT)::FLOAT[64] AS vec FROM range(0, 60000) r(i)) TO '{TEST_DIR}/dml_spill_{stable}/t.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 10000, enable_stable_row_ids {stable});
 
 statement ok
-ATTACH '{TEST_DIR}/dml_spill_${stable}' AS sp (TYPE LANCE);
+ATTACH '{TEST_DIR}/dml_spill_{stable}' AS sp (TYPE LANCE);
 
 statement ok
 CREATE TEMP TABLE before_rowids AS SELECT id, rowid AS rid FROM sp.main.t;
@@ -95,7 +95,7 @@ SELECT count(*) FROM glob('{TEST_DIR}/dml_spill_tmp/**');
 
 # Rows that were rewritten keep their row id when row ids are stable.
 query I
-SELECT count(*) FROM sp.main.t AS t JOIN before_rowids AS b USING (id) WHERE t.rowid <> b.rid AND ${stable};
+SELECT count(*) FROM sp.main.t AS t JOIN before_rowids AS b USING (id) WHERE t.rowid <> b.rid AND {stable};
 ----
 0
 
@@ -106,3 +106,35 @@ statement ok
 DETACH sp;
 
 endloop
+
+# With temp_file_encryption on, UPDATE and MERGE keep the values in memory
+# rather than writing them unencrypted, so a 1MB temp limit does not stop them.
+statement ok
+SET temp_file_encryption=true;
+
+statement ok
+COPY (SELECT i::BIGINT AS id, list_transform(range(64), lambda j: (i + j)::FLOAT)::FLOAT[64] AS vec FROM range(0, 60000) r(i)) TO '{TEST_DIR}/dml_spill_enc/t.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 10000);
+
+statement ok
+ATTACH '{TEST_DIR}/dml_spill_enc' AS enc (TYPE LANCE);
+
+statement ok
+SET max_temp_directory_size='1MB';
+
+query I
+UPDATE enc.main.t SET vec = list_transform(range(64), lambda j: (id * 2 + j)::FLOAT)::FLOAT[64];
+----
+60000
+
+query I
+MERGE INTO enc.main.t AS t
+USING (SELECT i::BIGINT AS id FROM range(0, 60000) r(i)) AS s
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET vec = list_transform(range(64), lambda j: (s.id * 3 + j)::FLOAT)::FLOAT[64];
+----
+60000
+
+query II
+SELECT count(*), count(*) FILTER (WHERE vec <> list_transform(range(64), lambda j: (id * 3 + j)::FLOAT)::FLOAT[64]) FROM enc.main.t;
+----
+60000	0
