@@ -380,6 +380,35 @@ def main() -> None:
             # Direct dataset reads through REST discovery still pin a dataset
             # snapshot and can use the native late-materialization rewrite.
             endpoint = f"http://127.0.0.1:{server.server_port}"
+            # Cover the catalog's remote stream and the direct namespace scan
+            # with DuckDB's native ordered sink.
+            for source, expected_rows, remote_requests in (
+                ("ns.main.many", 2503, 1),
+                (f"__lance_namespace_scan('{endpoint}', 'fallback', '$')", 2, 0),
+            ):
+                start = len(requests)
+                result = subprocess.run(
+                    [
+                        str(args.duckdb),
+                        "-unsigned",
+                        "-no-agent",
+                        "-json",
+                        "-c",
+                        prefix
+                        + "SET threads=4; SET preserve_insertion_order=true; "
+                        + f"CREATE TABLE copied AS SELECT id, txt FROM {source}; "
+                        + "SELECT count(*) AS n, count(*) FILTER (WHERE rowid IS DISTINCT FROM id "
+                        + "OR txt IS DISTINCT FROM 'row-' || rowid::VARCHAR) AS mismatches FROM copied;",
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    env={**os.environ, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+                )
+                assert result.returncode == 0, result.stderr
+                assert json.loads(result.stdout) == [{"n": expected_rows, "mismatches": 0}], result.stdout
+                assert len(requests) == start + remote_requests, "ordered CTAS must retain its namespace route"
             for source in ("ns.main.fallback", f"__lance_namespace_scan('{endpoint}', 'fallback', '$')"):
                 start = len(requests)
                 sql = f"SELECT id, txt FROM {source} ORDER BY id DESC LIMIT 1;"

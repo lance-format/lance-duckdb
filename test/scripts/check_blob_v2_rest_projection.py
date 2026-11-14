@@ -77,6 +77,20 @@ def main() -> None:
             blob_path,
             data_storage_version="2.2",
         )
+        blob_only_path = root / "blob_only.lance"
+        blob_only_schema = pa.schema([blob_arrow_schema.field("payload")])
+        for rows, mode in ((1, "create"), (5000, "append")):
+            blob_only_dataset = lance.write_dataset(
+                pa.Table.from_arrays(
+                    [pa.array([{"data": b"value", "uri": None}] * rows, type=blob_storage)],
+                    schema=blob_only_schema,
+                ),
+                blob_only_path,
+                mode=mode,
+                data_storage_version="2.2",
+                enable_stable_row_ids=True,
+            )
+        assert [fragment.metadata.physical_rows for fragment in blob_only_dataset.get_fragments()] == [1, 5000]
 
         blob_schema = {
             "fields": [
@@ -113,17 +127,21 @@ def main() -> None:
                 content_type = "application/json"
                 status = 200
                 if path.endswith("/table/list"):
-                    response: object = {"tables": ["blobs", "ordinary"]}
+                    response: object = {"tables": ["blobs", "blob_only", "ordinary"]}
                 elif path.endswith("/list") and "/namespace/" in path:
                     response = {"namespaces": []}
                 elif path.endswith("/describe") and "/table/" in path:
                     name = path.split("/")[-2].split("$")[-1]
                     response = {
-                        "location": str(blob_path) if name == "blobs" else str(root / "must-not-open.lance"),
-                        "version": 1,
-                        "schema": blob_schema,
+                        "location": (
+                            str(blob_only_path)
+                            if name == "blob_only"
+                            else str(blob_path) if name == "blobs" else str(root / "must-not-open.lance")
+                        ),
+                        "version": 2 if name == "blob_only" else 1,
+                        "schema": {"fields": blob_schema["fields"][1:]} if name == "blob_only" else blob_schema,
                     }
-                elif path.endswith("/query") and "/ordinary/" in path:
+                elif path.endswith("/query") and path.split("/")[-2].split("$")[-1] == "ordinary":
                     columns = request_body.get("columns")
                     if isinstance(columns, dict):
                         columns = columns.get("column_names")
@@ -171,6 +189,15 @@ def main() -> None:
                     "1|616263\n2|NULL\n",
                 ),
             ]
+            for threads in (1, 4):
+                cases.append(
+                    (
+                        f"blob_only_rowids_{threads}",
+                        f"SET threads={threads}; CREATE TABLE copied AS SELECT rowid AS rid FROM ns.main.blob_only; "
+                        "SELECT count(*), count(*) FILTER (WHERE rid IS DISTINCT FROM rowid) FROM copied;",
+                        "5001|0\n",
+                    )
+                )
             output: list[dict] = []
             for name, sql, expected in cases:
                 start = len(requests)
@@ -199,6 +226,8 @@ def main() -> None:
                         and request["body"].get("columns", {}).get("column_names") == ["id"]
                         for request in case_requests
                     )
+                if name.startswith("blob_only_rowids_"):
+                    passed = passed and not any(request["path"].endswith("/query") for request in case_requests)
                 output.append(
                     {
                         "name": name,

@@ -1,0 +1,322 @@
+# name: test/sql/scan_batch_index.test
+# description: Native ordered sinks preserve Lance fragment and row order while scanning in parallel
+# group: [sql]
+
+require lance
+
+statement ok
+SET preserve_insertion_order = true;
+
+foreach stable false true
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE batch_reference AS
+SELECT i::BIGINT AS id,
+       CASE WHEN i % 17 = 0 THEN NULL ELSE 'row-' || i::VARCHAR END AS label,
+       {'value': i * 3, 'items': [i, NULL, i + 1]} AS payload
+FROM range(327777) r(i);
+
+statement ok
+COPY batch_reference TO '{TEST_DIR}/batch_{stable}/t.lance'
+  (FORMAT lance, max_rows_per_file 65536, enable_stable_row_ids {stable});
+
+statement ok
+SET threads = 4;
+
+# This must select DuckDB's batch sink, not merely advertise four scan threads.
+query II
+EXPLAIN (FORMAT JSON) CREATE TABLE batch_plan AS SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance';
+----
+physical_plan	<REGEX>:[\s\S]*BATCH_CREATE_TABLE_AS[\s\S]*
+
+statement ok
+CREATE TABLE batch_actual AS SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance';
+
+# Compare every field by destination position; sorting by source id would hide
+# missing order guarantees or reassociated Arrow payloads.
+query II
+SELECT count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload)
+FROM batch_actual a FULL JOIN batch_reference e ON a.rowid = e.rowid;
+----
+327777	0
+
+# LIMIT/OFFSET selects a whole-dataset stream. Its native batches must preserve
+# source order before DuckDB assigns monotonically increasing sink indexes.
+foreach scan_threads 1 4
+
+statement ok
+SET threads = {scan_threads};
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance' LIMIT 300000 OFFSET 13;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+statement ok
+CREATE TABLE batch_limited AS SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance' LIMIT 300000 OFFSET 13;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload)
+FROM batch_limited a FULL JOIN (SELECT * FROM batch_reference WHERE rowid >= 13 AND rowid < 300013) e ON a.rowid + 13 = e.id;
+----
+300000	0
+
+statement ok
+DROP TABLE batch_limited;
+
+endloop
+
+statement ok
+SET threads = 4;
+
+statement ok
+ATTACH '{TEST_DIR}/batch_{stable}' AS ordered_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE batch_insert AS SELECT -1::BIGINT AS id, NULL::VARCHAR AS label, {'value': -3::BIGINT, 'items': [-1::BIGINT, NULL, 0::BIGINT]} AS payload;
+
+query II
+EXPLAIN (FORMAT JSON) INSERT INTO batch_insert SELECT * FROM ordered_ns.main.t;
+----
+physical_plan	<REGEX>:[\s\S]*BATCH_INSERT[\s\S]*
+
+statement ok
+INSERT INTO batch_insert SELECT * FROM ordered_ns.main.t;
+
+query III
+SELECT count(*), min(id), count(*) FILTER (WHERE rowid IS DISTINCT FROM id + 1) FROM batch_insert;
+----
+327778	-1	0
+
+query I
+SELECT count(*) FROM batch_insert a JOIN batch_reference e ON a.rowid = e.rowid + 1
+WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload;
+----
+0
+
+# Explicit COPY order wins over the session's opt-out.
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+COPY (SELECT id FROM ordered_ns.main.t) TO '{TEST_DIR}/ordered_{stable}.csv'
+  (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+CREATE TABLE batch_csv AS SELECT * FROM read_csv('{TEST_DIR}/ordered_{stable}.csv', header=false, columns={'id':'BIGINT'}, parallel=false);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE rowid IS DISTINCT FROM id) FROM batch_csv;
+----
+327777	0
+
+# Empty leading/interior fragments, partial deletions, NULLs and a short tail.
+statement ok
+DELETE FROM ordered_ns.main.t WHERE id < 65536 OR id BETWEEN 131072 AND 196607 OR id % 13 = 0;
+
+statement ok
+DELETE FROM batch_reference WHERE id < 65536 OR id BETWEEN 131072 AND 196607 OR id % 13 = 0;
+
+statement ok
+CREATE TABLE batch_expected AS SELECT * FROM batch_reference WHERE id % 7 = 0 ORDER BY id;
+
+statement ok
+CREATE TABLE batch_filtered AS SELECT * FROM ordered_ns.main.t WHERE id % 7 = 0;
+
+query I
+SELECT count(*) FROM batch_filtered a FULL JOIN batch_expected e ON a.rowid = e.rowid
+WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload;
+----
+0
+
+statement ok
+CREATE TABLE batch_empty AS SELECT * FROM ordered_ns.main.t WHERE id < 0;
+
+query I
+SELECT count(*) FROM batch_empty;
+----
+0
+
+statement ok
+CREATE TABLE batch_sorted AS SELECT id FROM ordered_ns.main.t ORDER BY id DESC;
+
+query I
+SELECT count(*) FROM (SELECT id, lag(id) OVER (ORDER BY rowid) AS previous FROM batch_sorted) WHERE id >= previous;
+----
+0
+
+# Prepared executions must obtain fresh fragment positions after an append.
+statement ok
+CREATE TABLE batch_prepared (id BIGINT);
+
+statement ok
+PREPARE batch_read AS INSERT INTO batch_prepared SELECT id FROM ordered_ns.main.t WHERE id >= 327770;
+
+statement ok
+EXECUTE batch_read;
+
+statement ok
+INSERT INTO ordered_ns.main.t VALUES (400000, 'appended', {'value': 1200000, 'items': [400000, NULL, 400001]});
+
+statement ok
+EXECUTE batch_read;
+
+query II
+SELECT count(*) FILTER (WHERE id = 400000), max(id) FROM batch_prepared;
+----
+1	400000
+
+statement ok
+DEALLOCATE batch_read;
+
+statement ok
+DETACH ordered_ns;
+
+statement ok
+DROP TABLE batch_reference;
+
+statement ok
+DROP TABLE batch_actual;
+
+statement ok
+DROP TABLE batch_insert;
+
+statement ok
+DROP TABLE batch_csv;
+
+statement ok
+DROP TABLE batch_expected;
+
+statement ok
+DROP TABLE batch_filtered;
+
+statement ok
+DROP TABLE batch_empty;
+
+statement ok
+DROP TABLE batch_sorted;
+
+statement ok
+DROP TABLE batch_prepared;
+
+endloop
+
+# Legacy manifests can omit row counts. Serial chunk IDs must continue across
+# fragments instead of resetting and reusing an earlier fragment's IDs.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/unknown_fragment_rows.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Max Threads": "1"[\s\S]*
+
+statement ok
+CREATE TABLE batch_legacy AS SELECT * FROM 'test/data/unknown_fragment_rows.lance';
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid OR label IS DISTINCT FROM 'row-' || rowid::VARCHAR) FROM batch_legacy;
+----
+10023	0
+
+statement ok
+DROP TABLE batch_legacy;
+
+# Legacy readers merge batches concurrently unless the dataset scanner also
+# receives the sink's order requirement. LIMIT selects that scanner.
+foreach scan_threads 1 4
+
+statement ok
+SET threads = {scan_threads};
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+statement ok
+CREATE TABLE batch_legacy_limit AS SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid + 3 OR label IS DISTINCT FROM 'row-' || (rowid + 3)::VARCHAR) FROM batch_legacy_limit;
+----
+9000	0
+
+statement ok
+DROP TABLE batch_legacy_limit;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+COPY (SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3)
+TO '{TEST_DIR}/batch_legacy_limit_{scan_threads}.csv' (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+CREATE TABLE batch_legacy_copy AS SELECT * FROM read_csv('{TEST_DIR}/batch_legacy_limit_{scan_threads}.csv',
+  header=false, columns={'id':'BIGINT', 'label':'VARCHAR'}, parallel=false);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid + 3 OR label IS DISTINCT FROM 'row-' || (rowid + 3)::VARCHAR) FROM batch_legacy_copy;
+----
+9000	0
+
+statement ok
+DROP TABLE batch_legacy_copy;
+
+endloop
+
+# One large fragment must not become one unbounded native COPY staging batch.
+statement ok
+SET threads = 1;
+
+statement ok
+COPY (SELECT i::BIGINT AS id, (i % 100)::DOUBLE AS value FROM range(6000000) r(i))
+TO '{TEST_DIR}/batch_large.lance' (FORMAT lance, max_rows_per_file 10000000);
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET memory_limit = '64MB';
+
+statement ok
+COPY (SELECT * FROM '{TEST_DIR}/batch_large.lance') TO '{TEST_DIR}/batch_large.csv'
+  (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM position - 1 OR value IS DISTINCT FROM ((position - 1) % 100)::DOUBLE)
+FROM (SELECT *, row_number() OVER () AS position FROM read_csv('{TEST_DIR}/batch_large.csv',
+      header=false, columns={'id':'BIGINT', 'value':'DOUBLE'}, parallel=false, buffer_size=1048576));
+----
+6000000	0
+
+# LIMIT uses the one-producer dataset stream, which also needs bounded batches.
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+COPY (SELECT * FROM '{TEST_DIR}/batch_large.lance' LIMIT 6000000)
+TO '{TEST_DIR}/batch_large_limit.csv' (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM position - 1 OR value IS DISTINCT FROM ((position - 1) % 100)::DOUBLE)
+FROM (SELECT *, row_number() OVER () AS position FROM read_csv('{TEST_DIR}/batch_large_limit.csv',
+      header=false, columns={'id':'BIGINT', 'value':'DOUBLE'}, parallel=false, buffer_size=1048576));
+----
+6000000	0
+
+statement ok
+RESET memory_limit;
+
+statement ok
+RESET threads;
+
+statement ok
+RESET preserve_insertion_order;

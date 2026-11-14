@@ -9,10 +9,12 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -570,6 +572,7 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
 
   vector<uint64_t> take_row_ids;
   vector<uint64_t> fragment_ids;
+  vector<idx_t> fragment_batch_offsets;
   idx_t max_threads = 1;
 
   vector<idx_t> projection_ids;
@@ -632,7 +635,9 @@ struct LanceScanLocalState : public ArrowScanLocalState {
   void *stream = nullptr;
   LanceScanGlobalState *global_state = nullptr;
   idx_t fragment_pos = 0;
+  idx_t next_batch_index = 0;
   idx_t rows_scanned = 0;
+  bool scan_in_order = false;
   bool filter_pushed_down = false;
   bool metric_slot_held = false;
   SelectionVector filter_sel;
@@ -1892,21 +1897,53 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
   }
 
+  if (scan_state.use_dataset_scanner) {
+    scan_state.max_threads = 1;
+    return state;
+  }
+
   size_t ffi_fragment_count = 0;
   auto fragments_ptr =
-      lance_dataset_list_fragments(dataset, &ffi_fragment_count);
+      lance_dataset_list_fragment_stats(dataset, &ffi_fragment_count);
   if (!fragments_ptr) {
     throw IOException("Failed to list Lance fragments" +
                       LanceFormatErrorSuffix());
   }
   auto fragment_count = NumericCast<idx_t>(ffi_fragment_count);
-  scan_state.fragment_ids.assign(
-      fragments_ptr, fragments_ptr + NumericCast<size_t>(fragment_count));
-  lance_free_fragment_list(fragments_ptr, ffi_fragment_count);
+  auto free_fragments = [ffi_fragment_count](LanceFragmentStats *ptr) {
+    lance_free_fragment_stats_list(ptr, ffi_fragment_count);
+  };
+  std::unique_ptr<LanceFragmentStats, decltype(free_fragments)> fragments(
+      fragments_ptr, free_fragments);
+  scan_state.fragment_ids.reserve(fragment_count);
+  scan_state.fragment_batch_offsets.reserve(fragment_count + 1);
+  scan_state.fragment_batch_offsets.push_back(0);
+  idx_t batch_end = 0;
+  bool known_row_counts = true;
+  for (idx_t fragment_idx = 0; fragment_idx < fragment_count; fragment_idx++) {
+    const auto &fragment = fragments_ptr[fragment_idx];
+    scan_state.fragment_ids.push_back(fragment.fragment_id);
+    // Each nonempty output chunk consumes one ID, so the undeleted row count
+    // bounds a fragment's ID range even after filter pushdown.
+    if (fragment.num_rows < 0 ||
+        uint64_t(fragment.num_rows) >=
+            PipelineBuildState::BATCH_INCREMENT - 2 - batch_end) {
+      known_row_counts = false;
+    } else if (known_row_counts) {
+      batch_end += NumericCast<idx_t>(fragment.num_rows);
+    }
+    scan_state.fragment_batch_offsets.push_back(batch_end);
+  }
 
   auto threads = context.db->NumberOfThreads();
   scan_state.max_threads = MaxValue<idx_t>(
       1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
+  if (!known_row_counts) {
+    // Legacy metadata cannot reserve disjoint ranges safely. Keep one producer
+    // with sequential chunk IDs rather than guessing a fragment's size.
+    scan_state.fragment_batch_offsets.clear();
+    scan_state.max_threads = 1;
+  }
 
   return state;
 }
@@ -1921,6 +1958,16 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   result->column_ids = scan_global.scan_column_ids;
   result->filters = input.filters.get();
   result->global_state = &scan_global;
+  result->scan_in_order =
+      Settings::Get<PreserveInsertionOrderSetting>(context.client);
+  if (context.pipeline && context.pipeline->GetSink()) {
+    // A sink can require order independently of preserve_insertion_order,
+    // including serial COPY, which does not request batch indexes.
+    auto &sink = *context.pipeline->GetSink();
+    result->scan_in_order |=
+        sink.RequiredPartitionInfo().RequiresBatchIndex() ||
+        (sink.SinkOrderDependent() && !sink.ParallelSink());
+  }
   result->filter_pushed_down = scan_global.filter_pushed_down;
   if (scan_global.CanRemoveFilterColumns()) {
     result->all_columns.Initialize(context.client, scan_global.scanned_types);
@@ -2036,7 +2083,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     auto offset_i64 = NumericCast<int64_t>(global_state.pushed_offset);
     stream = lance_create_dataset_stream_ir(
         dataset, columns.data(), columns.size(), filter_ir, filter_ir_len,
-        limit_i64, offset_i64);
+        limit_i64, offset_i64, local_state.scan_in_order ? 1 : 0);
     if (!stream && filter_ir) {
       if (global_state.limit_offset_pushed_down &&
           local_state.filter_pushed_down) {
@@ -2047,9 +2094,9 @@ static bool LanceScanOpenStream(ClientContext &context,
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
-      stream = lance_create_dataset_stream_ir(dataset, columns.data(),
-                                              columns.size(), nullptr, 0,
-                                              limit_i64, offset_i64);
+      stream = lance_create_dataset_stream_ir(
+          dataset, columns.data(), columns.size(), nullptr, 0, limit_i64,
+          offset_i64, local_state.scan_in_order ? 1 : 0);
     }
   } else {
     if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
@@ -2057,16 +2104,17 @@ static bool LanceScanOpenStream(ClientContext &context,
     }
     auto fragment_id = global_state.fragment_ids[local_state.fragment_pos];
 
-    stream = lance_create_fragment_stream_ir(dataset, fragment_id,
-                                             columns.data(), columns.size(),
-                                             filter_ir, filter_ir_len);
+    stream = lance_create_fragment_stream_ir(
+        dataset, fragment_id, columns.data(), columns.size(), filter_ir,
+        filter_ir_len, local_state.scan_in_order ? 1 : 0);
     if (!stream && filter_ir) {
       // Best-effort: if filter pushdown failed, retry without it and rely on
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
       stream = lance_create_fragment_stream_ir(
-          dataset, fragment_id, columns.data(), columns.size(), nullptr, 0);
+          dataset, fragment_id, columns.data(), columns.size(), nullptr, 0,
+          local_state.scan_in_order ? 1 : 0);
     }
   }
   if (!stream) {
@@ -2261,6 +2309,25 @@ static void LanceFillDeferredColumns(ClientContext &context,
   }
 }
 
+static void LanceScanSetBatchIndex(const LanceScanGlobalState &global_state,
+                                   LanceScanLocalState &local_state) {
+  auto batch_index = local_state.next_batch_index++;
+  if (!global_state.fragment_batch_offsets.empty()) {
+    auto start = global_state.fragment_batch_offsets[local_state.fragment_pos];
+    auto end =
+        global_state.fragment_batch_offsets[local_state.fragment_pos + 1];
+    if (batch_index >= end - start) {
+      throw IOException(
+          "Lance fragment emitted more batches than its row count");
+    }
+    batch_index += start;
+  }
+  if (batch_index >= PipelineBuildState::BATCH_INCREMENT - 2) {
+    throw IOException("Lance scan exceeded DuckDB's batch index range");
+  }
+  local_state.batch_index = batch_index;
+}
+
 static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
                           DataChunk &output) {
   if (!data.local_state) {
@@ -2291,6 +2358,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
     }
     output.CheckCardinality(output_size);
     output.Verify();
+    LanceScanSetBatchIndex(global_state, local_state);
     return;
   }
 
@@ -2309,6 +2377,9 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
         }
         // Stream finished, try next fragment.
         local_state.fragment_pos = global_state.next_fragment_idx.fetch_add(1);
+        if (!global_state.fragment_batch_offsets.empty()) {
+          local_state.next_batch_index = 0;
+        }
         continue;
       }
     }
@@ -2409,6 +2480,7 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
       continue;
     }
     output.Verify();
+    LanceScanSetBatchIndex(global_state, local_state);
     return;
   }
 }
@@ -2465,6 +2537,16 @@ LanceScanToString(TableFunctionToStringInput &input) {
   }
 
   return result;
+}
+
+static OperatorPartitionData
+LanceScanGetPartitionData(ClientContext &,
+                          TableFunctionGetPartitionInput &input) {
+  if (input.partition_info.RequiresPartitionColumns()) {
+    throw InternalException("Lance scan does not support partition columns");
+  }
+  auto &local_state = input.local_state->Cast<LanceScanLocalState>();
+  return OperatorPartitionData(local_state.batch_index);
 }
 
 static void LanceScanGetMetrics(TableFunctionGetMetricsInput &input) {
@@ -4082,6 +4164,7 @@ static TableFunction LanceTableScanFunction() {
   function.statistics = LanceScanStatistics;
   function.cardinality = LanceScanCardinality;
   function.get_partition_stats = LanceScanGetPartitionStats;
+  function.get_partition_data = LanceScanGetPartitionData;
   function.supports_pushdown_type = LanceSupportsPushdownType;
   function.pushdown_expression = LancePushdownExpression;
   function.pushdown_complex_filter = LancePushdownComplexFilter;
@@ -4206,6 +4289,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_scan.statistics = LanceScanStatistics;
   internal_scan.cardinality = LanceScanCardinality;
   internal_scan.get_partition_stats = LanceScanGetPartitionStats;
+  internal_scan.get_partition_data = LanceScanGetPartitionData;
   internal_scan.supports_pushdown_type = LanceSupportsPushdownType;
   internal_scan.pushdown_expression = LancePushdownExpression;
   internal_scan.pushdown_complex_filter = LancePushdownComplexFilter;
@@ -4242,6 +4326,7 @@ void RegisterLanceScan(ExtensionLoader &loader) {
   internal_namespace_scan.statistics = LanceScanStatistics;
   internal_namespace_scan.cardinality = LanceScanCardinality;
   internal_namespace_scan.get_partition_stats = LanceScanGetPartitionStats;
+  internal_namespace_scan.get_partition_data = LanceScanGetPartitionData;
   internal_namespace_scan.supports_pushdown_type = LanceSupportsPushdownType;
   internal_namespace_scan.pushdown_expression = LancePushdownExpression;
   internal_namespace_scan.pushdown_complex_filter = LancePushdownComplexFilter;
