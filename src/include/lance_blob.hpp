@@ -52,7 +52,7 @@ bool LanceNormalizeBlobInput(const Value &value, LanceBlobInput &out,
 // memory limit (one eighth).
 idx_t LanceBlobIngestBatchBudget(ClientContext &context);
 
-// Source storage options for the distinct ingest URIs in one batch, resolved
+// Source storage options for the distinct source URIs in one batch, resolved
 // by DuckDB's native secret lookup. `uris[i]` matches the exact URI carried by
 // the SQL value; `keys[i]`/`values[i]` hold its resolved Lance storage
 // options.
@@ -67,6 +67,12 @@ struct LanceBatchSourceOptions {
 // skipped; malformed values are left for the write boundary to reject.
 void LanceCollectIngestSourceOptions(ClientContext &context, DataChunk &chunk,
                                      LanceBatchSourceOptions &out);
+
+// Materializing Blob inputs also reads reference sources. Apply the same
+// admission and secret lookup to both variants before returning their bytes.
+void LanceCollectMaterializedBlobSourceOptions(ClientContext &context,
+                                               DataChunk &chunk,
+                                               LanceBatchSourceOptions &out);
 
 // Flattened C-pointer form of one batch's per-URI source options. Lives here
 // so every Lance batch sink (INSERT, UPDATE, MERGE) passes ingest credentials

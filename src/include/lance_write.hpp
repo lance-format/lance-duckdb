@@ -4,6 +4,8 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 
 namespace duckdb {
+bool IsLanceCopy(LogicalOperator &op);
+
 PhysicalOperator &PlanLanceCopy(ClientContext &context,
                                 PhysicalPlanGenerator &planner, CopyInfo &info,
                                 const vector<Identifier> &names,

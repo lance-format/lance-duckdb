@@ -340,6 +340,10 @@ private:
   LanceWriteBindData bind_data;
 };
 
+bool IsLanceCopy(LogicalOperator &op) {
+  return dynamic_cast<LogicalLanceCopy *>(&op) != nullptr;
+}
+
 static BoundStatement BindLanceCopy(Binder &binder, CopyStatement &statement) {
   auto &info = *statement.info;
   // Reject generic file-layout options: one COPY writes one Lance dataset.

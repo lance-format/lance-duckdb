@@ -46,6 +46,7 @@
 #include "lance_insert.hpp"
 #include "lance_merge.hpp"
 #include "lance_session_state.hpp"
+#include "lance_storage.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
 #include "lance_write.hpp"
@@ -1432,6 +1433,8 @@ public:
 
   bool SupportsNestedSchemas() const override { return false; }
 
+  bool SupportsMultipleDMLCTEs() const override { return false; }
+
   ErrorData SupportsCreateSchema(CreateSchemaInfo &info) override {
     if (info.IsNested()) {
       return ErrorData(ExceptionType::NOT_IMPLEMENTED,
@@ -2110,6 +2113,10 @@ private:
   shared_ptr<LanceRestNamespaceConfig> rest_ns;
   optional_ptr<LanceSchemaDefaultGenerator> schema_generator;
 };
+
+bool IsLanceCatalog(Catalog &catalog) {
+  return dynamic_cast<LanceDuckCatalog *>(&catalog) != nullptr;
+}
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
                                                PhysicalPlanGenerator &planner,

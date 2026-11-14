@@ -72,6 +72,48 @@ ORDER BY request_id;
 1	736F757263652D622D7061796C6F61640A
 2	736F757263652D612D7061796C6F61640A
 
+# Assigned references returned by DML need the same per-source credentials.
+statement ok
+ATTACH '{TEST_DIR}/returning_s3_sources' AS returning_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE returning_ns.main.rows (id BIGINT, payload BLOB);
+
+query IT rowsort
+INSERT INTO returning_ns.main.rows VALUES
+(1, lance_blob_ref('s3://{LANCE_S3_BUCKET}/blob_v2_external/b/object.bin')),
+(2, lance_blob_ref('s3://{LANCE_S3_BUCKET}/blob_v2_external/a/object.bin'))
+RETURNING id, hex(payload);
+----
+1	736F757263652D622D7061796C6F61640A
+2	736F757263652D612D7061796C6F61640A
+
+query IT rowsort
+UPDATE returning_ns.main.rows SET payload = CASE WHEN id = 1
+THEN lance_blob_ref('s3://{LANCE_S3_BUCKET}/blob_v2_external/a/object.bin')
+ELSE lance_blob_ref('s3://{LANCE_S3_BUCKET}/blob_v2_external/b/object.bin') END
+RETURNING id, hex(payload);
+----
+1	736F757263652D612D7061796C6F61640A
+2	736F757263652D622D7061796C6F61640A
+
+query IT
+MERGE INTO returning_ns.main.rows t USING (SELECT 1::BIGINT AS id) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET
+payload = lance_blob_ref('s3://{LANCE_S3_BUCKET}/blob_v2_external/b/object.bin', 0, 6)
+RETURNING id, hex(payload);
+----
+1	736F75726365
+
+query IT rowsort
+DELETE FROM returning_ns.main.rows RETURNING id, hex(payload);
+----
+1	736F75726365
+2	736F757263652D622D7061796C6F61640A
+
+statement ok
+DETACH returning_ns;
+
 # An absolute source can live beneath the dataset URI. The target reader is
 # explicitly denied that source path, so the narrower source secret must be used.
 statement ok

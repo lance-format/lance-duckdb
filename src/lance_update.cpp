@@ -5,6 +5,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/row_id_deduplicator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -16,6 +17,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
+#include "lance_returning.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 #include "lance_update.hpp"
@@ -50,8 +52,22 @@ idx_t ResolveUpdateSetChunkIndex(LogicalUpdate &op,
 
 class LanceUpdateValueGlobalState : public GlobalSinkState {
 public:
-  explicit LanceUpdateValueGlobalState(const LanceTableEntry &table_p)
-      : table(&table_p) {}
+  explicit LanceUpdateValueGlobalState(ClientContext &context,
+                                       const LanceTableEntry &table_p,
+                                       bool return_chunk,
+                                       RowIdHandling row_id_handling)
+      : table(&table_p) {
+    if (return_chunk) {
+      returning = make_uniq<ColumnDataCollection>(context, table_p.GetTypes());
+    }
+    if (row_id_handling != RowIdHandling::ASSUME_UNIQUE) {
+      seen = make_uniq<RowIdDeduplicator>(
+          context, vector<LogicalType>{LogicalType::ROW_TYPE});
+    }
+  }
+
+  unique_ptr<ColumnDataCollection> returning;
+  unique_ptr<RowIdDeduplicator> seen;
 
   const LanceTableEntry *table = nullptr;
   void *update_handle = nullptr;
@@ -68,7 +84,8 @@ public:
 
 class LanceUpdateValueLocalState : public LocalSinkState {};
 
-class PhysicalLanceUpdateValue final : public PhysicalOperator {
+class PhysicalLanceUpdateValue final : public PhysicalOperator,
+                                       public LanceReturningOperator {
 public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
@@ -78,14 +95,20 @@ public:
       LanceTableEntry &table_p, shared_ptr<LanceDatasetCacheEntry> dataset_p,
       vector<string> set_columns_p, vector<LogicalType> set_types_p,
       vector<idx_t> set_chunk_indices_p, idx_t rowid_chunk_index_p,
-      LogicalType rowid_type_p, idx_t estimated_cardinality)
+      LogicalType rowid_type_p, vector<idx_t> assigned_columns_p,
+      bool return_chunk_p, RowIdHandling row_id_handling_p,
+      idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
+        LanceReturningOperator(
+            return_chunk_p ? table_p.GetColumns().PhysicalColumnCount() : 0),
         table(table_p), dataset(std::move(dataset_p)),
         set_columns(std::move(set_columns_p)),
         set_types(std::move(set_types_p)),
         set_chunk_indices(std::move(set_chunk_indices_p)),
-        rowid_chunk_index(rowid_chunk_index_p) {
+        rowid_chunk_index(rowid_chunk_index_p),
+        assigned_columns(std::move(assigned_columns_p)),
+        return_chunk(return_chunk_p), row_id_handling(row_id_handling_p) {
     if (set_columns.size() != set_types.size() ||
         set_columns.size() != set_chunk_indices.size()) {
       throw InternalException(
@@ -101,8 +124,9 @@ public:
   bool SinkOrderDependent() const override { return false; }
 
   unique_ptr<GlobalSinkState>
-  GetGlobalSinkState(ClientContext &) const override {
-    return make_uniq<LanceUpdateValueGlobalState>(table);
+  GetGlobalSinkState(ClientContext &context) const override {
+    return make_uniq<LanceUpdateValueGlobalState>(context, table, return_chunk,
+                                                  row_id_handling);
   }
 
   unique_ptr<LocalSinkState>
@@ -118,6 +142,20 @@ public:
 
     auto &gstate = input.global_state.Cast<LanceUpdateValueGlobalState>();
     lock_guard<mutex> guard(gstate.lock);
+
+    if (gstate.seen) {
+      SelectionVector selection(chunk.size());
+      auto count = gstate.seen->Register(chunk.data[rowid_chunk_index],
+                                         chunk.size(), selection);
+      if (row_id_handling == RowIdHandling::ERROR && count != chunk.size()) {
+        throw InvalidInputException(
+            "UPDATE command cannot update the same row more than once");
+      }
+      chunk.Slice(selection, count);
+      if (count == 0) {
+        return SinkResultType::NEED_MORE_INPUT;
+      }
+    }
 
     if (!gstate.update_handle) {
       auto spill = LanceGetDmlSpillTarget(context.client);
@@ -145,6 +183,23 @@ public:
         chunk.data[rowid_chunk_index]);
     // Materialize ingest rows exactly once; the same values feed the writer.
     NormalizeIngestRowsInChunk(context.client, value_chunk);
+
+    if (return_chunk) {
+      vector<uint64_t> row_ids;
+      UnifiedVectorFormat ids;
+      chunk.data[rowid_chunk_index].ToUnifiedFormat(ids);
+      auto data = UnifiedVectorFormat::GetData<int64_t>(ids);
+      for (idx_t i = 0; i < chunk.size(); i++) {
+        auto index = ids.sel->get_index(i);
+        if (!ids.validity.RowIsValid(index) || data[index] < 0) {
+          throw InternalException("Lance UPDATE received an invalid row id");
+        }
+        row_ids.push_back(NumericCast<uint64_t>(data[index]));
+      }
+      LanceAppendReturningRows(context.client, *gstate.returning, table,
+                               returning_needed, value_chunk, assigned_columns,
+                               dataset.get(), row_ids);
+    }
 
     auto props = context.client.GetClientProperties();
     unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>>
@@ -216,19 +271,26 @@ public:
     return SinkFinalizeType::READY;
   }
 
-  class LanceUpdateValueSourceState : public GlobalSourceState {
+  class LanceUpdateValueSourceState : public LanceReturningSourceState {
   public:
+    explicit LanceUpdateValueSourceState(
+        optional_ptr<ColumnDataCollection> rows)
+        : LanceReturningSourceState(rows) {}
     bool emitted = false;
   };
 
   unique_ptr<GlobalSourceState>
   GetGlobalSourceState(ClientContext &) const override {
-    return make_uniq<LanceUpdateValueSourceState>();
+    return make_uniq<LanceUpdateValueSourceState>(
+        sink_state->Cast<LanceUpdateValueGlobalState>().returning.get());
   }
 
   SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
                                    OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<LanceUpdateValueSourceState>();
+    if (return_chunk) {
+      return state.Scan(chunk);
+    }
     if (state.emitted) {
       return SourceResultType::FINISHED;
     }
@@ -260,6 +322,9 @@ private:
   vector<idx_t> set_chunk_indices;
   idx_t rowid_chunk_index;
   vector<LogicalType> value_chunk_types;
+  vector<idx_t> assigned_columns;
+  bool return_chunk;
+  RowIdHandling row_id_handling;
 };
 
 } // namespace
@@ -268,10 +333,6 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
                                            PhysicalPlanGenerator &planner,
                                            LogicalUpdate &op,
                                            PhysicalOperator &plan) {
-  if (op.return_chunk) {
-    throw NotImplementedException("Lance UPDATE does not support RETURNING");
-  }
-
   auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
   if (!lance_table) {
     throw InternalException(
@@ -295,7 +356,8 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw InternalException("Lance UPDATE expects a child plan");
   }
   auto *projection = dynamic_cast<LogicalProjection *>(op.children[0].get());
-  if (!projection) {
+  if (!projection &&
+      op.children[0]->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
     throw NotImplementedException(
         "Lance UPDATE only supports the standard UPDATE planning path");
   }
@@ -307,11 +369,15 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
   vector<string> set_columns;
   vector<LogicalType> set_types;
   vector<idx_t> set_chunk_indices;
+  vector<idx_t> assigned_columns;
   set_columns.reserve(op.columns.size());
   set_types.reserve(op.columns.size());
   set_chunk_indices.reserve(op.columns.size());
 
   for (idx_t i = 0; i < op.columns.size(); i++) {
+    if (op.return_chunk) {
+      assigned_columns.push_back(op.columns[i].index);
+    }
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
     if (lance_table->IsJsonColumn(target_col.Name().GetIdentifierName())) {
       throw NotImplementedException(
@@ -349,7 +415,8 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
   auto &update = planner.Make<PhysicalLanceUpdateValue>(
       op.types, *lance_table, std::move(dataset), std::move(set_columns),
       std::move(set_types), std::move(set_chunk_indices), rowid_chunk_index,
-      plan.types[rowid_chunk_index], op.estimated_cardinality);
+      plan.types[rowid_chunk_index], std::move(assigned_columns),
+      op.return_chunk, op.row_id_handling, op.estimated_cardinality);
   update.children.push_back(plan);
   return update;
 }

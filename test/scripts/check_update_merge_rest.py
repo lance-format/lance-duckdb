@@ -83,6 +83,24 @@ def main() -> None:
 
         cases = [
             {
+                "name": "insert_returning",
+                "sql": "INSERT INTO ns.main.t VALUES (20, 200) RETURNING id, v;",
+                "returning": ["20|200"],
+                "rows": "0:0,1:1,2:2,3:3,4:4,5:5,6:6,7:7,8:8,9:9,20:200",
+            },
+            {
+                "name": "update_returning",
+                "sql": "UPDATE ns.main.t SET v = v + 10 WHERE id IN (2, 7) RETURNING id, v;",
+                "returning": ["2|12", "7|17"],
+                "rows": "0:0,1:1,2:12,3:3,4:4,5:5,6:6,7:17,8:8,9:9",
+            },
+            {
+                "name": "delete_returning",
+                "sql": "DELETE FROM ns.main.t USING range(5000) s(i) WHERE t.id IN (2, 7) RETURNING t.id, t.v;",
+                "returning": ["2|2", "7|7"],
+                "rows": "0:0,1:1,3:3,4:4,5:5,6:6,8:8,9:9",
+            },
+            {
                 "name": "update",
                 "sql": "UPDATE ns.main.t SET v = -1 WHERE id IN (2, 7);",
                 "rows": "0:0,1:1,2:-1,3:3,4:4,5:5,6:6,7:-1,8:8,9:9",
@@ -134,6 +152,10 @@ def main() -> None:
                 passed = (
                     setup.returncode == 0
                     and result.returncode == 0
+                    and (
+                        "returning" not in case
+                        or sorted(result.stdout.strip().splitlines()) == sorted(case["returning"])
+                    )
                     and check.stdout.strip() == case["rows"]
                     and not queries
                 )

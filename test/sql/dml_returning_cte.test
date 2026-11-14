@@ -1,0 +1,169 @@
+# name: test/sql/dml_returning_cte.test
+# description: A Lance statement cannot publish only part of a modifying CTE chain
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/returning_cte' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.t(id BIGINT, v BIGINT);
+
+statement ok
+CREATE TABLE ns.main.other(id BIGINT, v BIGINT);
+
+query II
+WITH inserted AS (INSERT INTO ns.main.t VALUES (1, 0) RETURNING id, v)
+SELECT * FROM inserted;
+----
+1	0
+
+statement error
+WITH changed AS (UPDATE ns.main.t SET v=10 WHERE id=1 RETURNING id)
+UPDATE ns.main.t SET v=20 WHERE id IN (SELECT id FROM changed) RETURNING id;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+query II
+SELECT * FROM ns.main.t;
+----
+1	0
+
+# Different targets and a consumer without RETURNING have the same boundary.
+statement error
+WITH changed AS NOT MATERIALIZED (UPDATE ns.main.t SET v=10 RETURNING id)
+UPDATE ns.main.t SET v=20 WHERE id IN (SELECT id FROM changed);
+----
+Multiple writes
+
+statement error
+WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id)
+UPDATE ns.main.t SET v=20;
+----
+Multiple writes
+
+statement error
+WITH changed AS (UPDATE ns.main.t SET v=10 WHERE id=1 RETURNING id)
+INSERT INTO ns.main.other SELECT id, 20 FROM changed;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+statement error
+WITH removed AS (DELETE FROM ns.main.t RETURNING id, v)
+INSERT INTO ns.main.t SELECT * FROM removed RETURNING id;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+statement error
+WITH a AS (UPDATE ns.main.t SET v=10 RETURNING id),
+     b AS (INSERT INTO ns.main.other SELECT id, 20 FROM a RETURNING id)
+SELECT * FROM b;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+statement ok
+CREATE TEMP TABLE local_rows(id BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO local_rows VALUES (1, 0);
+
+statement error
+WITH changed AS (UPDATE local_rows SET v=10 RETURNING id)
+UPDATE ns.main.t SET v=20 WHERE id IN (SELECT id FROM changed);
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+statement error
+WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id)
+UPDATE local_rows SET v=20 WHERE id IN (SELECT id FROM changed);
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+query II
+SELECT * FROM ns.main.t;
+----
+1	0
+
+query I
+SELECT count(*) FROM ns.main.other;
+----
+0
+
+query II
+SELECT * FROM local_rows;
+----
+1	0
+
+statement error
+PREPARE invalid_chain AS WITH changed AS
+(UPDATE ns.main.t SET v=10 RETURNING id)
+DELETE FROM ns.main.t WHERE id IN (SELECT id FROM changed) RETURNING id;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+query II
+WITH changed AS (UPDATE ns.main.t SET v=1 WHERE id=1 RETURNING id, v)
+SELECT * FROM changed;
+----
+1	1
+
+statement ok
+PREPARE change_one AS WITH changed AS
+(UPDATE ns.main.t SET v=v+1 WHERE id=1 RETURNING id, v)
+SELECT * FROM changed;
+
+query II
+EXECUTE change_one;
+----
+1	2
+
+query II
+EXECUTE change_one;
+----
+1	3
+
+query II
+WITH removed AS (DELETE FROM ns.main.t WHERE id=1 RETURNING id, v)
+SELECT * FROM removed;
+----
+1	3
+
+query I
+SELECT count(*) FROM ns.main.t;
+----
+0
+
+statement error
+WITH inserted AS (INSERT INTO ns.main.t VALUES (2, 20) RETURNING id)
+SELECT CAST('bad' || id::VARCHAR AS INTEGER) FROM inserted;
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM ns.main.t;
+----
+0
+
+statement error
+WITH inserted AS (INSERT INTO ns.main.t VALUES (3, 30) RETURNING id)
+MERGE INTO ns.main.t t USING inserted s ON t.id=s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 40)
+RETURNING id;
+----
+<REGEX>:.*Multiple (DML statements|writes).*not supported.*
+
+query I
+SELECT count(*) FROM ns.main.t;
+----
+0
+
+# Native-only statements retain DuckDB's multiple-DML behavior.
+query II
+WITH changed AS (UPDATE local_rows SET v=10 RETURNING id)
+UPDATE local_rows SET v=20 WHERE id IN (SELECT id FROM changed) RETURNING id, v;
+----
+1	20
+
+statement ok
+DETACH ns;

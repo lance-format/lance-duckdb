@@ -114,6 +114,22 @@ SELECT sum(id) FROM ns.main.beta;
 ----
 100
 
+# RETURNING uses the same namespace storage options for row images and writes.
+query IT
+UPDATE ns.main.alpha SET s = upper(s) WHERE id = 1 RETURNING id, s;
+----
+1	A
+
+query IT
+DELETE FROM ns.main.alpha WHERE id = 2 RETURNING id, s;
+----
+2	b
+
+query IT
+INSERT INTO ns.main.alpha VALUES (2, 'b') RETURNING id, s;
+----
+2	b
+
 statement ok
 DETACH ns;
 

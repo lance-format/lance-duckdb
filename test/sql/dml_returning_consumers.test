@@ -1,0 +1,163 @@
+# name: test/sql/dml_returning_consumers.test
+# description: Reject write consumers of modifying CTEs before publishing Lance data
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/returning_consumers' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.t AS SELECT 1::BIGINT id, 0::BIGINT v;
+
+statement ok
+CREATE TEMP TABLE local_rows AS SELECT * FROM ns.main.t;
+
+statement error
+CREATE OR REPLACE TABLE ns.main.t AS
+WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id,v)
+SELECT id,v+10 AS v FROM changed;
+----
+Multiple writes
+
+query II
+SELECT * FROM ns.main.t;
+----
+1	0
+
+statement error
+CREATE TABLE ns.main.other AS
+WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id,v)
+SELECT * FROM changed;
+----
+Multiple writes
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_catalog='ns' AND table_name='other';
+----
+0
+
+statement error
+CREATE TEMP TABLE other AS
+WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id,v)
+SELECT * FROM changed;
+----
+Multiple writes
+
+statement error
+CREATE TABLE ns.main.other AS
+WITH changed AS (UPDATE local_rows SET v=10 RETURNING id,v)
+SELECT * FROM changed;
+----
+Multiple writes
+
+statement error
+COPY (WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id,v) SELECT * FROM changed)
+TO '{TEST_DIR}/returning_copy_rejected.lance' (FORMAT lance);
+----
+Multiple writes
+
+statement error
+COPY (WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING id,v) SELECT * FROM changed)
+TO '{TEST_DIR}/returning_copy_rejected.csv' (FORMAT csv);
+----
+Multiple writes
+
+statement error
+COPY (WITH changed AS (UPDATE local_rows SET v=10 RETURNING id,v) SELECT * FROM changed)
+TO '{TEST_DIR}/returning_copy_rejected.lance' (FORMAT lance);
+----
+Multiple writes
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/returning_copy_rejected*');
+----
+0
+
+statement error
+CREATE TYPE ns.main.returning_enum AS ENUM
+(WITH changed AS (UPDATE ns.main.t SET v=10 RETURNING v) SELECT v::VARCHAR FROM changed);
+----
+Multiple writes
+
+statement error
+CREATE TYPE ns.main.returning_enum AS ENUM
+(WITH changed AS (UPDATE local_rows SET v=10 RETURNING v) SELECT v::VARCHAR FROM changed);
+----
+Multiple writes
+
+query II
+SELECT * FROM ns.main.t;
+----
+1	0
+
+query II
+SELECT * FROM local_rows;
+----
+1	0
+
+# A single CTAS or COPY with read-only input retains its normal behavior.
+statement ok
+CREATE TABLE ns.main.other AS SELECT * FROM ns.main.t;
+
+query II
+SELECT * FROM ns.main.other;
+----
+1	0
+
+statement ok
+COPY (SELECT * FROM ns.main.t) TO '{TEST_DIR}/returning_copy_allowed.lance' (FORMAT lance);
+
+query II
+SELECT * FROM '{TEST_DIR}/returning_copy_allowed.lance';
+----
+1	0
+
+statement ok
+COPY (SELECT * FROM ns.main.t) TO '{TEST_DIR}/returning_copy_allowed.csv' (FORMAT csv);
+
+query II
+SELECT * FROM read_csv('{TEST_DIR}/returning_copy_allowed.csv');
+----
+1	0
+
+# Native-only modifying CTEs and CTAS are unaffected.
+statement ok
+CREATE TEMP TABLE native_copy AS
+WITH changed AS (UPDATE local_rows SET v=1 RETURNING id,v) SELECT * FROM changed;
+
+query II
+SELECT * FROM native_copy;
+----
+1	1
+
+# COPY DATABASE generates multiple INSERT operators without a modifying CTE.
+statement ok
+ATTACH ':memory:' AS native_source;
+
+statement ok
+CREATE TABLE native_source.a AS SELECT 1::BIGINT id;
+
+statement ok
+CREATE TABLE native_source.b AS SELECT 2::BIGINT id;
+
+statement ok
+CREATE TABLE ns.main.a(id BIGINT);
+
+statement ok
+CREATE TABLE ns.main.b(id BIGINT);
+
+statement ok
+COPY FROM DATABASE native_source TO ns (DATA);
+
+query I rowsort
+SELECT id FROM ns.main.a UNION ALL SELECT id FROM ns.main.b;
+----
+1
+2
+
+statement ok
+DETACH native_source;
+
+statement ok
+DETACH ns;

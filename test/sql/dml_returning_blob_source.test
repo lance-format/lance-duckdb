@@ -1,0 +1,115 @@
+# name: test/sql/dml_returning_blob_source.test
+# description: RETURNING resolves Blob sources only when their bytes are needed
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 'seed'::BLOB AS payload)
+TO '{TEST_DIR}/returning allowed/rows.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}/returning allowed' AS ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT 'allowed'::BLOB)
+TO '{TEST_DIR}/returning allowed/source.bin' (FORMAT BLOB);
+
+statement ok
+COPY (SELECT 'outside'::BLOB)
+TO '{TEST_DIR}/returning outside.bin' (FORMAT BLOB);
+
+statement ok
+SET allowed_directories = ['{TEST_DIR}/returning allowed'];
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+INSERT INTO ns.main.rows VALUES
+(2, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20outside.bin'))
+RETURNING payload;
+----
+Cannot access source URI
+
+statement error
+UPDATE ns.main.rows
+SET payload = lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20allowed/%2e%2e/returning%20outside.bin')
+WHERE id = 1 RETURNING payload;
+----
+Cannot access source URI
+
+statement error
+MERGE INTO ns.main.rows t USING (SELECT 1::BIGINT AS id) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET
+payload = lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20outside.bin')
+RETURNING payload;
+----
+Cannot access source URI
+
+statement error
+MERGE INTO ns.main.rows t USING (SELECT 2::BIGINT AS id) s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, payload) VALUES
+(s.id, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20outside.bin'))
+RETURNING payload;
+----
+Cannot access source URI
+
+query IT
+SELECT id, hex(payload) FROM ns.main.rows;
+----
+1	73656564
+
+# Escaped allowed paths and byte ranges use the same resource identity.
+query IT
+INSERT INTO ns.main.rows VALUES
+(2, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20allowed/source.bin', 1, 3))
+RETURNING id, hex(payload);
+----
+2	6C6C6F
+
+query T
+UPDATE ns.main.rows
+SET payload = lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20allowed/source.bin')
+WHERE id = 2 RETURNING hex(payload);
+----
+616C6C6F776564
+
+# An unreturned reference is stored without opening its source.
+query I
+INSERT INTO ns.main.rows VALUES
+(3, lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20outside.bin'))
+RETURNING id;
+----
+3
+
+query I
+UPDATE ns.main.rows
+SET payload = lance_blob_ref('file://{TEMP_DIR_ABSOLUTE}/returning%20outside.bin')
+WHERE id = 2 RETURNING id;
+----
+2
+
+statement error
+UPDATE ns.main.rows SET id = id WHERE id = 3 RETURNING payload;
+----
+Cannot access source URI
+
+statement error
+DELETE FROM ns.main.rows WHERE id = 3 RETURNING payload;
+----
+Cannot access source URI
+
+query I rowsort
+DELETE FROM ns.main.rows WHERE id IN (2, 3) RETURNING id;
+----
+2
+3
+
+query IT
+SELECT id, hex(payload) FROM ns.main.rows;
+----
+1	73656564
+
+statement ok
+DETACH ns;
