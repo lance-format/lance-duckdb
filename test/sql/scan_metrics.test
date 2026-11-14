@@ -1,0 +1,102 @@
+# name: test/sql/scan_metrics.test
+# description: Lance scan runtime metrics for idle workers, empty datasets and count-only scans
+# group: [sql]
+
+require lance
+
+# An empty dataset lists no fragments, so LanceScanLocalInit never hands out a
+# fragment and the scan reports no local state. Profiling must still emit the
+# runtime metrics instead of dereferencing the missing local state.
+statement ok
+ATTACH '{TEST_DIR}/scan_metrics_ns' AS scan_metrics_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE scan_metrics_ns.main.empty_tbl (id BIGINT, val VARCHAR);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM scan_metrics_ns.main.empty_tbl;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "0"[\s\S]*"Lance Rows Out": "0"[\s\S]*"Lance Plan": "LanceRead:[\s\S]*
+
+# Only the last active worker publishes shared runtime metrics. Excess idle
+# workers and active workers that finish earlier must not overwrite that final
+# snapshot, regardless of the order in which their profiler information flushes.
+statement ok
+SET threads = 8;
+
+statement ok
+CREATE TABLE scan_metrics_one AS
+	SELECT i::BIGINT AS id, 'row-' || i::VARCHAR AS val FROM range(512) r(i);
+
+statement ok
+COPY scan_metrics_one TO '{TEST_DIR}/scan_metrics_one.lance'
+	(FORMAT lance, max_rows_per_file 100000);
+
+statement ok
+CREATE TABLE scan_metrics_four AS
+	SELECT i::BIGINT AS id, 'v-' || i::VARCHAR AS val FROM range(1024) r(i);
+
+statement ok
+COPY scan_metrics_four TO '{TEST_DIR}/scan_metrics_four.lance'
+	(FORMAT lance, max_rows_per_file 256);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/scan_metrics_one.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "1"[\s\S]*"Lance Record Batch Rows": "512"[\s\S]*"Lance Rows Out": "512"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/scan_metrics_four.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "4"[\s\S]*"Lance Record Batch Rows": "1024"[\s\S]*"Lance Rows Out": "1024"[\s\S]*
+
+# Joins add another pipeline schedule over the same scan.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT t.id, t.val FROM '{TEST_DIR}/scan_metrics_one.lance' t
+JOIN (SELECT range::BIGINT AS id FROM range(0, 512, 3)) d ON t.id = d.id;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "1"[\s\S]*"Lance Record Batch Rows": "512"[\s\S]*"Lance Rows Out": "512"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT t.id, t.val FROM '{TEST_DIR}/scan_metrics_four.lance' t
+JOIN (SELECT range::BIGINT AS id FROM range(0, 1024, 3)) d ON t.id = d.id;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "4"[\s\S]*"Lance Record Batch Rows": "1024"[\s\S]*"Lance Rows Out": "1024"[\s\S]*
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/scan_metrics_four.lance' t
+JOIN (SELECT range::BIGINT AS id FROM range(0, 1024, 3)) d ON t.id = d.id;
+----
+342
+
+# A non-pushable predicate prevents LIMIT pushdown. Finalizing the first worker
+# stops new workers from claiming fragments while the active workers drain.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT val FROM '{TEST_DIR}/scan_metrics_four.lance'
+WHERE sha256(val) != '' LIMIT 1;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "4"[\s\S]*"Lance Plan": "LanceRead:[\s\S]*
+
+# Count-only scans report their own metrics and stop there: there is no plan to
+# explain for a row count, so the count-only keys must not be replaced by a
+# second metrics snapshot.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 FROM '{TEST_DIR}/scan_metrics_four.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Count Only": "true"[\s\S]*"Lance Count Total Rows": "1024"[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 FROM '{TEST_DIR}/scan_metrics_four.lance';
+----
+analyzed_plan	<!REGEX>:[\s\S]*"Lance Plan"[\s\S]*
+
+query I
+SELECT count(*) FROM (SELECT 1 FROM '{TEST_DIR}/scan_metrics_four.lance');
+----
+1024
+
+statement ok
+DETACH scan_metrics_ns;

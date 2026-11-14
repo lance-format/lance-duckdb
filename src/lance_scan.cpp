@@ -542,6 +542,11 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> streams_opened{0};
   std::atomic<idx_t> filter_pushdown_fallbacks{0};
 
+  std::mutex metrics_mutex;
+  idx_t active_workers = 0;
+  bool had_active_worker = false;
+  bool stop_new_workers = false;
+
   // REST scans choose query_table or native access after the projection is
   // known. Native access pins the dataset and its materialized Arrow schemas.
   shared_ptr<LanceDatasetCacheEntry> native_dataset_entry;
@@ -629,11 +634,16 @@ struct LanceScanLocalState : public ArrowScanLocalState {
   idx_t fragment_pos = 0;
   idx_t rows_scanned = 0;
   bool filter_pushed_down = false;
+  bool metric_slot_held = false;
   SelectionVector filter_sel;
 
   ~LanceScanLocalState() override {
     if (stream) {
       lance_close_stream(stream);
+    }
+    if (metric_slot_held && global_state) {
+      std::lock_guard<std::mutex> guard(global_state->metrics_mutex);
+      global_state->active_workers--;
     }
   }
 };
@@ -1925,18 +1935,21 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     result->deferred_converted.Initialize(context.client,
                                           scan_global.deferred_column_types);
   }
-  if (scan_global.count_only) {
-    return std::move(result);
-  }
-  if (scan_global.use_dataset_scanner) {
-    return std::move(result);
-  }
-  // Early stop: no fragments left for this thread.
-  auto fragment_pos = scan_global.next_fragment_idx.fetch_add(1);
-  if (fragment_pos >= scan_global.fragment_ids.size()) {
+  std::lock_guard<std::mutex> guard(scan_global.metrics_mutex);
+  if (scan_global.stop_new_workers) {
     return nullptr;
   }
-  result->fragment_pos = fragment_pos;
+  if (!scan_global.count_only && !scan_global.use_dataset_scanner) {
+    auto fragment_pos = scan_global.next_fragment_idx.fetch_add(1);
+    if (fragment_pos >= scan_global.fragment_ids.size()) {
+      scan_global.stop_new_workers = true;
+      return nullptr;
+    }
+    result->fragment_pos = fragment_pos;
+  }
+  scan_global.active_workers++;
+  scan_global.had_active_worker = true;
+  result->metric_slot_held = true;
   return std::move(result);
 }
 
@@ -2455,11 +2468,38 @@ LanceScanToString(TableFunctionToStringInput &input) {
 }
 
 static void LanceScanGetMetrics(TableFunctionGetMetricsInput &input) {
-  input.operator_metrics.rows_scanned =
-      input.local_state->Cast<LanceScanLocalState>().rows_scanned;
   InsertionOrderPreservingMap<string> result;
   auto &bind_data = input.bind_data->Cast<LanceScanBindData>();
   auto &global_state = input.global_state->Cast<LanceScanGlobalState>();
+
+  // Shared counters are complete only after the last active worker finishes.
+  // Other workers leave extra_info empty because profiler flushes can arrive
+  // out of order and overwrite a previously published snapshot.
+  if (!input.local_state) {
+    input.operator_metrics.rows_scanned = 0;
+    std::lock_guard<std::mutex> guard(global_state.metrics_mutex);
+    if (global_state.had_active_worker) {
+      input.operator_metrics.SetExtraInfo({});
+      return;
+    }
+  } else {
+    auto &local_state = input.local_state->Cast<LanceScanLocalState>();
+    input.operator_metrics.rows_scanned = local_state.rows_scanned;
+    bool is_last_active_worker = false;
+    {
+      std::lock_guard<std::mutex> guard(global_state.metrics_mutex);
+      global_state.stop_new_workers = true;
+      if (local_state.metric_slot_held) {
+        local_state.metric_slot_held = false;
+        global_state.active_workers--;
+        is_last_active_worker = global_state.active_workers == 0;
+      }
+    }
+    if (!is_last_active_worker) {
+      input.operator_metrics.SetExtraInfo({});
+      return;
+    }
+  }
 
   result["Lance Path"] = bind_data.file_path;
   result["Lance Explain Verbose"] =
@@ -2513,6 +2553,7 @@ static void LanceScanGetMetrics(TableFunctionGetMetricsInput &input) {
     result["Lance Count Total Rows"] =
         to_string(global_state.count_only_total_rows);
     input.operator_metrics.SetExtraInfo(std::move(result));
+    return;
   }
 
   result["Lance Filter IR Bytes"] =
@@ -2523,7 +2564,10 @@ static void LanceScanGetMetrics(TableFunctionGetMetricsInput &input) {
   }
 
   if (global_state.use_namespace_query) {
+    // A namespace query has no local dataset handle, so there is no plan to
+    // explain, but the pushdown metrics above are still meaningful.
     input.operator_metrics.SetExtraInfo(std::move(result));
+    return;
   }
 
   if (!global_state.explain_computed.load()) {
