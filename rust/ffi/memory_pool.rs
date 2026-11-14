@@ -25,7 +25,14 @@ impl Drop for LanceMemoryPoolCallbacks {
     fn drop(&mut self) {
         // SAFETY: This object exclusively owns the host pool. MemoryReservation
         // retains its Arc, so release cannot race with a callback.
-        unsafe { (self.release)(self.pool) }
+        let release = || unsafe { (self.release)(self.pool) };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Exec tasks use our multi-thread runtime. Host release can destroy
+            // DuckDB and re-enter Rust to clear session caches with block_on.
+            tokio::task::block_in_place(release);
+        } else {
+            release();
+        }
     }
 }
 

@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import ctypes as c
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+# Teardown can run on a Rust worker; retain callbacks even if an assertion fails.
+_callbacks = []
 
 
 class Result(c.Structure):
@@ -24,6 +30,7 @@ class Result(c.Structure):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--database-close", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     lib = c.CDLL(str(args.library.resolve()))
     ptr = c.c_void_p
@@ -51,6 +58,28 @@ def main() -> None:
     chunk_size = bind("data_chunk_get_size", c.c_uint64, ptr)
     destroy_chunk = bind("destroy_data_chunk", None, c.POINTER(ptr))
     interrupt = bind("interrupt", None, ptr)
+
+    def watch_database_close(database):
+        closed, calls = threading.Event(), []
+        delete_callback = c.CFUNCTYPE(None, ptr)
+        replacement_callback = c.CFUNCTYPE(None, ptr, c.c_char_p, ptr)
+        add_scan = bind("add_replacement_scan", None, ptr, replacement_callback, ptr, delete_callback)
+
+        @delete_callback
+        def deleted(_):
+            calls.append(1)
+            closed.set()
+
+        @replacement_callback
+        def unused(_info, _name, _data):
+            pass
+
+        _callbacks.extend((deleted, unused))
+        # DBConfig owns replacement-scan data until after the database's session
+        # cache and buffer manager have been destroyed.
+        add_scan(database, unused, ptr(1), deleted)
+        assert not closed.is_set()
+        return closed, calls
 
     def execute(connection, sql, scalar=False):
         result = Result()
@@ -91,7 +120,11 @@ def main() -> None:
             )
             assert reserved() == 0
             sql = f"SELECT id, sum(v) FROM '{dataset}' GROUP BY id"
-            for mode in ("eof", "early_close", "interrupt", "disconnect"):
+            modes = ("eof", "early_close", "interrupt", "disconnect")
+            if args.database_close:
+                closed, close_calls = watch_database_close(db)
+                modes = ("database_close",)
+            for mode in modes:
                 connection, prepared, result = ptr(), ptr(), Result()
                 try:
                     assert connect(db, c.byref(connection)) == 0
@@ -131,17 +164,40 @@ def main() -> None:
                     elif mode == "disconnect":
                         destroy_prepare(c.byref(prepared))
                         disconnect(c.byref(connection))
+                    elif mode == "database_close":
+                        destroy_prepare(c.byref(prepared))
+                        disconnect(c.byref(connection))
+                        disconnect(c.byref(observer))
+                        close(c.byref(db))
+                        assert not (prepared or connection or observer or db)
+                        assert not closed.is_set(), "The live result must retain the database"
                 finally:
                     destroy(c.byref(result))
                     destroy_prepare(c.byref(prepared))
                     if connection:
                         disconnect(c.byref(connection))
-                wait_released()
-                print(f"{mode}: released {held} bytes")
+                if mode == "database_close":
+                    assert closed.wait(10), "Database teardown did not complete"
+                    assert len(close_calls) == 1, close_calls
+                    print(f"{mode}: database closed after abandoning {held} live bytes")
+                else:
+                    wait_released()
+                    print(f"{mode}: released {held} bytes")
     finally:
         if observer:
             disconnect(c.byref(observer))
         close(c.byref(db))
+
+    if not args.database_close:
+        child = subprocess.run(
+            [sys.executable, __file__, "--library", str(args.library), "--database-close"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert child.returncode == 0, child.stderr
+        assert "panicked" not in child.stderr and "Exception ignored" not in child.stderr, child.stderr
+        print(child.stdout, end="")
 
 
 if __name__ == "__main__":
