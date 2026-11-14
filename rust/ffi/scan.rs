@@ -111,6 +111,7 @@ pub unsafe extern "C" fn lance_create_dataset_stream_ir(
     filter_ir_len: usize,
     limit: i64,
     offset: i64,
+    scan_in_order: u8,
 ) -> *mut c_void {
     match create_dataset_stream_ir_inner(
         dataset,
@@ -120,6 +121,7 @@ pub unsafe extern "C" fn lance_create_dataset_stream_ir(
         filter_ir_len,
         limit,
         offset,
+        scan_in_order != 0,
     ) {
         Ok(stream) => {
             clear_last_error();
@@ -140,6 +142,7 @@ fn create_dataset_stream_ir_inner(
     filter_ir_len: usize,
     limit: i64,
     offset: i64,
+    scan_in_order: bool,
 ) -> FfiResult<StreamHandle> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
@@ -192,7 +195,7 @@ fn create_dataset_stream_ir_inner(
         })?;
     }
 
-    scan.scan_in_order(false);
+    scan.scan_in_order(scan_in_order);
     let stream = LanceStream::from_scanner(scan)
         .map_err(|err| FfiError::new(ErrorCode::StreamCreate, format!("stream create: {err}")))?;
     Ok(StreamHandle::Lance(stream))

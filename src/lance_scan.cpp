@@ -1897,6 +1897,11 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     }
   }
 
+  if (scan_state.use_dataset_scanner) {
+    scan_state.max_threads = 1;
+    return state;
+  }
+
   size_t ffi_fragment_count = 0;
   auto fragments_ptr =
       lance_dataset_list_fragment_stats(dataset, &ffi_fragment_count);
@@ -1957,10 +1962,11 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       Settings::Get<PreserveInsertionOrderSetting>(context.client);
   if (context.pipeline && context.pipeline->GetSink()) {
     // A sink can require order independently of preserve_insertion_order,
-    // for example COPY with an explicit PRESERVE_ORDER option.
-    result->scan_in_order |= context.pipeline->GetSink()
-                                 ->RequiredPartitionInfo()
-                                 .RequiresBatchIndex();
+    // including serial COPY, which does not request batch indexes.
+    auto &sink = *context.pipeline->GetSink();
+    result->scan_in_order |=
+        sink.RequiredPartitionInfo().RequiresBatchIndex() ||
+        (sink.SinkOrderDependent() && !sink.ParallelSink());
   }
   result->filter_pushed_down = scan_global.filter_pushed_down;
   if (scan_global.CanRemoveFilterColumns()) {
@@ -2077,7 +2083,7 @@ static bool LanceScanOpenStream(ClientContext &context,
     auto offset_i64 = NumericCast<int64_t>(global_state.pushed_offset);
     stream = lance_create_dataset_stream_ir(
         dataset, columns.data(), columns.size(), filter_ir, filter_ir_len,
-        limit_i64, offset_i64);
+        limit_i64, offset_i64, local_state.scan_in_order ? 1 : 0);
     if (!stream && filter_ir) {
       if (global_state.limit_offset_pushed_down &&
           local_state.filter_pushed_down) {
@@ -2088,9 +2094,9 @@ static bool LanceScanOpenStream(ClientContext &context,
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
-      stream = lance_create_dataset_stream_ir(dataset, columns.data(),
-                                              columns.size(), nullptr, 0,
-                                              limit_i64, offset_i64);
+      stream = lance_create_dataset_stream_ir(
+          dataset, columns.data(), columns.size(), nullptr, 0, limit_i64,
+          offset_i64, local_state.scan_in_order ? 1 : 0);
     }
   } else {
     if (local_state.fragment_pos >= global_state.fragment_ids.size()) {

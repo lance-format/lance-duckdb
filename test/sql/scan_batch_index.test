@@ -43,6 +43,35 @@ FROM batch_actual a FULL JOIN batch_reference e ON a.rowid = e.rowid;
 ----
 327777	0
 
+# LIMIT/OFFSET selects a whole-dataset stream. Its native batches must preserve
+# source order before DuckDB assigns monotonically increasing sink indexes.
+foreach scan_threads 1 4
+
+statement ok
+SET threads = {scan_threads};
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance' LIMIT 300000 OFFSET 13;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+statement ok
+CREATE TABLE batch_limited AS SELECT * FROM '{TEST_DIR}/batch_{stable}/t.lance' LIMIT 300000 OFFSET 13;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload)
+FROM batch_limited a FULL JOIN (SELECT * FROM batch_reference WHERE rowid >= 13 AND rowid < 300013) e ON a.rowid + 13 = e.id;
+----
+300000	0
+
+statement ok
+DROP TABLE batch_limited;
+
+endloop
+
+statement ok
+SET threads = 4;
+
 statement ok
 ATTACH '{TEST_DIR}/batch_{stable}' AS ordered_ns (TYPE LANCE);
 
@@ -196,6 +225,53 @@ SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid OR label IS DI
 statement ok
 DROP TABLE batch_legacy;
 
+# Legacy readers merge batches concurrently unless the dataset scanner also
+# receives the sink's order requirement. LIMIT selects that scanner.
+foreach scan_threads 1 4
+
+statement ok
+SET threads = {scan_threads};
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Mode": "dataset"[\s\S]*"Lance Limit Offset Pushdown": "true"[\s\S]*
+
+statement ok
+CREATE TABLE batch_legacy_limit AS SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid + 3 OR label IS DISTINCT FROM 'row-' || (rowid + 3)::VARCHAR) FROM batch_legacy_limit;
+----
+9000	0
+
+statement ok
+DROP TABLE batch_legacy_limit;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+COPY (SELECT * FROM 'test/data/unknown_fragment_rows.lance' LIMIT 9000 OFFSET 3)
+TO '{TEST_DIR}/batch_legacy_limit_{scan_threads}.csv' (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+CREATE TABLE batch_legacy_copy AS SELECT * FROM read_csv('{TEST_DIR}/batch_legacy_limit_{scan_threads}.csv',
+  header=false, columns={'id':'BIGINT', 'label':'VARCHAR'}, parallel=false);
+
+query II
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM rowid + 3 OR label IS DISTINCT FROM 'row-' || (rowid + 3)::VARCHAR) FROM batch_legacy_copy;
+----
+9000	0
+
+statement ok
+DROP TABLE batch_legacy_copy;
+
+endloop
+
 # One large fragment must not become one unbounded native COPY staging batch.
 statement ok
 SET threads = 1;
@@ -223,14 +299,18 @@ FROM (SELECT *, row_number() OVER () AS position FROM read_csv('{TEST_DIR}/batch
 
 # LIMIT uses the one-producer dataset stream, which also needs bounded batches.
 statement ok
+SET preserve_insertion_order = false;
+
+statement ok
 COPY (SELECT * FROM '{TEST_DIR}/batch_large.lance' LIMIT 6000000)
 TO '{TEST_DIR}/batch_large_limit.csv' (FORMAT CSV, HEADER false, PRESERVE_ORDER true);
 
 query II
-SELECT count(*), sum(id) FROM read_csv('{TEST_DIR}/batch_large_limit.csv',
-  header=false, columns={'id':'BIGINT', 'value':'DOUBLE'}, parallel=false, buffer_size=1048576);
+SELECT count(*), count(*) FILTER (WHERE id IS DISTINCT FROM position - 1 OR value IS DISTINCT FROM ((position - 1) % 100)::DOUBLE)
+FROM (SELECT *, row_number() OVER () AS position FROM read_csv('{TEST_DIR}/batch_large_limit.csv',
+      header=false, columns={'id':'BIGINT', 'value':'DOUBLE'}, parallel=false, buffer_size=1048576));
 ----
-6000000	17999997000000
+6000000	0
 
 statement ok
 RESET memory_limit;

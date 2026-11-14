@@ -265,7 +265,7 @@ void *lance_create_dataset_stream_ir(void *dataset, const char **columns,
                                      size_t columns_len,
                                      const uint8_t *filter_ir,
                                      size_t filter_ir_len, int64_t limit,
-                                     int64_t offset);
+                                     int64_t offset, uint8_t scan_in_order);
 void *lance_create_dataset_sample_stream_ir(void *dataset, const char **columns,
                                             size_t columns_len,
                                             double sample_percentage,
