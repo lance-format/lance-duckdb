@@ -173,3 +173,33 @@ SELECT id, m FROM st.main.enum_append ORDER BY id;
 1	happy
 2	sad
 3	calm
+
+# RETURNING has the SQL value that was validated against the stored Arrow type,
+# including unchanged fields fetched from the pinned dataset.
+query ITTT
+UPDATE st.main.stored_types_fixture
+SET t = TIME '00:00:07', fsb = '\x0A\x0B\x0C\x0D'::BLOB
+WHERE id = 1 RETURNING id, s, t, hex(fsb);
+----
+1	a	00:00:07	0A0B0C0D
+
+query IT
+INSERT INTO st.main.stored_types_fixture (id, ts)
+VALUES (6, TIMESTAMPTZ '2024-01-06 00:00:00.006+00') RETURNING id, ts;
+----
+6	2024-01-06 00:00:00.006+00
+
+statement error
+UPDATE st.main.stored_types_fixture SET t = TIME '00:00:01.9' WHERE id = 1 RETURNING id;
+----
+<REGEX>:.*column 't'.*would be stored as a different value.*
+
+query T
+SELECT t FROM st.main.stored_types_fixture WHERE id = 1;
+----
+00:00:07
+
+query IT
+DELETE FROM st.main.stored_types_fixture WHERE id = 6 RETURNING id, ts;
+----
+6	2024-01-06 00:00:00.006+00

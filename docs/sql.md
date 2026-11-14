@@ -191,9 +191,10 @@ explicit error; use `lance_blob_ref` for large external objects or raise
 or process RSS: buffered batches and downstream operators can hold additional
 memory.
 
-Existing SQL capability boundaries apply. `MERGE ... RETURNING` is supported
-and returns the action row's bytes; `INSERT ... RETURNING` and
-`UPDATE ... RETURNING` remain rejected by the extension.
+`INSERT`, `UPDATE`, `DELETE`, and `MERGE` support `RETURNING`. Returned BLOB
+columns contain the row's bytes. Unreferenced external payloads are not read
+solely to construct the returned row. Reading a returned reference uses the
+connection's source access policy and scoped Lance secrets.
 
 ## Blob range reads
 
@@ -599,6 +600,30 @@ DELETEs of different rows both commit in concurrent connections, even when the r
 fragment. `COMMIT` still fails with a retryable conflict when another writer deleted one of the same
 rows or rewrote one of the fragments (`UPDATE`, `MERGE`, compaction). See
 [Transactions](#transactions) for what one transaction may contain.
+
+### `RETURNING`
+
+`INSERT` and `UPDATE` return the new row values, including evaluated defaults
+and assignments; `DELETE` returns the old values. Expressions, aliases, and
+`RETURNING *` use DuckDB's normal binding rules. `UPDATE ... FROM` and
+`DELETE ... USING` return each affected target row once even when several
+source rows match it.
+
+```sql
+INSERT INTO ns.main.my_table VALUES (5, 'e') RETURNING id, s;
+UPDATE ns.main.my_table SET s = upper(s) WHERE id = 5 RETURNING *;
+DELETE FROM ns.main.my_table WHERE id = 5 RETURNING id, s;
+```
+
+Returned rows have no guaranteed order. They describe the statement's affected
+rows; inside an explicit transaction they do not imply that `COMMIT` has
+succeeded. The existing [transaction restrictions](#transactions) still apply.
+
+A single `INSERT`, `UPDATE`, or `DELETE` CTE can feed a `SELECT`. A statement
+containing a modifying CTE and a Lance write cannot combine multiple writes,
+including other DML operations, `CREATE TABLE AS`, `COPY TO`, or query-backed
+`CREATE TYPE`. These combinations fail before execution; ordinary CTAS and COPY
+with read-only inputs still work.
 
 ### `MERGE INTO`
 

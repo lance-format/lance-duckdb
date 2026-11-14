@@ -1,0 +1,115 @@
+# name: test/sql/dml_returning_transaction.test
+# description: RETURNING reports statement-local values without bypassing transaction conflicts
+# group: [sql]
+
+require lance
+
+statement ok con1
+ATTACH '{TEST_DIR}/returning_concurrent' AS r1 (TYPE LANCE);
+
+statement ok con2
+ATTACH '{TEST_DIR}/returning_concurrent' AS r2 (TYPE LANCE);
+
+statement ok con1
+CREATE TABLE r1.main.t AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(1, 4) r(i);
+
+statement ok con1
+BEGIN;
+
+query II con1
+UPDATE r1.main.t SET v = 10 WHERE id = 1 RETURNING id, v;
+----
+1	10
+
+query II con2
+UPDATE r2.main.t SET v = 20 WHERE id = 1 RETURNING id, v;
+----
+1	20
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query I con1
+SELECT v FROM r1.main.t WHERE id = 1;
+----
+20
+
+statement ok con1
+BEGIN;
+
+query II con1
+DELETE FROM r1.main.t WHERE id = 2 RETURNING id, v;
+----
+2	2
+
+query II con2
+UPDATE r2.main.t SET v = 30 WHERE id = 2 RETURNING id, v;
+----
+2	30
+
+statement error con1
+COMMIT;
+----
+Retryable commit conflict
+
+query I con1
+SELECT v FROM r1.main.t WHERE id = 2;
+----
+30
+
+statement ok con1
+BEGIN;
+
+query II con1
+INSERT INTO r1.main.t VALUES (4, 40) RETURNING id, v;
+----
+4	40
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM r1.main.t WHERE id = 4;
+----
+0
+
+statement ok con1
+BEGIN;
+
+query II con1
+DELETE FROM r1.main.t WHERE id = 3 RETURNING id, v;
+----
+3	3
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT count(*) FROM r1.main.t WHERE id = 3;
+----
+1
+
+# A RETURNING projection error invalidates the explicit transaction, too.
+statement ok con1
+BEGIN;
+
+statement error con1
+UPDATE r1.main.t SET v = 99 WHERE id = 3 RETURNING CAST('bad' || id::VARCHAR AS INTEGER);
+----
+Conversion Error
+
+statement ok con1
+ROLLBACK;
+
+query I con1
+SELECT v FROM r1.main.t WHERE id = 3;
+----
+3
+
+statement ok con1
+DETACH r1;
+
+statement ok con2
+DETACH r2;

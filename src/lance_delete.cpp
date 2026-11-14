@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/execution/row_id_deduplicator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -12,6 +13,7 @@
 #include "lance_delete.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
+#include "lance_returning.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
 
@@ -49,6 +51,15 @@ bool IsUnfilteredLanceScan(LogicalOperator &node) {
 
 class LanceDeleteGlobalState : public GlobalSinkState {
 public:
+  LanceDeleteGlobalState(ClientContext &context,
+                         const vector<LogicalType> &types, bool return_chunk) {
+    if (return_chunk) {
+      returning = make_uniq<ColumnDataCollection>(context, types);
+      seen = make_uniq<RowIdDeduplicator>(
+          context, vector<LogicalType>{LogicalType::ROW_TYPE});
+    }
+  }
+
   ~LanceDeleteGlobalState() override {
     if (delete_handle) {
       lance_delete_abort(delete_handle);
@@ -59,17 +70,23 @@ public:
   void *delete_handle = nullptr;
   idx_t rows_deleted = 0;
   mutex lock;
+  unique_ptr<ColumnDataCollection> returning;
+  unique_ptr<RowIdDeduplicator> seen;
 };
 
-class LanceDeleteSourceState : public GlobalSourceState {
+class LanceDeleteSourceState : public LanceReturningSourceState {
 public:
+  explicit LanceDeleteSourceState(
+      optional_ptr<ColumnDataCollection> rows = nullptr)
+      : LanceReturningSourceState(rows) {}
   bool emitted = false;
 };
 
 // DuckDB's child plan evaluates the whole WHERE clause (subqueries and joins
 // included); Lance receives the `_rowid` of every selected row and deletes
 // them from the dataset version pinned for the statement.
-class PhysicalLanceDelete final : public PhysicalOperator {
+class PhysicalLanceDelete final : public PhysicalOperator,
+                                  public LanceReturningOperator {
 public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
@@ -77,11 +94,15 @@ public:
   PhysicalLanceDelete(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                       LanceTableEntry &table_p,
                       shared_ptr<LanceDatasetCacheEntry> dataset_p,
-                      idx_t row_id_index_p, idx_t estimated_cardinality)
+                      idx_t row_id_index_p, vector<idx_t> return_columns_p,
+                      bool return_chunk_p, idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
+        LanceReturningOperator(return_chunk_p ? types.size() : 0),
         table(table_p), dataset(std::move(dataset_p)),
-        row_id_index(row_id_index_p) {}
+        row_id_index(row_id_index_p),
+        return_columns(std::move(return_columns_p)),
+        return_chunk(return_chunk_p) {}
 
   bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
@@ -89,8 +110,9 @@ public:
   bool SinkOrderDependent() const override { return false; }
 
   unique_ptr<GlobalSinkState>
-  GetGlobalSinkState(ClientContext &) const override {
-    auto state = make_uniq<LanceDeleteGlobalState>();
+  GetGlobalSinkState(ClientContext &context) const override {
+    auto state =
+        make_uniq<LanceDeleteGlobalState>(context, types, return_chunk);
     if (lance_delete_begin(dataset->Handle(), &state->delete_handle) != 0 ||
         !state->delete_handle) {
       throw IOException("Failed to start Lance DELETE for '" +
@@ -99,10 +121,23 @@ public:
     return std::move(state);
   }
 
-  SinkResultType Sink(ExecutionContext &, DataChunk &chunk,
+  SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
                       OperatorSinkInput &input) const override {
     if (chunk.size() == 0) {
       return SinkResultType::NEED_MORE_INPUT;
+    }
+
+    auto &gstate = input.global_state.Cast<LanceDeleteGlobalState>();
+    unique_lock<mutex> guard(gstate.lock, std::defer_lock);
+    if (return_chunk) {
+      guard.lock();
+      SelectionVector selection(chunk.size());
+      auto count = gstate.seen->Register(chunk.data[row_id_index], chunk.size(),
+                                         selection);
+      chunk.Slice(selection, count);
+      if (count == 0) {
+        return SinkResultType::NEED_MORE_INPUT;
+      }
     }
 
     UnifiedVectorFormat format;
@@ -118,12 +153,28 @@ public:
       row_ids.push_back(NumericCast<uint64_t>(row_id_data[idx]));
     }
 
-    auto &gstate = input.global_state.Cast<LanceDeleteGlobalState>();
-    lock_guard<mutex> guard(gstate.lock);
+    if (!return_chunk) {
+      guard.lock();
+    }
     if (lance_delete_add_rowids(gstate.delete_handle, row_ids.data(),
                                 row_ids.size()) != 0) {
       throw IOException("Failed to add Lance DELETE row ids" +
                         LanceFormatErrorSuffix());
+    }
+    if (return_chunk) {
+      DataChunk rows;
+      rows.Initialize(context.client, types);
+      rows.SetChildCardinality(chunk.size());
+      for (idx_t i = 0; i < return_columns.size(); i++) {
+        if (return_columns[i] == DConstants::INVALID_INDEX) {
+          rows.data[i].Reference(Value(types[i]), count_t(chunk.size()));
+        } else {
+          rows.data[i].Reference(chunk.data[return_columns[i]]);
+        }
+      }
+      // Lance exposes DuckDB's single virtual rowid after the physical fields.
+      rows.data[return_columns.size()].Reference(chunk.data[row_id_index]);
+      gstate.returning->Append(rows);
     }
     return SinkResultType::NEED_MORE_INPUT;
   }
@@ -158,12 +209,16 @@ public:
 
   unique_ptr<GlobalSourceState>
   GetGlobalSourceState(ClientContext &) const override {
-    return make_uniq<LanceDeleteSourceState>();
+    return make_uniq<LanceDeleteSourceState>(
+        sink_state->Cast<LanceDeleteGlobalState>().returning.get());
   }
 
   SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
                                    OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<LanceDeleteSourceState>();
+    if (return_chunk) {
+      return state.Scan(chunk);
+    }
     if (state.emitted) {
       return SourceResultType::FINISHED;
     }
@@ -181,6 +236,8 @@ private:
   LanceTableEntry &table;
   shared_ptr<LanceDatasetCacheEntry> dataset;
   idx_t row_id_index;
+  vector<idx_t> return_columns;
+  bool return_chunk;
 };
 
 // A plain `DELETE FROM t`: drops every fragment of the dataset version pinned
@@ -241,11 +298,6 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
                                   PhysicalPlanGenerator &planner,
                                   LogicalDelete &op,
                                   optional_ptr<PhysicalOperator> plan) {
-  if (op.return_chunk) {
-    throw NotImplementedException(
-        "Lance DELETE does not support RETURNING yet");
-  }
-
   auto *lance_table = dynamic_cast<LanceTableEntry *>(&op.table);
   if (!lance_table) {
     throw InternalException("PlanLanceDelete called for non-Lance table");
@@ -267,7 +319,8 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
   }
   // A plain `DELETE FROM t` drops whole fragments, which later deletes of the
   // same table conflict with.
-  const bool delete_all = !plan && IsUnfilteredLanceScan(*op.children[0]);
+  const bool delete_all =
+      !op.return_chunk && !plan && IsUnfilteredLanceScan(*op.children[0]);
   LanceRejectWriteAfterPendingWrite(context, *lance_table,
                                     delete_all ? LanceWriteKind::REWRITE
                                                : LanceWriteKind::DELETE);
@@ -280,9 +333,21 @@ PhysicalOperator &PlanLanceDelete(ClientContext &context,
 
   auto &child = plan ? *plan : planner.CreatePlan(*op.children[0]);
   auto &row_id = op.expressions[0]->Cast<BoundReferenceExpression>();
+  auto return_columns = op.return_columns;
+  if (op.return_chunk) {
+    if (op.types.size() != return_columns.size() + 1) {
+      throw InternalException(
+          "Lance DELETE RETURNING has unexpected virtual columns");
+    }
+    for (auto &index : return_columns) {
+      if (index != DConstants::INVALID_INDEX) {
+        index = op.expressions[index]->Cast<BoundReferenceExpression>().Index();
+      }
+    }
+  }
   auto &del = planner.Make<PhysicalLanceDelete>(
       op.types, *lance_table, std::move(dataset), row_id.Index(),
-      op.estimated_cardinality);
+      std::move(return_columns), op.return_chunk, op.estimated_cardinality);
   del.children.push_back(child);
   return del;
 }

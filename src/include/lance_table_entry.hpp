@@ -130,8 +130,8 @@ public:
 
   // Lance tables have no local CHECK constraints or secondary-index
   // maintenance for UPDATE. DuckDB's default also binds every physical column
-  // whenever RETURNING is present; the Lance MERGE sink builds the returned row
-  // image itself from the columns the RETURNING projection references.
+  // whenever RETURNING is present; the Lance UPDATE and MERGE sinks build the
+  // returned row from the columns the RETURNING projection references.
   void BindUpdateConstraints(Binder &binder, LogicalGet &get,
                              LogicalProjection &proj, LogicalUpdate &update,
                              ClientContext &context) override {}

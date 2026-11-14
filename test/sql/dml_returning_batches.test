@@ -1,0 +1,98 @@
+# name: test/sql/dml_returning_batches.test
+# description: DML RETURNING matches native DuckDB across chunks, fragments and stable row ids
+# group: [sql]
+
+require lance
+
+statement ok
+SET threads=4;
+
+statement ok
+SET memory_limit='64MB';
+
+statement ok
+SET temp_directory='{TEST_DIR}/returning_tmp';
+
+foreach stable false true
+
+statement ok
+CREATE TEMP TABLE returning_source AS
+SELECT i::BIGINT AS id, (i % 100)::INTEGER AS v,
+       CASE WHEN i % 3 = 0 THEN NULL ELSE 'row-' || i::VARCHAR END AS label,
+       [i::FLOAT, NULL, (i + 1)::FLOAT]::FLOAT[3] AS vec
+FROM range(10000) r(i);
+
+statement ok
+CREATE TEMP TABLE returning_native AS SELECT * FROM returning_source;
+
+statement ok
+COPY returning_source TO '{TEST_DIR}/returning_{stable}/t.lance'
+(FORMAT lance, mode 'overwrite', max_rows_per_file 2000, enable_stable_row_ids {stable});
+
+statement ok
+ATTACH '{TEST_DIR}/returning_{stable}' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TEMP TABLE returning_rowids AS SELECT id, rowid AS rid FROM ns.main.t;
+
+query IITT rowsort returning_update_rows
+UPDATE returning_native SET v = v + 1, label = upper(label) WHERE id % 2 = 0 RETURNING *;
+----
+
+query IITT rowsort returning_update_rows
+UPDATE ns.main.t SET v = v + 1, label = upper(label) WHERE id % 2 = 0 RETURNING *;
+----
+
+query I
+SELECT count(*) FROM ns.main.t t JOIN returning_rowids r USING (id)
+WHERE {stable} AND t.rowid <> r.rid;
+----
+0
+
+query IITT rowsort returning_insert_rows
+INSERT INTO returning_native SELECT id + 10000, v, label, vec FROM returning_source RETURNING *;
+----
+
+query IITT rowsort returning_insert_rows
+INSERT INTO ns.main.t SELECT id + 10000, v, label, vec FROM returning_source RETURNING *;
+----
+
+query IITT rowsort returning_delete_rows
+DELETE FROM returning_native t USING (VALUES (1), (2), (3)) s(i)
+WHERE t.id % 3 = 0 RETURNING *;
+----
+
+query IITT rowsort returning_delete_rows
+DELETE FROM ns.main.t t USING (VALUES (1), (2), (3)) s(i)
+WHERE t.id % 3 = 0 RETURNING *;
+----
+
+query IITT rowsort returning_remaining
+SELECT * FROM returning_native;
+----
+
+query IITT rowsort returning_remaining
+SELECT * FROM ns.main.t;
+----
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/returning_tmp/**');
+----
+0
+
+statement ok
+DETACH ns;
+
+statement ok
+DROP TABLE returning_native;
+
+statement ok
+DROP TABLE returning_source;
+
+statement ok
+DROP TABLE returning_rowids;
+
+endloop
+
+statement ok
+RESET memory_limit;

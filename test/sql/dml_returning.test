@@ -1,0 +1,233 @@
+# name: test/sql/dml_returning.test
+# description: Ordinary DML RETURNING uses the affected row image and rolls back failures
+# group: [sql]
+
+require lance
+
+statement ok
+PRAGMA threads=4;
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.returning_rows (id BIGINT, v INTEGER DEFAULT 42, label VARCHAR, nested INTEGER[]);
+
+# Defaults, input casts, reordered columns and the native RETURNING projection.
+query IIT rowsort
+INSERT INTO ns.main.returning_rows (label, id, nested) VALUES
+('first', '1', [1, NULL, 3]), (NULL, '2', NULL)
+RETURNING id AS inserted_id, v + 1, coalesce(label, 'missing');
+----
+1	43	first
+2	43	missing
+
+query IITT rowsort
+INSERT INTO ns.main.returning_rows VALUES (3, 7, 'third', [7, 8]) RETURNING *;
+----
+3	7	third	[7, 8]
+
+# Unassigned and nested fields come from the same row as the evaluated SET.
+query IIT rowsort
+UPDATE ns.main.returning_rows AS t SET v = v + 5, label = upper(label)
+WHERE id <= 2 RETURNING t.id, t.v, t.nested;
+----
+1	47	[1, NULL, 3]
+2	47	NULL
+
+query II rowsort
+SELECT id, v FROM ns.main.returning_rows;
+----
+1	47
+2	47
+3	7
+
+query II
+UPDATE ns.main.returning_rows SET v = DEFAULT WHERE id = 3 RETURNING id, v;
+----
+3	42
+
+# Empty inputs yield no row, including a constant RETURNING expression.
+query I
+INSERT INTO ns.main.returning_rows SELECT 9, 9, 'none', NULL WHERE FALSE RETURNING 1;
+----
+
+query I
+UPDATE ns.main.returning_rows SET v = 9 WHERE FALSE RETURNING 1;
+----
+
+query I
+DELETE FROM ns.main.returning_rows WHERE FALSE RETURNING 1;
+----
+
+# A volatile SET expression must be evaluated once and returned unchanged.
+query T nosort returning_volatile_value
+UPDATE ns.main.returning_rows SET label = uuid()::VARCHAR WHERE id = 1 RETURNING label;
+----
+
+query T nosort returning_volatile_value
+SELECT label FROM ns.main.returning_rows WHERE id = 1;
+----
+
+statement ok
+UPDATE ns.main.returning_rows SET label = 'FIRST', v = 100 WHERE id = 1;
+
+# Failure above the sink must not publish its staged transaction.
+statement error
+INSERT INTO ns.main.returning_rows VALUES (90, 90, 'bad', NULL) RETURNING CAST(label AS BIGINT);
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM ns.main.returning_rows WHERE id = 90;
+----
+0
+
+statement error
+UPDATE ns.main.returning_rows SET v = 900 WHERE id = 1 RETURNING CAST(label AS BIGINT);
+----
+Conversion Error
+
+query I
+SELECT v FROM ns.main.returning_rows WHERE id = 1;
+----
+100
+
+statement error
+DELETE FROM ns.main.returning_rows WHERE id = 1 RETURNING CAST(label AS BIGINT);
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM ns.main.returning_rows WHERE id = 1;
+----
+1
+
+statement ok
+BEGIN;
+
+query II
+UPDATE ns.main.returning_rows SET v = 200 WHERE id = 1 RETURNING id, v;
+----
+1	200
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT v FROM ns.main.returning_rows WHERE id = 1;
+----
+100
+
+# Prepared executions must bind a fresh target and reset the result scan.
+statement ok
+PREPARE returning_update AS UPDATE ns.main.returning_rows SET v = v + $1 WHERE id = 3 RETURNING id, v;
+
+query II
+EXECUTE returning_update(1);
+----
+3	43
+
+query II
+EXECUTE returning_update(2);
+----
+3	45
+
+# DELETE USING repeats a target across several input chunks. Equal target values
+# remain distinct rows; deduplication must use row identity.
+statement ok
+INSERT INTO ns.main.returning_rows VALUES (4, 5, 'duplicate', [1]), (4, 5, 'duplicate', [1]);
+
+query II rowsort
+DELETE FROM ns.main.returning_rows AS t USING range(5000) s(i)
+WHERE t.id = 4 RETURNING t.id, t.v;
+----
+4	5
+4	5
+
+query I
+SELECT count(*) FROM ns.main.returning_rows WHERE id = 4;
+----
+0
+
+query IT rowsort
+DELETE FROM ns.main.returning_rows WHERE id <= 2 RETURNING id, label;
+----
+1	FIRST
+2	NULL
+
+# Unfiltered DELETE RETURNING still produces old rows, not the Count fast path.
+query II
+DELETE FROM ns.main.returning_rows RETURNING id, v;
+----
+3	45
+
+query I
+SELECT count(*) FROM ns.main.returning_rows;
+----
+0
+
+query I
+INSERT INTO ns.main.returning_rows VALUES (5, 5, 'five', NULL) RETURNING 7;
+----
+7
+
+query I
+UPDATE ns.main.returning_rows SET v = 6 RETURNING 8;
+----
+8
+
+query I
+DELETE FROM ns.main.returning_rows RETURNING 9;
+----
+9
+
+statement ok
+INSERT INTO ns.main.returning_rows VALUES (6, 6, 'rowid', NULL);
+
+query II rowsort delete_returning_rowid
+SELECT id, rowid FROM ns.main.returning_rows;
+----
+
+query II rowsort delete_returning_rowid
+DELETE FROM ns.main.returning_rows RETURNING id, rowid;
+----
+
+# An error after several returned batches also rolls back every inserted row.
+statement error
+INSERT INTO ns.main.returning_rows (id, label)
+SELECT i, 'late' FROM range(5000) r(i)
+RETURNING CASE WHEN id = 4999 THEN CAST(label AS BIGINT) ELSE id END;
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM ns.main.returning_rows;
+----
+0
+
+statement ok
+INSERT INTO ns.main.returning_rows VALUES (7, 1, 'duplicate', NULL), (7, 1, 'duplicate', NULL);
+
+# UPDATE FROM follows DuckDB's KEEP_FIRST policy across input chunks. Distinct
+# target rows with equal values each produce exactly one result.
+query II rowsort
+UPDATE ns.main.returning_rows AS t SET v = 9 FROM range(5000) s(i)
+WHERE t.id = 7 RETURNING t.id, t.v;
+----
+7	9
+7	9
+
+query I
+UPDATE ns.main.returning_rows AS t SET v = 11 FROM range(5000) s(i)
+WHERE t.id = 7;
+----
+2
+
+query II
+SELECT count(*), sum(v) FROM ns.main.returning_rows;
+----
+2	22
+
+statement ok
+DETACH ns;

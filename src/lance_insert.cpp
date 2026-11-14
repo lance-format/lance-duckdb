@@ -13,6 +13,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_insert.hpp"
+#include "lance_returning.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -21,11 +22,19 @@
 namespace duckdb {
 
 struct LanceInsertGlobalState : public GlobalSinkState {
-  explicit LanceInsertGlobalState(const LanceTableEntry &table_p,
+  explicit LanceInsertGlobalState(ClientContext &context,
+                                  const LanceTableEntry &table_p,
                                   vector<string> column_names_p,
-                                  vector<LogicalType> column_types_p)
+                                  vector<LogicalType> column_types_p,
+                                  bool return_chunk)
       : table(&table_p), column_names(std::move(column_names_p)),
-        column_types(std::move(column_types_p)) {}
+        column_types(std::move(column_types_p)) {
+    if (return_chunk) {
+      returning = make_uniq<ColumnDataCollection>(context, column_types);
+    }
+  }
+
+  unique_ptr<ColumnDataCollection> returning;
 
   mutex lock;
 
@@ -53,19 +62,21 @@ struct LanceInsertGlobalState : public GlobalSinkState {
 
 struct LanceInsertLocalState : public LocalSinkState {};
 
-class PhysicalLanceInsert final : public PhysicalOperator {
+class PhysicalLanceInsert final : public PhysicalOperator,
+                                  public LanceReturningOperator {
 public:
   static constexpr const PhysicalOperatorType TYPE =
       PhysicalOperatorType::EXTENSION;
 
   PhysicalLanceInsert(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                       LanceTableEntry &table_p, vector<string> column_names_p,
-                      vector<LogicalType> column_types_p,
+                      vector<LogicalType> column_types_p, bool return_chunk_p,
                       idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
+        LanceReturningOperator(return_chunk_p ? column_types_p.size() : 0),
         table(table_p), column_names(std::move(column_names_p)),
-        column_types(std::move(column_types_p)) {}
+        column_types(std::move(column_types_p)), return_chunk(return_chunk_p) {}
 
   bool IsSink() const override { return true; }
   bool IsSource() const override { return true; }
@@ -73,8 +84,9 @@ public:
   bool SinkOrderDependent() const override { return false; }
 
   unique_ptr<GlobalSinkState>
-  GetGlobalSinkState(ClientContext &) const override {
-    return make_uniq<LanceInsertGlobalState>(table, column_names, column_types);
+  GetGlobalSinkState(ClientContext &context) const override {
+    return make_uniq<LanceInsertGlobalState>(context, table, column_names,
+                                             column_types, return_chunk);
   }
 
   unique_ptr<LocalSinkState>
@@ -90,6 +102,17 @@ public:
 
     auto &gstate = input.global_state.Cast<LanceInsertGlobalState>();
     lock_guard<mutex> guard(gstate.lock);
+
+    if (return_chunk) {
+      NormalizeIngestRowsInChunk(context.client, chunk);
+      vector<idx_t> assigned_columns;
+      for (idx_t i = 0; i < column_types.size(); i++) {
+        assigned_columns.push_back(i);
+      }
+      LanceAppendReturningRows(context.client, *gstate.returning, table,
+                               returning_needed, chunk, assigned_columns,
+                               nullptr, {});
+    }
 
     if (!gstate.writer) {
       // The chunk carries each column's evaluated type (BLOB or the
@@ -188,19 +211,25 @@ public:
     return SinkFinalizeType::READY;
   }
 
-  class LanceInsertSourceState : public GlobalSourceState {
+  class LanceInsertSourceState : public LanceReturningSourceState {
   public:
+    explicit LanceInsertSourceState(optional_ptr<ColumnDataCollection> rows)
+        : LanceReturningSourceState(rows) {}
     bool emitted = false;
   };
 
   unique_ptr<GlobalSourceState>
   GetGlobalSourceState(ClientContext &) const override {
-    return make_uniq<LanceInsertSourceState>();
+    return make_uniq<LanceInsertSourceState>(
+        sink_state->Cast<LanceInsertGlobalState>().returning.get());
   }
 
   SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
                                    OperatorSourceInput &input) const override {
     auto &state = input.global_state.Cast<LanceInsertSourceState>();
+    if (return_chunk) {
+      return state.Scan(chunk);
+    }
     if (state.emitted) {
       return SourceResultType::FINISHED;
     }
@@ -218,16 +247,13 @@ private:
   LanceTableEntry &table;
   vector<string> column_names;
   vector<LogicalType> column_types;
+  bool return_chunk;
 };
 
 PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
                                         PhysicalPlanGenerator &planner,
                                         LogicalInsert &op,
                                         optional_ptr<PhysicalOperator> plan) {
-  if (op.return_chunk) {
-    throw NotImplementedException(
-        "Lance INSERT does not support RETURNING yet");
-  }
   if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
     throw NotImplementedException("Lance INSERT does not support ON CONFLICT");
   }
@@ -277,7 +303,7 @@ PhysicalOperator &PlanLanceInsertAppend(ClientContext &context,
 
   auto &insert = planner.Make<PhysicalLanceInsert>(
       op.types, *lance_table, std::move(column_names), std::move(column_types),
-      op.estimated_cardinality);
+      op.return_chunk, op.estimated_cardinality);
   insert.children.push_back(*plan);
   return insert;
 }

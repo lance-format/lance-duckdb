@@ -18,7 +18,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 
-#include "lance_merge.hpp"
+#include "lance_returning.hpp"
 #include "lance_session_state.hpp"
 #include "lance_table_entry.hpp"
 
@@ -388,8 +388,9 @@ idx_t LanceBlobIngestBatchBudget(ClientContext &context) {
   return std::max<idx_t>(max_memory / 8, 1);
 }
 
-void LanceCollectIngestSourceOptions(ClientContext &context, DataChunk &chunk,
-                                     LanceBatchSourceOptions &out) {
+static void CollectBlobSourceOptions(ClientContext &context, DataChunk &chunk,
+                                     LanceBatchSourceOptions &out,
+                                     bool include_references) {
   out = LanceBatchSourceOptions();
   unordered_set<string> seen;
   for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
@@ -401,7 +402,8 @@ void LanceCollectIngestSourceOptions(ClientContext &context, DataChunk &chunk,
       string error;
       auto value = chunk.data[col].GetValue(row);
       if (!LanceNormalizeBlobInput(value, input, error) || input.is_null ||
-          input.kind != LanceBlobKind::INGEST) {
+          (input.kind != LanceBlobKind::INGEST &&
+           !(include_references && input.kind == LanceBlobKind::REFERENCE))) {
         continue;
       }
       if (!seen.insert(input.uri).second) {
@@ -430,6 +432,17 @@ void LanceCollectIngestSourceOptions(ClientContext &context, DataChunk &chunk,
       out.values.push_back(std::move(values));
     }
   }
+}
+
+void LanceCollectIngestSourceOptions(ClientContext &context, DataChunk &chunk,
+                                     LanceBatchSourceOptions &out) {
+  CollectBlobSourceOptions(context, chunk, out, false);
+}
+
+void LanceCollectMaterializedBlobSourceOptions(ClientContext &context,
+                                               DataChunk &chunk,
+                                               LanceBatchSourceOptions &out) {
+  CollectBlobSourceOptions(context, chunk, out, true);
 }
 
 void BuildLanceBlobSourceOptionArrays(
@@ -564,7 +577,7 @@ static void LanceBlobPostBind(PlannerExtensionInput &,
                               BoundStatement &statement) {
   if (statement.plan) {
     NormalizeLanceInsertBlobCasts(*statement.plan);
-    LanceWrapMergeReturningOperator(*statement.plan);
+    LanceWrapReturningOperator(*statement.plan);
   }
 }
 
