@@ -1,0 +1,156 @@
+# name: test/sql/exec_memory_limit.test
+# description: Pushed aggregates participate in DuckDB memory admission
+# group: [sql]
+
+require lance
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET memory_limit = '256MB';
+
+statement ok
+COPY (SELECT i::BIGINT AS id, (i % 100)::BIGINT AS g, (i % 100)::DOUBLE AS v FROM range(600000) r(i))
+TO '{TEST_DIR}/exec_memory.lance' (FORMAT lance, max_rows_per_file 65536);
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+statement ok
+SET temp_directory = '';
+
+statement ok
+SET memory_limit = '16MB';
+
+# High-cardinality state must not grow outside the native memory budget.
+statement error
+SELECT count(*), sum(s)::BIGINT
+FROM (SELECT id, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+memory
+
+# Small aggregates still work under the same limit.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+SELECT count(*), sum(s)::BIGINT
+FROM (SELECT g, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY g);
+----
+100	29700000
+
+statement ok
+SET memory_limit = '256MB';
+
+query II
+SELECT count(*), sum(s)::BIGINT
+FROM (SELECT id, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+600000	29700000
+
+# Reservations share the database budget with native DuckDB allocations.
+statement ok
+SET threads = 1;
+
+statement ok
+SET memory_limit = '32MB';
+
+query I
+SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+600000
+
+statement ok
+CREATE TABLE native_memory AS SELECT i::BIGINT AS i FROM range(2000000) r(i);
+
+statement error
+SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+Out of Memory Error
+
+statement ok
+DROP TABLE native_memory;
+
+query I
+SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+600000
+
+statement ok
+SET memory_limit = '256MB';
+
+statement ok
+PREPARE memory_query AS SELECT count(*), sum(s)::BIGINT
+FROM (SELECT id, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+
+statement ok
+SET memory_limit = '16MB';
+
+statement error
+EXECUTE memory_query;
+----
+memory
+
+statement ok
+SET memory_limit = '256MB';
+
+query II
+EXECUTE memory_query;
+----
+600000	29700000
+
+# Connection-local limits are read at execution time too.
+statement ok
+SET operator_memory_limit = '16MB';
+
+statement error
+EXECUTE memory_query;
+----
+memory
+
+statement ok
+RESET operator_memory_limit;
+
+statement ok
+SET threads = 4;
+
+query II
+EXECUTE memory_query;
+----
+600000	29700000
+
+statement ok
+DEALLOCATE memory_query;
+
+# A configured temp directory must not enable an independent spill budget.
+statement ok
+SET threads = 1;
+
+statement ok
+SET temp_directory = '{TEST_DIR}/exec_memory_tmp';
+
+statement ok
+SET max_temp_directory_size = '0B';
+
+statement ok
+SET temp_file_encryption = true;
+
+statement ok
+SET memory_limit = '16MB';
+
+statement error
+SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
+----
+Out of Memory Error
+
+query I
+SELECT count(*) FROM glob('{TEST_DIR}/exec_memory_tmp/*');
+----
+0

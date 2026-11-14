@@ -80,6 +80,21 @@ pub enum ErrorCode {
     NamespaceAlreadyExists = 62,
     NamespaceNotEmpty = 63,
     NamespaceUnsupported = 64,
+    OutOfMemory = 65,
+}
+
+pub(crate) fn datafusion_error_code(
+    err: &datafusion_common::DataFusionError,
+    fallback: ErrorCode,
+) -> ErrorCode {
+    if matches!(
+        err.find_root(),
+        datafusion_common::DataFusionError::ResourcesExhausted(_)
+    ) {
+        ErrorCode::OutOfMemory
+    } else {
+        fallback
+    }
 }
 
 pub(crate) fn downcast_namespace_error(

@@ -41,6 +41,17 @@ such as a fractional second in a seconds column, an `INTERVAL` with days in a
 type can index, fails the statement instead of being truncated or stored as
 NULL.
 
+### Aggregate memory
+
+Pushed aggregates account their tracked intermediate state in DuckDB's shared
+`memory_limit` budget and use the connection's `operator_memory_limit` at
+execution time, including prepared statements. Reservations appear under
+`EXTENSION` in `duckdb_memory()`.
+
+Pushed aggregates fail with a memory error when admission fails; they do not
+spill to disk. Scan batches and Lance caches are outside this accounting, so
+these settings are not a limit on total process memory.
+
 ## JSON columns
 
 Lance JSON extension fields scan as JSON text with SQL type `VARCHAR`, including

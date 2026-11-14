@@ -5,6 +5,8 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::dataframe::DataFrame;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
@@ -13,10 +15,11 @@ use datafusion_expr::Expr;
 use futures::StreamExt;
 use lance_table::format::Fragment;
 
-use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::error::{clear_last_error, datafusion_error_code, set_last_error, ErrorCode};
 use crate::exec_ir::{agg_ir_to_df_expr, output_type_to_arrow, parse_exec_ir_v1};
 use crate::runtime;
 
+use super::memory_pool::LanceMemoryPoolCallbacks;
 use super::types::{DatasetHandle, SchemaHandle, StreamHandle};
 use super::util::{dataset_handle, slice_from_ptr, FfiError, FfiResult};
 
@@ -199,6 +202,7 @@ fn projected_schema(handle: &DatasetHandle, projection: &[String]) -> Result<Arc
 async fn build_exec_df(
     handle: &DatasetHandle,
     exec_ir: &[u8],
+    ctx: SessionContext,
     threads: usize,
 ) -> Result<DataFrame, String> {
     let exec_ir = parse_exec_ir_v1(exec_ir).map_err(|e| format!("exec_ir parse: {e}"))?;
@@ -215,7 +219,6 @@ async fn build_exec_df(
     let projection: Arc<[String]> = exec_ir.scan_projection.clone().into();
     let schema = projected_schema(handle, projection.as_ref())?;
 
-    let ctx = SessionContext::new();
     let target_partitions = if threads > 0 {
         threads
     } else {
@@ -327,7 +330,7 @@ fn get_exec_schema_inner(
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
 
     let schema_res = runtime::block_on(async {
-        let df = build_exec_df(handle, bytes, 0).await?;
+        let df = build_exec_df(handle, bytes, SessionContext::new(), 0).await?;
         let plan = df.create_physical_plan().await.map_err(|e| e.to_string())?;
         Ok::<_, String>(plan.schema())
     })
@@ -339,9 +342,10 @@ fn get_exec_schema_inner(
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug)]
 pub struct LanceExecContext {
     pub threads: u32,
+    pub memory_pool: LanceMemoryPoolCallbacks,
 }
 
 #[no_mangle]
@@ -369,20 +373,42 @@ fn create_dataset_exec_stream_ir_inner(
     exec_ir_len: usize,
     exec_ctx: *const LanceExecContext,
 ) -> FfiResult<StreamHandle> {
+    if exec_ctx.is_null() {
+        return Err(FfiError::new(ErrorCode::Exec, "missing exec context"));
+    }
+    // SAFETY: The caller transfers ownership of the callbacks on every return
+    // path. Copy them before any fallible operation; do not retain the stack
+    // context. The caller must not use or release the pool after this call.
+    let exec_ctx = unsafe { ptr::read(exec_ctx) };
+    let pool = Arc::new(exec_ctx.memory_pool);
     let handle = unsafe { dataset_handle(dataset)? };
     let bytes = unsafe { slice_from_ptr(exec_ir, exec_ir_len, "exec_ir")? };
-    let threads = unsafe { exec_ctx.as_ref() }
-        .map(|c| c.threads as usize)
-        .unwrap_or(0);
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        // DataFusion spill files cannot participate in DuckDB's shared temp
+        // quota or encryption policy. Fail admission instead of bypassing them.
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
+        .build_arc()
+        .map_err(|e| FfiError::new(ErrorCode::Exec, e.to_string()))?;
+    let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
 
     let stream_res = runtime::block_on(async {
-        let df = build_exec_df(handle, bytes, threads).await?;
-        df.execute_stream().await.map_err(|e| e.to_string())
+        let df = build_exec_df(handle, bytes, ctx, exec_ctx.threads as usize)
+            .await
+            .map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec plan: {e}")))?;
+        df.execute_stream().await.map_err(|e| {
+            FfiError::new(
+                datafusion_error_code(&e, ErrorCode::Exec),
+                format!("exec stream: {e}"),
+            )
+        })
     })
     .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;
 
-    let stream =
-        stream_res.map_err(|e| FfiError::new(ErrorCode::Exec, format!("exec stream: {e}")))?;
+    let stream = stream_res?;
 
     let df_stream = crate::datafusion_stream::DataFusionStream::try_new(stream)
         .map_err(|e| FfiError::new(ErrorCode::Exec, format!("runtime: {e}")))?;

@@ -1,16 +1,16 @@
-#include "duckdb/function/partition_stats.hpp"
-#include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -26,6 +26,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -35,13 +36,15 @@
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/buffer/buffer_pool_reservation.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
+#include "lance_arrow_compat.hpp"
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
 #include "lance_exec_ir.hpp"
 #include "lance_ffi.hpp"
 #include "lance_filter_ir.hpp"
-#include "lance_arrow_compat.hpp"
 #include "lance_logical_exec.hpp"
 #include "lance_scan_bind_data.hpp"
 #include "lance_table_entry.hpp"
@@ -50,6 +53,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -3667,6 +3671,90 @@ void RegisterLanceScanOptimizer(DBConfig &config) {
 
 // ---- __lance_exec (internal-only) ----
 
+class LanceExecMemoryPool {
+public:
+  explicit LanceExecMemoryPool(ClientContext &context)
+      : db(context.db), manager(db->GetBufferManager()),
+        operator_limit(
+            BufferManager::GetBufferManager(context).GetOperatorMemoryLimit()),
+        reservation(MemoryTag::EXTENSION, manager.GetBufferPool(), 0) {}
+
+  static void Grow(void *pool, size_t bytes) noexcept {
+    auto &self = *static_cast<LanceExecMemoryPool *>(pool);
+    std::lock_guard<std::mutex> guard(self.lock);
+    // DataFusion's infallible growth must be accounted even above the limit.
+    self.reservation.Resize(self.reservation.size + bytes);
+  }
+
+  static void Shrink(void *pool, size_t bytes) noexcept {
+    auto &self = *static_cast<LanceExecMemoryPool *>(pool);
+    std::lock_guard<std::mutex> guard(self.lock);
+    D_ASSERT(bytes <= self.reservation.size);
+    self.reservation.Resize(self.reservation.size - bytes);
+  }
+
+  static int32_t TryGrow(void *pool, size_t bytes, char *error,
+                         size_t capacity) noexcept {
+    auto &self = *static_cast<LanceExecMemoryPool *>(pool);
+    try {
+      std::lock_guard<std::mutex> guard(self.lock);
+      auto limit = self.Limit();
+      if (self.reservation.size > limit ||
+          bytes > limit - self.reservation.size) {
+        std::snprintf(
+            error, capacity,
+            "Lance exec memory reservation exceeds the operator memory limit");
+        return 1;
+      }
+      self.manager.ReserveMemory(bytes);
+      // ReserveMemory already charged the shared pool. Adopt that charge;
+      // Resize here would charge it twice.
+      self.reservation.size += bytes;
+      return 0;
+    } catch (const std::exception &ex) {
+      try {
+        ErrorData data(ex);
+        std::snprintf(error, capacity, "%s", data.Message().c_str());
+        return data.Type() == ExceptionType::OUT_OF_MEMORY ? 1 : 2;
+      } catch (...) {
+        std::snprintf(error, capacity, "%s", ex.what());
+        return 2;
+      }
+    } catch (...) {
+      std::snprintf(error, capacity,
+                    "Unknown error reserving Lance exec memory");
+      return 2;
+    }
+  }
+
+  static size_t Reserved(void *pool) noexcept {
+    auto &self = *static_cast<LanceExecMemoryPool *>(pool);
+    std::lock_guard<std::mutex> guard(self.lock);
+    return self.reservation.size;
+  }
+
+  static size_t MemoryLimit(void *pool) noexcept {
+    return static_cast<LanceExecMemoryPool *>(pool)->Limit();
+  }
+
+  static void Release(void *pool) noexcept {
+    delete static_cast<LanceExecMemoryPool *>(pool);
+  }
+
+private:
+  idx_t Limit() const {
+    return MinValue(operator_limit, manager.GetMaxMemory());
+  }
+
+  // Keep the database manager alive until Rust drops its last reservation,
+  // including asynchronous cleanup after the DuckDB client is destroyed.
+  shared_ptr<DatabaseInstance> db;
+  BufferManager &manager;
+  const idx_t operator_limit;
+  std::mutex lock;
+  TempBufferPoolReservation reservation;
+};
+
 struct LanceExecGlobalState : public GlobalTableFunctionState {
   std::atomic<idx_t> lines_read{0};
   std::atomic<idx_t> record_batches{0};
@@ -3676,6 +3764,17 @@ struct LanceExecGlobalState : public GlobalTableFunctionState {
 
   idx_t MaxThreads() const override { return 1; }
 };
+
+[[noreturn]] static void ThrowLanceExecError(const string &message) {
+  // Mirrored by ErrorCode::OutOfMemory in rust/error.rs.
+  static constexpr int32_t LANCE_FFI_OUT_OF_MEMORY = 65;
+  auto code = lance_last_error_code();
+  auto suffix = LanceFormatErrorSuffix();
+  if (code == LANCE_FFI_OUT_OF_MEMORY) {
+    throw OutOfMemoryException(message + suffix);
+  }
+  throw IOException(message + suffix);
+}
 
 struct LanceExecLocalState : public ArrowScanLocalState {
   explicit LanceExecLocalState(unique_ptr<ArrowArrayWrapper> current_chunk,
@@ -3771,6 +3870,15 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
   LanceExecContext exec_ctx;
   exec_ctx.threads = NumericCast<uint32_t>(
       DBConfig::GetConfig(context.client).options.maximum_threads);
+  auto memory_pool = make_uniq<LanceExecMemoryPool>(context.client);
+  exec_ctx.memory_pool = {memory_pool.get(),
+                          LanceExecMemoryPool::Grow,
+                          LanceExecMemoryPool::Shrink,
+                          LanceExecMemoryPool::TryGrow,
+                          LanceExecMemoryPool::Reserved,
+                          LanceExecMemoryPool::MemoryLimit,
+                          LanceExecMemoryPool::Release};
+  memory_pool.release(); // The FFI call takes ownership even on failure.
   result->stream = lance_create_dataset_exec_stream_ir(
       bind_data.dataset,
       bind_data.exec_ir.empty()
@@ -3778,8 +3886,7 @@ LanceExecLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
           : reinterpret_cast<const uint8_t *>(bind_data.exec_ir.data()),
       bind_data.exec_ir.size(), &exec_ctx);
   if (!result->stream) {
-    throw IOException("Failed to create Lance exec stream" +
-                      LanceFormatErrorSuffix());
+    ThrowLanceExecError("Failed to create Lance exec stream");
   }
   return std::move(result);
 }
@@ -3796,8 +3903,7 @@ static bool LanceExecLoadNextBatch(LanceExecLocalState &local_state) {
     return false;
   }
   if (rc != 0) {
-    throw IOException("Failed to read next Lance RecordBatch" +
-                      LanceFormatErrorSuffix());
+    ThrowLanceExecError("Failed to read next Lance RecordBatch");
   }
 
   LanceArrowBatch exported(batch);
