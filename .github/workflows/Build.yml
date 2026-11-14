@@ -113,6 +113,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check aggregate memory lifecycle
+        run: python3 test/scripts/check_exec_memory_lifecycle.py --library build/release/src/libduckdb.so
+
   test_s3:
     name: Test S3 (MinIO)
     runs-on: ubuntu-24.04
