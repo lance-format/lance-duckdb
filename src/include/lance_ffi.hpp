@@ -17,8 +17,25 @@ typedef struct LanceDebugCounters {
   uint64_t commit_count;
 } LanceDebugCounters;
 
+// The exec stream takes ownership of `pool`, including on creation failure.
+// Callbacks are thread-safe and must not throw. release runs after the last
+// DataFusion reservation is dropped, which can outlive the outer stream.
+typedef struct LanceMemoryPoolCallbacks {
+  void *pool;
+  void (*grow)(void *pool, size_t bytes);
+  void (*shrink)(void *pool, size_t bytes);
+  // 0: admitted, 1: out of memory, 2: other error. Failure leaves the
+  // reservation unchanged and writes a NUL-terminated message into error
+  // (capacity > 0).
+  int32_t (*try_grow)(void *pool, size_t bytes, char *error, size_t capacity);
+  size_t (*reserved)(void *pool);
+  size_t (*memory_limit)(void *pool);
+  void (*release)(void *pool);
+} LanceMemoryPoolCallbacks;
+
 typedef struct LanceExecContext {
   uint32_t threads;
+  LanceMemoryPoolCallbacks memory_pool;
 } LanceExecContext;
 
 typedef struct LanceStringList {

@@ -7,6 +7,7 @@ mod dir_namespace;
 mod exec;
 mod index;
 mod knn;
+mod memory_pool;
 mod merge;
 mod namespace;
 pub(crate) mod projection;

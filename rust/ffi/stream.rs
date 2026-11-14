@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use crate::error::{clear_last_error, set_last_error, ErrorCode};
+use crate::error::{clear_last_error, datafusion_error_code, set_last_error, ErrorCode};
 
 use super::util::{stream_handle_mut, FfiError, FfiResult};
 
@@ -43,10 +43,13 @@ fn stream_next_inner(stream: *mut c_void, out_batch: *mut *mut c_void) -> FfiRes
             Ok(0)
         }
         Ok(None) => Ok(1),
-        Err(err) => Err(FfiError::new(
-            ErrorCode::StreamNext,
-            format!("stream next: {err}"),
-        )),
+        Err(err) => {
+            let code = err
+                .downcast_ref::<datafusion_common::DataFusionError>()
+                .map(|e| datafusion_error_code(e, ErrorCode::StreamNext))
+                .unwrap_or(ErrorCode::StreamNext);
+            Err(FfiError::new(code, format!("stream next: {err}")))
+        }
     }
 }
 
