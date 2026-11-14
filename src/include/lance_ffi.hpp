@@ -259,7 +259,8 @@ void lance_free_named_field_stats_list(LanceNamedFieldStats *ptr, size_t len);
 void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
                                       const char **columns, size_t columns_len,
                                       const uint8_t *filter_ir,
-                                      size_t filter_ir_len);
+                                      size_t filter_ir_len,
+                                      uint8_t scan_in_order);
 void *lance_create_dataset_stream_ir(void *dataset, const char **columns,
                                      size_t columns_len,
                                      const uint8_t *filter_ir,
