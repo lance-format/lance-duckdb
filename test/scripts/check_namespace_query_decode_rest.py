@@ -428,6 +428,31 @@ def main() -> None:
                 assert result.returncode == 0, result.stderr
                 assert json.loads(result.stdout) == [{"id": 0, "txt": "row-0"}] * 2, result.stdout
                 assert len(requests) == start, "direct reads must not call query_table"
+            # query_table scans have no local dataset handle, so profiling reports
+            # the pushdown metrics instead of trying to explain a dataset plan.
+            start = len(requests)
+            result = subprocess.run(
+                [
+                    str(args.duckdb),
+                    "-unsigned",
+                    "-no-agent",
+                    "-json",
+                    "-c",
+                    prefix
+                    + "SET lance_namespace_query_table = true; "
+                    + "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id, txt FROM ns.main.normal ORDER BY id;",
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                env={**os.environ, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"},
+            )
+            assert result.returncode == 0, result.stderr
+            assert '"Lance Scan Backend": "namespace_query_table"' in result.stdout, result.stdout
+            assert '"Lance Rows Out"' in result.stdout, result.stdout
+            assert '"Lance Plan Error"' not in result.stdout, result.stdout
+            assert len(requests) == start + 1, "a profiled query_table scan must use one snapshot"
             # query_table does not pin a dataset snapshot across requests. TopN
             # must remain one remote scan, with ordering and limiting in DuckDB.
             for mode in ("normal", "file"):
