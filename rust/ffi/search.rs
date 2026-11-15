@@ -2,7 +2,7 @@ use std::ffi::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
@@ -16,11 +16,12 @@ use crate::runtime;
 use crate::scanner::LanceStream;
 
 use super::projection;
+use super::query_vector::{query_array, validate_query_vector};
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize,
     optional_cstr_array, optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir,
-    slice_from_ptr, FfiError, FfiResult,
+    FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -213,8 +214,9 @@ fn get_hybrid_schema_inner(dataset: *mut c_void) -> FfiResult<SchemaHandle> {
 pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     text_column: *const c_char,
     text_query: *const c_char,
     k: u64,
@@ -236,6 +238,7 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
         vector_column,
         query_values,
         query_len,
+        query_element_type,
         text_column,
         text_query,
         k,
@@ -267,8 +270,9 @@ pub unsafe extern "C" fn lance_create_hybrid_stream_ir(
 fn create_hybrid_stream_ir_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     text_column: *const c_char,
     text_query: *const c_char,
     k: u64,
@@ -294,7 +298,7 @@ fn create_hybrid_stream_ir_inner(
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
     let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
     let text_query = unsafe { cstr_to_str(text_query, "text_query")? };
-    let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
     let requested_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
         parse_optional_filter_ir(
@@ -311,7 +315,7 @@ fn create_hybrid_stream_ir_inner(
     let rows = create_hybrid_batch(
         handle,
         vector_column,
-        query_values,
+        query,
         text_column,
         text_query,
         k_usize,
@@ -356,7 +360,7 @@ fn build_fts_query(text_column: Option<&str>, query: &str) -> Result<FullTextSea
 fn create_hybrid_batch(
     handle: &super::types::DatasetHandle,
     vector_column: &str,
-    query_values: &[f32],
+    query: ArrayRef,
     text_column: Option<&str>,
     text_query: &str,
     k: usize,
@@ -371,7 +375,7 @@ fn create_hybrid_batch(
     oversample_factor: u32,
     requested_columns: &[String],
 ) -> FfiResult<RecordBatch> {
-    let query = Float32Array::from_iter_values(query_values.iter().copied());
+    let query = validate_query_vector(handle, vector_column, query, distance_type.as_ref())?;
     let oversample = k.saturating_mul(oversample_factor.max(1) as usize).max(k);
 
     let mut vector_scan = handle.dataset.scan();
@@ -381,7 +385,7 @@ fn create_hybrid_batch(
         vector_scan.filter_expr(expr);
     }
     vector_scan
-        .nearest(vector_column, &query, oversample)
+        .nearest(vector_column, query.as_ref(), oversample)
         .map_err(|err| {
             FfiError::new(
                 ErrorCode::HybridStreamCreate,
