@@ -1,18 +1,17 @@
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
-use arrow_array::Float32Array;
-
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::LanceStream;
 
 use super::projection;
+use super::query_vector::{query_array, validate_query_vector};
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_usize, optional_cstr_array,
-    optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir, slice_from_ptr,
-    to_c_string, FfiError, FfiResult,
+    optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir, to_c_string, FfiError,
+    FfiResult,
 };
 
 /// Returns Lance's name for a vector search distance type, or null with the
@@ -43,8 +42,9 @@ pub unsafe extern "C" fn lance_normalize_distance_type(
 pub unsafe extern "C" fn lance_get_knn_schema(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -58,6 +58,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
         vector_column,
         query_values,
         query_len,
+        query_element_type,
         k,
         nprobes,
         refine_factor,
@@ -81,8 +82,9 @@ pub unsafe extern "C" fn lance_get_knn_schema(
 fn get_knn_schema_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -98,7 +100,7 @@ fn get_knn_schema_inner(
         ));
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
     let distance_type = unsafe { optional_distance_type(distance_type)? };
 
@@ -108,8 +110,8 @@ fn get_knn_schema_inner(
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
     scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
-    let query = Float32Array::from_iter_values(query_values.iter().copied());
-    scan.nearest(vector_column, &query, k_usize)
+    let query = validate_query_vector(handle, vector_column, query, distance_type.as_ref())?;
+    scan.nearest(vector_column, query.as_ref(), k_usize)
         .map_err(|err| FfiError::new(ErrorCode::KnnSchema, format!("knn schema nearest: {err}")))?;
     if nprobes != 0 {
         let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;
@@ -144,8 +146,9 @@ fn get_knn_schema_inner(
 pub unsafe extern "C" fn lance_create_knn_stream_ir(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -164,6 +167,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
         vector_column,
         query_values,
         query_len,
+        query_element_type,
         k,
         nprobes,
         refine_factor,
@@ -192,8 +196,9 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
 fn create_knn_stream_ir_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -214,7 +219,7 @@ fn create_knn_stream_ir_inner(
         ));
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
     let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
         parse_optional_filter_ir(
@@ -236,8 +241,8 @@ fn create_knn_stream_ir_inner(
     let mut scan = handle.dataset.scan();
     scan.prefilter(prefilter != 0);
     scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
-    let query = Float32Array::from_iter_values(query_values.iter().copied());
-    scan.nearest(vector_column, &query, k_usize)
+    let query = validate_query_vector(handle, vector_column, query, distance_type.as_ref())?;
+    scan.nearest(vector_column, query.as_ref(), k_usize)
         .map_err(|err| {
             FfiError::new(
                 ErrorCode::KnnStreamCreate,
@@ -297,8 +302,9 @@ fn create_knn_stream_ir_inner(
 pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -315,6 +321,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
         vector_column,
         query_values,
         query_len,
+        query_element_type,
         k,
         nprobes,
         refine_factor,
@@ -341,8 +348,9 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
 fn explain_knn_scan_ir_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const f32,
+    query_values: *const c_void,
     query_len: usize,
+    query_element_type: u8,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -361,7 +369,7 @@ fn explain_knn_scan_ir_inner(
         ));
     }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query_values = unsafe { slice_from_ptr(query_values, query_len, "query_values")? };
+    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
     let filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,
@@ -382,8 +390,8 @@ fn explain_knn_scan_ir_inner(
     if let Some(filter) = filter {
         scan.filter_expr(filter);
     }
-    let query = Float32Array::from_iter_values(query_values.iter().copied());
-    scan.nearest(vector_column, &query, k_usize)
+    let query = validate_query_vector(handle, vector_column, query, distance_type.as_ref())?;
+    scan.nearest(vector_column, query.as_ref(), k_usize)
         .map_err(|err| FfiError::new(ErrorCode::ExplainPlan, format!("knn scan nearest: {err}")))?;
     if nprobes != 0 {
         let nprobes_usize = nonzero_u64_to_usize(nprobes, "nprobes")?;

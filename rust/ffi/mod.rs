@@ -12,6 +12,7 @@ mod merge;
 mod namespace;
 pub(crate) mod projection;
 mod query_table;
+mod query_vector;
 mod scan;
 mod schema_evolution;
 mod search;

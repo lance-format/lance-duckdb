@@ -290,7 +290,7 @@ Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
-- `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
+- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a direct local dataset with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Namespace-backed tables reject UINT8 queries.
 
 Named parameters:
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
@@ -298,7 +298,7 @@ Named parameters:
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
 - `refine_factor` (BIGINT, optional): Over-fetch factor for re-ranking using original vectors. Must be > 0. A value of `1` still enables re-ranking.
 - `ef` (BIGINT, optional): Search-time candidate list size for HNSW sub-indexes (for example `IVF_HNSW_SQ`). Must be > 0 and at least `k * refine_factor`, otherwise Lance fails the query with `ef must be greater than or equal to k`. The Lance default is `1.5 * k * refine_factor`, which can give poor recall on large partitions; raise it (for example `ef = 200`) to trade latency for recall. Ignored by index types without an HNSW graph.
-- `distance_type` (VARCHAR, optional): Distance metric of `_distance`: `l2` (or `euclidean`), `cosine`, `dot`, or `hamming`, case-insensitive. If unset, a search that uses a vector index ranks by the index's metric, while an exact search (`use_index = false`, or no index) uses Lance's default for the column type (`l2` for floating-point vectors). Set it to the index's `metric_type` to compare ANN results with exact ones. Lance does not use an index built with a different metric; it runs an exact search instead.
+- `distance_type` (VARCHAR, optional): Distance metric of `_distance`: `l2` (or `euclidean`), `cosine`, `dot`, or `hamming`, case-insensitive. If unset, a search that uses a vector index ranks by the index's metric, while an exact search (`use_index = false`, or no index) uses Lance's default for the column type (`l2` for floating-point vectors, `hamming` for binary vectors). Set it to the index's `metric_type` to compare ANN results with exact ones. Lance does not use an index built with a different metric; it runs an exact search instead.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
 - `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
@@ -396,7 +396,7 @@ Signatures:
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
-- `query_vector` (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). `FLOAT[]` / `DOUBLE[]` are also accepted.
+- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a direct local dataset with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Namespace-backed tables reject UINT8 queries.
 - `text_column` (VARCHAR): Text column name.
 - `query` (VARCHAR): Query string, or a structured query in the four-argument form.
 

@@ -1,0 +1,243 @@
+# name: test/sql/search_uint8_query.test
+# description: Native UINT8 binary query vectors use Hamming distance on direct local datasets
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    (1, [15, 0, 0, 0]::UTINYINT[4], 'common alpha'),
+    (2, [3, 0, 0, 0]::UTINYINT[4], 'common beta'),
+    (3, [0, 0, 0, 0]::UTINYINT[4], 'common gamma'),
+    (4, [255, 0, 0, 0]::UTINYINT[4], 'common delta')
+  ) AS t(id, vec, txt)
+) TO '{TEST_DIR}/uint8_query.lance' (FORMAT lance);
+
+query I
+SELECT DISTINCT typeof(vec) FROM '{TEST_DIR}/uint8_query.lance';
+----
+UTINYINT[4]
+
+# Native Hamming results: 15 differs from 3 in two bits and from 0 in four.
+query II
+SELECT id, _distance
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 3,
+  use_index = false
+)
+ORDER BY id;
+----
+1	0
+2	2
+3	4
+
+# LIST and ARRAY overloads both preserve UINT8 instead of casting to FLOAT.
+query I
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[],
+  k = 3,
+  use_index = false
+)
+ORDER BY id;
+----
+1
+2
+3
+
+query II
+SELECT id, _distance
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 3,
+  use_index = false,
+  distance_type = 'hamming'
+)
+ORDER BY id;
+----
+1	0
+2	2
+3	4
+
+# Hybrid fusion consumes the same native Hamming distances.
+query II
+SELECT id, _distance
+FROM lance_hybrid_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  'txt',
+  'common',
+  k = 3,
+  use_index = false
+)
+ORDER BY id;
+----
+1	0
+2	2
+3	4
+
+# Explain and row-id projection use the typed schema/stream paths too.
+statement ok
+EXPLAIN ANALYZE
+SELECT id, _rowid
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 3,
+  use_index = false
+);
+
+query I
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 3,
+  use_index = false
+)
+WHERE _rowid IS NOT NULL
+ORDER BY id;
+----
+1
+2
+3
+
+statement ok
+PREPARE uint8_vector_query AS
+SELECT id, _distance
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  $1,
+  k = 3,
+  use_index = false
+)
+ORDER BY id;
+
+query II
+EXECUTE uint8_vector_query([15, 0, 0, 0]::UTINYINT[4]);
+----
+1	0
+2	2
+3	4
+
+statement ok
+DEALLOCATE uint8_vector_query;
+
+# Existing FLOAT behavior is unchanged by the added overloads.
+query I
+SELECT id
+FROM lance_vector_search(
+  'test/data/search_test_data.lance',
+  'vec',
+  [0.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 1,
+  use_index = false
+);
+----
+1
+
+statement error
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  []::UTINYINT[],
+  k = 1
+);
+----
+Invalid Input Error: lance_vector_search requires a non-empty query vector
+
+statement error
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0]::UTINYINT[2],
+  k = 1,
+  use_index = false
+);
+----
+query dim(2) doesn't match the column vec vector dim(4)
+
+statement error
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 1,
+  distance_type = 'l2'
+);
+----
+UINT8 binary vector column vec requires distance_type='hamming', got l2
+
+# Explicit UINT8 keeps the old numeric-cast behavior on FLOAT columns.
+query I
+SELECT id
+FROM lance_vector_search(
+  'test/data/search_test_data.lance',
+  'vec',
+  [0, 0, 0, 0]::UTINYINT[4],
+  k = 1,
+  use_index = false
+);
+----
+1
+
+# A FLOAT query on a binary column is still rejected.
+
+statement error
+SELECT id
+FROM lance_vector_search(
+  '{TEST_DIR}/uint8_query.lance',
+  'vec',
+  [15.0, 0.0, 0.0, 0.0]::FLOAT[4],
+  k = 1,
+  use_index = false
+);
+----
+Column vec has element type UInt8 and the query vector is Float32
+
+# Namespace-backed tables reject this local-only contract before any request.
+statement ok
+ATTACH '{TEST_DIR}/uint8_query_ns' AS uint8_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE uint8_ns.main.uint8_query AS
+SELECT * FROM '{TEST_DIR}/uint8_query.lance';
+
+statement error
+SELECT id
+FROM lance_vector_search(
+  'uint8_ns.main.uint8_query',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  k = 1
+);
+----
+Invalid Input Error: lance_vector_search UINT8 query vectors are supported only for direct local datasets, not namespace-backed tables
+
+statement error
+SELECT id
+FROM lance_hybrid_search(
+  'uint8_ns.main.uint8_query',
+  'vec',
+  [15, 0, 0, 0]::UTINYINT[4],
+  'txt',
+  'common',
+  k = 1
+);
+----
+Invalid Input Error: lance_hybrid_search UINT8 query vectors are supported only for direct local datasets, not namespace-backed tables
