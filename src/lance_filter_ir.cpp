@@ -299,9 +299,13 @@ static bool TryGetLanceContainmentFunctionName(const string &duckdb_name,
 }
 
 // `skipped_optional` is set when optional conjuncts of the filter's AND chain
-// were left out of `out_ir`.
+// were left out of `out_ir`, or were only encoded as a hint. With
+// `include_runtime_hints`, an optional `col IN (...)` that a hash join derived
+// from its build side is encoded so that Lance can prune on it. The join keeps
+// filtering above the scan, so the hint only narrows what Lance reads.
 static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
                                            const TableFilter &filter,
+                                           bool include_runtime_hints,
                                            string &out_ir,
                                            bool &skipped_optional) {
   std::function<bool(const Expression &, string &)> build_from_expr;
@@ -545,6 +549,24 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
     }
     if (ExpressionFilter::IsOptionalExpression(expr)) {
       skipped_optional = true;
+      if (include_runtime_hints &&
+          ExpressionFilter::IsRootOptionalExpression(expr)) {
+        auto hint = ExpressionFilter::GetOptionalFilterChild(expr);
+        // Only a plain column IN list: anything else (a cast of the column, a
+        // min/max range, a dynamic TopN bound) is left to DuckDB.
+        string hint_ir;
+        if (hint && hint->GetExpressionClass() ==
+                        ExpressionClass::BOUND_OPERATOR &&
+            hint->GetExpressionType() == ExpressionType::COMPARE_IN) {
+          auto &in_expr = hint->Cast<BoundOperatorExpression>();
+          if (!in_expr.GetChildren().empty() && in_expr.GetChildren()[0] &&
+              in_expr.GetChildren()[0]->GetExpressionClass() ==
+                  ExpressionClass::BOUND_REF &&
+              build_from_expr(*hint, hint_ir)) {
+            children.push_back(std::move(hint_ir));
+          }
+        }
+      }
       return true;
     }
     string child_ir;
@@ -573,13 +595,13 @@ ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
   TableFunctionInitInput probe_input(get.bind_data.get(), get.GetColumnIds(),
                                      projection_ids, &get.table_filters);
   return BuildLanceTableFilterIRParts(names, types, json_columns, probe_input,
-                                      false);
+                                      false, false);
 }
 
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const vector<string> &json_columns, const TableFunctionInitInput &input,
-    bool exclude_computed_columns) {
+    bool exclude_computed_columns, bool include_runtime_hints) {
   LanceFilterIRBuildResult result;
   if (!input.filters) {
     return result;
@@ -597,7 +619,8 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     // pruning hint. A predicate the query wrote reached the search functions'
     // complex-filter pushdown too, which pushes it or rejects a required
     // prefilter.
-    if (ExpressionFilter::IsOptionalFilter(filter)) {
+    const bool optional_filter = ExpressionFilter::IsOptionalFilter(filter);
+    if (optional_filter && !include_runtime_hints) {
       result.all_filters_pushed = false;
       continue;
     }
@@ -635,10 +658,13 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     }
     string filter_ir;
     bool skipped_optional = false;
-    if (!TryBuildLanceTableFilterIRExpr({col_ref_ir}, filter, filter_ir,
+    if (!TryBuildLanceTableFilterIRExpr({col_ref_ir}, filter,
+                                        include_runtime_hints, filter_ir,
                                         skipped_optional)) {
       result.all_filters_pushed = false;
-      result.all_prefilterable_filters_pushed = false;
+      if (!optional_filter) {
+        result.all_prefilterable_filters_pushed = false;
+      }
       continue;
     }
     if (skipped_optional) {
@@ -689,7 +715,8 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     string filter_ir;
     bool skipped_optional = false;
     if (!supported || !TryBuildLanceTableFilterIRExpr(
-                          column_refs, *filter, filter_ir, skipped_optional)) {
+                          column_refs, *filter, false, filter_ir,
+                          skipped_optional)) {
       result.all_filters_pushed = false;
       if (!computed) {
         result.all_prefilterable_filters_pushed = false;

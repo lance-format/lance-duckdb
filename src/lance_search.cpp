@@ -828,7 +828,7 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
                                         input.projection_ids, input.filters);
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
-      true);
+      true, false);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException("lance_vector_search requires filter pushdown "
                                 "for prefilterable columns when "
@@ -1802,7 +1802,7 @@ LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
                                         input.projection_ids, input.filters);
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
-      true);
+      true, false);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"
