@@ -9,7 +9,10 @@ use tokio::runtime::{Handle, Runtime};
 
 static RUNTIME: OnceLock<Result<Runtime, io::Error>> = OnceLock::new();
 
-const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often a running Lance call re-checks the interrupt hook. A short interval keeps
+/// `max_execution_time` deadlines only a few milliseconds away observable while a Lance call is
+/// still running, instead of letting that call finish and commit first.
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Reports whether the query that owns `ctx` was interrupted; non-zero means interrupted.
 pub type InterruptCheck = unsafe extern "C" fn(ctx: *mut c_void) -> i32;

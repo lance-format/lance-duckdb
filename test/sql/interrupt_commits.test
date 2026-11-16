@@ -4,7 +4,7 @@
 
 require lance
 
-# 1000 tiny fragments, so both statements below run well past the 50 ms
+# 1000 tiny fragments, so both statements below run well past the 5 ms
 # interrupt poll interval.
 statement ok
 COPY (SELECT range AS id FROM range(100000))
@@ -20,8 +20,11 @@ CREATE INDEX interrupt_idx ON '{TEST_DIR}/interrupt_commits.lance' (id) USING BT
 ----
 Query exceeded maximum execution time
 
+# Compaction gets a single thread: with the default thread count a fast Release
+# runner can compact all 1000 fragments in less than the 1 ms deadline plus one
+# interrupt poll, which makes the statement succeed instead of being interrupted.
 statement error
-OPTIMIZE '{TEST_DIR}/interrupt_commits.lance';
+OPTIMIZE '{TEST_DIR}/interrupt_commits.lance' WITH (num_threads = 1);
 ----
 Query exceeded maximum execution time
 
