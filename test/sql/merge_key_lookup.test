@@ -1,0 +1,79 @@
+# name: test/sql/merge_key_lookup.test
+# description: Hash-join runtime IN hints reach the Lance scan, so MERGE and joins with few keys read only matching rows
+# group: [sql]
+
+require lance
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE mk_reference AS
+SELECT i::BIGINT AS id, 'v' || i::VARCHAR AS s, (i % 7)::BIGINT AS g
+FROM range(8192) r(i);
+
+statement ok
+COPY mk_reference TO '{TEST_DIR}/merge_key_lookup.lance' (FORMAT lance, max_rows_per_file 1024);
+
+statement ok
+CREATE TABLE mk_keys AS SELECT (i * 97 + 3)::BIGINT AS id FROM range(20) r(i);
+
+# The probe-side Lance scan receives the build side keys as a filter and
+# returns only the matching rows instead of the whole table.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM mk_keys k JOIN '{TEST_DIR}/merge_key_lookup.lance' t ON t.id = k.id;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Rows Out": "20"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query I
+SELECT count(*) FROM mk_keys k JOIN '{TEST_DIR}/merge_key_lookup.lance' t ON t.id = k.id;
+----
+20
+
+# Disabling the runtime filter falls back to a full scan with the same result.
+statement ok
+SET dynamic_or_filter_threshold = 0;
+
+query I
+SELECT count(*) FROM mk_keys k JOIN '{TEST_DIR}/merge_key_lookup.lance' t ON t.id = k.id;
+----
+20
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
+# Keys that match nothing, and duplicate keys, stay correct.
+query I
+SELECT count(*) FROM (SELECT -1::BIGINT AS id UNION ALL SELECT 5 UNION ALL SELECT 5) k JOIN '{TEST_DIR}/merge_key_lookup.lance' t ON t.id = k.id;
+----
+2
+
+# MERGE through the catalog uses the hint and still updates exactly the matched rows.
+statement ok
+ATTACH '{TEST_DIR}/merge_key_lookup_ns' AS mk_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE mk_ns.main.t AS SELECT * FROM mk_reference;
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+MERGE INTO mk_ns.main.t USING (SELECT id, 'merged' AS s FROM mk_keys) src ON t.id = src.id
+WHEN MATCHED THEN UPDATE SET s = src.s;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Rows Out": "20"[\s\S]*"Lance Filter IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s = 'merged') FROM mk_ns.main.t;
+----
+8192	20
+
+query I
+SELECT count(*) FROM mk_ns.main.t t JOIN mk_keys k ON t.id = k.id WHERE t.s = 'merged';
+----
+20
+
+query I
+SELECT count(*) FROM mk_ns.main.t WHERE s = 'merged' AND id NOT IN (SELECT id FROM mk_keys);
+----
+0

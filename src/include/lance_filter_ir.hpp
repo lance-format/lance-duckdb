@@ -18,10 +18,16 @@ struct LanceFilterIRBuildResult {
 
 // `json_columns` names top-level fields whose DuckDB VARCHAR view is logical
 // JSON text. Filters that touch one of these fields must remain in DuckDB.
+//
+// `include_runtime_hints` also encodes the `col IN (...)` list a hash join
+// derived from its build side, which DuckDB marks optional. Such a hint only
+// narrows what the scan reads and never counts as a pushed filter
+// (`all_filters_pushed` stays false). Do not enable it for search functions: a
+// prefilter changes which rows a top-k search returns.
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const vector<string> &json_columns, const TableFunctionInitInput &input,
-    bool exclude_computed_columns);
+    bool exclude_computed_columns, bool include_runtime_hints);
 
 // Probe whether every filter attached to `get.table_filters` can be encoded
 // into Lance filter IR. Owns the invariant "filters encodable → limit/offset
