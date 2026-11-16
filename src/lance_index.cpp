@@ -1287,12 +1287,17 @@ static void LanceCreateIndexFunc(ClientContext &context,
   const char *params_ptr =
       bind_data.params_json.empty() ? nullptr : bind_data.params_json.c_str();
 
-  auto rc = lance_dataset_create_index(
-      dataset, name_ptr, col_ptrs.data(), col_ptrs.size(),
-      bind_data.index_type.c_str(), params_ptr, bind_data.replace ? 1 : 0,
-      bind_data.train ? 1 : 0);
+  int32_t rc;
+  {
+    LanceInterruptScope interrupt_scope(context);
+    rc = lance_dataset_create_index(
+        dataset, name_ptr, col_ptrs.data(), col_ptrs.size(),
+        bind_data.index_type.c_str(), params_ptr, bind_data.replace ? 1 : 0,
+        bind_data.train ? 1 : 0);
+  }
   lance_close_dataset(dataset);
   if (rc != 0) {
+    context.BlockingInterruptCheck();
     throw IOException("Failed to create Lance index" +
                       LanceFormatErrorSuffix());
   }
@@ -1440,11 +1445,16 @@ public:
     const char *params_ptr =
         params_json.empty() ? nullptr : params_json.c_str();
 
-    auto rc = lance_dataset_create_index(dataset, name_ptr, &column_ptr, 1,
-                                         index_type.c_str(), params_ptr,
-                                         replace ? 1 : 0, train ? 1 : 0);
+    int32_t rc;
+    {
+      LanceInterruptScope interrupt_scope(client_context);
+      rc = lance_dataset_create_index(dataset, name_ptr, &column_ptr, 1,
+                                      index_type.c_str(), params_ptr,
+                                      replace ? 1 : 0, train ? 1 : 0);
+    }
     lance_close_dataset(dataset);
     if (rc != 0) {
+      client_context.BlockingInterruptCheck();
       throw IOException("Failed to create Lance index" +
                         LanceFormatErrorSuffix());
     }

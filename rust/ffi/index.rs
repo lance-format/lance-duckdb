@@ -921,10 +921,14 @@ where
     T: Send + 'static,
 {
     const STACK_SIZE: usize = 32 * 1024 * 1024;
+    let hook = runtime::interrupt_hook();
     let handle = std::thread::Builder::new()
         .name("lance_duckdb_index".to_string())
         .stack_size(STACK_SIZE)
-        .spawn(f)
+        .spawn(move || {
+            runtime::set_interrupt_hook(hook);
+            f()
+        })
         .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("spawn: {err}")))?;
     handle
         .join()

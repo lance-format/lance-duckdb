@@ -6,6 +6,7 @@ mod delete;
 mod dir_namespace;
 mod exec;
 mod index;
+mod interrupt;
 mod knn;
 mod memory_pool;
 mod merge;

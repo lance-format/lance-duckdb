@@ -207,6 +207,10 @@ int32_t lance_dataset_update_field_metadata(void *dataset,
                                             const char *field_path,
                                             const char *key, const char *value);
 
+// Lance calls made on this thread fail once check(ctx) returns non-zero. A NULL
+// check clears the hook.
+void lance_set_interrupt_check(int32_t (*check)(void *ctx), void *ctx);
+
 int32_t lance_dataset_compact_files(void *dataset);
 int32_t lance_dataset_compact_files_with_options(void *dataset,
                                                  const char *options_json,

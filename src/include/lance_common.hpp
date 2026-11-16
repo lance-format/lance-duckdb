@@ -11,6 +11,17 @@ string LanceConsumeLastError();
 string LanceFormatErrorSuffix();
 vector<string> LanceConsumeStringList(LanceStringList &list);
 
+// While alive, Lance calls on this thread fail once the query is interrupted.
+// Call context.BlockingInterruptCheck() after such a failure to raise DuckDB's
+// InterruptException instead of a Lance error.
+class LanceInterruptScope {
+public:
+  explicit LanceInterruptScope(ClientContext &context);
+  ~LanceInterruptScope();
+  LanceInterruptScope(const LanceInterruptScope &) = delete;
+  LanceInterruptScope &operator=(const LanceInterruptScope &) = delete;
+};
+
 bool IsComputedSearchColumn(const string &name);
 
 void ApplyDuckDBFilters(ClientContext &context, TableFilterSet &filters,

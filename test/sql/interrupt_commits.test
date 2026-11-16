@@ -1,0 +1,45 @@
+# name: test/sql/interrupt_commits.test
+# description: An interrupted query must not let CREATE INDEX or OPTIMIZE commit to the dataset
+# group: [sql]
+
+require lance
+
+# 1000 tiny fragments, so both statements below run well past the 50 ms
+# interrupt poll interval.
+statement ok
+COPY (SELECT range AS id FROM range(100000))
+TO '{TEST_DIR}/interrupt_commits.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 100);
+
+# max_execution_time is in milliseconds. Its deadline must stop the Lance call
+# itself, not only be noticed after the call has committed.
+statement ok
+SET max_execution_time = 1;
+
+statement error
+CREATE INDEX interrupt_idx ON '{TEST_DIR}/interrupt_commits.lance' (id) USING BTREE;
+----
+Query exceeded maximum execution time
+
+statement error
+OPTIMIZE '{TEST_DIR}/interrupt_commits.lance';
+----
+Query exceeded maximum execution time
+
+statement ok
+SET max_execution_time = 0;
+
+# Neither interrupted statement committed: there is no index to drop ...
+statement error
+DROP INDEX interrupt_idx ON '{TEST_DIR}/interrupt_commits.lance';
+----
+
+# ... and all 1000 fragments are still there for the next OPTIMIZE to compact.
+query TTT
+OPTIMIZE '{TEST_DIR}/interrupt_commits.lance' WITH (target_rows_per_fragment = 10000000);
+----
+compact	{TEST_DIR}/interrupt_commits.lance	<REGEX>:.*"fragments_removed":1000.*
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/interrupt_commits.lance';
+----
+100000
