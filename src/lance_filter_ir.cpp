@@ -555,8 +555,8 @@ static bool TryBuildLanceTableFilterIRExpr(const vector<string> &column_refs,
         // Only a plain column IN list: anything else (a cast of the column, a
         // min/max range, a dynamic TopN bound) is left to DuckDB.
         string hint_ir;
-        if (hint && hint->GetExpressionClass() ==
-                        ExpressionClass::BOUND_OPERATOR &&
+        if (hint &&
+            hint->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
             hint->GetExpressionType() == ExpressionType::COMPARE_IN) {
           auto &in_expr = hint->Cast<BoundOperatorExpression>();
           if (!in_expr.GetChildren().empty() && in_expr.GetChildren()[0] &&
@@ -714,9 +714,9 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     }
     string filter_ir;
     bool skipped_optional = false;
-    if (!supported || !TryBuildLanceTableFilterIRExpr(
-                          column_refs, *filter, false, filter_ir,
-                          skipped_optional)) {
+    if (!supported ||
+        !TryBuildLanceTableFilterIRExpr(column_refs, *filter, false, filter_ir,
+                                        skipped_optional)) {
       result.all_filters_pushed = false;
       if (!computed) {
         result.all_prefilterable_filters_pushed = false;
