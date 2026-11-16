@@ -9,9 +9,9 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parallel/pipeline.hpp"
@@ -536,8 +536,21 @@ static bool TryLanceExplainDatasetScan(void *dataset,
   return true;
 }
 
+// Slices are only worth their per-stream setup cost when they hold a few
+// DuckDB row groups; two per thread keeps threads busy despite uneven decode.
+static constexpr uint64_t LANCE_MIN_SLICE_ROWS = 131072;
+static constexpr uint64_t LANCE_SLICES_PER_THREAD = 2;
+
+struct LanceScanMorsel {
+  uint64_t fragment_id = 0;
+  // Physical rows [slice_offset, slice_offset + slice_rows) of the fragment.
+  // A negative slice_rows scans the whole fragment.
+  int64_t slice_offset = 0;
+  int64_t slice_rows = -1;
+};
+
 struct LanceScanGlobalState : public GlobalTableFunctionState {
-  std::atomic<idx_t> next_fragment_idx{0};
+  std::atomic<idx_t> next_morsel_idx{0};
   std::atomic<idx_t> lines_read{0};
   std::atomic<idx_t> record_batches{0};
   std::atomic<idx_t> record_batch_rows{0};
@@ -571,8 +584,11 @@ struct LanceScanGlobalState : public GlobalTableFunctionState {
   idx_t pushed_offset = 0;
 
   vector<uint64_t> take_row_ids;
-  vector<uint64_t> fragment_ids;
-  vector<idx_t> fragment_batch_offsets;
+  // Scan tasks. A task is a whole fragment or, when there are fewer fragments
+  // than scan threads, a slice of one so that every thread has work.
+  vector<LanceScanMorsel> morsels;
+  vector<idx_t> morsel_batch_offsets;
+  idx_t fragment_count = 0;
   idx_t max_threads = 1;
 
   vector<idx_t> projection_ids;
@@ -634,7 +650,7 @@ struct LanceScanLocalState : public ArrowScanLocalState {
   shared_ptr<ArrowArrayWrapper> deferred_arrow_owner;
   void *stream = nullptr;
   LanceScanGlobalState *global_state = nullptr;
-  idx_t fragment_pos = 0;
+  idx_t morsel_pos = 0;
   idx_t next_batch_index = 0;
   idx_t rows_scanned = 0;
   bool scan_in_order = false;
@@ -1915,33 +1931,66 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   };
   std::unique_ptr<LanceFragmentStats, decltype(free_fragments)> fragments(
       fragments_ptr, free_fragments);
-  scan_state.fragment_ids.reserve(fragment_count);
-  scan_state.fragment_batch_offsets.reserve(fragment_count + 1);
-  scan_state.fragment_batch_offsets.push_back(0);
+  scan_state.fragment_count = fragment_count;
+  auto threads = context.db->NumberOfThreads();
+
+  // A fragment is one scan task, so fewer fragments than threads leaves threads
+  // idle. Split fragments into physical row slices to give every thread work;
+  // with enough fragments the scan keeps one task per fragment.
+  uint64_t slice_rows = 0;
+  if (fragment_count < threads) {
+    uint64_t total_rows = 0;
+    for (idx_t i = 0; i < fragment_count; i++) {
+      if (fragments_ptr[i].physical_rows > 0) {
+        total_rows += uint64_t(fragments_ptr[i].physical_rows);
+      }
+    }
+    auto target_tasks = uint64_t(threads) * LANCE_SLICES_PER_THREAD;
+    slice_rows = MaxValue<uint64_t>(
+        LANCE_MIN_SLICE_ROWS, (total_rows + target_tasks - 1) / target_tasks);
+  }
+
+  scan_state.morsels.reserve(fragment_count);
+  scan_state.morsel_batch_offsets.reserve(fragment_count + 1);
+  scan_state.morsel_batch_offsets.push_back(0);
   idx_t batch_end = 0;
   bool known_row_counts = true;
-  for (idx_t fragment_idx = 0; fragment_idx < fragment_count; fragment_idx++) {
-    const auto &fragment = fragments_ptr[fragment_idx];
-    scan_state.fragment_ids.push_back(fragment.fragment_id);
-    // Each nonempty output chunk consumes one ID, so the undeleted row count
-    // bounds a fragment's ID range even after filter pushdown.
-    if (fragment.num_rows < 0 ||
-        uint64_t(fragment.num_rows) >=
+  // Each nonempty output chunk consumes one ID, so the row count of a task
+  // bounds its ID range even after filter pushdown.
+  auto add_morsel = [&](uint64_t fragment_id, int64_t slice_offset,
+                        int64_t task_slice_rows, int64_t reserved_rows) {
+    scan_state.morsels.push_back({fragment_id, slice_offset, task_slice_rows});
+    if (reserved_rows < 0 ||
+        uint64_t(reserved_rows) >=
             PipelineBuildState::BATCH_INCREMENT - 2 - batch_end) {
       known_row_counts = false;
     } else if (known_row_counts) {
-      batch_end += NumericCast<idx_t>(fragment.num_rows);
+      batch_end += NumericCast<idx_t>(reserved_rows);
     }
-    scan_state.fragment_batch_offsets.push_back(batch_end);
+    scan_state.morsel_batch_offsets.push_back(batch_end);
+  };
+  for (idx_t fragment_idx = 0; fragment_idx < fragment_count; fragment_idx++) {
+    const auto &fragment = fragments_ptr[fragment_idx];
+    if (slice_rows == 0 || fragment.physical_rows <= 0 ||
+        uint64_t(fragment.physical_rows) <= slice_rows) {
+      // The undeleted row count bounds the fragment's ID range.
+      add_morsel(fragment.fragment_id, 0, -1, fragment.num_rows);
+      continue;
+    }
+    auto physical_rows = uint64_t(fragment.physical_rows);
+    for (uint64_t offset = 0; offset < physical_rows; offset += slice_rows) {
+      auto rows = MinValue<uint64_t>(slice_rows, physical_rows - offset);
+      add_morsel(fragment.fragment_id, int64_t(offset), int64_t(rows),
+                 int64_t(rows));
+    }
   }
 
-  auto threads = context.db->NumberOfThreads();
-  scan_state.max_threads = MaxValue<idx_t>(
-      1, MinValue<idx_t>(threads, scan_state.fragment_ids.size()));
+  scan_state.max_threads =
+      MaxValue<idx_t>(1, MinValue<idx_t>(threads, scan_state.morsels.size()));
   if (!known_row_counts) {
     // Legacy metadata cannot reserve disjoint ranges safely. Keep one producer
     // with sequential chunk IDs rather than guessing a fragment's size.
-    scan_state.fragment_batch_offsets.clear();
+    scan_state.morsel_batch_offsets.clear();
     scan_state.max_threads = 1;
   }
 
@@ -1987,12 +2036,12 @@ LanceScanLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
     return nullptr;
   }
   if (!scan_global.count_only && !scan_global.use_dataset_scanner) {
-    auto fragment_pos = scan_global.next_fragment_idx.fetch_add(1);
-    if (fragment_pos >= scan_global.fragment_ids.size()) {
+    auto morsel_pos = scan_global.next_morsel_idx.fetch_add(1);
+    if (morsel_pos >= scan_global.morsels.size()) {
       scan_global.stop_new_workers = true;
       return nullptr;
     }
-    result->fragment_pos = fragment_pos;
+    result->morsel_pos = morsel_pos;
   }
   scan_global.active_workers++;
   scan_global.had_active_worker = true;
@@ -2099,21 +2148,23 @@ static bool LanceScanOpenStream(ClientContext &context,
           offset_i64, local_state.scan_in_order ? 1 : 0);
     }
   } else {
-    if (local_state.fragment_pos >= global_state.fragment_ids.size()) {
+    if (local_state.morsel_pos >= global_state.morsels.size()) {
       return false;
     }
-    auto fragment_id = global_state.fragment_ids[local_state.fragment_pos];
+    const auto &morsel = global_state.morsels[local_state.morsel_pos];
 
     stream = lance_create_fragment_stream_ir(
-        dataset, fragment_id, columns.data(), columns.size(), filter_ir,
-        filter_ir_len, local_state.scan_in_order ? 1 : 0);
+        dataset, morsel.fragment_id, morsel.slice_offset, morsel.slice_rows,
+        columns.data(), columns.size(), filter_ir, filter_ir_len,
+        local_state.scan_in_order ? 1 : 0);
     if (!stream && filter_ir) {
       // Best-effort: if filter pushdown failed, retry without it and rely on
       // DuckDB-side filter execution for correctness.
       global_state.filter_pushdown_fallbacks.fetch_add(1);
       local_state.filter_pushed_down = false;
       stream = lance_create_fragment_stream_ir(
-          dataset, fragment_id, columns.data(), columns.size(), nullptr, 0,
+          dataset, morsel.fragment_id, morsel.slice_offset, morsel.slice_rows,
+          columns.data(), columns.size(), nullptr, 0,
           local_state.scan_in_order ? 1 : 0);
     }
   }
@@ -2312,10 +2363,9 @@ static void LanceFillDeferredColumns(ClientContext &context,
 static void LanceScanSetBatchIndex(const LanceScanGlobalState &global_state,
                                    LanceScanLocalState &local_state) {
   auto batch_index = local_state.next_batch_index++;
-  if (!global_state.fragment_batch_offsets.empty()) {
-    auto start = global_state.fragment_batch_offsets[local_state.fragment_pos];
-    auto end =
-        global_state.fragment_batch_offsets[local_state.fragment_pos + 1];
+  if (!global_state.morsel_batch_offsets.empty()) {
+    auto start = global_state.morsel_batch_offsets[local_state.morsel_pos];
+    auto end = global_state.morsel_batch_offsets[local_state.morsel_pos + 1];
     if (batch_index >= end - start) {
       throw IOException(
           "Lance fragment emitted more batches than its row count");
@@ -2376,8 +2426,8 @@ static void LanceScanFunc(ClientContext &context, TableFunctionInput &data,
           return;
         }
         // Stream finished, try next fragment.
-        local_state.fragment_pos = global_state.next_fragment_idx.fetch_add(1);
-        if (!global_state.fragment_batch_offsets.empty()) {
+        local_state.morsel_pos = global_state.next_morsel_idx.fetch_add(1);
+        if (!global_state.morsel_batch_offsets.empty()) {
           local_state.next_batch_index = 0;
         }
         continue;
@@ -2618,7 +2668,8 @@ static void LanceScanGetMetrics(TableFunctionGetMetricsInput &input) {
                               ? to_string(global_state.pushed_limit.GetIndex())
                               : "none";
   result["Lance Offset"] = to_string(global_state.pushed_offset);
-  result["Lance Fragments"] = to_string(global_state.fragment_ids.size());
+  result["Lance Fragments"] = to_string(global_state.fragment_count);
+  result["Lance Scan Tasks"] = to_string(global_state.morsels.size());
   result["Lance Max Threads"] = to_string(global_state.max_threads);
   result["Lance Streams Opened"] =
       to_string(global_state.streams_opened.load());

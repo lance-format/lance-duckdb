@@ -11,6 +11,7 @@ use super::util::{
     optional_cstr_array, parse_optional_filter_ir, to_c_string, u64_to_usize, FfiError, FfiResult,
 };
 
+use lance::dataset::scanner::FragmentSlice;
 use lance::dataset::ProjectionRequest;
 use rand::rngs::StdRng;
 use rand::seq::index::sample;
@@ -20,6 +21,8 @@ use rand::SeedableRng;
 pub unsafe extern "C" fn lance_create_fragment_stream_ir(
     dataset: *mut c_void,
     fragment_id: u64,
+    slice_offset: i64,
+    slice_rows: i64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -29,6 +32,8 @@ pub unsafe extern "C" fn lance_create_fragment_stream_ir(
     match create_fragment_stream_ir_inner(
         dataset,
         fragment_id,
+        slice_offset,
+        slice_rows,
         columns,
         columns_len,
         filter_ir,
@@ -46,9 +51,12 @@ pub unsafe extern "C" fn lance_create_fragment_stream_ir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_fragment_stream_ir_inner(
     dataset: *mut c_void,
     fragment_id: u64,
+    slice_offset: i64,
+    slice_rows: i64,
     columns: *const *const c_char,
     columns_len: usize,
     filter_ir: *const u8,
@@ -70,6 +78,29 @@ fn create_fragment_stream_ir_inner(
 
     let mut scan = fragment.scan();
     scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
+
+    if slice_rows >= 0 {
+        let slice = FragmentSlice {
+            fragment_id: u32::try_from(fragment_id).map_err(|_| {
+                FfiError::new(
+                    ErrorCode::FragmentScan,
+                    format!("fragment_id {fragment_id} does not fit in u32"),
+                )
+            })?,
+            row_offset: u64::try_from(slice_offset).map_err(|_| {
+                FfiError::new(ErrorCode::FragmentScan, "slice_offset must be non-negative")
+            })?,
+            row_count: slice_rows as u64,
+        };
+        runtime::block_on(scan.with_fragment_slices(&[slice]))
+            .map_err(|err| FfiError::new(ErrorCode::FragmentScan, format!("runtime: {err}")))?
+            .map_err(|err| {
+                FfiError::new(
+                    ErrorCode::FragmentScan,
+                    format!("fragment scan slice: {err}"),
+                )
+            })?;
+    }
 
     let projection = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     if !projection.is_empty() {
@@ -400,5 +431,72 @@ fn explain_dataset_scan_ir_inner(
             format!("dataset scan explain_plan: {err}"),
         )),
         Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Array, Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use lance::dataset::WriteParams;
+    use lance::Dataset;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::ffi::types::DatasetHandle;
+
+    fn ids(handle: *mut c_void, fragment_id: u64, offset: i64, rows: i64) -> Vec<i64> {
+        let mut stream = create_fragment_stream_ir_inner(
+            handle,
+            fragment_id,
+            offset,
+            rows,
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            true,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next_batch().unwrap() {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            out.extend(col.iter().flatten());
+        }
+        out
+    }
+
+    #[test]
+    fn fragment_slice_uses_physical_offsets_and_skips_deleted_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from((0..10_i64).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = runtime::block_on(Dataset::write(
+            batches,
+            "memory://fragment-slice-physical",
+            Some(WriteParams::default()),
+        ))
+        .unwrap()
+        .unwrap();
+        runtime::block_on(dataset.delete("id IN (2, 3, 7)"))
+            .unwrap()
+            .unwrap();
+
+        let mut handle = Box::new(DatasetHandle::new(Arc::new(dataset)));
+        let ptr = handle.as_mut() as *mut DatasetHandle as *mut c_void;
+
+        // Deleted rows keep their physical slots, so [0, 4) holds only 0 and 1.
+        assert_eq!(ids(ptr, 0, 0, 4), vec![0, 1]);
+        assert_eq!(ids(ptr, 0, 4, 3), vec![4, 5, 6]);
+        assert_eq!(ids(ptr, 0, 7, 3), vec![8, 9]);
+        // A negative row count scans the whole fragment.
+        assert_eq!(ids(ptr, 0, 0, -1), vec![0, 1, 4, 5, 6, 8, 9]);
     }
 }

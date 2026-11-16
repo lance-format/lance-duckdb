@@ -1,0 +1,114 @@
+# name: test/sql/scan_fragment_slices.test
+# description: A scan with fewer fragments than threads splits them into row slices without changing rows, order or deletions
+# group: [sql]
+
+require lance
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE slice_reference AS
+SELECT i::BIGINT AS id,
+       CASE WHEN i % 17 = 0 THEN NULL ELSE 'row-' || i::VARCHAR END AS label,
+       {'value': i * 3, 'items': [i, NULL, i + 1]} AS payload
+FROM range(1000000) r(i);
+
+foreach stable false true
+
+# One fragment of 1M rows.
+statement ok
+COPY slice_reference TO '{TEST_DIR}/slice_{stable}/t.lance'
+  (FORMAT lance, max_rows_per_file 2000000, enable_stable_row_ids {stable});
+
+statement ok
+SET threads = 4;
+
+# 1M rows / (4 threads * 2 slices) is below the 131072-row minimum, so the
+# fragment is split into ceil(1M / 131072) = 8 scan tasks.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/slice_{stable}/t.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "1"[\s\S]*"Lance Scan Tasks": "8"[\s\S]*"Lance Max Threads": "4"[\s\S]*
+
+# Slices must stay in source order for ordered sinks.
+statement ok
+CREATE TABLE slice_actual AS SELECT * FROM '{TEST_DIR}/slice_{stable}/t.lance';
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload)
+FROM slice_actual a FULL JOIN slice_reference e ON a.rowid = e.rowid;
+----
+1000000	0
+
+# Each slice reports the row ids of its own rows.
+query I
+SELECT count(*) FROM '{TEST_DIR}/slice_{stable}/t.lance' WHERE _rowid IS DISTINCT FROM id;
+----
+0
+
+# Pushed-down filters apply inside every slice.
+query I
+SELECT (SELECT (count(*), sum(id)) FROM '{TEST_DIR}/slice_{stable}/t.lance' WHERE id >= 150000 AND id < 850000 AND id % 3 = 0)
+     = (SELECT (count(*), sum(id)) FROM slice_reference WHERE id >= 150000 AND id < 850000 AND id % 3 = 0);
+----
+true
+
+# Deletions keep physical offsets, so slices must not shift or drop rows.
+statement ok
+ATTACH '{TEST_DIR}/slice_{stable}' AS slice_ns (TYPE LANCE);
+
+statement ok
+DELETE FROM slice_ns.main.t WHERE id % 5 = 0 OR id BETWEEN 400000 AND 600000;
+
+query I
+SELECT (SELECT (count(*), sum(id)) FROM slice_ns.main.t)
+     = (SELECT (count(*), sum(id)) FROM slice_reference WHERE NOT (id % 5 = 0 OR id BETWEEN 400000 AND 600000));
+----
+true
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM slice_ns.main.t;
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Scan Tasks": "8"[\s\S]*
+
+statement ok
+CREATE TABLE slice_deleted AS SELECT * FROM slice_ns.main.t;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a.id IS DISTINCT FROM e.id OR a.label IS DISTINCT FROM e.label OR a.payload IS DISTINCT FROM e.payload)
+FROM slice_deleted a FULL JOIN (SELECT row_number() OVER (ORDER BY id) - 1 AS rn, * FROM slice_reference WHERE NOT (id % 5 = 0 OR id BETWEEN 400000 AND 600000)) e ON a.rowid = e.rn;
+----
+640000	0
+
+statement ok
+DETACH slice_ns;
+
+statement ok
+DROP TABLE slice_actual;
+
+statement ok
+DROP TABLE slice_deleted;
+
+endloop
+
+# With at least as many fragments as threads the scan keeps one task per fragment.
+statement ok
+COPY slice_reference TO '{TEST_DIR}/slice_many/t.lance' (FORMAT lance, max_rows_per_file 250000);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/slice_many/t.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "4"[\s\S]*"Lance Scan Tasks": "4"[\s\S]*
+
+# A fragment that fits in one slice is not split.
+statement ok
+COPY (SELECT * FROM slice_reference LIMIT 100000) TO '{TEST_DIR}/slice_small/t.lance' (FORMAT lance);
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM '{TEST_DIR}/slice_small/t.lance';
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Fragments": "1"[\s\S]*"Lance Scan Tasks": "1"[\s\S]*
