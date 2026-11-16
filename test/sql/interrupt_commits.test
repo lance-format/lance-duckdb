@@ -4,8 +4,9 @@
 
 require lance
 
-# 1000 tiny fragments, so both statements below run well past the 50 ms
-# interrupt poll interval.
+# 1000 tiny fragments give CREATE INDEX and OPTIMIZE asynchronous work to do
+# after the deadline. Interrupt checks must also run when that work wakes up,
+# even if it completes within the 50 ms idle interrupt poll interval.
 statement ok
 COPY (SELECT range AS id FROM range(100000))
 TO '{TEST_DIR}/interrupt_commits.lance' (FORMAT lance, mode 'overwrite', max_rows_per_file 100);
