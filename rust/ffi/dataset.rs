@@ -25,12 +25,18 @@ pub struct LanceFieldStats {
     pub bytes_on_disk: u64,
 }
 
+/// Manifest string of the legacy (V1) data storage format.
+const LEGACY_FILE_FORMAT_VERSION: &str = "0.1";
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LanceFragmentStats {
     pub fragment_id: u64,
     /// Number of rows in the fragment. `-1` means unknown.
     pub num_rows: i64,
+    /// Physical row slots, deleted rows included. `-1` means unknown or that the
+    /// dataset's storage format cannot scan a fragment in physical slices.
+    pub physical_rows: i64,
     /// Sum of known data file sizes in bytes. Missing/unknown sizes are treated as 0.
     pub bytes_on_disk: u64,
 }
@@ -574,6 +580,15 @@ fn dataset_list_fragment_stats_inner(
     }
     let handle = unsafe { super::util::dataset_handle(dataset)? };
 
+    // Lance rejects physical slices on legacy (V1) storage.
+    let sliceable = handle
+        .dataset
+        .manifest
+        .data_storage_format
+        .lance_file_format()
+        .to_manifest_string()
+        != LEGACY_FILE_FORMAT_VERSION;
+
     let mut out: Vec<LanceFragmentStats> = Vec::with_capacity(handle.dataset.fragments().len());
     for frag in handle.dataset.fragments().iter() {
         let mut bytes_on_disk = 0u64;
@@ -586,9 +601,14 @@ fn dataset_list_fragment_stats_inner(
             Some(v) => i64::try_from(v).unwrap_or(-1),
             None => -1,
         };
+        let physical_rows = match frag.physical_rows {
+            Some(v) if sliceable => i64::try_from(v).unwrap_or(-1),
+            _ => -1,
+        };
         out.push(LanceFragmentStats {
             fragment_id: frag.id,
             num_rows,
+            physical_rows,
             bytes_on_disk,
         });
     }

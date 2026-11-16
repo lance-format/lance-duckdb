@@ -238,6 +238,9 @@ typedef struct LanceFieldStats {
 typedef struct LanceFragmentStats {
   uint64_t fragment_id;
   int64_t num_rows;
+  // Physical row slots, deleted rows included; -1 when unknown or when the
+  // dataset cannot be scanned in physical slices.
+  int64_t physical_rows;
   uint64_t bytes_on_disk;
 } LanceFragmentStats;
 
@@ -256,7 +259,10 @@ typedef struct LanceNamedFieldStats {
 LanceNamedFieldStats *lance_dataset_list_named_field_stats(void *dataset,
                                                            size_t *out_len);
 void lance_free_named_field_stats_list(LanceNamedFieldStats *ptr, size_t len);
+// `slice_rows` < 0 scans the whole fragment; otherwise only the physical rows
+// [slice_offset, slice_offset + slice_rows) of it.
 void *lance_create_fragment_stream_ir(void *dataset, uint64_t fragment_id,
+                                      int64_t slice_offset, int64_t slice_rows,
                                       const char **columns, size_t columns_len,
                                       const uint8_t *filter_ir,
                                       size_t filter_ir_len,
