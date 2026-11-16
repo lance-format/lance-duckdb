@@ -51,6 +51,25 @@ string LanceFormatErrorSuffix() {
   return " (Lance error: " + err + ")";
 }
 
+static int32_t LanceIsInterrupted(void *context) {
+  // Also covers `max_execution_time`. The hook is called from Rust and must
+  // not let an exception cross the FFI boundary.
+  try {
+    static_cast<ClientContext *>(context)->BlockingInterruptCheck();
+  } catch (const InterruptException &) {
+    return 1;
+  }
+  return 0;
+}
+
+LanceInterruptScope::LanceInterruptScope(ClientContext &context) {
+  lance_set_interrupt_check(LanceIsInterrupted, &context);
+}
+
+LanceInterruptScope::~LanceInterruptScope() {
+  lance_set_interrupt_check(nullptr, nullptr);
+}
+
 vector<string> LanceConsumeStringList(LanceStringList &list) {
   std::unique_ptr<LanceStringList, decltype(&lance_free_string_list)> owner(
       &list, lance_free_string_list);

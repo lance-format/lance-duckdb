@@ -209,6 +209,7 @@ static void LanceMaintenanceFunc(ClientContext &context,
   int32_t rc = -1;
   const char *metrics_ptr = nullptr;
   string op_name;
+  LanceInterruptScope interrupt_scope(context);
   switch (bind_data.op) {
   case LanceMaintenanceOp::COMPACT:
     rc = lance_dataset_compact_files_with_options(dataset, options_ptr,
@@ -235,6 +236,7 @@ static void LanceMaintenanceFunc(ClientContext &context,
   lance_close_dataset(dataset);
 
   if (rc != 0) {
+    context.BlockingInterruptCheck();
     throw IOException("Failed to execute Lance maintenance operation '" +
                       op_name + "' on dataset: " + display_uri +
                       LanceFormatErrorSuffix());
