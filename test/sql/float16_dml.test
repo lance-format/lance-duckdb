@@ -1,0 +1,140 @@
+# name: test/sql/float16_dml.test
+# description: UPDATE, MERGE and DELETE leave float16 columns unchanged; assigning one stays refused
+# group: [sql]
+
+require lance
+
+# Copy the fixture byte-for-byte into this test's private directory. A Lance
+# SQL round trip would store float32 and erase the condition under test.
+# Fixture: test/data/float16_fixture.lance, written by pylance with float16
+# scalar, fixed-size list, list, struct and list-of-struct columns beside the
+# BIGINT id.
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/float16_fixture.lance' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+foreach directory _versions _transactions data
+
+statement ok
+COPY (SELECT NULL::BLOB WHERE false)
+TO '{TEST_DIR}/float16_fixture.lance/{directory}' (FORMAT BLOB, PER_THREAD_OUTPUT true);
+
+endloop
+
+foreach file _transactions/0-c57b8664-2ed8-432b-a457-1998fc2bf1ed.txn _versions/18446744073709551614.manifest data/010111011101000100010111fe97224d3d8e6c6b859e1d31a1.lance
+
+statement ok
+COPY (SELECT content FROM read_blob('test/data/float16_fixture.lance/{file}'))
+TO '{TEST_DIR}/float16_fixture.lance/{file}' (FORMAT BLOB);
+
+endloop
+
+statement ok
+ATTACH '{TEST_DIR}' AS f16 (TYPE LANCE);
+
+# --- UPDATE of another column ----------------------------------------------
+
+query I
+UPDATE f16.main.float16_fixture SET id = id + 100 WHERE id = 0;
+----
+1
+
+query IRTTT
+SELECT id, half_scalar, half_vec, half_struct, half_in_list
+FROM f16.main.float16_fixture ORDER BY id;
+----
+1	-2.25	[-1.0, -2.0, -3.0]	{'half': -2.25, 'f32': 20.0}	[{'h': 2.0}, {'h': 3.0}]
+2	3.0	[10.0, 20.0, 30.0]	{'half': 3.0, 'f32': 30.0}	[]
+3	0.0	[0.125, 0.25, 0.5]	{'half': 0.0, 'f32': 40.0}	[{'h': 4.0}, {'h': 5.0}]
+4	65504.0	[100.0, 200.0, 300.0]	{'half': 65504.0, 'f32': 50.0}	[{'h': 6.0}]
+100	1.5	[0.5, 1.5, 2.5]	{'half': 1.5, 'f32': 10.0}	[{'h': 1.0}]
+
+# RETURNING reads the unchanged float16 columns like a SELECT does.
+query IRT
+UPDATE f16.main.float16_fixture SET id = id + 100 WHERE id = 1 RETURNING id, half_scalar, half_list;
+----
+101	-2.25	[3.0]
+
+# --- MERGE that leaves float16 columns alone -------------------------------
+
+query I
+MERGE INTO f16.main.float16_fixture t
+USING (SELECT 2 AS id) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET id = 102;
+----
+1
+
+query I
+MERGE INTO f16.main.float16_fixture t
+USING (SELECT 3 AS id) s ON t.id = s.id
+WHEN MATCHED THEN DELETE;
+----
+1
+
+query IRT
+SELECT id, half_scalar, half_vec FROM f16.main.float16_fixture ORDER BY id;
+----
+4	65504.0	[100.0, 200.0, 300.0]
+100	1.5	[0.5, 1.5, 2.5]
+101	-2.25	[-1.0, -2.0, -3.0]
+102	3.0	[10.0, 20.0, 30.0]
+
+# --- Writing a float16 column stays refused --------------------------------
+
+statement error
+UPDATE f16.main.float16_fixture SET half_scalar = 0 WHERE id = 4;
+----
+column(s) [half_scalar] have Arrow types DuckDB cannot represent
+
+statement error
+UPDATE f16.main.float16_fixture SET id = 5, half_vec = [1.0, 2.0, 3.0] WHERE id = 4;
+----
+column(s) [half_vec] have Arrow types DuckDB cannot represent
+
+statement error
+MERGE INTO f16.main.float16_fixture t
+USING (SELECT 4 AS id) s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET half_scalar = 0;
+----
+half_scalar
+
+statement error
+MERGE INTO f16.main.float16_fixture t
+USING (SELECT 9 AS id) s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id);
+----
+have Arrow types DuckDB cannot represent
+
+statement error
+INSERT INTO f16.main.float16_fixture (id) VALUES (9);
+----
+have Arrow types DuckDB cannot represent
+
+# Refused statements changed nothing.
+query I
+SELECT count(*) FROM f16.main.float16_fixture WHERE id IN (5, 9);
+----
+0
+
+# --- The columns are still stored as float16 -------------------------------
+
+# A fresh catalog reads the on-disk type again: the columns are still coerced,
+# so the earlier statements did not rewrite them as float32.
+statement ok
+DETACH f16;
+
+statement ok
+ATTACH '{TEST_DIR}' AS f16 (TYPE LANCE);
+
+statement error
+UPDATE f16.main.float16_fixture SET half_scalar = 0 WHERE id = 4;
+----
+column(s) [half_scalar] have Arrow types DuckDB cannot represent
+
+query IR
+SELECT id, half_scalar FROM f16.main.float16_fixture ORDER BY id;
+----
+4	65504.0
+100	1.5
+101	-2.25
+102	3.0

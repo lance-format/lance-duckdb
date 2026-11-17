@@ -598,6 +598,15 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 
+bool LanceTableEntry::IsCoercedColumn(const string &name) const {
+  for (const auto &coerced_column : coerced_column_names) {
+    if (StringUtil::CIEquals(coerced_column, name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool LanceTableEntry::IsJsonColumn(const string &name) const {
   for (const auto &json_column : json_column_names) {
     if (StringUtil::CIEquals(json_column, name)) {

@@ -27,8 +27,10 @@ LIMIT 10;
 ```
 
 Float16 columns are exposed as `FLOAT`, including values nested in arrays, lists,
-and structs. `INSERT`, `UPDATE`, and `MERGE` reject tables with coerced columns
-to avoid silently changing their on-disk types. For a scalar float16 column,
+and structs. To avoid silently changing their on-disk types, `INSERT` rejects
+tables with coerced columns, and `UPDATE` and `MERGE` reject statements that
+write one; `DELETE`, and `UPDATE` or `MERGE` of other columns, leave them
+unchanged. For a scalar float16 column,
 `ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT` explicitly migrates it to float32
 and makes it writable.
 
