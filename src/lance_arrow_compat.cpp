@@ -640,6 +640,11 @@ LogicalType UhugeintToHugeint(const LogicalType &type, bool &found) {
 } // namespace
 
 void LanceValidateUhugeintValues(ClientContext &context, DataChunk &chunk) {
+  // Lossless conversion exports UHUGEINT as fixed_size_binary(16), which keeps
+  // every value.
+  if (context.GetClientProperties().arrow_lossless_conversion) {
+    return;
+  }
   for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
     bool found = false;
     auto target = UhugeintToHugeint(chunk.data[col].GetType(), found);

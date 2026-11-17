@@ -71,3 +71,36 @@ query I
 SELECT u::VARCHAR FROM ns.main.ctas_ok;
 ----
 170141183460469231731687303715884105727
+
+# arrow_lossless_conversion exports UHUGEINT as fixed_size_binary(16), which keeps
+# every value, so the range check does not apply.
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 340282366920938463463374607431768211455::UHUGEINT AS u,
+             [340282366920938463463374607431768211455::UHUGEINT] AS l)
+TO '{TEST_DIR}/hugeint_ns/lossless_copy.lance' (FORMAT lance, mode 'overwrite');
+
+query III
+SELECT id, u::VARCHAR, l[1]::VARCHAR FROM '{TEST_DIR}/hugeint_ns/lossless_copy.lance';
+----
+1	340282366920938463463374607431768211455	340282366920938463463374607431768211455
+
+statement ok
+CREATE TABLE ns.main.lossless_ctas AS SELECT 340282366920938463463374607431768211455::UHUGEINT AS u;
+
+query I
+SELECT u::VARCHAR FROM ns.main.lossless_ctas;
+----
+340282366920938463463374607431768211455
+
+statement ok
+SET arrow_lossless_conversion = false;
+
+statement error
+COPY (SELECT 340282366920938463463374607431768211455::UHUGEINT AS u)
+TO '{TEST_DIR}/hugeint_ns/default_again.lance' (FORMAT lance, mode 'overwrite');
+----
+<REGEX>:.*HUGEINT maximum.*

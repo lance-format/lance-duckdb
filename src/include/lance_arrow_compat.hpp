@@ -99,7 +99,8 @@ void LanceNormalizeArrowListFieldNames(ArrowSchema *schema);
 // DuckDB exports UHUGEINT as a signed decimal128(38, 0), so a value above the
 // HUGEINT maximum (2^127 - 1) wraps negative on read. Refuse such a chunk
 // before it is exported instead of persisting a different number. Call it at
-// every DuckDB -> Lance write boundary.
+// every DuckDB -> Lance write boundary. Does nothing under
+// arrow_lossless_conversion, which keeps every value.
 void LanceValidateUhugeintValues(ClientContext &context, DataChunk &chunk);
 
 } // namespace duckdb
