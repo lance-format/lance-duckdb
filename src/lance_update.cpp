@@ -338,16 +338,6 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
     throw InternalException(
         "PlanLanceUpdateOverwrite called for non-Lance table");
   }
-  if (lance_table->HasCoercedColumns()) {
-    throw NotImplementedException(
-        "UPDATE on Lance table '" + lance_table->name +
-        "' is not supported: column(s) [" +
-        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
-        "] have Arrow types DuckDB cannot represent natively, so the "
-        "catalog exposes a coerced type. Writing in the coerced type would "
-        "silently change the on-disk storage.");
-  }
-
   if (op.expressions.size() != op.columns.size()) {
     throw InternalException(
         "Lance UPDATE has mismatched SET columns/expressions");
@@ -379,6 +369,15 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
       assigned_columns.push_back(op.columns[i].index);
     }
     auto &target_col = op.table.GetColumns().GetColumn(op.columns[i]);
+    if (lance_table->IsCoercedColumn(target_col.Name().GetIdentifierName())) {
+      throw NotImplementedException(
+          "UPDATE on Lance table '" + lance_table->name +
+          "' is not supported: column(s) [" +
+          target_col.Name().GetIdentifierName() +
+          "] have Arrow types DuckDB cannot represent natively, so the "
+          "catalog exposes a coerced type. Writing in the coerced type would "
+          "silently change the on-disk storage.");
+    }
     if (lance_table->IsJsonColumn(target_col.Name().GetIdentifierName())) {
       throw NotImplementedException(
           "UPDATE on Lance table '" + lance_table->name +

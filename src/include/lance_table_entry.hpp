@@ -148,9 +148,11 @@ public:
   // Top-level catalog columns whose declared type was coerced to a
   // DuckDB-compatible shape by the Arrow-compat reader-boundary layer
   // (e.g. FloatingPoint(HALF) → FloatingPoint(SINGLE)). Writers must refuse
-  // to operate on such columns — DuckDB would hand back values in the
-  // coerced type and silently widen / otherwise corrupt the on-disk storage.
+  // to write such columns — DuckDB would hand back values in the coerced type
+  // and silently widen / otherwise corrupt the on-disk storage. A statement
+  // that leaves them unchanged does not touch their storage.
   bool HasCoercedColumns() const { return !coerced_column_names.empty(); }
+  bool IsCoercedColumn(const string &name) const;
   const vector<string> &CoercedColumnNames() const {
     return coerced_column_names;
   }

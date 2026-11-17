@@ -874,15 +874,17 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
   if (!lance_table) {
     throw InternalException("PlanLanceMergeInto called for non-Lance table");
   }
-  if (lance_table->HasCoercedColumns()) {
-    throw NotImplementedException(
+  // The catalog exposes a coerced type for these columns, so writing them
+  // would silently change the on-disk storage. Only an action that writes one
+  // is refused; DELETE and an UPDATE of other columns leave it untouched.
+  const auto coerced_write_error = [&](const vector<string> &columns) {
+    return NotImplementedException(
         "MERGE INTO Lance table '" + lance_table->name +
-        "' is not supported: column(s) [" +
-        StringUtil::Join(lance_table->CoercedColumnNames(), ", ") +
+        "' is not supported: column(s) [" + StringUtil::Join(columns, ", ") +
         "] have Arrow types DuckDB cannot represent natively, so the "
         "catalog exposes a coerced type. Writing in the coerced type would "
         "silently change the on-disk storage.");
-  }
+  };
 
   if (op.children.empty() || !op.children[0]) {
     throw InternalException("Lance MERGE expects a child plan");
@@ -904,14 +906,23 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
 
       switch (bound_action->action_type) {
       case MergeActionType::MERGE_UPDATE: {
+        vector<string> updated_coerced_columns;
         vector<string> updated_json_columns;
         for (auto column_idx : bound_action->columns) {
           auto &target_column = op.table.GetColumns().GetColumn(column_idx);
+          if (lance_table->IsCoercedColumn(
+                  target_column.Name().GetIdentifierName())) {
+            updated_coerced_columns.push_back(
+                target_column.Name().GetIdentifierName());
+          }
           if (lance_table->IsJsonColumn(
                   target_column.Name().GetIdentifierName())) {
             updated_json_columns.push_back(
                 target_column.Name().GetIdentifierName());
           }
+        }
+        if (!updated_coerced_columns.empty()) {
+          throw coerced_write_error(updated_coerced_columns);
         }
         if (!updated_json_columns.empty()) {
           throw NotImplementedException(
@@ -931,6 +942,9 @@ PhysicalOperator &PlanLanceMergeInto(ClientContext &context,
         break;
       }
       case MergeActionType::MERGE_INSERT:
+        if (lance_table->HasCoercedColumns()) {
+          throw coerced_write_error(lance_table->CoercedColumnNames());
+        }
         if (lance_table->HasJsonColumns()) {
           throw NotImplementedException(
               "MERGE INTO Lance table '" + lance_table->name +
