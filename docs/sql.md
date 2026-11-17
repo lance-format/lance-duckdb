@@ -476,6 +476,30 @@ Set `lance_namespace_query_table = false` to have REST namespace scans open
 the underlying dataset directly as well, e.g. when the namespace server does
 not implement `query_table`.
 
+### Time travel
+
+Attached tables accept DuckDB's `AT` clause to read an earlier version of the
+dataset. `AT (VERSION => n)` reads Lance version `n`. `AT (TIMESTAMP => ts)`
+reads the newest version committed at or before `ts`, and fails if the first
+version is newer. The scan, projection, filter, and aggregate pushdown, and the
+column list all come from that version, so a later `ALTER TABLE` does not
+change the result.
+
+```sql
+SELECT * FROM ns.main.my_table AT (VERSION => 3);
+SELECT count(*) FROM ns.main.my_table AT (TIMESTAMP => TIMESTAMP '2026-01-01 00:00:00');
+
+-- Restore rows that were deleted since version 3
+INSERT INTO ns.main.my_table
+SELECT * FROM ns.main.my_table AT (VERSION => 3) WHERE id = 42;
+```
+
+Time travel is read-only: DuckDB does not accept `AT` on the target of
+`INSERT`, `UPDATE`, `DELETE`, or `MERGE`. `VERSION` and `TIMESTAMP` are the
+only units DuckDB's `AT` clause defines, so Lance tags and branches are not
+addressable yet. On REST namespaces, historical reads open the dataset directly
+rather than through `query_table`.
+
 ## Write datasets
 
 ### `COPY ... TO ... (FORMAT lance, ...)`

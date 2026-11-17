@@ -129,6 +129,13 @@ void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri);
 
+// Opens the table's dataset pinned to `version`. Null when it cannot be opened;
+// details via LanceFormatErrorSuffix().
+void *LanceOpenDatasetForTableAtVersion(ClientContext &context,
+                                        const LanceTableEntry &table,
+                                        uint64_t version,
+                                        string &out_display_uri);
+
 void ResolveLanceStorageOptionsForTable(ClientContext &context,
                                         const LanceTableEntry &table,
                                         string &out_open_path,

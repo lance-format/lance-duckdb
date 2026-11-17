@@ -587,13 +587,11 @@ void *LanceOpenDataset(ClientContext &context, const string &path) {
       });
 }
 
-void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
-                                const optional_idx &version) {
-  string open_path;
-  vector<string> option_keys;
-  vector<string> option_values;
-  ResolveLanceStorageOptions(context, path, open_path, option_keys,
-                             option_values);
+static void *OpenResolvedDatasetAtVersion(ClientContext &context,
+                                          const string &open_path,
+                                          const vector<string> &option_keys,
+                                          const vector<string> &option_values,
+                                          const optional_idx &version) {
   const uint8_t has_version = version.IsValid() ? 1 : 0;
   const uint64_t version_value =
       version.IsValid() ? NumericCast<uint64_t>(version.GetIndex()) : 0;
@@ -609,6 +607,17 @@ void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
             value_ptrs.empty() ? nullptr : value_ptrs.data(),
             option_keys.size(), session, has_version, version_value);
       });
+}
+
+void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
+                                const optional_idx &version) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptions(context, path, open_path, option_keys,
+                             option_values);
+  return OpenResolvedDatasetAtVersion(context, open_path, option_keys,
+                                      option_values, version);
 }
 
 static unordered_map<string, Value>
@@ -677,6 +686,20 @@ void *LanceOpenDatasetForTable(ClientContext &context,
     out_display_uri = cfg.endpoint + "/" + cfg.table_id;
   }
   return dataset;
+}
+
+void *LanceOpenDatasetForTableAtVersion(ClientContext &context,
+                                        const LanceTableEntry &table,
+                                        uint64_t version,
+                                        string &out_display_uri) {
+  string open_path;
+  vector<string> option_keys;
+  vector<string> option_values;
+  ResolveLanceStorageOptionsForTable(context, table, open_path, option_keys,
+                                     option_values, out_display_uri);
+  return OpenResolvedDatasetAtVersion(
+      context, open_path, option_keys, option_values,
+      optional_idx(NumericCast<idx_t>(version)));
 }
 
 void ResolveLanceStorageOptionsForTable(ClientContext &context,
