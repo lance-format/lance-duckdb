@@ -1891,6 +1891,7 @@ public:
           LanceCollectIngestSourceOptions(context.client, chunk,
                                           source_options);
 
+          LanceValidateUhugeintValues(context.client, chunk);
           ArrowArray array;
           memset(&array, 0, sizeof(array));
           ArrowConverter::ToArrowArray(chunk, &array, props,

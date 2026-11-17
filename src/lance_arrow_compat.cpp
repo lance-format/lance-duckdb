@@ -605,4 +605,59 @@ void LanceNormalizeArrowListFieldNames(ArrowSchema *schema) {
   }
 }
 
+namespace {
+
+// Maps every UHUGEINT in `type`, nested ones included, to the HUGEINT whose
+// bits DuckDB exports. `found` reports whether any was seen.
+LogicalType UhugeintToHugeint(const LogicalType &type, bool &found) {
+  switch (type.id()) {
+  case LogicalTypeId::UHUGEINT:
+    found = true;
+    return LogicalType::HUGEINT;
+  case LogicalTypeId::LIST:
+    return LogicalType::LIST(
+        UhugeintToHugeint(ListType::GetChildType(type), found));
+  case LogicalTypeId::ARRAY:
+    return LogicalType::ARRAY(
+        UhugeintToHugeint(ArrayType::GetChildType(type), found),
+        ArrayType::GetSize(type));
+  case LogicalTypeId::MAP:
+    return LogicalType::MAP(UhugeintToHugeint(MapType::KeyType(type), found),
+                            UhugeintToHugeint(MapType::ValueType(type), found));
+  case LogicalTypeId::STRUCT: {
+    child_list_t<LogicalType> children;
+    for (auto &child : StructType::GetChildTypes(type)) {
+      children.emplace_back(child.first,
+                            UhugeintToHugeint(child.second, found));
+    }
+    return LogicalType::STRUCT(std::move(children));
+  }
+  default:
+    return type;
+  }
+}
+
+} // namespace
+
+void LanceValidateUhugeintValues(ClientContext &context, DataChunk &chunk) {
+  for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+    bool found = false;
+    auto target = UhugeintToHugeint(chunk.data[col].GetType(), found);
+    if (!found) {
+      continue;
+    }
+    Vector decimals(target, chunk.size());
+    try {
+      VectorOperations::Cast(context, chunk.data[col], decimals, chunk.size());
+    } catch (std::exception &ex) {
+      ErrorData error(ex);
+      throw InvalidInputException(
+          "Lance stores UHUGEINT as a signed 128-bit decimal; column #%llu "
+          "holds a value above the HUGEINT maximum (%s). Cast the column to "
+          "VARCHAR or a narrower type.",
+          static_cast<unsigned long long>(col), error.RawMessage());
+    }
+  }
+}
+
 } // namespace duckdb

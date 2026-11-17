@@ -1,0 +1,73 @@
+# name: test/sql/write_lossless_types.test
+# description: HUGEINT and UHUGEINT round-trip exactly on write; values Lance cannot store are rejected, not corrupted
+# group: [sql]
+
+require lance
+
+# DuckDB exports UHUGEINT as a signed decimal128(38, 0). A value above 2^127 - 1
+# wrapped negative on read, so every write path must refuse it.
+
+statement ok
+ATTACH '{TEST_DIR}/hugeint_ns' AS ns (TYPE LANCE);
+
+# The HUGEINT range and the UHUGEINT values up to its maximum round-trip exactly.
+
+statement ok
+COPY (SELECT 1::BIGINT AS id, 170141183460469231731687303715884105727::UHUGEINT AS u,
+             -170141183460469231731687303715884105727::HUGEINT AS h)
+TO '{TEST_DIR}/hugeint_ns/ok.lance' (FORMAT lance, mode 'overwrite');
+
+query III
+SELECT id, u::VARCHAR, h::VARCHAR FROM ns.main.ok;
+----
+1	170141183460469231731687303715884105727	-170141183460469231731687303715884105727
+
+# COPY rejects UHUGEINT values above the HUGEINT maximum.
+
+statement error
+COPY (SELECT 1::BIGINT AS id, 170141183460469231731687303715884105728::UHUGEINT AS u)
+TO '{TEST_DIR}/hugeint_ns/bad_copy.lance' (FORMAT lance, mode 'overwrite');
+----
+<REGEX>:.*HUGEINT maximum.*
+
+statement error
+COPY (SELECT md5_number(i::VARCHAR) AS u FROM range(10) t(i))
+TO '{TEST_DIR}/hugeint_ns/bad_md5.lance' (FORMAT lance, mode 'overwrite');
+----
+<REGEX>:.*HUGEINT maximum.*
+
+# Nested values are checked too.
+
+statement error
+COPY (SELECT [340282366920938463463374607431768211455::UHUGEINT] AS l)
+TO '{TEST_DIR}/hugeint_ns/bad_list.lance' (FORMAT lance, mode 'overwrite');
+----
+<REGEX>:.*HUGEINT maximum.*
+
+statement error
+COPY (SELECT {'a': 340282366920938463463374607431768211455::UHUGEINT} AS s)
+TO '{TEST_DIR}/hugeint_ns/bad_struct.lance' (FORMAT lance, mode 'overwrite');
+----
+<REGEX>:.*HUGEINT maximum.*
+
+# A rejected write leaves no dataset behind.
+
+statement error
+SELECT * FROM '{TEST_DIR}/hugeint_ns/bad_copy.lance';
+----
+<REGEX>:.*(No such|not exist|Failed|Invalid|Cannot).*
+
+# CREATE TABLE AS goes through its own sink.
+
+statement error
+CREATE TABLE ns.main.ctas AS SELECT 340282366920938463463374607431768211455::UHUGEINT AS u;
+----
+<REGEX>:.*HUGEINT maximum.*
+
+statement ok
+CREATE TABLE ns.main.ctas_ok AS SELECT 170141183460469231731687303715884105727::UHUGEINT AS u;
+
+query I
+SELECT u::VARCHAR FROM ns.main.ctas_ok;
+----
+170141183460469231731687303715884105727
