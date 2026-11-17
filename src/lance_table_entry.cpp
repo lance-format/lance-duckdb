@@ -348,7 +348,7 @@ static uint64_t ResolveAtClauseVersion(ClientContext &context,
   }
   if (rc > 0) {
     throw BinderException(
-        "Lance table \"%s\" has no version at or before %s: its first version "
+        "Lance table %s has no version at or before %s: its first version "
         "is newer",
         table.name, value.ToString());
   }

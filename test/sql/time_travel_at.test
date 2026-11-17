@@ -173,7 +173,7 @@ requires a non-NULL value
 statement error
 SELECT * FROM ns.main.tt AT (TIMESTAMP => TIMESTAMP '2000-01-01')
 ----
-has no version at or before
+Lance table "tt" has no version at or before
 
 statement error
 SELECT * FROM ns.main.missing AT (VERSION => 1)
