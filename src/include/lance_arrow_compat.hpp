@@ -3,6 +3,7 @@
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include <string>
 #include <vector>
@@ -94,5 +95,11 @@ bool LanceArrowFieldContainsBlob(const ArrowSchema &field);
 // Call on the ROOT ArrowSchema before handing it to Lance. Names are rewritten
 // to static storage, so no allocation is added to the producer's lifetime.
 void LanceNormalizeArrowListFieldNames(ArrowSchema *schema);
+
+// DuckDB exports UHUGEINT as a signed decimal128(38, 0), so a value above the
+// HUGEINT maximum (2^127 - 1) wraps negative on read. Refuse such a chunk
+// before it is exported instead of persisting a different number. Call it at
+// every DuckDB -> Lance write boundary.
+void LanceValidateUhugeintValues(ClientContext &context, DataChunk &chunk);
 
 } // namespace duckdb

@@ -205,6 +205,7 @@ static void LanceWriteSink(ExecutionContext &context,
   LanceBatchSourceOptions source_options;
   LanceCollectIngestSourceOptions(context.client, input, source_options);
 
+  LanceValidateUhugeintValues(context.client, input);
   ArrowArray array;
   memset(&array, 0, sizeof(array));
   ArrowConverter::ToArrowArray(input, &array, props, extension_type_cast);
