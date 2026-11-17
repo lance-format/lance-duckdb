@@ -1,0 +1,43 @@
+# name: test/sql/exec_minmax_nan.test
+# description: Exec pushdown keeps DuckDB's NaN ordering in grouped min and max
+# group: [sql]
+
+require lance
+
+# Group 2 holds NaN at id 5. DuckDB orders NaN after every other value, so its
+# max is NaN and its min is 2; DataFusion's grouped accumulator would return
+# the min/max of the values that follow the NaN.
+statement ok
+COPY (
+  SELECT
+    i::BIGINT AS id,
+    (i % 3)::BIGINT AS g,
+    CASE WHEN i = 5 THEN 'NaN'::DOUBLE ELSE i::DOUBLE END AS d,
+    CASE WHEN i = 5 THEN 'NaN'::FLOAT ELSE i::FLOAT END AS f
+  FROM range(30) t(i)
+) TO '{TEST_DIR}/exec_minmax_nan.lance' (FORMAT lance, mode 'overwrite');
+
+query IRR
+SELECT g, min(d), max(d) FROM '{TEST_DIR}/exec_minmax_nan.lance' GROUP BY g ORDER BY g;
+----
+0	0.0	27.0
+1	1.0	28.0
+2	2.0	nan
+
+query IRR
+SELECT g, min(f), max(f) FROM '{TEST_DIR}/exec_minmax_nan.lance' GROUP BY g ORDER BY g;
+----
+0	0.0	27.0
+1	1.0	28.0
+2	2.0	nan
+
+query RR
+SELECT min(d), max(d) FROM '{TEST_DIR}/exec_minmax_nan.lance';
+----
+0.0	nan
+
+# Integer min and max stay pushed down.
+query II
+EXPLAIN (FORMAT JSON) SELECT g, min(id), max(id) FROM '{TEST_DIR}/exec_minmax_nan.lance' GROUP BY g;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*

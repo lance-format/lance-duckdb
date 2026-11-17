@@ -897,6 +897,18 @@ bool TryEncodeLanceExecIRv1(
       return false;
     }
 
+    // DataFusion's grouped MIN/MAX of a DOUBLE replaces the state on every
+    // NaN comparison, where DuckDB orders NaN after every other value.
+    if ((func == ExecIrAggFunc::MIN || func == ExecIrAggFunc::MAX) &&
+        !groups.empty() && arg_expr &&
+        arg_expr->GetReturnType().id() == LogicalTypeId::DOUBLE) {
+      if (ExecIrFailfast()) {
+        throw IOException("ExecIR grouped min/max of DOUBLE not supported: " +
+                          arg_expr->ToString());
+      }
+      return false;
+    }
+
     EncodedAgg enc;
     enc.func = func;
     enc.output_name = expr->GetName().GetIdentifierName();
