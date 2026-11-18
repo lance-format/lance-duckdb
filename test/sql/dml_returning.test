@@ -209,8 +209,9 @@ SELECT count(*) FROM ns.main.returning_rows;
 statement ok
 INSERT INTO ns.main.returning_rows VALUES (7, 1, 'duplicate', NULL), (7, 1, 'duplicate', NULL);
 
-# UPDATE FROM follows DuckDB's KEEP_FIRST policy across input chunks. Distinct
-# target rows with equal values each produce exactly one result.
+# UPDATE FROM assigns each target row once, across input chunks as well: a
+# rewrite takes one value per affected row. Distinct target rows with equal
+# values each produce exactly one result.
 query II rowsort
 UPDATE ns.main.returning_rows AS t SET v = 9 FROM range(5000) s(i)
 WHERE t.id = 7 RETURNING t.id, t.v;

@@ -585,6 +585,10 @@ conflict when another writer, or an earlier statement of the same transaction, u
 rows of a fragment it updates; changes to other fragments do not conflict. See
 [Transactions](#transactions) for what one transaction may contain.
 
+A rewrite of a Lance fragment takes one new value per affected row, so `UPDATE ... FROM` assigns
+each target row once. When several source rows match the same target row, Lance applies one of the
+matches and counts, and returns, that target row once; which match is applied is not guaranteed.
+
 ### `DELETE`
 
 ```sql
