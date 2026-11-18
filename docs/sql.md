@@ -59,7 +59,7 @@ and are read only when named:
 
 ```sql
 SELECT id, _row_last_updated_at_version
-FROM ns.main.events
+FROM '/data/events.lance'
 WHERE _row_last_updated_at_version > 12;
 ```
 
