@@ -718,9 +718,45 @@ statement ok
 CREATE INDEX vec_idx ON '{TEST_DIR}/search_hybrid_indexed.lance' (vec)
 USING IVF_FLAT WITH (num_partitions=1, metric_type='l2');
 
+# FTS EXPLAIN shows the Lance plan: a flat match until the column has an
+# inverted index, then a match on the index
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id FROM lance_fts('{TEST_DIR}/search_hybrid_indexed.lance', 'text', 'puppy', k = 3);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Plan \(Bind\)": \[[\s\S]*FlatMatchQuery: column=text[\s\S]*
+
 statement ok
 CREATE INDEX text_idx ON '{TEST_DIR}/search_hybrid_indexed.lance' (text)
 USING INVERTED;
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT id FROM lance_fts('{TEST_DIR}/search_hybrid_indexed.lance', 'text', 'puppy', k = 3);
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Plan \(Bind\)": \[[\s\S]*" *MatchQuery: column=text[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id FROM lance_fts('{TEST_DIR}/search_hybrid_indexed.lance', 'text', 'puppy', k = 3);
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Plan": \[[\s\S]*" *MatchQuery: column=text[\s\S]*
+
+# After a filter pushdown fallback the stream runs without the filter, and so
+# does the plan EXPLAIN ANALYZE shows
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id FROM lance_fts('{TEST_DIR}/search_hybrid_indexed.lance', 'text', 'puppy', k = 3, prefilter = false)
+WHERE regexp_matches(text, 'p.ppy', 'p');
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "1"[\s\S]*"Lance Plan": \[[\s\S]*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT id FROM lance_vector_search('{TEST_DIR}/search_hybrid_indexed.lance', 'vec', [0.0, 0.0, 0.0, 0.0]::FLOAT[4], k = 3, prefilter = false)
+WHERE regexp_matches(text, 'p.ppy', 'p');
+----
+analyzed_plan	<REGEX>:[\s\S]*"Lance Filter Pushdown Fallbacks": "1"[\s\S]*"Lance Plan": \[[\s\S]*
 
 # Hybrid search exposes vector search controls in EXPLAIN when using an index
 query II
@@ -1115,13 +1151,13 @@ SELECT
 
 # Inside a DELETE, a namespace-backed search of the target reads the dataset
 # the DELETE pinned, as the target's own scan does, so its _rowid values
-# address the rows being deleted.
+# address the rows being deleted. EXPLAIN ANALYZE shows its plan there.
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 DELETE FROM rowid_ns.main.t
 WHERE rowid IN (SELECT _rowid FROM lance_fts('rowid_ns.main.t', 'txt', 'w3', k = 100));
 ----
-analyzed_plan	<REGEX>:[\s\S]*"Lance Search Backend": "dataset_scan"[\s\S]*
+analyzed_plan	<REGEX>:[\s\S]*"Lance Search Backend": "dataset_scan"[\s\S]*"Lance Plan": \[[\s\S]*MatchQuery: column=txt[\s\S]*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)

@@ -1091,9 +1091,9 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   }
   result["Lance Filter IR Bytes (Bind)"] = to_string(filter_ir_msg.size());
 
-  // A namespace-backed search has no local dataset handle, so there is no plan
-  // to explain -- but the pushdown metrics above are still meaningful.
-  if (bind_data.namespace_backed) {
+  // A namespace query has no local dataset handle, so there is no plan to
+  // explain, but the pushdown metrics above are still meaningful.
+  if (!bind_data.dataset) {
     return result;
   }
 
@@ -1168,12 +1168,15 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
     if (!global_state.explain_computed.load()) {
       string plan;
       string error;
+      // After a filter pushdown fallback the stream ran without the filter.
+      const bool use_filter =
+          !global_state.lance_filter_ir.empty() &&
+          global_state.filter_pushdown_fallbacks.load() == 0;
       auto ok = TryLanceExplainKnn(
           dataset, bind_data.vector_column, bind_data.query, bind_data.k,
           bind_data.nprobes, bind_data.refine_factor, bind_data.ef,
           bind_data.distance_type,
-          global_state.lance_filter_ir.empty() ? nullptr
-                                               : &global_state.lance_filter_ir,
+          use_filter ? &global_state.lance_filter_ir : nullptr,
           bind_data.prefilter, bind_data.use_index, bind_data.explain_verbose,
           plan, error);
       if (ok) {
@@ -1320,6 +1323,11 @@ struct LanceSearchGlobalState : public GlobalTableFunctionState {
   vector<idx_t> projection_ids;
   vector<LogicalType> scanned_types;
   vector<string> native_columns;
+
+  std::atomic<bool> explain_computed{false};
+  string explain_plan;
+  string explain_error;
+  std::mutex explain_mutex;
 
   idx_t MaxThreads() const override { return 1; }
   bool CanRemoveFilterColumns() const { return !projection_ids.empty(); }
@@ -1975,10 +1983,61 @@ LanceSearchBindToString(const LanceSearchBindData &bind_data) {
   return result;
 }
 
+// Explains the Lance scan that a full-text search's stream runs on `dataset`
+// when it reads `columns` with `filter_ir`.
+static bool TryLanceExplainFts(void *dataset,
+                               const LanceSearchBindData &bind_data,
+                               const vector<string> &columns,
+                               const string &filter_ir, string &out_plan,
+                               string &out_error) {
+  vector<const char *> column_ptrs;
+  column_ptrs.reserve(columns.size());
+  for (auto &name : columns) {
+    column_ptrs.push_back(name.c_str());
+  }
+  auto *plan_ptr = lance_explain_fts_scan_ir(
+      dataset, bind_data.TextColumnArg(), bind_data.query.c_str(), bind_data.k,
+      column_ptrs.empty() ? nullptr : column_ptrs.data(), column_ptrs.size(),
+      filter_ir.empty() ? nullptr
+                        : reinterpret_cast<const uint8_t *>(filter_ir.data()),
+      filter_ir.size(),
+      bind_data.namespace_filter.empty() ? nullptr
+                                         : bind_data.namespace_filter.c_str(),
+      bind_data.prefilter ? 1 : 0);
+  if (!plan_ptr) {
+    out_error = LanceConsumeLastError();
+    if (out_error.empty()) {
+      out_error = "unknown error";
+    }
+    return false;
+  }
+  out_plan = plan_ptr;
+  lance_free_string(plan_ptr);
+  return true;
+}
+
 static InsertionOrderPreservingMap<string>
 LanceSearchToString(TableFunctionToStringInput &input) {
   auto &bind_data = input.bind_data->Cast<LanceSearchBindData>();
-  return LanceSearchBindToString(bind_data);
+  auto result = LanceSearchBindToString(bind_data);
+  // A hybrid search fuses two Lance scans, and a namespace query has no local
+  // dataset handle, so only a full-text search on a dataset has a plan.
+  if (bind_data.mode != LanceSearchMode::Fts || !bind_data.dataset) {
+    return result;
+  }
+
+  string filter_ir_msg;
+  TryEncodeLanceFilterIRMessage(bind_data.lance_pushed_filter_ir_parts,
+                                filter_ir_msg);
+  string plan;
+  string error;
+  if (TryLanceExplainFts(bind_data.dataset, bind_data, {}, filter_ir_msg, plan,
+                         error)) {
+    result["Lance Plan (Bind)"] = plan;
+  } else {
+    result["Lance Plan Error (Bind)"] = error;
+  }
+  return result;
 }
 
 static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
@@ -2000,6 +2059,30 @@ static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
   result["Lance Record Batch Rows"] =
       to_string(global_state.record_batch_rows.load());
   result["Lance Rows Out"] = to_string(global_state.lines_read.load());
+
+  auto *dataset = global_state.pinned_dataset
+                      ? global_state.pinned_dataset->Handle()
+                      : bind_data.dataset;
+  if (bind_data.mode == LanceSearchMode::Fts && dataset) {
+    if (!global_state.explain_computed.load()) {
+      std::lock_guard<std::mutex> guard(global_state.explain_mutex);
+      if (!global_state.explain_computed.load()) {
+        // After a filter pushdown fallback the stream ran without the filter.
+        const bool use_filter =
+            global_state.filter_pushdown_fallbacks.load() == 0;
+        TryLanceExplainFts(dataset, bind_data, global_state.native_columns,
+                           use_filter ? global_state.lance_filter_ir : string(),
+                           global_state.explain_plan,
+                           global_state.explain_error);
+        global_state.explain_computed.store(true);
+      }
+    }
+    if (!global_state.explain_plan.empty()) {
+      result["Lance Plan"] = global_state.explain_plan;
+    } else if (!global_state.explain_error.empty()) {
+      result["Lance Plan Error"] = global_state.explain_error;
+    }
+  }
 
   input.operator_metrics.SetExtraInfo(std::move(result));
 }
