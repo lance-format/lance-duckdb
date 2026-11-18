@@ -54,20 +54,21 @@ class LanceUpdateValueGlobalState : public GlobalSinkState {
 public:
   explicit LanceUpdateValueGlobalState(ClientContext &context,
                                        const LanceTableEntry &table_p,
-                                       bool return_chunk,
-                                       RowIdHandling row_id_handling)
+                                       bool return_chunk)
       : table(&table_p) {
     if (return_chunk) {
       returning = make_uniq<ColumnDataCollection>(context, table_p.GetTypes());
     }
-    if (row_id_handling != RowIdHandling::ASSUME_UNIQUE) {
-      seen = make_uniq<RowIdDeduplicator>(
-          context, vector<LogicalType>{LogicalType::ROW_TYPE});
-    }
+    // Every Lance UPDATE is a rewrite: the fragment rewriter joins the new
+    // values on the row id, so it takes exactly one value per affected row.
+    // UPDATE ... FROM can match one target row through several source rows;
+    // keep the first match that reaches this operator and drop the rest.
+    assigned_row_ids = make_uniq<RowIdDeduplicator>(
+        context, vector<LogicalType>{LogicalType::ROW_TYPE});
   }
 
   unique_ptr<ColumnDataCollection> returning;
-  unique_ptr<RowIdDeduplicator> seen;
+  unique_ptr<RowIdDeduplicator> assigned_row_ids;
 
   const LanceTableEntry *table = nullptr;
   void *update_handle = nullptr;
@@ -96,8 +97,7 @@ public:
       vector<string> set_columns_p, vector<LogicalType> set_types_p,
       vector<idx_t> set_chunk_indices_p, idx_t rowid_chunk_index_p,
       LogicalType rowid_type_p, vector<idx_t> assigned_columns_p,
-      bool return_chunk_p, RowIdHandling row_id_handling_p,
-      idx_t estimated_cardinality)
+      bool return_chunk_p, idx_t estimated_cardinality)
       : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION,
                          std::move(types_p), estimated_cardinality),
         LanceReturningOperator(
@@ -108,7 +108,7 @@ public:
         set_chunk_indices(std::move(set_chunk_indices_p)),
         rowid_chunk_index(rowid_chunk_index_p),
         assigned_columns(std::move(assigned_columns_p)),
-        return_chunk(return_chunk_p), row_id_handling(row_id_handling_p) {
+        return_chunk(return_chunk_p) {
     if (set_columns.size() != set_types.size() ||
         set_columns.size() != set_chunk_indices.size()) {
       throw InternalException(
@@ -125,8 +125,7 @@ public:
 
   unique_ptr<GlobalSinkState>
   GetGlobalSinkState(ClientContext &context) const override {
-    return make_uniq<LanceUpdateValueGlobalState>(context, table, return_chunk,
-                                                  row_id_handling);
+    return make_uniq<LanceUpdateValueGlobalState>(context, table, return_chunk);
   }
 
   unique_ptr<LocalSinkState>
@@ -143,14 +142,10 @@ public:
     auto &gstate = input.global_state.Cast<LanceUpdateValueGlobalState>();
     lock_guard<mutex> guard(gstate.lock);
 
-    if (gstate.seen) {
-      SelectionVector selection(chunk.size());
-      auto count = gstate.seen->Register(chunk.data[rowid_chunk_index],
-                                         chunk.size(), selection);
-      if (row_id_handling == RowIdHandling::ERROR && count != chunk.size()) {
-        throw InvalidInputException(
-            "UPDATE command cannot update the same row more than once");
-      }
+    SelectionVector selection(chunk.size());
+    auto count = gstate.assigned_row_ids->Register(
+        chunk.data[rowid_chunk_index], chunk.size(), selection);
+    if (count != chunk.size()) {
       chunk.Slice(selection, count);
       if (count == 0) {
         return SinkResultType::NEED_MORE_INPUT;
@@ -324,7 +319,6 @@ private:
   vector<LogicalType> value_chunk_types;
   vector<idx_t> assigned_columns;
   bool return_chunk;
-  RowIdHandling row_id_handling;
 };
 
 } // namespace
@@ -415,7 +409,7 @@ PhysicalOperator &PlanLanceUpdateOverwrite(ClientContext &context,
       op.types, *lance_table, std::move(dataset), std::move(set_columns),
       std::move(set_types), std::move(set_chunk_indices), rowid_chunk_index,
       plan.types[rowid_chunk_index], std::move(assigned_columns),
-      op.return_chunk, op.row_id_handling, op.estimated_cardinality);
+      op.return_chunk, op.estimated_cardinality);
   update.children.push_back(plan);
   return update;
 }
