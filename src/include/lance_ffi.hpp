@@ -411,6 +411,10 @@ void *lance_create_fts_stream_ir(void *dataset, const char *text_column,
                                  const char **columns, size_t columns_len,
                                  const uint8_t *filter_ir, size_t filter_ir_len,
                                  const char *filter_sql, uint8_t prefilter);
+const char *lance_explain_fts_scan_ir(
+    void *dataset, const char *text_column, const char *query, uint64_t k,
+    const char **columns, size_t columns_len, const uint8_t *filter_ir,
+    size_t filter_ir_len, const char *filter_sql, uint8_t prefilter);
 
 typedef struct LanceNamespaceQueryConfig {
   uint8_t namespace_kind;

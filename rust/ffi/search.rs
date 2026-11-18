@@ -6,6 +6,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::Float32Builder;
 use arrow_array::{Float32Array, UInt64Array};
+use lance::dataset::scanner::Scanner;
 use lance_index::scalar::inverted::query::FtsQuery;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
@@ -21,7 +22,7 @@ use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_i64, nonzero_u64_to_usize,
     optional_cstr_array, optional_cstr_to_str, optional_distance_type, parse_optional_filter_ir,
-    FfiError, FfiResult,
+    to_c_string, FfiError, FfiResult,
 };
 
 #[no_mangle]
@@ -115,6 +116,57 @@ pub unsafe extern "C" fn lance_create_fts_stream_ir(
     }
 }
 
+/// The scan behind `lance_fts`. Its stream and its EXPLAIN both build it here, so the
+/// plan shown is the one that runs.
+#[allow(clippy::too_many_arguments)]
+fn fts_scanner(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    filter_sql: *const c_char,
+    prefilter: u8,
+    code: ErrorCode,
+) -> FfiResult<Scanner> {
+    let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
+    let query = unsafe { cstr_to_str(query, "query")? };
+    let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
+    let filter =
+        unsafe { parse_optional_filter_ir(filter_ir, filter_ir_len, code, "fts filter_ir")? };
+    let k_i64 = nonzero_u64_to_i64(k, "k")?;
+
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
+    let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
+    let fts_query = build_fts_query(text_column, query)
+        .map_err(|err| FfiError::new(code, format!("fts query: {err}")))?
+        .limit(Some(k_i64));
+    projection_columns.extend(fts_query.columns());
+    projection_columns.push(SCORE_COLUMN.to_string());
+    projection_columns.push(ROW_ID_COLUMN.to_string());
+
+    let mut scan = handle.dataset.scan();
+    scan.prefilter(prefilter != 0);
+    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
+    scan.full_text_search(fts_query)
+        .map_err(|err| FfiError::new(code, format!("fts scan search: {err}")))?;
+    scan.with_row_id();
+    let filter = apply_scanner_filter(&mut scan, filter, filter_sql, code, "fts filter_sql")?;
+    if let Some(filter) = &filter {
+        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
+    }
+    projection_columns.sort();
+    projection_columns.dedup();
+    scan.disable_scoring_autoprojection();
+    scan.project(&projection_columns)
+        .map_err(|err| FfiError::new(code, format!("fts scan project: {err}")))?;
+    scan.scan_in_order(false);
+    Ok(scan)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_fts_stream_ir_inner(
     dataset: *mut c_void,
@@ -128,59 +180,20 @@ fn create_fts_stream_ir_inner(
     filter_sql: *const c_char,
     prefilter: u8,
 ) -> FfiResult<StreamHandle> {
-    let text_column = unsafe { optional_cstr_to_str(text_column, "text_column")? };
-    let query = unsafe { cstr_to_str(query, "query")? };
-    let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
-    let filter = unsafe {
-        parse_optional_filter_ir(
-            filter_ir,
-            filter_ir_len,
-            ErrorCode::FtsStreamCreate,
-            "fts filter_ir",
-        )?
-    };
-    let k_i64 = nonzero_u64_to_i64(k, "k")?;
-
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let filter_sql = unsafe { optional_cstr_to_str(filter_sql, "filter_sql")? };
-    let fts_query = build_fts_query(text_column, query)
-        .map_err(|err| FfiError::new(ErrorCode::FtsStreamCreate, format!("fts query: {err}")))?
-        .limit(Some(k_i64));
-    projection_columns.extend(fts_query.columns());
-    projection_columns.push(SCORE_COLUMN.to_string());
-    projection_columns.push(ROW_ID_COLUMN.to_string());
-
-    let mut scan = handle.dataset.scan();
-    scan.prefilter(prefilter != 0);
-    scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
-    scan.full_text_search(fts_query).map_err(|err| {
-        FfiError::new(
-            ErrorCode::FtsStreamCreate,
-            format!("fts scan search: {err}"),
-        )
-    })?;
-    scan.with_row_id();
-    let filter = apply_scanner_filter(
-        &mut scan,
-        filter,
+    let scan = fts_scanner(
+        dataset,
+        text_column,
+        query,
+        k,
+        columns,
+        columns_len,
+        filter_ir,
+        filter_ir_len,
         filter_sql,
+        prefilter,
         ErrorCode::FtsStreamCreate,
-        "fts filter_sql",
     )?;
-    if let Some(filter) = &filter {
-        projection_columns.extend(lance::io::exec::Planner::column_names_in_expr(filter));
-    }
-    projection_columns.sort();
-    projection_columns.dedup();
-    scan.disable_scoring_autoprojection();
-    scan.project(&projection_columns).map_err(|err| {
-        FfiError::new(
-            ErrorCode::FtsStreamCreate,
-            format!("fts scan project: {err}"),
-        )
-    })?;
-    scan.scan_in_order(false);
-
+    let handle = unsafe { super::util::dataset_handle(dataset)? };
     let full_schema = projection::build_fts_schema(&handle.read_schema);
     let stream = LanceStream::from_scanner_with_schema(scan, full_schema).map_err(|err| {
         FfiError::new(
@@ -189,6 +202,79 @@ fn create_fts_stream_ir_inner(
         )
     })?;
     Ok(StreamHandle::Lance(stream))
+}
+
+/// Explains the scan `lance_create_fts_stream_ir` runs for the same arguments.
+#[no_mangle]
+pub unsafe extern "C" fn lance_explain_fts_scan_ir(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    filter_sql: *const c_char,
+    prefilter: u8,
+) -> *const c_char {
+    match explain_fts_scan_ir_inner(
+        dataset,
+        text_column,
+        query,
+        k,
+        columns,
+        columns_len,
+        filter_ir,
+        filter_ir_len,
+        filter_sql,
+        prefilter,
+    ) {
+        Ok(plan) => {
+            clear_last_error();
+            to_c_string(plan).into_raw() as *const c_char
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explain_fts_scan_ir_inner(
+    dataset: *mut c_void,
+    text_column: *const c_char,
+    query: *const c_char,
+    k: u64,
+    columns: *const *const c_char,
+    columns_len: usize,
+    filter_ir: *const u8,
+    filter_ir_len: usize,
+    filter_sql: *const c_char,
+    prefilter: u8,
+) -> FfiResult<String> {
+    let scan = fts_scanner(
+        dataset,
+        text_column,
+        query,
+        k,
+        columns,
+        columns_len,
+        filter_ir,
+        filter_ir_len,
+        filter_sql,
+        prefilter,
+        ErrorCode::ExplainPlan,
+    )?;
+    match runtime::block_on(scan.explain_plan(false)) {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(err)) => Err(FfiError::new(
+            ErrorCode::ExplainPlan,
+            format!("fts scan explain_plan: {err}"),
+        )),
+        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
+    }
 }
 
 #[no_mangle]
