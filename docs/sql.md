@@ -950,3 +950,4 @@ ALTER TABLE ns.main.my_table RESTORE TO TAG before_migration;
 - `CREATE TAG`, `DROP TAG` and `RESTORE` return `Operation`, `Target`, `Tag` and `Version`. For `RESTORE`, `Version` is the new latest version; the restored version and all earlier ones stay in the history until `VACUUM LANCE` removes them.
 - `RESTORE` is rejected while the current transaction has uncommitted Lance writes.
 - `CREATE TAG`, `DROP TAG` and `RESTORE` modify the table, so they are rejected in a `READ ONLY` transaction.
+- A tag protects a version from `VACUUM LANCE` and `AUTO_CLEANUP` only if it exists when the cleanup starts. Lance reads the tags once before it deletes old versions, so a tag created or a `RESTORE` run on an old version while a cleanup is running can still lose that version ([lance#10499](https://github.com/lance-format/lance/issues/10499)). Tag or restore versions well inside the cleanup window, and keep `older_than_seconds` or `older_than` at days rather than minutes.
