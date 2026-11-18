@@ -945,7 +945,8 @@ ALTER TABLE 'path/to/dataset.lance' RESTORE TO VERSION 3;
 ALTER TABLE ns.main.my_table RESTORE TO TAG before_migration;
 ```
 
-- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`). `lance_tags` returns `tag`, `version`, `created_at` and `updated_at`.
+- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`). `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`. Tags are shared by every branch of a dataset; `lance_versions` lists only the tags on the opened branch, and `RESTORE TO TAG` rejects a tag that belongs to another branch.
 - Tag names may contain letters, digits, `.`, `-` and `_`. A tag name that is not a bare identifier-like word can be written as a string literal.
 - `CREATE TAG`, `DROP TAG` and `RESTORE` return `Operation`, `Target`, `Tag` and `Version`. For `RESTORE`, `Version` is the new latest version; the restored version and all earlier ones stay in the history until `VACUUM LANCE` removes them.
 - `RESTORE` is rejected while the current transaction has uncommitted Lance writes.
+- `CREATE TAG`, `DROP TAG` and `RESTORE` modify the table, so they are rejected in a `READ ONLY` transaction.

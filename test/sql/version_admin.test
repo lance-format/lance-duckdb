@@ -182,3 +182,55 @@ uncommitted Lance writes
 
 statement ok
 ROLLBACK;
+
+# A read-only transaction rejects every administration command and leaves the
+# table untouched, for attached tables and for paths. Each failure aborts the
+# transaction, so every command gets its own.
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+ALTER TABLE vadmin_ns.main.g4_f1_attached CREATE TAG ro_tag;
+----
+read-only
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+ALTER TABLE vadmin_ns.main.g4_f1_attached RESTORE TO VERSION 1;
+----
+read-only
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+ALTER TABLE vadmin_ns.main.g4_f1_attached DROP TAG before_insert;
+----
+read-only
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_attached.lance' CREATE TAG ro_tag;
+----
+read-only
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT tag FROM lance_tags('vadmin_ns.main.g4_f1_attached') ORDER BY tag;
+----
+before_insert

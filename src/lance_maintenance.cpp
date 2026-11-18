@@ -1423,6 +1423,7 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
   }
 
   string target;
+  optional_ptr<Catalog> target_catalog;
   if (parse_data->target_is_path) {
     target = parse_data->dataset_uri;
   } else {
@@ -1431,6 +1432,7 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
                       .Cast<TableCatalogEntry>();
     qname = entry.schema.GetQualifiedName(entry.name);
     target = qname.ToString();
+    target_catalog = &entry.ParentCatalog();
   }
 
   ParserExtensionPlanResult result;
@@ -1501,6 +1503,17 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     break;
   default:
     throw InternalException("unknown maintenance statement kind");
+  }
+  // Version administration mutates the table: declare the catalog so DuckDB
+  // rejects it in a read-only transaction or on a read-only attachment.
+  if (target_catalog &&
+      (parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG ||
+       parse_data->kind == LanceMaintenanceStmtKind::DROP_TAG ||
+       parse_data->kind == LanceMaintenanceStmtKind::RESTORE)) {
+    StatementProperties properties;
+    properties.RegisterDBModify(*target_catalog, context,
+                                DatabaseModificationType::ALTER_TABLE);
+    result.modified_databases = std::move(properties.modified_databases);
   }
   return result;
 }

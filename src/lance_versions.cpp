@@ -2,6 +2,7 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include "lance_common.hpp"
 #include "lance_dataset_cache.hpp"
@@ -89,8 +90,9 @@ unique_ptr<FunctionData> LanceVersionsBind(ClientContext &context,
           .Reference();
   if (tags) {
     return_types = {LogicalType::VARCHAR, LogicalType::BIGINT,
-                    LogicalType::TIMESTAMP_TZ, LogicalType::TIMESTAMP_TZ};
-    names = {"tag", "version", "created_at", "updated_at"};
+                    LogicalType::VARCHAR, LogicalType::TIMESTAMP_TZ,
+                    LogicalType::TIMESTAMP_TZ};
+    names = {"tag", "version", "branch", "created_at", "updated_at"};
   } else {
     return_types = {LogicalType::BIGINT, LogicalType::TIMESTAMP_TZ,
                     LogicalType::LIST(LogicalType::VARCHAR)};
@@ -130,10 +132,11 @@ LanceVersionsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     LanceInterruptScope interrupt_scope(context);
     if (bind_data.tags) {
       for (auto &f :
-           ParseVersionRows(lance_dataset_list_tags(dataset), 4, "tags")) {
-        state->rows.push_back({Value(f[0]), Value::BIGINT(std::stoll(f[1])),
-                               MicrosToTimestampTz(f[2]),
-                               MicrosToTimestampTz(f[3])});
+           ParseVersionRows(lance_dataset_list_tags(dataset), 5, "tags")) {
+        state->rows.push_back(
+            {Value(f[0]), Value::BIGINT(std::stoll(f[1])),
+             f[2].empty() ? Value(LogicalType::VARCHAR) : Value(f[2]),
+             MicrosToTimestampTz(f[3]), MicrosToTimestampTz(f[4])});
       }
     } else {
       for (auto &f : ParseVersionRows(lance_dataset_list_versions(dataset), 3,
@@ -288,6 +291,12 @@ void LanceVersionAdminFunc(ClientContext &context, TableFunctionInput &data,
   gstate.finished = true;
 
   auto &bind_data = data.bind_data->Cast<LanceVersionAdminBindData>();
+  // The statement path declares the modified catalog and DuckDB rejects it in a
+  // read-only transaction; this guards direct calls and path targets.
+  if (MetaTransaction::Get(context).IsReadOnly()) {
+    throw TransactionException(
+        "Cannot modify a Lance table in a read-only transaction");
+  }
   if (bind_data.op == LanceVersionAdminOp::RESTORE &&
       LanceHasUncommittedWrites(context)) {
     throw NotImplementedException(

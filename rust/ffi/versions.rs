@@ -10,6 +10,11 @@ fn version_error(message: String) -> FfiError {
     FfiError::new(ErrorCode::DatasetVersionAdmin, message)
 }
 
+/// The branch a dataset handle or tag belongs to; `None` is the main branch.
+fn branch_of(branch: Option<&str>) -> Option<&str> {
+    branch.filter(|name| !name.is_empty() && *name != "main")
+}
+
 fn timestamp_micros(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
@@ -46,8 +51,14 @@ fn dataset_list_versions_inner(dataset: *mut c_void) -> FfiResult<String> {
         Err(err) => return Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
     };
 
+    // Tags are global to the dataset root and carry a branch; only the ones on
+    // this handle's branch name one of its versions.
+    let current = ds.branch_location().branch;
     let mut tags_by_version: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     for (name, contents) in tags {
+        if branch_of(contents.branch.as_deref()) != branch_of(current.as_deref()) {
+            continue;
+        }
         tags_by_version
             .entry(contents.version)
             .or_default()
@@ -74,8 +85,9 @@ fn dataset_list_versions_inner(dataset: *mut c_void) -> FfiResult<String> {
     Ok(out)
 }
 
-/// List the dataset's tags as `tag\tversion\tcreated_micros\tupdated_micros` lines.
-/// A timestamp Lance did not record is left empty.
+/// List the dataset's tags as `tag\tversion\tbranch\tcreated_micros\tupdated_micros`
+/// lines. The branch is empty for the main branch; a timestamp Lance did not
+/// record is left empty.
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_list_tags(dataset: *mut c_void) -> *const c_char {
     match dataset_list_tags_inner(dataset) {
@@ -109,9 +121,10 @@ fn dataset_list_tags_inner(dataset: *mut c_void) -> FfiResult<String> {
     let mut out = String::new();
     for (name, contents) in tags {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             name,
             contents.version,
+            branch_of(contents.branch.as_deref()).unwrap_or_default(),
             micros(contents.created_at),
             micros(contents.updated_at)
         ));
@@ -144,7 +157,8 @@ fn dataset_create_tag_inner(
     }
 }
 
-/// Report the version `tag` points at.
+/// Report the version `tag` points at. A tag on another branch is rejected: its
+/// version number names a snapshot this handle cannot open.
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_tag_version(
     dataset: *mut c_void,
@@ -166,10 +180,17 @@ fn dataset_tag_version_inner(
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
     let tag = unsafe { cstr_to_str(tag, "tag")? }.to_string();
-    match runtime::block_on(async { ds.tags().get_version(tag.as_str()).await }) {
-        Ok(Ok(version)) => {
+    match runtime::block_on(async { ds.tags().get(tag.as_str()).await }) {
+        Ok(Ok(contents)) => {
+            let current = ds.branch_location().branch;
+            if branch_of(contents.branch.as_deref()) != branch_of(current.as_deref()) {
+                return Err(version_error(format!(
+                    "tag '{tag}' is on branch '{}', which this table is not opened on",
+                    branch_of(contents.branch.as_deref()).unwrap_or("main")
+                )));
+            }
             unsafe {
-                *out_version = version;
+                *out_version = contents.version;
             }
             Ok(())
         }
