@@ -1477,6 +1477,14 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.output_is_forced_null.push_back(false);
   }
 
+  if (has_version_column) {
+    // Lance's unsorted take and sampling plans carry the row address through
+    // the projection, so a version-only projection misaligns without it. Scan
+    // the address as an extra column that no output refers to.
+    add_scan_column(rowid_internal_index + 1, LANCE_ROW_ADDR_COLUMN_NAME,
+                    LogicalType::UBIGINT);
+  }
+
   shared_ptr<LanceDatasetCacheEntry> write_dataset;
   if (bind_data.UsesNamespaceQuery() && bind_data.table_entry) {
     write_dataset = LanceGetDatasetPinnedForWrite(
