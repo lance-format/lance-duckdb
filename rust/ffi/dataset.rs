@@ -7,7 +7,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::statistics::DatasetStatisticsExt;
 
-use crate::constants::ROW_ID_COLUMN;
+use crate::constants::{
+    ROW_ADDR_COLUMN, ROW_CREATED_AT_VERSION_COLUMN, ROW_ID_COLUMN,
+    ROW_LAST_UPDATED_AT_VERSION_COLUMN,
+};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
@@ -512,6 +515,15 @@ fn get_schema_for_scan_inner(dataset: *mut c_void) -> FfiResult<super::types::Sc
     if !has_row_id {
         let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
         fields.push(Arc::new(Field::new(ROW_ID_COLUMN, DataType::UInt64, false)));
+        // Row address and row lineage columns follow `_rowid`, in the order the C++ scan
+        // expects: internal column indexes are the table width plus 0..=3.
+        for name in [
+            ROW_ADDR_COLUMN,
+            ROW_CREATED_AT_VERSION_COLUMN,
+            ROW_LAST_UPDATED_AT_VERSION_COLUMN,
+        ] {
+            fields.push(Arc::new(Field::new(name, DataType::UInt64, true)));
+        }
         schema.fields = fields.into();
     }
 

@@ -65,6 +65,20 @@ static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ID =
     UINT64_C(9223372036854775900);
 static constexpr const char *LANCE_ROW_ID_COLUMN_NAME = "_rowid";
 
+// Lance's row address and row lineage columns, exposed by table scans as
+// virtual columns. The version columns need a dataset with stable row ids.
+static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_ADDR =
+    UINT64_C(9223372036854775901);
+static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_CREATED_AT_VERSION =
+    UINT64_C(9223372036854775902);
+static constexpr column_t LANCE_COLUMN_IDENTIFIER_ROW_LAST_UPDATED_AT_VERSION =
+    UINT64_C(9223372036854775903);
+static constexpr const char *LANCE_ROW_ADDR_COLUMN_NAME = "_rowaddr";
+static constexpr const char *LANCE_ROW_CREATED_AT_VERSION_COLUMN_NAME =
+    "_row_created_at_version";
+static constexpr const char *LANCE_ROW_LAST_UPDATED_AT_VERSION_COLUMN_NAME =
+    "_row_last_updated_at_version";
+
 void ResolveLanceNamespaceAuth(ClientContext &context, const string &endpoint,
                                const unordered_map<string, Value> &options,
                                string &out_bearer_token, string &out_api_key);
