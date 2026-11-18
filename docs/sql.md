@@ -43,6 +43,32 @@ such as a fractional second in a seconds column, an `INTERVAL` with days in a
 type can index, fails the statement instead of being truncated or stored as
 NULL.
 
+### Row address and row lineage
+
+A scan exposes Lance's row address and row lineage as virtual columns. They are not part of `SELECT *`
+and are read only when named:
+
+- `_rowid`: the row id. With stable row ids it survives updates and compaction; without them it is the
+  physical row address.
+- `_rowaddr` (UBIGINT): the physical row address, `(fragment id << 32) | row offset`. It changes when
+  compaction or an update moves a row.
+- `_row_created_at_version` and `_row_last_updated_at_version` (UBIGINT): the dataset version that
+  inserted the row and the version that last wrote it. They need a dataset created with
+  `enable_stable_row_ids`; on any other dataset reading them is an error, because Lance cannot tell
+  when a row changed.
+
+```sql
+SELECT id, _row_last_updated_at_version
+FROM '/data/events.lance'
+WHERE _row_last_updated_at_version > 12;
+```
+
+Predicates on these columns are evaluated by DuckDB after the scan; they are not pushed to Lance. They
+are available when scanning a dataset path, including the `<name>.lance` directory of a table in an
+attached directory namespace, but not on a name bound through `ATTACH` (`_rowid` is also path-only;
+`rowid` is the attached-table equivalent) or on tables read through a REST namespace `query_table`
+endpoint.
+
 ### Aggregate memory
 
 Pushed aggregates account their tracked intermediate state in DuckDB's shared

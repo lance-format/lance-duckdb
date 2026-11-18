@@ -231,6 +231,14 @@ LanceScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
   return make_uniq<NodeStatistics>(count, count);
 }
 
+static idx_t LanceLineageColumnPosition(column_t col_id);
+
+static bool LanceIsRowIdOrLineageColumn(column_t col_id) {
+  return col_id == COLUMN_IDENTIFIER_ROW_ID ||
+         col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID ||
+         LanceLineageColumnPosition(col_id) != DConstants::INVALID_INDEX;
+}
+
 static bool LanceExpressionReferencesRowId(const LogicalGet &get,
                                            const Expression &expr) {
   bool found = false;
@@ -245,8 +253,7 @@ static bool LanceExpressionReferencesRowId(const LogicalGet &get,
           colref.Binding().column_index < column_ids.size()) {
         auto col_id =
             column_ids[colref.Binding().column_index].GetPrimaryIndex();
-        if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-            col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID) {
+        if (LanceIsRowIdOrLineageColumn(col_id)) {
           found = true;
           return;
         }
@@ -257,8 +264,7 @@ static bool LanceExpressionReferencesRowId(const LogicalGet &get,
       auto &column_ids = get.GetColumnIds();
       if (ref_index < column_ids.size()) {
         auto col_id = column_ids[ref_index].GetPrimaryIndex();
-        if (col_id == COLUMN_IDENTIFIER_ROW_ID ||
-            col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID) {
+        if (LanceIsRowIdOrLineageColumn(col_id)) {
           found = true;
           return;
         }
@@ -275,7 +281,8 @@ static bool LancePushdownExpression(ClientContext &, const LogicalGet &get,
   // Keep rowid predicates as expressions. DuckDB's table-filter path drops
   // the virtual rowid binding before physical planning for single-value
   // equality, while LanceRowIdInRewrite can turn the expression directly into
-  // a native point lookup.
+  // a native point lookup. The row address and lineage columns are not table
+  // columns either, so DuckDB evaluates their predicates itself.
   if (LanceExpressionReferencesRowId(get, expr)) {
     return false;
   }
@@ -394,6 +401,32 @@ static bool IsLanceVirtualRowIdColumnId(column_t col_id) {
   return col_id == LANCE_COLUMN_IDENTIFIER_ROW_ID;
 }
 
+// The row address and row lineage columns, in the order the scan schema lists
+// them after `_rowid`.
+struct LanceLineageColumn {
+  column_t col_id;
+  const char *name;
+};
+
+static const LanceLineageColumn LANCE_LINEAGE_COLUMNS[] = {
+    {LANCE_COLUMN_IDENTIFIER_ROW_ADDR, LANCE_ROW_ADDR_COLUMN_NAME},
+    {LANCE_COLUMN_IDENTIFIER_ROW_CREATED_AT_VERSION,
+     LANCE_ROW_CREATED_AT_VERSION_COLUMN_NAME},
+    {LANCE_COLUMN_IDENTIFIER_ROW_LAST_UPDATED_AT_VERSION,
+     LANCE_ROW_LAST_UPDATED_AT_VERSION_COLUMN_NAME},
+};
+
+// The position of a lineage column after `_rowid` in the scan schema, or
+// INVALID_INDEX when `col_id` is not one.
+static idx_t LanceLineageColumnPosition(column_t col_id) {
+  for (idx_t i = 0; i < 3; i++) {
+    if (LANCE_LINEAGE_COLUMNS[i].col_id == col_id) {
+      return i;
+    }
+  }
+  return DConstants::INVALID_INDEX;
+}
+
 static vector<bool> LanceBlobColumnsFromSchema(const ArrowSchema &schema_root) {
   vector<bool> result;
   result.reserve(schema_root.n_children);
@@ -470,6 +503,10 @@ static virtual_column_map_t LanceGetVirtualColumns(ClientContext &,
                  TableColumn("", LogicalType::BOOLEAN));
   result.emplace(LANCE_COLUMN_IDENTIFIER_ROW_ID,
                  TableColumn(LANCE_ROW_ID_COLUMN_NAME, LogicalType::UBIGINT));
+  for (auto &column : LANCE_LINEAGE_COLUMNS) {
+    result.emplace(column.col_id,
+                   TableColumn(column.name, LogicalType::UBIGINT));
+  }
   return result;
 }
 
@@ -1360,6 +1397,8 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   };
 
   bool has_projected_blob = false;
+  bool has_lineage_column = false;
+  bool has_version_column = false;
 
   for (auto col_id : input.column_ids) {
     if (col_id == COLUMN_IDENTIFIER_EMPTY) {
@@ -1396,6 +1435,23 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       continue;
     }
 
+    auto lineage_position = LanceLineageColumnPosition(col_id);
+    if (lineage_position != DConstants::INVALID_INDEX) {
+      has_lineage_column = true;
+      has_version_column =
+          has_version_column || col_id != LANCE_COLUMN_IDENTIFIER_ROW_ADDR;
+      scan_state.scan_includes_virtual_rowid = true;
+      auto scan_idx = add_scan_column(
+          rowid_internal_index + 1 + lineage_position,
+          LANCE_LINEAGE_COLUMNS[lineage_position].name, LogicalType::UBIGINT);
+      scan_state.scanned_types.push_back(LogicalType::UBIGINT);
+      scan_state.output_to_scan_converted_idx.push_back(scan_idx);
+      scan_state.output_is_duckdb_rowid.push_back(false);
+      scan_state.output_is_empty.push_back(false);
+      scan_state.output_is_forced_null.push_back(false);
+      continue;
+    }
+
     if (col_id >= bind_data.types.size() || col_id >= bind_data.names.size()) {
       throw IOException("Invalid column id in projection");
     }
@@ -1419,6 +1475,14 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
     scan_state.output_is_duckdb_rowid.push_back(false);
     scan_state.output_is_empty.push_back(false);
     scan_state.output_is_forced_null.push_back(false);
+  }
+
+  if (has_version_column) {
+    // Lance's unsorted take and sampling plans carry the row address through
+    // the projection, so a version-only projection misaligns without it. Scan
+    // the address as an extra column that no output refers to.
+    add_scan_column(rowid_internal_index + 1, LANCE_ROW_ADDR_COLUMN_NAME,
+                    LogicalType::UBIGINT);
   }
 
   shared_ptr<LanceDatasetCacheEntry> write_dataset;
@@ -1548,6 +1612,12 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   if (bind_data.UsesNamespaceQuery() && !scan_state.native_dataset) {
+    if (has_lineage_column) {
+      throw NotImplementedException(
+          "Lance row address and row lineage columns (_rowaddr, "
+          "_row_created_at_version, _row_last_updated_at_version) are not "
+          "available on tables read through a namespace query_table endpoint");
+    }
     if (scan_state.sampling_pushed_down) {
       throw InternalException(
           "Lance namespace query_table scan does not support sampling");
@@ -1609,6 +1679,21 @@ LanceScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   auto *dataset = LanceScanDatasetHandle(bind_data, scan_state);
+
+  if (has_version_column && dataset) {
+    // Without stable row ids Lance has no per-row version history and reports
+    // the dataset's first version for every row.
+    uint8_t uses_stable_row_ids = 0;
+    if (lance_dataset_uses_stable_row_ids(dataset, &uses_stable_row_ids) != 0) {
+      throw IOException("Failed to read the dataset's row id mode" +
+                        LanceFormatErrorSuffix());
+    }
+    if (!uses_stable_row_ids) {
+      throw InvalidInputException(
+          "_row_created_at_version and _row_last_updated_at_version require a "
+          "Lance dataset with stable row ids (enable_stable_row_ids)");
+    }
+  }
 
   if (!bind_data.take_row_ids.empty()) {
     if (scan_state.sampling_pushed_down) {

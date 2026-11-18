@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
-use crate::constants::ROW_ID_COLUMN;
+use crate::constants::{ROW_ADDR_COLUMN, ROW_ID_COLUMN};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 use crate::scanner::{LanceStream, LanceTakeStream};
@@ -107,6 +107,9 @@ fn create_fragment_stream_ir_inner(
         if projection.iter().any(|c| c == ROW_ID_COLUMN) {
             scan.with_row_id();
         }
+        if projection.iter().any(|c| c == ROW_ADDR_COLUMN) {
+            scan.with_row_address();
+        }
         scan.project(&projection).map_err(|err| {
             FfiError::new(
                 ErrorCode::FragmentScan,
@@ -197,6 +200,9 @@ fn create_dataset_stream_ir_inner(
     if !projection.is_empty() {
         if projection.iter().any(|c| c == ROW_ID_COLUMN) {
             scan.with_row_id();
+        }
+        if projection.iter().any(|c| c == ROW_ADDR_COLUMN) {
+            scan.with_row_address();
         }
         scan.project(&projection).map_err(|err| {
             FfiError::new(

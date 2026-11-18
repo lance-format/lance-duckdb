@@ -1,0 +1,213 @@
+# name: test/sql/scan_row_lineage.test
+# description: Table scans expose _rowaddr and the row lineage version columns
+# group: [sql]
+
+require lance
+
+# Stable row ids: the first fragment is version 1, the appended one version 2.
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(0, 4) r(i)) TO '{TEST_DIR}/lineage_stable.lance' (FORMAT lance, enable_stable_row_ids true);
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(10, 13) r(i)) TO '{TEST_DIR}/lineage_stable.lance' (FORMAT lance, mode 'append');
+
+query IIIII
+SELECT id, _rowid, _rowaddr, _row_created_at_version, _row_last_updated_at_version
+FROM '{TEST_DIR}/lineage_stable.lance' ORDER BY id;
+----
+0	0	0	1	1
+1	1	1	1	1
+2	2	2	1	1
+3	3	3	1	1
+10	4	4294967296	2	2
+11	5	4294967297	2	2
+12	6	4294967298	2	2
+
+# The columns are not part of SELECT *.
+query I
+SELECT * FROM '{TEST_DIR}/lineage_stable.lance' WHERE id = 0;
+----
+0
+
+# Each column can be read alone, filtered on, and aggregated.
+query I
+SELECT id FROM '{TEST_DIR}/lineage_stable.lance' WHERE _row_created_at_version = 2 ORDER BY id;
+----
+10
+11
+12
+
+query I
+SELECT id FROM '{TEST_DIR}/lineage_stable.lance' WHERE _rowaddr = 4294967297;
+----
+11
+
+query II
+SELECT _row_last_updated_at_version AS v, count(*) FROM '{TEST_DIR}/lineage_stable.lance' GROUP BY v ORDER BY v;
+----
+1	4
+2	3
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/lineage_stable.lance' WHERE _row_last_updated_at_version >= 2;
+----
+3
+
+# Without stable row ids the address is available, the version columns are not.
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(0, 2) r(i)) TO '{TEST_DIR}/lineage_plain.lance' (FORMAT lance);
+
+statement ok
+COPY (SELECT i::BIGINT AS id FROM range(2, 4) r(i)) TO '{TEST_DIR}/lineage_plain.lance' (FORMAT lance, mode 'append');
+
+query II
+SELECT id, _rowaddr FROM '{TEST_DIR}/lineage_plain.lance' ORDER BY id;
+----
+0	0
+1	1
+2	4294967296
+3	4294967297
+
+statement error
+SELECT _row_created_at_version FROM '{TEST_DIR}/lineage_plain.lance';
+----
+require a Lance dataset with stable row ids
+
+statement error
+SELECT id FROM '{TEST_DIR}/lineage_plain.lance' WHERE _row_last_updated_at_version > 1;
+----
+require a Lance dataset with stable row ids
+
+# A table of an attached directory namespace, read through its dataset path: an UPDATE moves the row's last-updated version, not its
+# creation version or its row id.
+statement ok
+ATTACH '{TEST_DIR}/lineage_ns' AS lineage_ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE lineage_ns.main.t WITH (enable_stable_row_ids = true) AS SELECT i::BIGINT AS id, repeat('x', 2000) AS payload FROM range(0, 4) r(i);
+
+statement ok
+INSERT INTO lineage_ns.main.t VALUES (100, 'y');
+
+statement ok
+UPDATE lineage_ns.main.t SET id = 201 WHERE id = 1;
+
+query IIII
+SELECT id, _rowid, _row_created_at_version, _row_last_updated_at_version
+FROM '{TEST_DIR}/lineage_ns/t.lance' ORDER BY id;
+----
+0	0	1	1
+2	2	1	1
+3	3	1	1
+100	4	2	2
+201	1	1	3
+
+# A wide column is still read for the rows the lineage predicate selects.
+query II
+SELECT id, length(payload) FROM '{TEST_DIR}/lineage_ns/t.lance' WHERE _row_last_updated_at_version = 3;
+----
+201	2000
+
+query I
+SELECT _row_created_at_version FROM '{TEST_DIR}/lineage_ns/t.lance' WHERE _rowid = 3;
+----
+1
+
+# Compaction keeps ids and versions of the surviving rows; addresses may move.
+statement ok
+DELETE FROM lineage_ns.main.t WHERE id = 2;
+
+statement ok
+OPTIMIZE lineage_ns.main.t;
+
+query IIII
+SELECT id, _rowid, _row_created_at_version, _row_last_updated_at_version
+FROM '{TEST_DIR}/lineage_ns/t.lance' ORDER BY id;
+----
+0	0	1	1
+3	3	1	1
+100	4	2	2
+201	1	1	3
+
+query I
+SELECT count(DISTINCT _rowaddr) FROM '{TEST_DIR}/lineage_ns/t.lance';
+----
+4
+
+# A namespace table created without stable row ids rejects the version columns.
+statement ok
+CREATE TABLE lineage_ns.main.plain AS SELECT 1::BIGINT AS id;
+
+statement error
+SELECT _row_created_at_version FROM '{TEST_DIR}/lineage_ns/plain.lance';
+----
+require a Lance dataset with stable row ids
+
+query I
+SELECT _rowaddr FROM '{TEST_DIR}/lineage_ns/plain.lance';
+----
+0
+
+# Planner paths: top-N with a wide column, a self join on the address, an IN
+# list, and a prepared statement.
+statement ok
+COPY (SELECT i::BIGINT AS id, repeat('x', 3000) AS big FROM range(0, 20) r(i)) TO '{TEST_DIR}/lineage_wide.lance' (FORMAT lance, enable_stable_row_ids true);
+
+statement ok
+COPY (SELECT i::BIGINT AS id, repeat('y', 3000) AS big FROM range(100, 103) r(i)) TO '{TEST_DIR}/lineage_wide.lance' (FORMAT lance, mode 'append');
+
+query III
+SELECT id, _rowaddr, length(big) FROM '{TEST_DIR}/lineage_wide.lance' ORDER BY _rowaddr DESC LIMIT 2;
+----
+102	4294967298	3000
+101	4294967297	3000
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/lineage_wide.lance' a JOIN '{TEST_DIR}/lineage_wide.lance' b USING (_rowaddr);
+----
+23
+
+query I
+SELECT id FROM '{TEST_DIR}/lineage_wide.lance' WHERE _rowaddr IN (0, 4294967296) ORDER BY id;
+----
+0
+100
+
+statement ok
+PREPARE lineage_q AS SELECT count(*) FROM '{TEST_DIR}/lineage_wide.lance' WHERE _row_created_at_version = ?;
+
+query I
+EXECUTE lineage_q(2);
+----
+3
+
+query I
+EXECUTE lineage_q(1);
+----
+20
+
+# A version column without _rowaddr works on point lookups that Lance reorders
+# and on sampled scans.
+query II
+SELECT id, _row_created_at_version FROM '{TEST_DIR}/lineage_stable.lance' WHERE _rowid IN (5, 1, 3) ORDER BY id;
+----
+1	1
+3	1
+11	2
+
+query II
+SELECT id, _row_last_updated_at_version FROM '{TEST_DIR}/lineage_stable.lance' WHERE _rowid IN (6, 0) ORDER BY id;
+----
+0	1
+12	2
+
+query III
+SELECT id, _row_created_at_version, _rowaddr FROM '{TEST_DIR}/lineage_stable.lance' WHERE _rowid IN (5, 1) ORDER BY id;
+----
+1	1	1
+11	2	4294967297
+
+query III
+SELECT count(*), min(_row_created_at_version), max(_row_last_updated_at_version) FROM '{TEST_DIR}/lineage_stable.lance' TABLESAMPLE SYSTEM (100 PERCENT) REPEATABLE (42);
+----
+7	1	2
