@@ -15,6 +15,7 @@ namespace duckdb {
 // Forward declaration
 void RegisterLanceMaintenance(ExtensionLoader &loader);
 void RegisterLanceMaintenanceParser(DBConfig &config);
+void RegisterLanceVersions(ExtensionLoader &loader);
 void RegisterLanceScan(ExtensionLoader &loader);
 void RegisterLanceSearch(ExtensionLoader &loader);
 void RegisterLanceRangeRead(ExtensionLoader &loader);
@@ -32,6 +33,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   RegisterLanceRangeRead(loader);
   RegisterLanceWrite(loader);
   RegisterLanceMaintenance(loader);
+  RegisterLanceVersions(loader);
 }
 
 void LanceExtension::Load(ExtensionLoader &loader) {

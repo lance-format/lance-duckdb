@@ -1,0 +1,184 @@
+# name: test/sql/version_admin.test
+# description: lance_versions, lance_tags, ALTER TABLE ... CREATE/DROP TAG and RESTORE
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT range AS id FROM range(3)) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT range AS id FROM range(3, 5)) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'append');
+
+statement ok
+COPY (SELECT 5::BIGINT AS id) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'append');
+
+# Every write is a version; none is tagged yet.
+query ITT
+SELECT version, "timestamp" IS NOT NULL, tags FROM lance_versions('{TEST_DIR}/g4_f1_versions.lance') ORDER BY version;
+----
+1	true	[]
+2	true	[]
+3	true	[]
+
+query I
+SELECT count(*) FROM lance_tags('{TEST_DIR}/g4_f1_versions.lance');
+----
+0
+
+# CREATE TAG defaults to the latest version; AT VERSION tags an older one.
+query TTTI
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG v1_tag AT VERSION 1;
+----
+create_tag	{TEST_DIR}/g4_f1_versions.lance	v1_tag	1
+
+query TTTI
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG 'release-latest';
+----
+create_tag	{TEST_DIR}/g4_f1_versions.lance	release-latest	3
+
+query TITT
+SELECT tag, version, created_at IS NOT NULL, updated_at IS NOT NULL FROM lance_tags('{TEST_DIR}/g4_f1_versions.lance') ORDER BY version;
+----
+v1_tag	1	true	true
+release-latest	3	true	true
+
+query IT
+SELECT version, tags FROM lance_versions('{TEST_DIR}/g4_f1_versions.lance') ORDER BY version;
+----
+1	[v1_tag]
+2	[]
+3	[release-latest]
+
+# Tag errors.
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG v1_tag AT VERSION 2;
+----
+Failed to create_tag
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG future AT VERSION 99;
+----
+Failed to create_tag
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG future AT VERSION 0;
+----
+expected a positive version number
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' CREATE TAG;
+----
+expected a tag name
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' DROP TAG missing_tag;
+----
+Failed to drop_tag
+
+# RESTORE commits an old version as the new latest and keeps the history.
+query TTTI
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' RESTORE TO VERSION 1;
+----
+restore	{TEST_DIR}/g4_f1_versions.lance	NULL	4
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/g4_f1_versions.lance';
+----
+3
+
+query I
+SELECT max(version) FROM lance_versions('{TEST_DIR}/g4_f1_versions.lance');
+----
+4
+
+query TTTI
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' RESTORE TO TAG 'release-latest';
+----
+restore	{TEST_DIR}/g4_f1_versions.lance	release-latest	5
+
+query II
+SELECT count(*), max(id) FROM '{TEST_DIR}/g4_f1_versions.lance';
+----
+6	5
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' RESTORE TO TAG no_such_tag;
+----
+Failed to restore
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' RESTORE TO VERSION 99;
+----
+Failed to restore
+
+statement error
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' RESTORE;
+----
+RESTORE TO VERSION <n> | TAG <name> is required
+
+query TTTI
+ALTER TABLE '{TEST_DIR}/g4_f1_versions.lance' DROP TAG v1_tag;
+----
+drop_tag	{TEST_DIR}/g4_f1_versions.lance	v1_tag	1
+
+query T
+SELECT tag FROM lance_tags('{TEST_DIR}/g4_f1_versions.lance') ORDER BY tag;
+----
+release-latest
+
+# Attached tables resolve the same way, and a restore is visible to later reads.
+statement ok
+COPY (SELECT range AS id FROM range(2)) TO '{TEST_DIR}/g4_f1_attached.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS vadmin_ns (TYPE LANCE);
+
+statement ok
+INSERT INTO vadmin_ns.main.g4_f1_attached VALUES (10), (11);
+
+query I
+SELECT count(*) FROM vadmin_ns.main.g4_f1_attached;
+----
+4
+
+query TTTI
+ALTER TABLE vadmin_ns.main.g4_f1_attached CREATE TAG before_insert AT VERSION 1;
+----
+create_tag	<REGEX>:.*g4_f1_attached\.lance	before_insert	1
+
+query IT
+SELECT version, tags FROM lance_versions('vadmin_ns.main.g4_f1_attached') ORDER BY version;
+----
+1	[before_insert]
+2	[]
+
+query TTTI
+ALTER TABLE vadmin_ns.main.g4_f1_attached RESTORE TO TAG before_insert;
+----
+restore	<REGEX>:.*g4_f1_attached\.lance	before_insert	3
+
+query I
+SELECT count(*) FROM vadmin_ns.main.g4_f1_attached;
+----
+2
+
+query I
+SELECT count(*) FROM '{TEST_DIR}/g4_f1_attached.lance';
+----
+2
+
+# Restoring inside a transaction with uncommitted Lance writes is rejected.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO vadmin_ns.main.g4_f1_attached VALUES (20);
+
+statement error
+ALTER TABLE vadmin_ns.main.g4_f1_attached RESTORE TO VERSION 1;
+----
+uncommitted Lance writes
+
+statement ok
+ROLLBACK;

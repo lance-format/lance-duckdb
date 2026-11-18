@@ -16,6 +16,7 @@
 #include "lance_insert.hpp"
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
+#include "lance_versions.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -556,6 +557,9 @@ enum class LanceMaintenanceStmtKind : uint8_t {
   SET_AUTO_CLEANUP = 4,
   UNSET_AUTO_CLEANUP = 5,
   SHOW_AUTO_CLEANUP = 6,
+  CREATE_TAG = 7,
+  DROP_TAG = 8,
+  RESTORE = 9,
 };
 
 static bool IsSpace(char c) {
@@ -978,6 +982,45 @@ static bool TryParseIdentifier(const string &sql, string &out_ident,
   return true;
 }
 
+// A tag is a quoted string or a bare run of characters Lance allows in tag
+// names (letters, digits, '.', '-' and '_').
+static bool TryParseTagName(string &rest, string &out_tag, string &out_error) {
+  out_tag.clear();
+  if (StartsWithQuotedString(rest)) {
+    idx_t consumed = 0;
+    if (!TryParseSqlStringLiteral(rest, out_tag, consumed)) {
+      out_error = "invalid tag name string literal";
+      return false;
+    }
+    rest = TrimCopy(rest.substr(consumed));
+  } else {
+    idx_t i = 0;
+    while (i < rest.size() && (IsIdentChar(rest[i]) || rest[i] == '-')) {
+      i++;
+    }
+    out_tag = rest.substr(0, i);
+    rest = TrimCopy(rest.substr(i));
+  }
+  if (out_tag.empty()) {
+    out_error = "expected a tag name";
+    return false;
+  }
+  return true;
+}
+
+static bool TryParseVersionNumber(string &rest, int64_t &out_version,
+                                  string &out_error) {
+  string token;
+  idx_t consumed = 0;
+  if (!TryParseIdentifier(rest, token, consumed) ||
+      !TryParseIntegerLiteral(token, out_version) || out_version < 1) {
+    out_error = "expected a positive version number";
+    return false;
+  }
+  rest = TrimCopy(rest.substr(consumed));
+  return true;
+}
+
 struct LanceMaintenanceParseData final : public ParserExtensionParseData {
   explicit LanceMaintenanceParseData(LanceMaintenanceStmtKind kind_p)
       : kind(kind_p) {}
@@ -992,6 +1035,9 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
   string auto_cleanup_older_than;
   bool auto_cleanup_has_retain_versions = false;
   int64_t auto_cleanup_retain_versions = 0;
+  string tag;
+  bool has_version = false;
+  int64_t version = 0;
 
   unique_ptr<ParserExtensionParseData> Copy() const override {
     auto out = make_uniq<LanceMaintenanceParseData>(kind);
@@ -1004,6 +1050,9 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
     out->auto_cleanup_older_than = auto_cleanup_older_than;
     out->auto_cleanup_has_retain_versions = auto_cleanup_has_retain_versions;
     out->auto_cleanup_retain_versions = auto_cleanup_retain_versions;
+    out->tag = tag;
+    out->has_version = has_version;
+    out->version = version;
     return std::move(out);
   }
 
@@ -1024,6 +1073,12 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
       return "ALTER TABLE " + target_sql + " UNSET AUTO_CLEANUP";
     case LanceMaintenanceStmtKind::SHOW_AUTO_CLEANUP:
       return "SHOW MAINTENANCE ON " + target_sql;
+    case LanceMaintenanceStmtKind::CREATE_TAG:
+      return "ALTER TABLE " + target_sql + " CREATE TAG " + tag;
+    case LanceMaintenanceStmtKind::DROP_TAG:
+      return "ALTER TABLE " + target_sql + " DROP TAG " + tag;
+    case LanceMaintenanceStmtKind::RESTORE:
+      return "ALTER TABLE " + target_sql + " RESTORE";
     default:
       return "LANCE MAINTENANCE";
     }
@@ -1209,6 +1264,84 @@ static ParserExtensionParseResult LanceMaintenanceParse(ParserExtensionInfo *,
       return ParserExtensionParseResult(parse_error);
     }
 
+    if (ConsumeKeyword(rest, "create")) {
+      string tag;
+      if (!ConsumeKeyword(rest, "tag") ||
+          !TryParseTagName(rest, tag, parse_error)) {
+        return ParserExtensionParseResult(
+            parse_error.empty()
+                ? "ALTER TABLE ... CREATE TAG <name> [AT VERSION <n>]"
+                : parse_error);
+      }
+      auto out = make_uniq<LanceMaintenanceParseData>(
+          LanceMaintenanceStmtKind::CREATE_TAG);
+      if (ConsumeKeyword(rest, "at")) {
+        if (!ConsumeKeyword(rest, "version") ||
+            !TryParseVersionNumber(rest, out->version, parse_error)) {
+          return ParserExtensionParseResult(
+              parse_error.empty() ? "expected AT VERSION <n>" : parse_error);
+        }
+        out->has_version = true;
+      }
+      if (!TrimCopy(rest).empty()) {
+        return ParserExtensionParseResult("unexpected trailing tokens");
+      }
+      out->target_is_path = target_is_path;
+      out->dataset_uri = dataset_uri;
+      out->target_sql = target_sql;
+      out->tag = tag;
+      return ParserExtensionParseResult(std::move(out));
+    }
+
+    if (ConsumeKeyword(rest, "drop")) {
+      string tag;
+      if (!ConsumeKeyword(rest, "tag") ||
+          !TryParseTagName(rest, tag, parse_error)) {
+        return ParserExtensionParseResult(
+            parse_error.empty() ? "ALTER TABLE ... DROP TAG <name>"
+                                : parse_error);
+      }
+      if (!TrimCopy(rest).empty()) {
+        return ParserExtensionParseResult("unexpected trailing tokens");
+      }
+      auto out = make_uniq<LanceMaintenanceParseData>(
+          LanceMaintenanceStmtKind::DROP_TAG);
+      out->target_is_path = target_is_path;
+      out->dataset_uri = dataset_uri;
+      out->target_sql = target_sql;
+      out->tag = tag;
+      return ParserExtensionParseResult(std::move(out));
+    }
+
+    if (ConsumeKeyword(rest, "restore")) {
+      auto out = make_uniq<LanceMaintenanceParseData>(
+          LanceMaintenanceStmtKind::RESTORE);
+      const char *usage =
+          "ALTER TABLE ... RESTORE TO VERSION <n> | TAG <name> is required";
+      if (!ConsumeKeyword(rest, "to")) {
+        return ParserExtensionParseResult(usage);
+      }
+      if (ConsumeKeyword(rest, "version")) {
+        if (!TryParseVersionNumber(rest, out->version, parse_error)) {
+          return ParserExtensionParseResult(parse_error);
+        }
+        out->has_version = true;
+      } else if (ConsumeKeyword(rest, "tag")) {
+        if (!TryParseTagName(rest, out->tag, parse_error)) {
+          return ParserExtensionParseResult(parse_error);
+        }
+      } else {
+        return ParserExtensionParseResult(usage);
+      }
+      if (!TrimCopy(rest).empty()) {
+        return ParserExtensionParseResult("unexpected trailing tokens");
+      }
+      out->target_is_path = target_is_path;
+      out->dataset_uri = dataset_uri;
+      out->target_sql = target_sql;
+      return ParserExtensionParseResult(std::move(out));
+    }
+
     if (ConsumeKeyword(rest, "set")) {
       if (!ConsumeKeyword(rest, "auto_cleanup")) {
         return ParserExtensionParseResult(
@@ -1272,8 +1405,8 @@ static ParserExtensionParseResult LanceMaintenanceParse(ParserExtensionInfo *,
     }
 
     return ParserExtensionParseResult(
-        "ALTER TABLE maintenance syntax must be SET/UNSET AUTO_CLEANUP or "
-        "OPTIMIZE INDEXES");
+        "ALTER TABLE maintenance syntax must be SET/UNSET AUTO_CLEANUP, "
+        "OPTIMIZE INDEXES, CREATE/DROP TAG or RESTORE");
   }
 
   return ParserExtensionParseResult();
@@ -1341,6 +1474,29 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
   case LanceMaintenanceStmtKind::SHOW_AUTO_CLEANUP:
     result.function = LanceInternalShowAutoCleanupTableFunction();
     result.parameters = {Value(target)};
+    result.return_type = StatementReturnType::QUERY_RESULT;
+    break;
+  case LanceMaintenanceStmtKind::CREATE_TAG:
+    result.function = LanceInternalCreateTagTableFunction();
+    result.parameters = {Value(target), Value(parse_data->tag),
+                         parse_data->has_version
+                             ? Value::BIGINT(parse_data->version)
+                             : Value(LogicalType::BIGINT)};
+    result.return_type = StatementReturnType::QUERY_RESULT;
+    break;
+  case LanceMaintenanceStmtKind::DROP_TAG:
+    result.function = LanceInternalDeleteTagTableFunction();
+    result.parameters = {Value(target), Value(parse_data->tag)};
+    result.return_type = StatementReturnType::QUERY_RESULT;
+    break;
+  case LanceMaintenanceStmtKind::RESTORE:
+    result.function = LanceInternalRestoreTableFunction();
+    result.parameters = {Value(target),
+                         parse_data->tag.empty() ? Value(LogicalType::VARCHAR)
+                                                 : Value(parse_data->tag),
+                         parse_data->has_version
+                             ? Value::BIGINT(parse_data->version)
+                             : Value(LogicalType::BIGINT)};
     result.return_type = StatementReturnType::QUERY_RESULT;
     break;
   default:

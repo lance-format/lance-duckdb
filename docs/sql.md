@@ -923,3 +923,29 @@ SHOW MAINTENANCE ON 'path/to/dataset.lance';
 - `interval` (if configured)
 - `older_than` (if configured)
 - `retain_versions` (if configured)
+## Versions and tags
+
+Every committed write creates a new dataset version. These statements accept a dataset path string literal or an attached Lance table name.
+
+```sql
+-- List versions and the tags that point at them.
+SELECT version, "timestamp", tags FROM lance_versions('path/to/dataset.lance');
+
+-- List tags.
+SELECT tag, version, created_at, updated_at FROM lance_tags('path/to/dataset.lance');
+
+-- Tag the latest version, or a specific one.
+ALTER TABLE 'path/to/dataset.lance' CREATE TAG stable;
+ALTER TABLE ns.main.my_table CREATE TAG before_migration AT VERSION 3;
+
+ALTER TABLE 'path/to/dataset.lance' DROP TAG stable;
+
+-- Commit an older version as the new latest version.
+ALTER TABLE 'path/to/dataset.lance' RESTORE TO VERSION 3;
+ALTER TABLE ns.main.my_table RESTORE TO TAG before_migration;
+```
+
+- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`). `lance_tags` returns `tag`, `version`, `created_at` and `updated_at`.
+- Tag names may contain letters, digits, `.`, `-` and `_`. A tag name that is not a bare identifier-like word can be written as a string literal.
+- `CREATE TAG`, `DROP TAG` and `RESTORE` return `Operation`, `Target`, `Tag` and `Version`. For `RESTORE`, `Version` is the new latest version; the restored version and all earlier ones stay in the history until `VACUUM LANCE` removes them.
+- `RESTORE` is rejected while the current transaction has uncommitted Lance writes.
