@@ -75,6 +75,12 @@ void *lance_open_dataset_with_storage_options_and_version(
     const char *path, const char **option_keys, const char **option_values,
     size_t options_len, void *session, uint8_t has_version, uint64_t version);
 int32_t lance_dataset_version(void *dataset, uint64_t *out_version);
+// 0: found, 1: every version is newer than the timestamp, -1: error.
+int32_t lance_dataset_version_at_timestamp(void *dataset,
+                                           int64_t timestamp_micros,
+                                           uint64_t *out_version);
+int32_t lance_dataset_checkout_version(void *dataset, uint64_t version,
+                                       void **out_dataset);
 int32_t lance_dataset_uses_stable_row_ids(void *dataset,
                                           uint8_t *out_uses_stable_row_ids);
 int32_t lance_dir_namespace_list_tables(const char *root,

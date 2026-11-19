@@ -3598,8 +3598,17 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       exec_bind = make_uniq<LanceExecBindData>();
       exec_bind->file_path = scan_bind.file_path;
       exec_bind->exec_ir = exec_ir;
-      exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
-          context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
+      auto *scan_table =
+          scan_bind.table_entry
+              ? dynamic_cast<LanceTableEntry *>(scan_bind.table_entry.get())
+              : nullptr;
+      if (scan_table && scan_table->IsHistorical()) {
+        // The latest version at this path is not the one the scan reads.
+        exec_bind->dataset_entry = scan_table->HistoricalDataset();
+      } else {
+        exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
+            context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
+      }
       exec_bind->dataset = exec_bind->dataset_entry
                                ? exec_bind->dataset_entry->Handle()
                                : nullptr;
@@ -4338,7 +4347,7 @@ LanceTableEntry::GetScanFunction(ClientContext &context,
   result->table_entry = this;
   result->file_path = dataset_uri;
 
-  if (IsNamespaceBacked() && NamespaceConfig().IsRest() &&
+  if (IsNamespaceBacked() && NamespaceConfig().IsRest() && !IsHistorical() &&
       LanceNamespaceQueryTableEnabled(context)) {
     result->namespace_query_config =
         make_uniq<LanceNamespaceTableConfig>(NamespaceConfig());

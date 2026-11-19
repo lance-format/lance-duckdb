@@ -20,6 +20,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <algorithm>
@@ -181,16 +182,12 @@ void LanceTableSchema::LoadTableComment(void *dataset) {
   }
 }
 
-static unique_ptr<CatalogEntry>
-BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
-                            bool internal) {
-  string display_uri;
-  void *dataset = LanceOpenDatasetForTable(context, base, display_uri);
-  if (!dataset) {
-    throw IOException("Failed to open Lance dataset: " + display_uri +
-                      LanceFormatErrorSuffix());
-  }
-
+// Interprets `dataset`'s schema as a catalog entry for `base`'s name and
+// location. Does not take ownership of the handle.
+static unique_ptr<LanceTableEntry>
+BuildLanceTableEntryFromDataset(ClientContext &context,
+                                const LanceTableEntry &base, bool internal,
+                                void *dataset) {
   auto &catalog = base.catalog;
   auto &schema = base.schema;
 
@@ -198,24 +195,11 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
   create_info.internal = internal;
   create_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 
-  vector<string> coerced;
-  vector<string> json_columns;
-  vector<bool> blob_columns;
-  vector<string> writable_blob_v2_columns;
-  try {
-    auto live = LanceTableSchema::FromDataset(context, dataset);
-    live.LoadTableComment(dataset);
-    create_info.comment = live.comment;
-    create_info.columns = std::move(live.columns);
-    create_info.constraints = std::move(live.constraints);
-    coerced = std::move(live.coerced_columns);
-    json_columns = std::move(live.json_columns);
-    blob_columns = std::move(live.blob_columns);
-    writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
-  } catch (...) {
-    lance_close_dataset(dataset);
-    throw;
-  }
+  auto live = LanceTableSchema::FromDataset(context, dataset);
+  live.LoadTableComment(dataset);
+  create_info.comment = live.comment;
+  create_info.columns = std::move(live.columns);
+  create_info.constraints = std::move(live.constraints);
 
   unique_ptr<LanceTableEntry> entry;
   if (base.IsNamespaceBacked()) {
@@ -225,11 +209,29 @@ BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
     entry = make_uniq<LanceTableEntry>(catalog, schema, create_info,
                                        base.DatasetUri());
   }
-  entry->SetCoercedColumnNames(std::move(coerced));
-  entry->SetJsonColumnNames(std::move(json_columns));
-  entry->SetBlobColumns(std::move(blob_columns));
-  entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
+  entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+  entry->SetJsonColumnNames(std::move(live.json_columns));
+  entry->SetBlobColumns(std::move(live.blob_columns));
+  entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));
+  return entry;
+}
 
+static unique_ptr<CatalogEntry>
+BuildUpdatedLanceTableEntry(ClientContext &context, const LanceTableEntry &base,
+                            bool internal) {
+  string display_uri;
+  void *dataset = LanceOpenDatasetForTable(context, base, display_uri);
+  if (!dataset) {
+    throw IOException("Failed to open Lance dataset: " + display_uri +
+                      LanceFormatErrorSuffix());
+  }
+  unique_ptr<LanceTableEntry> entry;
+  try {
+    entry = BuildLanceTableEntryFromDataset(context, base, internal, dataset);
+  } catch (...) {
+    lance_close_dataset(dataset);
+    throw;
+  }
   lance_close_dataset(dataset);
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
 }
@@ -297,11 +299,105 @@ static bool IsImplicitCastUsingExpression(const ParsedExpression &expr,
 
 unique_ptr<CatalogEntry>
 LanceTableEntry::Rebuild(ClientContext &context) const {
+  if (IsHistorical()) {
+    throw InternalException("A historical Lance table version is read-only");
+  }
   return BuildUpdatedLanceTableEntry(context, *this, internal);
+}
+
+// The dataset version an AT clause names. VERSION is a Lance manifest version;
+// TIMESTAMP is the newest version committed at or before it. For TIMESTAMP,
+// also return the dataset handle whose manifests supplied that version.
+static uint64_t ResolveAtClauseVersion(
+    ClientContext &context, const LanceTableEntry &table,
+    const BoundAtClause &at,
+    shared_ptr<LanceDatasetCacheEntry> &out_timestamp_dataset,
+    string &out_display_uri) {
+  const auto unit = StringUtil::Upper(at.Unit().GetIdentifierName());
+  const auto &value = at.GetValue();
+  if (unit != "VERSION" && unit != "TIMESTAMP") {
+    throw BinderException("Lance tables support AT (VERSION => ...) and "
+                          "AT (TIMESTAMP => ...), not AT (%s => ...)",
+                          at.Unit().GetIdentifierName());
+  }
+  if (value.IsNull()) {
+    throw BinderException("AT (%s => ...) requires a non-NULL value", unit);
+  }
+  if (unit == "VERSION") {
+    auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
+    if (version_value.DefaultCastAs(value.type()) != value) {
+      throw BinderException(
+          "AT (VERSION => ...) requires an integer value, got %s",
+          value.ToString());
+    }
+    auto version = version_value.GetValue<int64_t>();
+    if (version < 1) {
+      throw BinderException(
+          "Lance table versions start at 1, got AT (VERSION => %lld)",
+          static_cast<long long>(version));
+    }
+    return NumericCast<uint64_t>(version);
+  }
+
+  auto micros = value.CastAs(context, LogicalType::TIMESTAMP_TZ)
+                    .GetValueUnsafe<int64_t>();
+  out_timestamp_dataset =
+      LanceGetOrOpenDatasetEntryForTable(context, table, out_display_uri);
+  if (!out_timestamp_dataset || !out_timestamp_dataset->Handle()) {
+    throw IOException("Failed to open Lance dataset: " + out_display_uri +
+                      LanceFormatErrorSuffix());
+  }
+  uint64_t version = 0;
+  auto rc = lance_dataset_version_at_timestamp(out_timestamp_dataset->Handle(),
+                                               micros, &version);
+  if (rc < 0) {
+    throw IOException("Failed to resolve the Lance version at " +
+                      value.ToString() + ": " + out_display_uri +
+                      LanceFormatErrorSuffix());
+  }
+  if (rc > 0) {
+    throw BinderException(
+        "Lance table %s has no version at or before %s: its first version "
+        "is newer",
+        table.name, value.ToString());
+  }
+  return version;
+}
+
+unique_ptr<LanceTableEntry>
+LanceTableEntry::AtClause(ClientContext &context,
+                          const BoundAtClause &at) const {
+  shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;
+  string display_uri;
+  auto version = ResolveAtClauseVersion(context, *this, at, timestamp_dataset,
+                                        display_uri);
+  void *dataset = nullptr;
+  if (timestamp_dataset) {
+    if (lance_dataset_checkout_version(timestamp_dataset->Handle(), version,
+                                       &dataset) < 0) {
+      dataset = nullptr;
+    }
+  } else {
+    dataset =
+        LanceOpenDatasetForTableAtVersion(context, *this, version, display_uri);
+  }
+  if (!dataset) {
+    throw IOException("Failed to open version " + to_string(version) +
+                      " of Lance dataset: " + display_uri +
+                      LanceFormatErrorSuffix());
+  }
+  auto pinned = make_shared_ptr<LanceDatasetCacheEntry>(dataset, display_uri);
+  auto entry =
+      BuildLanceTableEntryFromDataset(context, *this, internal, dataset);
+  entry->historical_dataset = std::move(pinned);
+  return entry;
 }
 
 unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                                                      AlterInfo &info) {
+  if (IsHistorical()) {
+    throw InternalException("A historical Lance table version is read-only");
+  }
   if (!context.transaction.IsAutoCommit()) {
     throw NotImplementedException(
         "Lance DDL does not support explicit transactions yet");
@@ -595,6 +691,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
   copy->SetJsonColumnNames(json_column_names);
   copy->SetBlobColumns(blob_column_flags);
   copy->SetWritableBlobV2Columns(writable_blob_v2_columns);
+  copy->historical_dataset = historical_dataset;
   return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(copy));
 }
 

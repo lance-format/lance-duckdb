@@ -289,6 +289,120 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void, out_version
     }
 }
 
+fn newest_version_at_timestamp(
+    versions: &[lance::dataset::Version],
+    timestamp_micros: i64,
+) -> Option<u64> {
+    let cutoff = (
+        timestamp_micros.div_euclid(1_000_000),
+        timestamp_micros.rem_euclid(1_000_000) as u32 * 1_000,
+    );
+    versions
+        .iter()
+        .filter(|version| {
+            (
+                version.timestamp.timestamp(),
+                version.timestamp.timestamp_subsec_nanos(),
+            ) <= cutoff
+        })
+        .map(|version| version.version)
+        .max()
+}
+
+/// Resolve the newest version committed at or before `timestamp_micros`
+/// (microseconds since the Unix epoch, UTC).
+///
+/// Returns `0` and writes `out_version` when such a version exists, `1` when
+/// every version is newer than the timestamp (`out_version` is untouched), and
+/// `-1` on error. Reads every manifest of the dataset.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
+    dataset: *mut c_void,
+    timestamp_micros: i64,
+    out_version: *mut u64,
+) -> i32 {
+    if out_version.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_version must not be null");
+        return -1;
+    }
+    let handle = match unsafe { dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    let versions = match runtime::block_on(handle.dataset.versions()) {
+        Ok(Ok(versions)) => versions,
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("list dataset versions: {err}"),
+            );
+            return -1;
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            return -1;
+        }
+    };
+    clear_last_error();
+    match newest_version_at_timestamp(&versions, timestamp_micros) {
+        Some(version) => {
+            unsafe {
+                *out_version = version;
+            }
+            0
+        }
+        None => 1,
+    }
+}
+
+/// Check out a version from the same dataset handle, preserving its location,
+/// branch, object store and session instead of resolving the namespace again.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_version(
+    dataset: *mut c_void,
+    version: u64,
+    out_dataset: *mut *mut c_void,
+) -> i32 {
+    if out_dataset.is_null() {
+        set_last_error(ErrorCode::InvalidArgument, "out_dataset must not be null");
+        return -1;
+    }
+    unsafe {
+        ptr::write_unaligned(out_dataset, ptr::null_mut());
+    }
+    let handle = match unsafe { dataset_handle(dataset) } {
+        Ok(handle) => handle,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    let checked_out = match runtime::block_on(handle.dataset.checkout_version(version)) {
+        Ok(Ok(dataset)) => dataset,
+        Ok(Err(err)) => {
+            set_last_error(
+                ErrorCode::DatasetOpen,
+                format!("checkout dataset version {version}: {err}"),
+            );
+            return -1;
+        }
+        Err(err) => {
+            set_last_error(ErrorCode::Runtime, format!("runtime: {err}"));
+            return -1;
+        }
+    };
+    let new_handle =
+        Box::into_raw(Box::new(DatasetHandle::new(Arc::new(checked_out)))) as *mut c_void;
+    unsafe {
+        ptr::write_unaligned(out_dataset, new_handle);
+    }
+    clear_last_error();
+    0
+}
+
 /// Report whether the dataset manifest enables stable row ids.
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_uses_stable_row_ids(
@@ -1001,5 +1115,165 @@ mod tests {
 
             lance_close_dataset(handle);
         }
+    }
+
+    #[test]
+    fn test_version_at_timestamp_preserves_submicrosecond_precision() {
+        let version = |version: u64, seconds: i64, nanos: u32| lance::dataset::Version {
+            version,
+            timestamp: chrono::DateTime::from_timestamp(seconds, nanos).unwrap(),
+            metadata: Default::default(),
+        };
+        let versions = vec![version(1, 0, 0), version(2, 1, 999), version(3, 2, 0)];
+
+        // Version 2 commits 999ns after this cutoff and must not be selected.
+        assert_eq!(newest_version_at_timestamp(&versions, 1_000_000), Some(1));
+        assert_eq!(newest_version_at_timestamp(&versions, 1_000_001), Some(2));
+        assert_eq!(newest_version_at_timestamp(&versions, 2_000_000), Some(3));
+
+        // Euclidean cutoff decomposition also keeps pre-epoch timestamps exact.
+        let pre_epoch = vec![version(1, -1, 999_999_999)]; // one ns before epoch
+        assert_eq!(newest_version_at_timestamp(&pre_epoch, -1), None);
+        assert_eq!(newest_version_at_timestamp(&pre_epoch, 0), Some(1));
+    }
+
+    #[test]
+    fn test_checkout_version_preserves_source_dataset_identity() {
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+        let dataset_dir = std::env::temp_dir().join(format!(
+            "ffi-dataset-at-ts-identity-{}",
+            rand::random::<u64>()
+        ));
+        let uri = dataset_dir.to_string_lossy().to_string();
+
+        external_write(&uri, vec![1, 2, 3], WriteMode::Create);
+        external_write(&uri, vec![4], WriteMode::Append);
+        let source = runtime::block_on(Dataset::open(&uri)).unwrap().unwrap();
+        let versions = runtime::block_on(source.versions()).unwrap().unwrap();
+        let first_timestamp = versions
+            .iter()
+            .find(|version| version.version == 1)
+            .unwrap()
+            .timestamp;
+        let mut first_cutoff = first_timestamp.timestamp_micros();
+        if first_timestamp.timestamp_subsec_nanos() % 1_000 != 0 {
+            first_cutoff += 1;
+        }
+        drop(versions);
+        drop(source);
+
+        unsafe {
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let handle = lance_open_dataset(uri_c.as_ptr());
+            assert!(!handle.is_null());
+            let mut version = 0u64;
+            assert_eq!(
+                lance_dataset_version_at_timestamp(handle, first_cutoff, &mut version),
+                0
+            );
+            assert_eq!(version, 1);
+
+            let mut checked_out: *mut c_void = ptr::null_mut();
+            assert_eq!(
+                lance_dataset_checkout_version(handle, version, &mut checked_out),
+                0
+            );
+            assert!(!checked_out.is_null());
+            assert_eq!(lance_dataset_count_rows(checked_out), 3);
+            assert_eq!(lance_dataset_count_rows(handle), 4);
+
+            let source_handle = dataset_handle(handle).unwrap();
+            let checked_out_handle = dataset_handle(checked_out).unwrap();
+            assert_eq!(
+                checked_out_handle.dataset.uri(),
+                source_handle.dataset.uri()
+            );
+            assert_eq!(
+                checked_out_handle.dataset.manifest.branch,
+                source_handle.dataset.manifest.branch
+            );
+            assert!(Arc::ptr_eq(
+                &checked_out_handle.dataset.session(),
+                &source_handle.dataset.session()
+            ));
+
+            lance_close_dataset(checked_out);
+            lance_close_dataset(handle);
+        }
+
+        let _ = fs::remove_dir_all(dataset_dir);
+    }
+
+    #[test]
+    fn test_version_at_timestamp_picks_newest_version_not_after_timestamp() {
+        // Opening datasets mutates the process-global debug counters, which
+        // other tests assert on; serialize with them.
+        let _counter_guard = crate::ffi::session::debug_counter_test_lock();
+        let dataset_dir =
+            std::env::temp_dir().join(format!("ffi-dataset-at-ts-{}", rand::random::<u64>()));
+        let uri = dataset_dir.to_string_lossy().to_string();
+
+        external_write(&uri, vec![1], WriteMode::Create);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        external_write(&uri, vec![2], WriteMode::Append);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        external_write(&uri, vec![3], WriteMode::Append);
+
+        let timestamp = |version: u64| {
+            let ds = runtime::block_on(lance::Dataset::open(&uri))
+                .unwrap()
+                .unwrap();
+            let versions = runtime::block_on(ds.versions()).unwrap().unwrap();
+            versions
+                .iter()
+                .find(|v| v.version == version)
+                .unwrap()
+                .timestamp
+        };
+        let (commit1, commit2, commit3) = (timestamp(1), timestamp(2), timestamp(3));
+        let inclusive_micros = |timestamp: chrono::DateTime<chrono::Utc>| {
+            timestamp.timestamp_micros()
+                + i64::from(timestamp.timestamp_subsec_nanos() % 1_000 != 0)
+        };
+        let (ts1, ts2, ts3) = (
+            commit1.timestamp_micros(),
+            inclusive_micros(commit2),
+            commit3.timestamp_micros(),
+        );
+        assert!(ts1 < ts2 && ts2 < ts3);
+
+        unsafe {
+            let uri_c = CString::new(uri.clone()).unwrap();
+            let handle = lance_open_dataset(uri_c.as_ptr());
+            assert!(!handle.is_null());
+
+            let resolve = |ts: i64| {
+                let mut version = 0u64;
+                let rc = lance_dataset_version_at_timestamp(handle, ts, &mut version);
+                (rc, version)
+            };
+            // The first microsecond containing the full commit time includes
+            // it; one microsecond earlier does not, even within the same
+            // truncated microsecond as the commit.
+            assert_eq!(resolve(ts2), (0, 2));
+            assert_eq!(resolve(ts2 - 1), (0, 1));
+            assert_eq!(resolve(ts3 + 1_000_000), (0, 3));
+            // Every version is newer than the timestamp: no error, no version.
+            assert_eq!(resolve(ts1 - 1), (1, 0));
+
+            let mut version = 0u64;
+            assert_eq!(
+                lance_dataset_version_at_timestamp(handle, ts2, ptr::null_mut()),
+                -1
+            );
+            assert_eq!(
+                lance_dataset_version_at_timestamp(ptr::null_mut(), ts2, &mut version),
+                -1
+            );
+
+            lance_close_dataset(handle);
+        }
+
+        let _ = fs::remove_dir_all(dataset_dir);
     }
 }

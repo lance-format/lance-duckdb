@@ -33,6 +33,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -1246,7 +1247,17 @@ private:
         // Scan and DML binding still validate the live schema and fail closed.
       }
     }
-    return PinLanceCatalogEntry(*transaction.context, found->second);
+    auto latest = PinLanceCatalogEntry(*transaction.context, found->second);
+    auto at_clause = lookup_info.GetAtClause();
+    if (!at_clause) {
+      return latest;
+    }
+    // Resolved against the latest entry so a missing table fails the same way;
+    // the view is per lookup and never cached. The query pins it.
+    auto view = latest->Cast<LanceTableEntry>().AtClause(*transaction.context,
+                                                         *at_clause);
+    return PinLanceCatalogEntry(*transaction.context,
+                                shared_ptr<CatalogEntry>(std::move(view)));
   }
 
   void InvalidateTableEntry(const Identifier &name) {
@@ -1432,6 +1443,11 @@ public:
   }
 
   bool SupportsNestedSchemas() const override { return false; }
+
+  // Lance tables are versioned datasets: AT (VERSION | TIMESTAMP => ...) binds
+  // a read-only view of one version (see
+  // LanceSchemaEntry::LookupEntryInternal).
+  bool SupportsTimeTravel() const override { return true; }
 
   bool SupportsMultipleDMLCTEs() const override { return false; }
 

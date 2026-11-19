@@ -621,6 +621,12 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryInNamespace(
 shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
     ClientContext &context, const LanceTableEntry &table,
     string &out_display_uri, bool *out_cache_hit) {
+  if (table.IsHistorical()) {
+    // A historical view is bound to the one version it opened; the cache only
+    // tracks the latest.
+    out_display_uri = table.HistoricalDataset()->DisplayUri();
+    return table.HistoricalDataset();
+  }
   out_display_uri = table.DatasetUri();
   if (!table.IsNamespaceBacked()) {
     auto entry =

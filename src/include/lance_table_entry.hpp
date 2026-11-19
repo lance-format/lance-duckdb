@@ -16,6 +16,8 @@ class LogicalProjection;
 class LogicalUpdate;
 class CatalogEntry;
 class ClientContext;
+class BoundAtClause;
+class LanceDatasetCacheEntry;
 struct ArrowTableSchema;
 
 // A transient interpretation shared by catalog discovery, rebuild, and
@@ -85,6 +87,16 @@ public:
   unique_ptr<CatalogEntry> Rebuild(ClientContext &context) const;
 
   unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
+
+  // A read-only view of this table at the dataset version an AT clause names
+  // (VERSION or TIMESTAMP). Its schema comes from that version and it holds
+  // the opened dataset, so every read of the view sees that one version.
+  unique_ptr<LanceTableEntry> AtClause(ClientContext &context,
+                                       const BoundAtClause &at) const;
+  bool IsHistorical() const { return historical_dataset != nullptr; }
+  const shared_ptr<LanceDatasetCacheEntry> &HistoricalDataset() const {
+    return historical_dataset;
+  }
 
   TableFunction GetScanFunction(ClientContext &context,
                                 unique_ptr<FunctionData> &bind_data) override;
@@ -205,6 +217,8 @@ private:
   vector<string> json_column_names;
   vector<bool> blob_column_flags;
   vector<string> writable_blob_v2_columns;
+  // Set only on views built by AtClause.
+  shared_ptr<LanceDatasetCacheEntry> historical_dataset;
 };
 
 // Rebuild a stale cache entry without changing storage. Executing queries pin
