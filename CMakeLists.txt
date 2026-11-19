@@ -25,6 +25,7 @@ set(EXTENSION_SOURCES
     src/lance_storage.cpp
     src/lance_table_entry.cpp
     src/lance_maintenance.cpp
+    src/lance_versions.cpp
     src/lance_replacement.cpp
     src/lance_insert.cpp
     src/lance_merge.cpp

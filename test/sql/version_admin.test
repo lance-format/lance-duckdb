@@ -1,0 +1,89 @@
+# name: test/sql/version_admin.test
+# description: lance_versions and lance_tags on dataset paths and attached tables
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT range AS id FROM range(3)) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+COPY (SELECT range AS id FROM range(3, 5)) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'append');
+
+statement ok
+COPY (SELECT 5::BIGINT AS id) TO '{TEST_DIR}/g4_f1_versions.lance' (FORMAT lance, mode 'append');
+
+# Every write is a version; none is tagged.
+query ITT
+SELECT version, "timestamp" IS NOT NULL, tags FROM lance_versions('{TEST_DIR}/g4_f1_versions.lance') ORDER BY version;
+----
+1	true	[]
+2	true	[]
+3	true	[]
+
+query I
+SELECT count(*) FROM lance_tags('{TEST_DIR}/g4_f1_versions.lance');
+----
+0
+
+# Versions are listed in commit order with non-decreasing timestamps.
+query I
+SELECT count(*) FROM (
+  SELECT "timestamp" >= lag("timestamp") OVER (ORDER BY version) AS ordered
+  FROM lance_versions('{TEST_DIR}/g4_f1_versions.lance')
+) WHERE ordered = false;
+----
+0
+
+statement error
+SELECT * FROM lance_versions('{TEST_DIR}/g4_f1_missing.lance');
+----
+g4_f1_missing
+
+# A write through an attached table adds a version that the listing sees.
+statement ok
+COPY (SELECT range AS id FROM range(2)) TO '{TEST_DIR}/g4_f1_attached.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+ATTACH '{TEST_DIR}' AS vadmin_ns (TYPE LANCE);
+
+query I
+SELECT count(*) FROM lance_versions('vadmin_ns.main.g4_f1_attached');
+----
+1
+
+statement ok
+INSERT INTO vadmin_ns.main.g4_f1_attached VALUES (10), (11);
+
+query IT
+SELECT version, tags FROM lance_versions('vadmin_ns.main.g4_f1_attached') ORDER BY version;
+----
+1	[]
+2	[]
+
+query I
+SELECT count(*) FROM lance_versions('{TEST_DIR}/g4_f1_attached.lance');
+----
+2
+
+query I
+SELECT count(*) FROM lance_tags('vadmin_ns.main.g4_f1_attached');
+----
+0
+
+# The listings only read, so a read-only transaction accepts them.
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+query I
+SELECT count(*) FROM lance_versions('vadmin_ns.main.g4_f1_attached');
+----
+2
+
+query I
+SELECT count(*) FROM lance_tags('{TEST_DIR}/g4_f1_versions.lance');
+----
+0
+
+statement ok
+ROLLBACK;

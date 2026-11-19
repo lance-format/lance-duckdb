@@ -977,3 +977,19 @@ SHOW MAINTENANCE ON 'path/to/dataset.lance';
 - `interval` (if configured)
 - `older_than` (if configured)
 - `retain_versions` (if configured)
+
+## Versions and tags
+
+Every committed write creates a new dataset version. `lance_versions` and `lance_tags` are read-only and accept a dataset path string literal or an attached Lance table name.
+
+```sql
+-- List versions and the tags that point at them.
+SELECT version, "timestamp", tags FROM lance_versions('path/to/dataset.lance');
+
+-- List tags.
+SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_table');
+```
+
+- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
+- `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
+- Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.

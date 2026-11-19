@@ -234,6 +234,12 @@ const char *lance_dataset_list_schema_metadata(void *dataset);
 const char *lance_dataset_list_field_metadata(void *dataset,
                                               const char *field_path);
 const char *lance_dataset_list_indices(void *dataset);
+
+// Version history. The list functions return tab separated rows:
+// `version, timestamp_micros, tags` and
+// `tag, version, branch, created_micros, updated_micros`.
+const char *lance_dataset_list_versions(void *dataset);
+const char *lance_dataset_list_tags(void *dataset);
 int32_t lance_dataset_create_scalar_index(void *dataset, const char *column,
                                           const char *index_name,
                                           uint8_t replace);
