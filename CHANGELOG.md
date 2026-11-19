@@ -9,7 +9,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 
 - `array_has_any` / `array_has_all` (and their `list_has_any` / `list_has_all` aliases) on `LIST` columns are now pushed down to Lance, where a `LABEL_LIST` index turns them into an index query instead of a scan.
-- Dataset version administration from SQL: `lance_versions(...)` and `lance_tags(...)` list versions and tags, `ALTER TABLE ... CREATE TAG <name> [AT VERSION <n>]` and `DROP TAG <name>` manage tags, and `ALTER TABLE ... RESTORE TO VERSION <n> | TAG <name>` commits an older version as the new latest. Each accepts a dataset path or an attached table.
+- `lance_versions(...)` and `lance_tags(...)` list the versions and tags of a dataset path or an attached table.
 - `lance_fts` and `lance_hybrid_search` now push scalar-function predicates (containment, `starts_with`, `LIKE`, `regexp_matches`) to Lance as a prefilter. Previously only simple comparisons reached Lance from those two functions, and `prefilter := true` silently ignored everything else.
 - Searches over namespace-backed tables now prefilter on a pushed `WHERE` clause. `lance_vector_search` and `lance_fts` previously rejected `prefilter := true` on such tables unless the caller passed an explicit `filter := '<string>'` argument, because a pushed predicate could not reach the namespace request. A pushed predicate is now unparsed into that request, and combines with an explicit `filter` argument when both are present.
 

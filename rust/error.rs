@@ -81,7 +81,7 @@ pub enum ErrorCode {
     NamespaceNotEmpty = 63,
     NamespaceUnsupported = 64,
     OutOfMemory = 65,
-    DatasetVersionAdmin = 66,
+    DatasetVersions = 66,
 }
 
 pub(crate) fn datafusion_error_code(

@@ -1,5 +1,5 @@
 # name: test/sql/version_admin_branch_tag.test
-# description: Tags that live on another Lance branch are not treated as snapshots of the opened branch.
+# description: lance_tags and lance_versions on a dataset that holds tags on another Lance branch
 # group: [sql]
 
 # Fixture: test/data/branch_tag_fixture.lance, regenerate with
@@ -15,6 +15,12 @@ SELECT tag, version, branch FROM lance_tags('test/data/branch_tag_fixture.lance'
 dev_tag	3	dev
 main_tag	1	NULL
 
+query TT
+SELECT tag, created_at IS NOT NULL AND updated_at IS NOT NULL FROM lance_tags('test/data/branch_tag_fixture.lance') ORDER BY tag;
+----
+dev_tag	true
+main_tag	true
+
 # Only the main-branch tag names a version of main.
 query IT
 SELECT version, tags FROM lance_versions('test/data/branch_tag_fixture.lance') ORDER BY version;
@@ -23,14 +29,19 @@ SELECT version, tags FROM lance_versions('test/data/branch_tag_fixture.lance') O
 2	[]
 3	[]
 
-# Restoring a branch tag is rejected instead of restoring main's version with the
-# same number.
-statement error
-ALTER TABLE 'test/data/branch_tag_fixture.lance' RESTORE TO TAG dev_tag;
-----
-branch 'dev'
+# An attached table resolves to the same dataset and lists the same tags.
+statement ok
+ATTACH 'test/data' AS vtag_ns (TYPE LANCE);
 
-query I
-SELECT id FROM 'test/data/branch_tag_fixture.lance';
+query TIT
+SELECT tag, version, branch FROM lance_tags('vtag_ns.main.branch_tag_fixture') ORDER BY tag;
 ----
-3
+dev_tag	3	dev
+main_tag	1	NULL
+
+query IT
+SELECT version, tags FROM lance_versions('vtag_ns.main.branch_tag_fixture') ORDER BY version;
+----
+1	[main_tag]
+2	[]
+3	[]

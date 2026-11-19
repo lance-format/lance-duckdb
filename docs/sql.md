@@ -923,31 +923,19 @@ SHOW MAINTENANCE ON 'path/to/dataset.lance';
 - `interval` (if configured)
 - `older_than` (if configured)
 - `retain_versions` (if configured)
+
 ## Versions and tags
 
-Every committed write creates a new dataset version. These statements accept a dataset path string literal or an attached Lance table name.
+Every committed write creates a new dataset version. `lance_versions` and `lance_tags` are read-only and accept a dataset path string literal or an attached Lance table name.
 
 ```sql
 -- List versions and the tags that point at them.
 SELECT version, "timestamp", tags FROM lance_versions('path/to/dataset.lance');
 
 -- List tags.
-SELECT tag, version, created_at, updated_at FROM lance_tags('path/to/dataset.lance');
-
--- Tag the latest version, or a specific one.
-ALTER TABLE 'path/to/dataset.lance' CREATE TAG stable;
-ALTER TABLE ns.main.my_table CREATE TAG before_migration AT VERSION 3;
-
-ALTER TABLE 'path/to/dataset.lance' DROP TAG stable;
-
--- Commit an older version as the new latest version.
-ALTER TABLE 'path/to/dataset.lance' RESTORE TO VERSION 3;
-ALTER TABLE ns.main.my_table RESTORE TO TAG before_migration;
+SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_table');
 ```
 
-- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`). `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`. Tags are shared by every branch of a dataset; `lance_versions` lists only the tags on the opened branch, and `RESTORE TO TAG` rejects a tag that belongs to another branch.
-- Tag names may contain letters, digits, `.`, `-` and `_`. A tag name that is not a bare identifier-like word can be written as a string literal.
-- `CREATE TAG`, `DROP TAG` and `RESTORE` return `Operation`, `Target`, `Tag` and `Version`. For `RESTORE`, `Version` is the new latest version; the restored version and all earlier ones stay in the history until `VACUUM LANCE` removes them.
-- `RESTORE` is rejected while the current transaction has uncommitted Lance writes.
-- `CREATE TAG`, `DROP TAG` and `RESTORE` modify the table, so they are rejected in a `READ ONLY` transaction.
-- A tag protects a version from `VACUUM LANCE` and `AUTO_CLEANUP` only if it exists when the cleanup starts. Lance reads the tags once before it deletes old versions, so a tag created or a `RESTORE` run on an old version while a cleanup is running can still lose that version ([lance#10499](https://github.com/lance-format/lance/issues/10499)). Tag or restore versions well inside the cleanup window, and keep `older_than_seconds` or `older_than` at days rather than minutes.
+- `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
+- `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
+- Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.

@@ -4,10 +4,10 @@ use std::ffi::{c_char, c_void};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::util::{cstr_to_str, to_c_string, FfiError, FfiResult};
+use super::util::{to_c_string, FfiError, FfiResult};
 
 fn version_error(message: String) -> FfiError {
-    FfiError::new(ErrorCode::DatasetVersionAdmin, message)
+    FfiError::new(ErrorCode::DatasetVersions, message)
 }
 
 /// The branch a dataset handle or tag belongs to; `None` is the main branch.
@@ -130,139 +130,4 @@ fn dataset_list_tags_inner(dataset: *mut c_void) -> FfiResult<String> {
         ));
     }
     Ok(out)
-}
-
-/// Tag `version` as `tag`. A tag that already exists is an error.
-#[no_mangle]
-pub unsafe extern "C" fn lance_dataset_create_tag(
-    dataset: *mut c_void,
-    tag: *const c_char,
-    version: u64,
-) -> i32 {
-    finish(dataset_create_tag_inner(dataset, tag, version))
-}
-
-fn dataset_create_tag_inner(
-    dataset: *mut c_void,
-    tag: *const c_char,
-    version: u64,
-) -> FfiResult<()> {
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let ds = (*handle.dataset).clone();
-    let tag = unsafe { cstr_to_str(tag, "tag")? }.to_string();
-    match runtime::block_on(async { ds.tags().create(tag.as_str(), version).await }) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(version_error(format!("create tag '{tag}': {err}"))),
-        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    }
-}
-
-/// Report the version `tag` points at. A tag on another branch is rejected: its
-/// version number names a snapshot this handle cannot open.
-#[no_mangle]
-pub unsafe extern "C" fn lance_dataset_tag_version(
-    dataset: *mut c_void,
-    tag: *const c_char,
-    out_version: *mut u64,
-) -> i32 {
-    if out_version.is_null() {
-        set_last_error(ErrorCode::InvalidArgument, "out_version must not be null");
-        return -1;
-    }
-    finish(dataset_tag_version_inner(dataset, tag, out_version))
-}
-
-fn dataset_tag_version_inner(
-    dataset: *mut c_void,
-    tag: *const c_char,
-    out_version: *mut u64,
-) -> FfiResult<()> {
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let ds = (*handle.dataset).clone();
-    let tag = unsafe { cstr_to_str(tag, "tag")? }.to_string();
-    match runtime::block_on(async { ds.tags().get(tag.as_str()).await }) {
-        Ok(Ok(contents)) => {
-            let current = ds.branch_location().branch;
-            if branch_of(contents.branch.as_deref()) != branch_of(current.as_deref()) {
-                return Err(version_error(format!(
-                    "tag '{tag}' is on branch '{}', which this table is not opened on",
-                    branch_of(contents.branch.as_deref()).unwrap_or("main")
-                )));
-            }
-            unsafe {
-                *out_version = contents.version;
-            }
-            Ok(())
-        }
-        Ok(Err(err)) => Err(version_error(format!("tag '{tag}': {err}"))),
-        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    }
-}
-
-/// Delete `tag`. A tag that does not exist is an error.
-#[no_mangle]
-pub unsafe extern "C" fn lance_dataset_delete_tag(dataset: *mut c_void, tag: *const c_char) -> i32 {
-    finish(dataset_delete_tag_inner(dataset, tag))
-}
-
-fn dataset_delete_tag_inner(dataset: *mut c_void, tag: *const c_char) -> FfiResult<()> {
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let ds = (*handle.dataset).clone();
-    let tag = unsafe { cstr_to_str(tag, "tag")? }.to_string();
-    match runtime::block_on(async { ds.tags().delete(tag.as_str()).await }) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(version_error(format!("delete tag '{tag}': {err}"))),
-        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    }
-}
-
-/// Commit the contents of `version` as a new latest version. History is kept.
-/// Reports the new version through `out_version`.
-#[no_mangle]
-pub unsafe extern "C" fn lance_dataset_restore_version(
-    dataset: *mut c_void,
-    version: u64,
-    out_version: *mut u64,
-) -> i32 {
-    finish(dataset_restore_version_inner(dataset, version, out_version))
-}
-
-fn dataset_restore_version_inner(
-    dataset: *mut c_void,
-    version: u64,
-    out_version: *mut u64,
-) -> FfiResult<()> {
-    let handle = unsafe { super::util::dataset_handle(dataset)? };
-    let ds = (*handle.dataset).clone();
-    let restored = runtime::block_on(async {
-        let mut target = ds.checkout_version(version).await?;
-        target.restore().await?;
-        target.checkout_latest().await?;
-        Ok::<_, lance::Error>(target.manifest.version)
-    });
-    match restored {
-        Ok(Ok(new_version)) => {
-            if !out_version.is_null() {
-                unsafe {
-                    *out_version = new_version;
-                }
-            }
-            Ok(())
-        }
-        Ok(Err(err)) => Err(version_error(format!("restore version {version}: {err}"))),
-        Err(err) => Err(FfiError::new(ErrorCode::Runtime, format!("runtime: {err}"))),
-    }
-}
-
-fn finish(result: FfiResult<()>) -> i32 {
-    match result {
-        Ok(()) => {
-            clear_last_error();
-            0
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            -1
-        }
-    }
 }
