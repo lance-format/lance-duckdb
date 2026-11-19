@@ -325,8 +325,7 @@ static uint64_t ResolveAtClauseVersion(
   }
   if (unit == "VERSION") {
     auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
-    if (value.type().IsNumeric() &&
-        version_value.DefaultCastAs(value.type()) != value) {
+    if (version_value.DefaultCastAs(value.type()) != value) {
       throw BinderException(
           "AT (VERSION => ...) requires an integer value, got %s",
           value.ToString());

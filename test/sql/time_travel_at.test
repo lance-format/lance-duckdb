@@ -186,6 +186,11 @@ SELECT * FROM ns.main.tt AT (VERSION => 1.6::DOUBLE)
 requires an integer value
 
 statement error
+SELECT * FROM ns.main.tt AT (VERSION => '1.6')
+----
+requires an integer value
+
+statement error
 SELECT * FROM ns.main.tt AT (VERSION => NULL)
 ----
 requires a non-NULL value
