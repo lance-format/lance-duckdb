@@ -65,6 +65,9 @@ jobs:
         run: |
           GEN=ninja make release -j 4
 
+      - name: Check AT TIMESTAMP dataset identity
+        run: python3 test/scripts/check_time_travel_at_rest.py
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:

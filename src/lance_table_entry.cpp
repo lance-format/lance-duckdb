@@ -306,10 +306,13 @@ LanceTableEntry::Rebuild(ClientContext &context) const {
 }
 
 // The dataset version an AT clause names. VERSION is a Lance manifest version;
-// TIMESTAMP is the newest version committed at or before it.
-static uint64_t ResolveAtClauseVersion(ClientContext &context,
-                                       const LanceTableEntry &table,
-                                       const BoundAtClause &at) {
+// TIMESTAMP is the newest version committed at or before it. For TIMESTAMP,
+// also return the dataset handle whose manifests supplied that version.
+static uint64_t ResolveAtClauseVersion(
+    ClientContext &context, const LanceTableEntry &table,
+    const BoundAtClause &at,
+    shared_ptr<LanceDatasetCacheEntry> &out_timestamp_dataset,
+    string &out_display_uri) {
   const auto unit = StringUtil::Upper(at.Unit().GetIdentifierName());
   const auto &value = at.GetValue();
   if (unit != "VERSION" && unit != "TIMESTAMP") {
@@ -321,7 +324,14 @@ static uint64_t ResolveAtClauseVersion(ClientContext &context,
     throw BinderException("AT (%s => ...) requires a non-NULL value", unit);
   }
   if (unit == "VERSION") {
-    auto version = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+    auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
+    if (value.type().IsNumeric() &&
+        version_value.DefaultCastAs(value.type()) != value) {
+      throw BinderException(
+          "AT (VERSION => ...) requires an integer value, got %s",
+          value.ToString());
+    }
+    auto version = version_value.GetValue<int64_t>();
     if (version < 1) {
       throw BinderException(
           "Lance table versions start at 1, got AT (VERSION => %lld)",
@@ -332,18 +342,18 @@ static uint64_t ResolveAtClauseVersion(ClientContext &context,
 
   auto micros = value.CastAs(context, LogicalType::TIMESTAMP_TZ)
                     .GetValueUnsafe<int64_t>();
-  string display_uri;
-  auto latest = LanceGetOrOpenDatasetEntryForTable(context, table, display_uri);
-  if (!latest || !latest->Handle()) {
-    throw IOException("Failed to open Lance dataset: " + display_uri +
+  out_timestamp_dataset =
+      LanceGetOrOpenDatasetEntryForTable(context, table, out_display_uri);
+  if (!out_timestamp_dataset || !out_timestamp_dataset->Handle()) {
+    throw IOException("Failed to open Lance dataset: " + out_display_uri +
                       LanceFormatErrorSuffix());
   }
   uint64_t version = 0;
-  auto rc =
-      lance_dataset_version_at_timestamp(latest->Handle(), micros, &version);
+  auto rc = lance_dataset_version_at_timestamp(out_timestamp_dataset->Handle(),
+                                               micros, &version);
   if (rc < 0) {
     throw IOException("Failed to resolve the Lance version at " +
-                      value.ToString() + ": " + display_uri +
+                      value.ToString() + ": " + out_display_uri +
                       LanceFormatErrorSuffix());
   }
   if (rc > 0) {
@@ -358,10 +368,20 @@ static uint64_t ResolveAtClauseVersion(ClientContext &context,
 unique_ptr<LanceTableEntry>
 LanceTableEntry::AtClause(ClientContext &context,
                           const BoundAtClause &at) const {
-  auto version = ResolveAtClauseVersion(context, *this, at);
+  shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;
   string display_uri;
-  auto *dataset =
-      LanceOpenDatasetForTableAtVersion(context, *this, version, display_uri);
+  auto version = ResolveAtClauseVersion(context, *this, at, timestamp_dataset,
+                                        display_uri);
+  void *dataset = nullptr;
+  if (timestamp_dataset) {
+    if (lance_dataset_checkout_version(timestamp_dataset->Handle(), version,
+                                       &dataset) < 0) {
+      dataset = nullptr;
+    }
+  } else {
+    dataset =
+        LanceOpenDatasetForTableAtVersion(context, *this, version, display_uri);
+  }
   if (!dataset) {
     throw IOException("Failed to open version " + to_string(version) +
                       " of Lance dataset: " + display_uri +

@@ -44,6 +44,16 @@ SELECT count(*) FROM ns.main.tt AT (VERSION => 1)
 ----
 3
 
+query I
+SELECT count(*) FROM ns.main.tt AT (VERSION => 1.0)
+----
+3
+
+query I
+SELECT count(*) FROM ns.main.tt AT (VERSION => 2.0::DOUBLE)
+----
+4
+
 query IT
 SELECT * FROM ns.main.tt AT (VERSION => 2) ORDER BY id
 ----
@@ -164,6 +174,16 @@ statement error
 SELECT * FROM ns.main.tt AT (VERSION => 0)
 ----
 Lance table versions start at 1
+
+statement error
+SELECT * FROM ns.main.tt AT (VERSION => 1.4)
+----
+requires an integer value
+
+statement error
+SELECT * FROM ns.main.tt AT (VERSION => 1.6::DOUBLE)
+----
+requires an integer value
 
 statement error
 SELECT * FROM ns.main.tt AT (VERSION => NULL)
