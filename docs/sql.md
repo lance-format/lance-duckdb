@@ -514,6 +514,7 @@ change the result.
 ```sql
 SELECT * FROM ns.main.my_table AT (VERSION => 3);
 SELECT * FROM ns.main.my_table AT (VERSION => 'tag:release');
+SELECT * FROM ns.main.my_table AT (VERSION => 'branch:dev');
 SELECT * FROM ns.main.my_table AT (VERSION => 'branch:dev:3');
 SELECT count(*) FROM ns.main.my_table AT (TIMESTAMP => TIMESTAMP '2026-01-01 00:00:00');
 
@@ -530,6 +531,9 @@ A statement resolves each tag once per table. A subsequent execution observes
 tag updates or deletion. On REST namespaces, historical reads open the dataset
 directly.
 
+Use `branch:<name>` to read the latest snapshot of a named branch. References to
+the same branch head on the same table share one snapshot within a statement.
+The next execution sees any intervening branch commits.
 Use `branch:<name>:<version>` to read a specific version on a named branch
 without creating a tag. For example, `branch:dev:3` reads version 3 on `dev`,
 which can contain different rows and columns from version 3 on `main`.

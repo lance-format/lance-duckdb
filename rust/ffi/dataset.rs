@@ -375,16 +375,18 @@ fn parse_named_ref(reference: &str) -> FfiResult<Ref> {
     if let Some(tag) = reference.strip_prefix("tag:") {
         return Ok(Ref::from(tag));
     }
-    let (branch, version) = reference
+    let selector = reference
         .strip_prefix("branch:")
-        .and_then(|selector| selector.split_once(':'))
-        .filter(|(branch, _)| !branch.is_empty())
+        .filter(|selector| !selector.is_empty() && !selector.starts_with(':'))
         .ok_or_else(|| {
             FfiError::new(
                 ErrorCode::InvalidArgument,
-                "expected branch:<name>:<version>",
+                "expected branch:<name> or branch:<name>:<version>",
             )
         })?;
+    let Some((branch, version)) = selector.split_once(':') else {
+        return Ok(Ref::from((selector, None)));
+    };
     // Only one decimal spelling per version, since the SQL reference also keys
     // the statement's pinned dataset.
     let version = match version.as_bytes().first() {
@@ -1204,6 +1206,45 @@ mod tests {
         let pre_epoch = vec![version(1, -1, 999_999_999)]; // one ns before epoch
         assert_eq!(newest_version_at_timestamp(&pre_epoch, -1), None);
         assert_eq!(newest_version_at_timestamp(&pre_epoch, 0), Some(1));
+    }
+
+    #[test]
+    fn branch_head_observes_external_commits_without_moving_pinned_snapshots() {
+        let _guard = crate::ffi::session::debug_counter_test_lock();
+        let dir = std::env::temp_dir().join(format!("ffi-branch-head-{}", rand::random::<u64>()));
+        let uri = dir.to_str().unwrap();
+        external_write(uri, vec![1, 2, 3], WriteMode::Create);
+        let mut writer = runtime::block_on(async {
+            Dataset::open(uri)
+                .await?
+                .create_branch("dev", 1, None)
+                .await
+        })
+        .unwrap()
+        .unwrap();
+
+        unsafe {
+            let source = lance_open_dataset(CString::new(uri).unwrap().as_ptr());
+            assert!(!source.is_null());
+            let checkout = || {
+                let mut snapshot = ptr::null_mut();
+                assert_eq!(
+                    lance_dataset_checkout_named_ref(source, c"branch:dev".as_ptr(), &mut snapshot),
+                    0
+                );
+                snapshot
+            };
+            let before = checkout();
+            runtime::block_on(writer.delete("id = 1")).unwrap().unwrap();
+            let after = checkout();
+            assert_eq!(lance_dataset_count_rows(before), 3);
+            assert_eq!(lance_dataset_count_rows(after), 2);
+            assert_eq!(lance_dataset_count_rows(source), 3);
+            lance_close_dataset(after);
+            lance_close_dataset(before);
+            lance_close_dataset(source);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

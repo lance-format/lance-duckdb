@@ -1,5 +1,5 @@
 # name: test/sql/scan_version_ref.test
-# description: attached tables read snapshots by tag or by branch and version
+# description: attached tables read snapshots by tag, branch, or branch and version
 # group: [sql]
 
 require lance
@@ -63,15 +63,33 @@ SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:1');
 ----
 branch:dev:1
 
-statement error
-SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev');
+query III
+SELECT d.id, m.id, v.id
+FROM ns.main.branch_tag_fixture d AT (VERSION => 'branch:dev'),
+     ns.main.branch_tag_fixture m AT (VERSION => 'branch:main'),
+     ns.main.branch_tag_fixture v AT (VERSION => 'branch:main:2');
 ----
-branch:<name>:<version>
+99	3	2
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:missing');
+----
+branch missing does not exist
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:');
+----
+expected branch:<name>
 
 statement error
 SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch::3');
 ----
-branch:<name>:<version>
+expected branch:<name>
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:');
+----
+positive decimal
 
 statement error
 SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:0');
