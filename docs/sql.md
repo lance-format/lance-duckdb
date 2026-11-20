@@ -513,6 +513,7 @@ change the result.
 
 ```sql
 SELECT * FROM ns.main.my_table AT (VERSION => 3);
+SELECT * FROM ns.main.my_table AT (VERSION => 'tag:release');
 SELECT count(*) FROM ns.main.my_table AT (TIMESTAMP => TIMESTAMP '2026-01-01 00:00:00');
 
 -- Restore rows that were deleted since version 3
@@ -521,10 +522,12 @@ SELECT * FROM ns.main.my_table AT (VERSION => 3) WHERE id = 42;
 ```
 
 Time travel is read-only: DuckDB does not accept `AT` on the target of
-`INSERT`, `UPDATE`, `DELETE`, or `MERGE`. `VERSION` and `TIMESTAMP` are the
-only units DuckDB's `AT` clause defines, so Lance tags and branches are not
-addressable yet. On REST namespaces, historical reads open the dataset directly
-rather than through `query_table`.
+`INSERT`, `UPDATE`, `DELETE`, or `MERGE`. Use the literal prefix `tag:`
+followed by the exact tag name to read its snapshot on the branch it names.
+For example, `'tag:2'` selects the tag named `2` and `'2'` selects version 2.
+A statement resolves each tag once per table. A subsequent execution observes
+tag updates or deletion. On REST namespaces, historical reads open the dataset
+directly.
 
 ## Write datasets
 

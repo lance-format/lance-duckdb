@@ -1,0 +1,38 @@
+# name: test/sql/scan_version_ref.test
+# description: attached tables read the snapshot and branch named by a Lance tag
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH 'test/data' AS ns (TYPE LANCE);
+
+# dev_tag and main's latest both have version 3 but different rows.
+query IIII
+SELECT d.id, m.id, v.id, l.id
+FROM ns.main.branch_tag_fixture d AT (VERSION => 'tag:dev_tag'),
+     ns.main.branch_tag_fixture m AT (VERSION => 'tag:main_tag'),
+     ns.main.branch_tag_fixture v AT (VERSION => '2'),
+     ns.main.branch_tag_fixture l;
+----
+99	1	2	3
+
+query I
+SELECT sum(id) FROM ns.main.branch_tag_fixture AT (VERSION => 'tag:dev_tag') WHERE id > 10;
+----
+99
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'tag:missing');
+----
+tag missing does not exist
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'tag:');
+----
+Ref cannot be empty
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'tag:main_tag' || chr(0) || 'x');
+----
+cannot contain a NUL byte

@@ -110,6 +110,22 @@ public:
     return write_query_id == query_id && !write_datasets.empty();
   }
 
+  shared_ptr<LanceDatasetCacheEntry> GetTagged(idx_t query_id,
+                                               const string &key) {
+    lock_guard<mutex> guard(lock);
+    if (query_id != tag_query_id) {
+      tagged_datasets.clear();
+      tag_query_id = query_id;
+    }
+    auto found = tagged_datasets.find(key);
+    return found == tagged_datasets.end() ? nullptr : found->second;
+  }
+
+  void PinTag(const string &key, shared_ptr<LanceDatasetCacheEntry> entry) {
+    lock_guard<mutex> guard(lock);
+    tagged_datasets.emplace(key, std::move(entry));
+  }
+
   void Invalidate(const string &key) {
     lock_guard<mutex> guard(lock);
     entries.erase(key);
@@ -130,6 +146,7 @@ public:
   void QueryEnd() override {
     lock_guard<mutex> guard(lock);
     write_datasets.clear();
+    tagged_datasets.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
@@ -151,6 +168,9 @@ private:
   // QueryBegin/QueryEnd may span a submission expanded into several statements.
   // DuckDB's active query number distinguishes those statement boundaries.
   idx_t write_query_id = DConstants::INVALID_INDEX;
+  // Tags can be reassigned by other writers between statements.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> tagged_datasets;
+  idx_t tag_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
   idx_t query_revalidations = 0;
@@ -702,6 +722,36 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
   return LanceBuildNamespaceDatasetCacheKey(context, cfg.endpoint, cfg.table_id,
                                             bearer_token, api_key,
                                             cfg.delimiter, cfg.headers_tsv);
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetTaggedDatasetForTable(ClientContext &context,
+                              const LanceTableEntry &table, const string &tag) {
+  if (tag.find('\0') != string::npos) {
+    throw BinderException("Lance tag names cannot contain a NUL byte");
+  }
+  auto key = LanceBuildDatasetCacheKeyForTable(context, table);
+  AppendCacheKeyPart(key, tag);
+  auto state = GetOrCreateLanceDatasetCacheState(context);
+  auto pinned = state->GetTagged(context.transaction.GetActiveQuery(), key);
+  if (pinned) {
+    return pinned;
+  }
+  string uri;
+  auto source = LanceGetOrOpenDatasetEntryForTable(context, table, uri);
+  if (!source) {
+    throw IOException("Failed to open Lance dataset: " + uri +
+                      LanceFormatErrorSuffix());
+  }
+  void *snapshot = nullptr;
+  if (lance_dataset_checkout_tag(source->Handle(), tag.c_str(), &snapshot) <
+      0) {
+    throw IOException("Failed to open tag '%s' of Lance dataset %s%s", tag, uri,
+                      LanceFormatErrorSuffix());
+  }
+  pinned = make_shared_ptr<LanceDatasetCacheEntry>(snapshot, uri);
+  state->PinTag(key, pinned);
+  return pinned;
 }
 
 void LanceInvalidateDatasetCache(ClientContext &context,
