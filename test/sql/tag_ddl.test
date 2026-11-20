@@ -14,7 +14,7 @@ statement ok
 INSERT INTO tag_ns.main."tag.case" VALUES (22);
 
 statement ok
-ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'Release-2' AT VERSION 1;
+ALTER TABLE tag_ns."tag.case" CREATE TAG 'Release-2' AT VERSION 1;
 
 query II reader
 SELECT (SELECT sum(id) FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2')),
@@ -134,7 +134,7 @@ statement ok
 ALTER TABLE tag_ns.main."tag.case" DROP TAG '2';
 
 statement ok
-ALTER TABLE tag_ns.main."tag.case" DROP TAG 'Release-2';
+ALTER TABLE tag_ns."tag.case" DROP TAG 'Release-2';
 
 statement error reader
 SELECT * FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2');
@@ -177,6 +177,19 @@ SELECT (SELECT max(version) FROM lance_versions('tag_ns.main."tag.case"')),
        (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"'));
 ----
 1	0
+
+statement ok
+CREATE SCHEMA memory.tag_ns;
+
+statement error
+ALTER TABLE tag_ns."tag.case" CREATE TAG 'ambiguous' AT VERSION 1;
+----
+Ambiguous reference to catalog or schema
+
+query I
+SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"');
+----
+0
 
 # The shared memory store keeps case-distinct physical tables on every platform.
 statement ok

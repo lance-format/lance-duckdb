@@ -114,6 +114,17 @@ SELECT sum(id) FROM ns.main.beta;
 ----
 100
 
+statement ok
+ALTER TABLE ns.beta CREATE TAG 'before_insert' AT VERSION 1;
+
+query I
+SELECT sum(id) FROM ns.beta AT (VERSION => 'tag:before_insert');
+----
+60
+
+statement ok
+ALTER TABLE ns.beta DROP TAG 'before_insert';
+
 # RETURNING uses the same namespace storage options for row images and writes.
 query IT
 UPDATE ns.main.alpha SET s = upper(s) WHERE id = 1 RETURNING id, s;

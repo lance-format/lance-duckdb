@@ -10,6 +10,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
@@ -1404,6 +1405,7 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
     target = parse_data->dataset_uri;
   } else {
     auto qname = QualifiedName::Parse(parse_data->target_sql);
+    Binder::BindSchemaOrCatalog(context, qname);
     auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname);
     if (parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG ||
         parse_data->kind == LanceMaintenanceStmtKind::DROP_TAG) {
