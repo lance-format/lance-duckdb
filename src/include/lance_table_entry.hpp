@@ -82,6 +82,8 @@ public:
 
   unique_ptr<CatalogEntry> AlterEntry(ClientContext &context,
                                       AlterInfo &info) override;
+  void MutateTag(ClientContext &context, const string &tag,
+                 const int64_t *version) const;
   // Rebuild metadata without changing storage. Executing queries retain their
   // previous generation until QueryEnd; prepared statements rebind on EXECUTE.
   unique_ptr<CatalogEntry> Rebuild(ClientContext &context) const;

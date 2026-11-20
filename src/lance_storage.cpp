@@ -738,6 +738,38 @@ public:
     return rest_ns.get();
   }
 
+  void MutateTag(ClientContext &context, const LanceTableEntry &table,
+                 const string &tag, const int64_t *version) {
+    lock_guard<mutex> guard(table_lock);
+    LanceInterruptScope interrupt_scope(context);
+    auto current = tables.find(table.name);
+    if (current == tables.end() || current->second.get() != &table) {
+      throw TransactionException(
+          "Lance table changed concurrently; retry tag operation");
+    }
+    // A second physical table differing only in case can appear after binding.
+    auto physical = FindDirectoryNamespaceTable(*directory_ns,
+                                                table.name.GetIdentifierName());
+    if (physical != table.NamespaceConfig().table_id) {
+      throw CatalogException("Lance directory listing does not match the "
+                             "bound table '%s'",
+                             table.NamespaceConfig().table_id);
+    }
+    string uri;
+    std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+        LanceOpenDatasetForTable(context, table, uri), lance_close_dataset);
+    if (!dataset) {
+      context.BlockingInterruptCheck();
+      throw IOException("Failed to open Lance dataset: " + uri +
+                        LanceFormatErrorSuffix());
+    }
+    context.BlockingInterruptCheck();
+    if (lance_dataset_mutate_tag(dataset.get(), tag.c_str(), version) != 0) {
+      throw IOException(string("Failed to ") + (version ? "create" : "drop") +
+                        " Lance tag" + LanceFormatErrorSuffix());
+    }
+  }
+
   vector<string> CachedDatasetKeys(ClientContext &context) {
     lock_guard<mutex> guard(table_lock);
     vector<string> keys;
@@ -1413,6 +1445,12 @@ private:
   static constexpr int32_t NAMESPACE_UNSUPPORTED = 64;
   identifier_map_t<string> names;
 };
+
+void LanceTableEntry::MutateTag(ClientContext &context, const string &tag,
+                                const int64_t *version) const {
+  auto &owner = dynamic_cast<LanceSchemaEntry &>(schema);
+  owner.MutateTag(context, *this, tag, version);
+}
 
 bool LanceTryReplaceStaleTableEntry(ClientContext &context,
                                     LanceTableEntry &table) {

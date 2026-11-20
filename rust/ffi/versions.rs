@@ -4,10 +4,84 @@ use std::ffi::{c_char, c_void};
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
-use super::util::{to_c_string, FfiError, FfiResult};
+use super::util::{cstr_to_str, dataset_handle, to_c_string, FfiError, FfiResult};
 
 fn version_error(message: String) -> FfiError {
     FfiError::new(ErrorCode::DatasetVersions, message)
+}
+
+async fn drop_dataset_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
+    let store = dataset.object_store(None).await?;
+    if store.is_local() || store.scheme() == "file-object-store" {
+        // A case-insensitive volume can open another spelling of this name.
+        // Compare the stored directory entry before asking Lance to delete it.
+        let root = dataset.refs.root()?.path;
+        let path = lance::dataset::refs::tag_path(&root, tag);
+        let dir = lance::dataset::refs::base_tags_path(&root);
+        let entries = store.list_with_delimiter(Some(&dir)).await?;
+        if !entries
+            .objects
+            .iter()
+            .any(|e| e.location.filename() == path.filename())
+        {
+            return Err(lance::Error::RefNotFound {
+                message: format!("tag {tag} does not exist"),
+            });
+        }
+    }
+    dataset.tags().delete(tag).await
+}
+
+/// Create a tag at the supplied version, or delete it when version is null.
+///
+/// # Safety
+/// The dataset handle, NUL-terminated tag and optional version must be valid
+/// for this call.
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_mutate_tag(
+    dataset: *mut c_void,
+    tag: *const c_char,
+    version: *const i64,
+) -> i32 {
+    match mutate_tag_inner(dataset, tag, version) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            -1
+        }
+    }
+}
+
+fn mutate_tag_inner(
+    dataset: *mut c_void,
+    tag: *const c_char,
+    version: *const i64,
+) -> FfiResult<()> {
+    // SAFETY: The caller keeps all inputs alive until the operation completes.
+    let handle = unsafe { dataset_handle(dataset)? };
+    let tag = unsafe { cstr_to_str(tag, "tag")? };
+    let version = unsafe { version.as_ref() }.copied();
+    lance::dataset::refs::check_valid_tag(tag).map_err(|err| version_error(err.to_string()))?;
+    // A dispatched object store write can outlive a dropped future. The caller
+    // checks interruption before dispatch and holds its catalog lock until completion.
+    let rt = runtime::runtime()
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?;
+    match version {
+        // Lance 14.0.3 re-encodes non-ASCII tag filenames while listing them.
+        Some(_) if !tag.is_ascii() => Err(version_error(
+            "CREATE TAG requires an ASCII tag name".into(),
+        )),
+        Some(v) if v <= 0 => Err(version_error("tag version must be positive".into())),
+        Some(v) => rt
+            .block_on(handle.dataset.tags().create(tag, v as u64))
+            .map_err(|err| version_error(err.to_string())),
+        None => rt
+            .block_on(drop_dataset_tag(&handle.dataset, tag))
+            .map_err(|err| version_error(err.to_string())),
+    }
 }
 
 /// The branch a dataset handle or tag belongs to; `None` is the main branch.

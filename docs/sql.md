@@ -1004,3 +1004,22 @@ SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_
 - `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
 - `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
 - Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.
+
+On a writable directory attachment, use `ALTER TABLE` to tag a committed
+version or drop a tag. Both statements require autocommit.
+
+```sql
+ALTER TABLE ns.main.my_table CREATE TAG 'Release-2' AT VERSION 7;
+SELECT * FROM ns.main.my_table AT (VERSION => 'tag:Release-2');
+ALTER TABLE ns.main.my_table DROP TAG 'Release-2';
+```
+
+Creating a tag requires a new name and an existing positive version. New tag
+names may contain ASCII letters, digits, underscores, hyphens and dots, subject
+to Lance's naming rules. Dropping a tag takes its exact name and leaves the
+version in place, subject to ordinary cleanup. Neither statement advances the
+table version. When another client or attachment uses the same storage,
+coordinate table replacement, deletion and re-creation of the same tag
+(including case variants on case-insensitive filesystems), and cleanup of a
+version being tagged. REST attachments do not support these two write
+statements.

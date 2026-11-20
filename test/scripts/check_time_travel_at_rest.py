@@ -68,6 +68,7 @@ def main() -> None:
         describes: list[str] = []
         move_on_marker = False
         moves: list[str] = []
+        tag_requests: list[str] = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_: object) -> None:
@@ -88,6 +89,9 @@ def main() -> None:
                     dataset = dataset_a if move_on_marker or len(describes) < 2 else dataset_b
                     describes.append(dataset)
                     response = {"location": dataset, "schema": SCHEMA}
+                elif "/tags/" in path:
+                    tag_requests.append(path)
+                    response = {}
                 else:
                     status = 404
                     response = {"message": "Unhandled fixture route", "path": path}
@@ -109,6 +113,12 @@ def main() -> None:
                 f"LOAD '{args.extension}'; ATTACH 'default' AS ns "
                 f"(TYPE LANCE, ENDPOINT 'http://127.0.0.1:{server.server_port}'); "
             )
+            for operation in ("CREATE TAG 'new' AT VERSION 1", "DROP TAG 'dev_tag'"):
+                describes.clear()
+                duckdb(attach + f"ALTER TABLE ns.main.t {operation};", expected_error="directory-attached")
+            if tag_requests or (tags / "new.json").exists() or not (tags / "dev_tag.json").is_file():
+                raise RuntimeError("Tag DDL on a REST attachment reached the namespace or changed dataset tags")
+
             for query, expected in [
                 ("SELECT count(*) FROM ns.main.t AT (TIMESTAMP => TIMESTAMP '2999-01-01');", "1"),
                 ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'tag:2');", "99"),
@@ -145,7 +155,15 @@ def main() -> None:
                 "99\n99\n99\n1\n99",
             )
             # A branch selector must still read dev when no tag points to it.
-            (tags / "dev_tag.json").unlink()
+            # A different Lance writer can leave a non-ASCII tag in storage.
+            shutil.copyfile(tags / "main_tag.json", tags / "%C3%A9.json")
+            duckdb(
+                f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
+                "ALTER TABLE ns.main.a DROP TAG 'é'; "
+                "ALTER TABLE ns.main.a DROP TAG 'dev_tag'; "
+                "SELECT tag FROM lance_tags('ns.main.a') ORDER BY tag;",
+                "2\nmain_tag",
+            )
             read_dev = (
                 f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
                 "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');"
