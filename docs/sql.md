@@ -1019,10 +1019,14 @@ names may contain ASCII letters, digits, underscores, hyphens and dots, subject
 to Lance's naming rules. Dropping a tag takes its exact name and leaves the
 version in place, subject to ordinary cleanup. Neither statement advances the
 table version. When another client or attachment uses the same storage,
-coordinate table replacement, deletion and re-creation of the same tag
-(including case variants on case-insensitive filesystems), and cleanup of a
-version being tagged. REST attachments do not support these two write
-statements.
+coordinate table replacement and operations that delete or re-create the same
+tag (including case variants on case-insensitive filesystems). REST attachments
+do not support these two write statements.
+
+Run `CREATE TAG` and any cleanup that could remove its target version at
+different times, even when both connections use the same attachment. This
+includes automatic cleanup after ordinary writes. Cleanup reads the tag list
+once and can delete a version whose tag was created after that read.
 
 With Lance 14.0.3, `CREATE TAG` rejects local dataset paths whose components
 would change when Lance builds the staging path, such as `warehouse~tags/t.lance`.
