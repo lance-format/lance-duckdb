@@ -68,10 +68,12 @@ pub(super) async fn resolve_tag(dataset: &lance::Dataset, tag: &str) -> lance::R
                 Err(err) => return Err(err.into()),
             }
         };
-        let stamp = object.meta.e_tag.as_ref().ok_or_else(|| {
-            lance::Error::io("The local store did not return an ETag for the tag file")
-        })?;
-        if entry.e_tag.as_ref() == Some(stamp) {
+        if object.meta.e_tag.is_none() || entry.e_tag.is_none() {
+            return Err(lance::Error::io(
+                "The local store did not return an ETag for the tag file",
+            ));
+        }
+        if entry.e_tag == object.meta.e_tag {
             break object;
         }
         // An atomic replacement between GET and listing invalidates the name
