@@ -371,14 +371,44 @@ pub unsafe extern "C" fn lance_dataset_checkout_version(
     unsafe { checkout_ref(dataset, Ok(Ref::from(version)), out_dataset) }
 }
 
+fn parse_named_ref(reference: &str) -> FfiResult<Ref> {
+    if let Some(tag) = reference.strip_prefix("tag:") {
+        return Ok(Ref::from(tag));
+    }
+    let (branch, version) = reference
+        .strip_prefix("branch:")
+        .and_then(|selector| selector.split_once(':'))
+        .filter(|(branch, _)| !branch.is_empty())
+        .ok_or_else(|| {
+            FfiError::new(
+                ErrorCode::InvalidArgument,
+                "expected branch:<name>:<version>",
+            )
+        })?;
+    // Only one decimal spelling per version, since the SQL reference also keys
+    // the statement's pinned dataset.
+    let version = match version.as_bytes().first() {
+        Some(b'1'..=b'9') => version.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::InvalidArgument,
+            "branch version must be a positive decimal integer without leading zeros",
+        )
+    })?;
+    Ok(Ref::from((branch, version)))
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn lance_dataset_checkout_tag(
+pub unsafe extern "C" fn lance_dataset_checkout_named_ref(
     dataset: *mut c_void,
-    tag: *const c_char,
+    reference: *const c_char,
     out_dataset: *mut *mut c_void,
 ) -> i32 {
-    // SAFETY: The caller supplies a NUL-terminated tag for the duration of this call.
-    let reference = unsafe { cstr_to_str(tag, "tag") }.map(Ref::from);
+    // SAFETY: The caller supplies a NUL-terminated reference for the duration of this call.
+    let reference =
+        unsafe { cstr_to_str(reference, "snapshot reference") }.and_then(parse_named_ref);
     // SAFETY: Both handles follow the same contract as numeric checkout.
     unsafe { checkout_ref(dataset, reference, out_dataset) }
 }

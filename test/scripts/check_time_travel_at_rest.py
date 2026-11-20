@@ -108,6 +108,7 @@ def main() -> None:
             for query, expected in [
                 ("SELECT count(*) FROM ns.main.t AT (TIMESTAMP => TIMESTAMP '2999-01-01');", "1"),
                 ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'tag:2');", "99"),
+                ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'branch:dev:3');", "99"),
             ]:
                 describes.clear()
                 duckdb(attach + query, expected)
@@ -132,10 +133,19 @@ def main() -> None:
                 "SELECT * FROM ns.main.a AT (VERSION => 'tag:2'); "
                 "PREPARE tagged AS SELECT sum(id) FROM ns.main.a AT (VERSION => 'tag:2'); "
                 "EXECUTE tagged; "
+                "PREPARE branched AS SELECT * FROM ns.main.a AT (VERSION => 'branch:dev:3'); "
+                "EXECUTE branched; "
                 f"COPY (SELECT content FROM read_text('{tags / 'main_tag.json'}')) TO '{tags / '2.json'}' "
                 "(FORMAT CSV, HEADER false, QUOTE '', ESCAPE ''); "
-                "EXECUTE tagged;",
-                "99\n99\n1",
+                "EXECUTE tagged; EXECUTE branched;",
+                "99\n99\n99\n1\n99",
+            )
+            # A branch selector must still read dev when no tag points to it.
+            (tags / "dev_tag.json").unlink()
+            duckdb(
+                f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
+                "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');",
+                "99",
             )
         finally:
             server.shutdown()

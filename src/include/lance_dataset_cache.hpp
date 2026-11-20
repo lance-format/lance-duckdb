@@ -50,8 +50,9 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
     string &out_display_uri, bool *out_cache_hit = nullptr);
 
 shared_ptr<LanceDatasetCacheEntry>
-LanceGetTaggedDatasetForTable(ClientContext &context,
-                              const LanceTableEntry &table, const string &tag);
+LanceGetNamedSnapshotForTable(ClientContext &context,
+                              const LanceTableEntry &table,
+                              const string &reference);
 
 // A write's target reads must use its pinned generation across the complete
 // statement, even when DuckDB plans CTE producers outside the write subtree.
