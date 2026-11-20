@@ -1,5 +1,5 @@
 # name: test/sql/scan_version_ref.test
-# description: attached tables read the snapshot and branch named by a Lance tag
+# description: attached tables read snapshots by tag or by branch and version
 # group: [sql]
 
 require lance
@@ -34,5 +34,66 @@ Ref cannot be empty
 
 statement error
 SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'tag:main_tag' || chr(0) || 'x');
+----
+cannot contain a NUL byte
+
+# The same version number belongs to distinct chains. Main version 2 has no tag.
+query IIII
+SELECT d.id, m.id, u.id, t.id
+FROM ns.main.branch_tag_fixture d AT (VERSION => 'branch:dev:3'),
+     ns.main.branch_tag_fixture m AT (VERSION => 'branch:main:3'),
+     ns.main.branch_tag_fixture u AT (VERSION => 'branch:main:2'),
+     ns.main.branch_tag_fixture t AT (VERSION => 'tag:dev_tag');
+----
+99	3	2	99
+
+query I
+SELECT sum(id) FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:3') WHERE id > 10;
+----
+99
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:missing:3');
+----
+branch:missing:3
+
+# main has a version 1, but dev starts at version 2.
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:1');
+----
+branch:dev:1
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev');
+----
+branch:<name>:<version>
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch::3');
+----
+branch:<name>:<version>
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:0');
+----
+positive decimal
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:03');
+----
+positive decimal
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:3.0');
+----
+positive decimal
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:18446744073709551616');
+----
+positive decimal
+
+statement error
+SELECT * FROM ns.main.branch_tag_fixture AT (VERSION => 'branch:dev:3' || chr(0) || '1');
 ----
 cannot contain a NUL byte

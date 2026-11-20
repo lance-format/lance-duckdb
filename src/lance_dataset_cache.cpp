@@ -110,20 +110,21 @@ public:
     return write_query_id == query_id && !write_datasets.empty();
   }
 
-  shared_ptr<LanceDatasetCacheEntry> GetTagged(idx_t query_id,
-                                               const string &key) {
+  shared_ptr<LanceDatasetCacheEntry> GetNamedSnapshot(idx_t query_id,
+                                                      const string &key) {
     lock_guard<mutex> guard(lock);
-    if (query_id != tag_query_id) {
-      tagged_datasets.clear();
-      tag_query_id = query_id;
+    if (query_id != snapshot_query_id) {
+      named_snapshots.clear();
+      snapshot_query_id = query_id;
     }
-    auto found = tagged_datasets.find(key);
-    return found == tagged_datasets.end() ? nullptr : found->second;
+    auto found = named_snapshots.find(key);
+    return found == named_snapshots.end() ? nullptr : found->second;
   }
 
-  void PinTag(const string &key, shared_ptr<LanceDatasetCacheEntry> entry) {
+  void PinNamedSnapshot(const string &key,
+                        shared_ptr<LanceDatasetCacheEntry> entry) {
     lock_guard<mutex> guard(lock);
-    tagged_datasets.emplace(key, std::move(entry));
+    named_snapshots.emplace(key, std::move(entry));
   }
 
   void Invalidate(const string &key) {
@@ -146,7 +147,7 @@ public:
   void QueryEnd() override {
     lock_guard<mutex> guard(lock);
     write_datasets.clear();
-    tagged_datasets.clear();
+    named_snapshots.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
@@ -168,9 +169,9 @@ private:
   // QueryBegin/QueryEnd may span a submission expanded into several statements.
   // DuckDB's active query number distinguishes those statement boundaries.
   idx_t write_query_id = DConstants::INVALID_INDEX;
-  // Tags can be reassigned by other writers between statements.
-  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> tagged_datasets;
-  idx_t tag_query_id = DConstants::INVALID_INDEX;
+  // Another writer can move a tag or recreate a branch between statements.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> named_snapshots;
+  idx_t snapshot_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
   idx_t query_revalidations = 0;
@@ -725,15 +726,18 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
 }
 
 shared_ptr<LanceDatasetCacheEntry>
-LanceGetTaggedDatasetForTable(ClientContext &context,
-                              const LanceTableEntry &table, const string &tag) {
-  if (tag.find('\0') != string::npos) {
-    throw BinderException("Lance tag names cannot contain a NUL byte");
+LanceGetNamedSnapshotForTable(ClientContext &context,
+                              const LanceTableEntry &table,
+                              const string &reference) {
+  if (reference.find('\0') != string::npos) {
+    throw BinderException(
+        "Lance snapshot references cannot contain a NUL byte");
   }
   auto key = LanceBuildDatasetCacheKeyForTable(context, table);
-  AppendCacheKeyPart(key, tag);
+  AppendCacheKeyPart(key, reference);
   auto state = GetOrCreateLanceDatasetCacheState(context);
-  auto pinned = state->GetTagged(context.transaction.GetActiveQuery(), key);
+  auto pinned =
+      state->GetNamedSnapshot(context.transaction.GetActiveQuery(), key);
   if (pinned) {
     return pinned;
   }
@@ -744,13 +748,13 @@ LanceGetTaggedDatasetForTable(ClientContext &context,
                       LanceFormatErrorSuffix());
   }
   void *snapshot = nullptr;
-  if (lance_dataset_checkout_tag(source->Handle(), tag.c_str(), &snapshot) <
-      0) {
-    throw IOException("Failed to open tag '%s' of Lance dataset %s%s", tag, uri,
-                      LanceFormatErrorSuffix());
+  if (lance_dataset_checkout_named_ref(source->Handle(), reference.c_str(),
+                                       &snapshot) < 0) {
+    throw IOException("Failed to open snapshot '%s' of Lance dataset %s%s",
+                      reference, uri, LanceFormatErrorSuffix());
   }
   pinned = make_shared_ptr<LanceDatasetCacheEntry>(snapshot, uri);
-  state->PinTag(key, pinned);
+  state->PinNamedSnapshot(key, pinned);
   return pinned;
 }
 

@@ -32,7 +32,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    def duckdb(sql: str, expected: str | None = None) -> None:
+    def duckdb(sql: str, expected: str | None = None, *, expected_error: str | None = None) -> None:
         result = subprocess.run(
             [
                 str(args.duckdb),
@@ -48,6 +48,10 @@ def main() -> None:
             capture_output=True,
             timeout=120,
         )
+        if expected_error is not None:
+            if result.returncode == 0 or expected_error not in result.stderr:
+                raise RuntimeError(f"{sql}\nexpected error {expected_error!r}, got {result.stdout!r}\n{result.stderr}")
+            return
         if result.returncode or (expected is not None and result.stdout.strip() != expected):
             raise RuntimeError(f"{sql}\nexpected {expected!r}, got {result.stdout!r}\n{result.stderr}")
 
@@ -108,6 +112,7 @@ def main() -> None:
             for query, expected in [
                 ("SELECT count(*) FROM ns.main.t AT (TIMESTAMP => TIMESTAMP '2999-01-01');", "1"),
                 ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'tag:2');", "99"),
+                ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'branch:dev:3');", "99"),
             ]:
                 describes.clear()
                 duckdb(attach + query, expected)
@@ -132,11 +137,24 @@ def main() -> None:
                 "SELECT * FROM ns.main.a AT (VERSION => 'tag:2'); "
                 "PREPARE tagged AS SELECT sum(id) FROM ns.main.a AT (VERSION => 'tag:2'); "
                 "EXECUTE tagged; "
+                "PREPARE branched AS SELECT * FROM ns.main.a AT (VERSION => 'branch:dev:3'); "
+                "EXECUTE branched; "
                 f"COPY (SELECT content FROM read_text('{tags / 'main_tag.json'}')) TO '{tags / '2.json'}' "
                 "(FORMAT CSV, HEADER false, QUOTE '', ESCAPE ''); "
-                "EXECUTE tagged;",
-                "99\n99\n1",
+                "EXECUTE tagged; EXECUTE branched;",
+                "99\n99\n99\n1\n99",
             )
+            # A branch selector must still read dev when no tag points to it.
+            (tags / "dev_tag.json").unlink()
+            read_dev = (
+                f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
+                "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');"
+            )
+            duckdb(read_dev, "99")
+            # Lance may leave a branch directory behind after its ref is deleted.
+            # A fresh statement must reject the orphaned manifests.
+            (Path(dataset_a) / "_refs/branches/dev.json").unlink()
+            duckdb(read_dev, expected_error="branch dev does not exist")
         finally:
             server.shutdown()
             server.server_close()

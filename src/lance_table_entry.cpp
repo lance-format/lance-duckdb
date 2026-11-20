@@ -371,8 +371,9 @@ OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
   if (StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
       !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
     const auto &reference = StringValue::Get(value);
-    if (StringUtil::StartsWith(reference, "tag:")) {
-      return LanceGetTaggedDatasetForTable(context, table, reference.substr(4));
+    if (StringUtil::StartsWith(reference, "tag:") ||
+        StringUtil::StartsWith(reference, "branch:")) {
+      return LanceGetNamedSnapshotForTable(context, table, reference);
     }
   }
   shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;
