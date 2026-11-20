@@ -83,8 +83,12 @@ def main() -> None:
                     response = {"namespaces": []}
                 elif path.endswith("/describe") and "/table/" in path:
                     if move_on_marker and "marker" in path and not moves:
-                        shutil.copyfile(tags / "main_tag.json", tags / "2.json")
                         moves.append(path)
+                        shutil.copyfile(tags / "main_tag.json", tags / "2.json")
+                        duckdb(
+                            f"LOAD '{args.extension}'; ATTACH '{tmp}' AS local_ns (TYPE LANCE); "
+                            "INSERT INTO local_ns.main.a VALUES (7);"
+                        )
                     dataset = dataset_a if move_on_marker or len(describes) < 2 else dataset_b
                     describes.append(dataset)
                     response = {"location": dataset, "schema": SCHEMA}
@@ -113,21 +117,23 @@ def main() -> None:
                 ("SELECT count(*) FROM ns.main.t AT (TIMESTAMP => TIMESTAMP '2999-01-01');", "1"),
                 ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'tag:2');", "99"),
                 ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'branch:dev:3');", "99"),
+                ("SELECT sum(id) FROM ns.main.t AT (VERSION => 'branch:dev');", "99"),
             ]:
                 describes.clear()
                 duckdb(attach + query, expected)
                 if not describes or dataset_b in describes:
                     raise RuntimeError(f"Unexpected describe locations: {describes}")
 
-            # Binding the middle table reassigns the tag between the two lookups.
+            # Binding the middle table moves both the tag and the main branch head.
             move_on_marker = True
             duckdb(
-                attach + "SELECT a.id, b.id FROM ns.main.t a AT (VERSION => 'tag:2'), "
-                "ns.main.marker m AT (VERSION => 1), ns.main.t b AT (VERSION => 'tag:2');",
-                "99|99",
+                attach + "SELECT a.id, h.id, b.id, j.id FROM ns.main.t a AT (VERSION => 'tag:2'), "
+                "ns.main.t h AT (VERSION => 'branch:main'), ns.main.marker m AT (VERSION => 1), "
+                "ns.main.t b AT (VERSION => 'tag:2'), ns.main.t j AT (VERSION => 'branch:main');",
+                "99|3|99|3",
             )
             if not moves:
-                raise RuntimeError("Marker table did not move the tag")
+                raise RuntimeError("Marker table did not advance the branch and move the tag")
 
             # Repoint a tag between EXECUTEs on a private copy of the fixture.
             shutil.copyfile(tags / "dev_tag.json", tags / "2.json")
@@ -139,28 +145,32 @@ def main() -> None:
                 "EXECUTE tagged; "
                 "PREPARE branched AS SELECT * FROM ns.main.a AT (VERSION => 'branch:dev:3'); "
                 "EXECUTE branched; "
+                "PREPARE latest AS SELECT sum(id) FROM ns.main.a AT (VERSION => 'branch:main'); "
+                "EXECUTE latest; INSERT INTO ns.main.a (id) VALUES (11); EXECUTE latest; "
                 f"COPY (SELECT content FROM read_text('{tags / 'main_tag.json'}')) TO '{tags / '2.json'}' "
                 "(FORMAT CSV, HEADER false, QUOTE '', ESCAPE ''); "
                 "EXECUTE tagged; EXECUTE branched;",
-                "99\n99\n99\n1\n99",
+                "99\n99\n99\n10\n21\n1\n99",
             )
             # A branch selector must still read dev when no tag points to it.
             (tags / "dev_tag.json").unlink()
             read_dev = (
                 f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
-                "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');"
+                "SELECT id FROM ns.main.a AT (VERSION => '{}');"
             )
-            duckdb(read_dev, "99")
+            for ref in ("branch:dev:3", "branch:dev"):
+                duckdb(read_dev.format(ref), "99")
             # Lance may leave a branch directory behind after its ref is deleted.
             # A fresh statement must reject the orphaned manifests.
             (Path(dataset_a) / "_refs/branches/dev.json").unlink()
-            duckdb(read_dev, expected_error="branch dev does not exist")
+            for ref in ("branch:dev:3", "branch:dev"):
+                duckdb(read_dev.format(ref), expected_error="branch dev does not exist")
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
-    print("Historical REST reads and prepared tag reassignment passed")
+    print("Historical REST reads and prepared tag and branch reads passed")
 
 
 if __name__ == "__main__":
