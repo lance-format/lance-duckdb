@@ -32,7 +32,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    def duckdb(sql: str, expected: str | None = None) -> None:
+    def duckdb(sql: str, expected: str | None = None, *, expected_error: str | None = None) -> None:
         result = subprocess.run(
             [
                 str(args.duckdb),
@@ -48,6 +48,10 @@ def main() -> None:
             capture_output=True,
             timeout=120,
         )
+        if expected_error is not None:
+            if result.returncode == 0 or expected_error not in result.stderr:
+                raise RuntimeError(f"{sql}\nexpected error {expected_error!r}, got {result.stdout!r}\n{result.stderr}")
+            return
         if result.returncode or (expected is not None and result.stdout.strip() != expected):
             raise RuntimeError(f"{sql}\nexpected {expected!r}, got {result.stdout!r}\n{result.stderr}")
 
@@ -142,11 +146,15 @@ def main() -> None:
             )
             # A branch selector must still read dev when no tag points to it.
             (tags / "dev_tag.json").unlink()
-            duckdb(
+            read_dev = (
                 f"LOAD '{args.extension}'; ATTACH '{tmp}' AS ns (TYPE LANCE); "
-                "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');",
-                "99",
+                "SELECT id FROM ns.main.a AT (VERSION => 'branch:dev:3');"
             )
+            duckdb(read_dev, "99")
+            # Lance may leave a branch directory behind after its ref is deleted.
+            # A fresh statement must reject the orphaned manifests.
+            (Path(dataset_a) / "_refs/branches/dev.json").unlink()
+            duckdb(read_dev, expected_error="branch dev does not exist")
         finally:
             server.shutdown()
             server.server_close()

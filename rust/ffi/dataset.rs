@@ -441,7 +441,14 @@ unsafe fn checkout_ref(
             return -1;
         }
     };
-    let checked_out = match runtime::block_on(handle.dataset.checkout_version(reference)) {
+    let checked_out = match runtime::block_on(async {
+        // Lance can retain a branch's manifests after deleting its ref, e.g.
+        // when a nested branch still uses the directory. The ref owns the name.
+        if let Ref::Version(Some(branch), _) = &reference {
+            handle.dataset.branches().get(branch).await?;
+        }
+        handle.dataset.checkout_version(reference).await
+    }) {
         Ok(Ok(dataset)) => dataset,
         Ok(Err(err)) => {
             set_last_error(
