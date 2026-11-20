@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::Ref;
 use lance::dataset::statistics::DatasetStatisticsExt;
 
 use crate::constants::{
@@ -366,13 +367,36 @@ pub unsafe extern "C" fn lance_dataset_checkout_version(
     version: u64,
     out_dataset: *mut *mut c_void,
 ) -> i32 {
+    // SAFETY: The caller supplies a live dataset handle and a writable output slot.
+    unsafe { checkout_ref(dataset, Ok(Ref::from(version)), out_dataset) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lance_dataset_checkout_tag(
+    dataset: *mut c_void,
+    tag: *const c_char,
+    out_dataset: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: The caller supplies a NUL-terminated tag for the duration of this call.
+    let reference = unsafe { cstr_to_str(tag, "tag") }.map(Ref::from);
+    // SAFETY: Both handles follow the same contract as numeric checkout.
+    unsafe { checkout_ref(dataset, reference, out_dataset) }
+}
+
+unsafe fn checkout_ref(
+    dataset: *mut c_void,
+    reference: FfiResult<Ref>,
+    out_dataset: *mut *mut c_void,
+) -> i32 {
     if out_dataset.is_null() {
         set_last_error(ErrorCode::InvalidArgument, "out_dataset must not be null");
         return -1;
     }
+    // SAFETY: The non-null output slot is writable even on failure.
     unsafe {
         ptr::write_unaligned(out_dataset, ptr::null_mut());
     }
+    // SAFETY: The caller keeps the input handle alive throughout checkout.
     let handle = match unsafe { dataset_handle(dataset) } {
         Ok(handle) => handle,
         Err(err) => {
@@ -380,12 +404,19 @@ pub unsafe extern "C" fn lance_dataset_checkout_version(
             return -1;
         }
     };
-    let checked_out = match runtime::block_on(handle.dataset.checkout_version(version)) {
+    let reference = match reference {
+        Ok(reference) => reference,
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            return -1;
+        }
+    };
+    let checked_out = match runtime::block_on(handle.dataset.checkout_version(reference)) {
         Ok(Ok(dataset)) => dataset,
         Ok(Err(err)) => {
             set_last_error(
                 ErrorCode::DatasetOpen,
-                format!("checkout dataset version {version}: {err}"),
+                format!("checkout dataset reference: {err}"),
             );
             return -1;
         }
@@ -396,6 +427,7 @@ pub unsafe extern "C" fn lance_dataset_checkout_version(
     };
     let new_handle =
         Box::into_raw(Box::new(DatasetHandle::new(Arc::new(checked_out)))) as *mut c_void;
+    // SAFETY: Transfer the new handle into the validated output slot.
     unsafe {
         ptr::write_unaligned(out_dataset, new_handle);
     }

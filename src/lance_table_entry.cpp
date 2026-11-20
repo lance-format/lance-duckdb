@@ -364,12 +364,20 @@ static uint64_t ResolveAtClauseVersion(
   return version;
 }
 
-unique_ptr<LanceTableEntry>
-LanceTableEntry::AtClause(ClientContext &context,
-                          const BoundAtClause &at) const {
+static shared_ptr<LanceDatasetCacheEntry>
+OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
+                    const BoundAtClause &at) {
+  const auto &value = at.GetValue();
+  if (StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
+      !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
+    const auto &reference = StringValue::Get(value);
+    if (StringUtil::StartsWith(reference, "tag:")) {
+      return LanceGetTaggedDatasetForTable(context, table, reference.substr(4));
+    }
+  }
   shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;
   string display_uri;
-  auto version = ResolveAtClauseVersion(context, *this, at, timestamp_dataset,
+  auto version = ResolveAtClauseVersion(context, table, at, timestamp_dataset,
                                         display_uri);
   void *dataset = nullptr;
   if (timestamp_dataset) {
@@ -379,16 +387,22 @@ LanceTableEntry::AtClause(ClientContext &context,
     }
   } else {
     dataset =
-        LanceOpenDatasetForTableAtVersion(context, *this, version, display_uri);
+        LanceOpenDatasetForTableAtVersion(context, table, version, display_uri);
   }
   if (!dataset) {
     throw IOException("Failed to open version " + to_string(version) +
                       " of Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
-  auto pinned = make_shared_ptr<LanceDatasetCacheEntry>(dataset, display_uri);
-  auto entry =
-      BuildLanceTableEntryFromDataset(context, *this, internal, dataset);
+  return make_shared_ptr<LanceDatasetCacheEntry>(dataset, display_uri);
+}
+
+unique_ptr<LanceTableEntry>
+LanceTableEntry::AtClause(ClientContext &context,
+                          const BoundAtClause &at) const {
+  auto pinned = OpenAtClauseDataset(context, *this, at);
+  auto entry = BuildLanceTableEntryFromDataset(context, *this, internal,
+                                               pinned->Handle());
   entry->historical_dataset = std::move(pinned);
   return entry;
 }
