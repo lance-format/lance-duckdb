@@ -1041,6 +1041,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn tag_lookup_only_needs_search_permission_on_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = lance_core::utils::tempfile::TempDir::default();
+        external_write(&dir.path_str(), vec![1], WriteMode::Create);
+        let ds = runtime::block_on(Dataset::open(&dir.path_str()))
+            .unwrap()
+            .unwrap();
+        runtime::block_on(ds.tags().create("Release", 1))
+            .unwrap()
+            .unwrap();
+        let tags = dir.std_path().join("_refs/tags");
+        let original = fs::metadata(&tags).unwrap().permissions();
+        fs::set_permissions(&tags, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = runtime::block_on(crate::ffi::versions::resolve_tag(&ds, "Release"));
+        fs::set_permissions(&tags, original).unwrap();
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Ref::Version(None, Some(1))
+        ));
+    }
+
+    #[test]
+    fn tag_reads_survive_concurrent_metadata_replacement() {
+        let dir = lance_core::utils::tempfile::TempDir::default();
+        external_write(&dir.path_str(), vec![1], WriteMode::Create);
+        runtime::block_on(async {
+            let ds = Dataset::open(&dir.path_str()).await.unwrap();
+            let tags = ds.tags();
+            tags.create("release", 1).await.unwrap();
+            let writer = async {
+                for i in 0..32 {
+                    let metadata = [("sequence".to_owned(), i.to_string())].into();
+                    tags.replace_metadata("release", metadata).await.unwrap();
+                }
+            };
+            let reader = async {
+                for _ in 0..64 {
+                    let tag = crate::ffi::versions::resolve_tag(&ds, "release")
+                        .await
+                        .unwrap();
+                    assert!(matches!(tag, Ref::Version(None, Some(1))));
+                }
+            };
+            tokio::join!(writer, reader);
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn interrupted_tag_lookup_preserves_the_tag() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 

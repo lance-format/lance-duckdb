@@ -1023,3 +1023,8 @@ coordinate table replacement, deletion and re-creation of the same tag
 (including case variants on case-insensitive filesystems), and cleanup of a
 version being tagged. REST attachments do not support these two write
 statements.
+
+With Lance 14.0.3, `CREATE TAG` rejects local dataset paths whose components
+would change when Lance builds the staging path, such as `warehouse~tags/t.lance`.
+This restriction can be lifted after the extension picks up
+[Lance's local staging fix](https://github.com/lance-format/lance/pull/11220).

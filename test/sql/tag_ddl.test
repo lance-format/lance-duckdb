@@ -7,6 +7,32 @@ require lance
 statement ok
 ATTACH '{TEST_DIR}' AS tag_ns (TYPE LANCE);
 
+# Lance 14.0.3 re-encodes the local staging parent (lance-format/lance#11220).
+# Once the dependency includes the fix, expect CREATE to succeed and read the tag.
+statement ok
+COPY (SELECT 7 AS id) TO '{TEST_DIR}/warehouse~tags/t.lance' (FORMAT lance);
+
+statement ok
+ATTACH '{TEST_DIR}/warehouse~tags' AS encoded_ns (TYPE LANCE);
+
+statement error
+ALTER TABLE encoded_ns.main.t CREATE TAG 'release' AT VERSION 1;
+----
+cannot stage a tag under this local dataset path
+
+query I
+SELECT count(*) FROM lance_tags('encoded_ns.main.t');
+----
+0
+
+query I
+SELECT id FROM encoded_ns.main.t;
+----
+7
+
+statement ok
+DETACH encoded_ns;
+
 statement ok
 CREATE TABLE tag_ns.main."tag.case" AS SELECT 11::BIGINT AS id;
 
