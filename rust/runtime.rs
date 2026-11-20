@@ -43,7 +43,7 @@ impl InterruptHook {
         Self { check, ctx }
     }
 
-    fn interrupted(&self) -> bool {
+    pub(crate) fn interrupted(&self) -> bool {
         unsafe { (self.check)(self.ctx) != 0 }
     }
 }

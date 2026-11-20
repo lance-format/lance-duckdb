@@ -765,6 +765,7 @@ public:
     }
     context.BlockingInterruptCheck();
     if (lance_dataset_mutate_tag(dataset.get(), tag.c_str(), version) != 0) {
+      context.BlockingInterruptCheck();
       throw IOException(string("Failed to ") + (version ? "create" : "drop") +
                         " Lance tag" + LanceFormatErrorSuffix());
     }

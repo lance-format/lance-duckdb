@@ -1036,6 +1036,42 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_tag_lookup_preserves_the_tag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        unsafe extern "C" fn interrupt_during_lookup(ctx: *mut c_void) -> i32 {
+            // Allow the first poll, then interrupt before the result can be used.
+            let polls = unsafe { &*ctx.cast::<AtomicUsize>() };
+            i32::from(polls.fetch_add(1, Ordering::SeqCst) >= 2)
+        }
+
+        let dir = std::env::temp_dir().join(format!("ffi-tag-drop-{}", rand::random::<u64>()));
+        let uri = dir.to_str().unwrap();
+        external_write(uri, vec![1], WriteMode::Create);
+        let ds = runtime::block_on(Dataset::open(uri)).unwrap().unwrap();
+        let mut handle = DatasetHandle::new(Arc::new(ds));
+        let handle_ptr = (&mut handle as *mut DatasetHandle).cast();
+        let tag = c"release";
+        let mutate = crate::ffi::versions::lance_dataset_mutate_tag;
+        assert_eq!(unsafe { mutate(handle_ptr, tag.as_ptr(), &1) }, 0);
+        let mut polls = AtomicUsize::new(0);
+        runtime::set_interrupt_hook(Some(runtime::InterruptHook::new(
+            interrupt_during_lookup,
+            (&mut polls as *mut AtomicUsize).cast(),
+        )));
+        let status = unsafe { mutate(handle_ptr, tag.as_ptr(), std::ptr::null()) };
+        runtime::set_interrupt_hook(None);
+        assert_eq!(status, -1);
+        assert_eq!(
+            runtime::block_on(handle.dataset.tags().get_version("release"))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_checkout_latest_if_stale_sees_external_commits() {
         // Opening datasets mutates the process-global debug counters, which
         // other tests assert on; serialize with them.

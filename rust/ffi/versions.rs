@@ -10,7 +10,7 @@ fn version_error(message: String) -> FfiError {
     FfiError::new(ErrorCode::DatasetVersions, message)
 }
 
-async fn drop_dataset_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
+async fn check_drop_tag_name(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
     let store = dataset.object_store(None).await?;
     if store.is_local() || store.scheme() == "file-object-store" {
         // A case-insensitive volume can open another spelling of this name.
@@ -29,7 +29,7 @@ async fn drop_dataset_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<
             });
         }
     }
-    dataset.tags().delete(tag).await
+    Ok(())
 }
 
 /// Create a tag at the supplied version, or delete it when version is null.
@@ -65,23 +65,34 @@ fn mutate_tag_inner(
     let tag = unsafe { cstr_to_str(tag, "tag")? };
     let version = unsafe { version.as_ref() }.copied();
     lance::dataset::refs::check_valid_tag(tag).map_err(|err| version_error(err.to_string()))?;
-    // A dispatched object store write can outlive a dropped future. The caller
-    // checks interruption before dispatch and holds its catalog lock until completion.
-    let rt = runtime::runtime()
-        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?;
     match version {
         // Lance 14.0.3 re-encodes non-ASCII tag filenames while listing them.
-        Some(_) if !tag.is_ascii() => Err(version_error(
-            "CREATE TAG requires an ASCII tag name".into(),
-        )),
-        Some(v) if v <= 0 => Err(version_error("tag version must be positive".into())),
-        Some(v) => rt
-            .block_on(handle.dataset.tags().create(tag, v as u64))
-            .map_err(|err| version_error(err.to_string())),
-        None => rt
-            .block_on(drop_dataset_tag(&handle.dataset, tag))
-            .map_err(|err| version_error(err.to_string())),
+        Some(_) if !tag.is_ascii() => {
+            return Err(version_error(
+                "CREATE TAG requires an ASCII tag name".into(),
+            ))
+        }
+        Some(v) if v <= 0 => return Err(version_error("tag version must be positive".into())),
+        None => runtime::block_on(check_drop_tag_name(&handle.dataset, tag))
+            .map_err(|err| FfiError::new(ErrorCode::Runtime, err.to_string()))?
+            .map_err(|err| version_error(err.to_string()))?,
+        Some(_) => {}
     }
+    let rt = runtime::runtime()
+        .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?;
+    // Check again after the read-only work. Once dispatched, a store write can
+    // outlive a cancelled future, so retain the catalog lock until Lance returns.
+    if runtime::interrupt_hook().is_some_and(|hook| hook.interrupted()) {
+        return Err(FfiError::new(ErrorCode::Runtime, "interrupted"));
+    }
+    let tags = handle.dataset.tags();
+    rt.block_on(async {
+        match version {
+            Some(v) => tags.create(tag, v as u64).await,
+            None => tags.delete(tag).await,
+        }
+    })
+    .map_err(|err| version_error(err.to_string()))
 }
 
 /// The branch a dataset handle or tag belongs to; `None` is the main branch.
