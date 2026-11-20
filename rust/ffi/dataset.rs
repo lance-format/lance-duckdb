@@ -446,9 +446,14 @@ unsafe fn checkout_ref(
     let checked_out = match runtime::block_on(async {
         // Lance can retain a branch's manifests after deleting its ref, e.g.
         // when a nested branch still uses the directory. The ref owns the name.
-        if let Ref::Version(Some(branch), _) = &reference {
-            handle.dataset.branches().get(branch).await?;
-        }
+        let reference = match &reference {
+            Ref::Tag(tag) => super::versions::resolve_tag(&handle.dataset, tag).await?,
+            Ref::Version(Some(branch), _) => {
+                handle.dataset.branches().get(branch).await?;
+                reference
+            }
+            _ => reference,
+        };
         handle.dataset.checkout_version(reference).await
     }) {
         Ok(Ok(dataset)) => dataset,
@@ -1035,6 +1040,93 @@ mod tests {
         runtime::block_on(Dataset::write(reader, uri, Some(params)))
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tag_lookup_only_needs_search_permission_on_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = lance_core::utils::tempfile::TempDir::default();
+        external_write(&dir.path_str(), vec![1], WriteMode::Create);
+        let ds = runtime::block_on(Dataset::open(&dir.path_str()))
+            .unwrap()
+            .unwrap();
+        runtime::block_on(ds.tags().create("Release", 1))
+            .unwrap()
+            .unwrap();
+        let tags = dir.std_path().join("_refs/tags");
+        let original = fs::metadata(&tags).unwrap().permissions();
+        fs::set_permissions(&tags, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = runtime::block_on(crate::ffi::versions::resolve_tag(&ds, "Release"));
+        fs::set_permissions(&tags, original).unwrap();
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Ref::Version(None, Some(1))
+        ));
+    }
+
+    #[test]
+    fn tag_reads_survive_concurrent_metadata_replacement() {
+        let dir = lance_core::utils::tempfile::TempDir::default();
+        external_write(&dir.path_str(), vec![1], WriteMode::Create);
+        runtime::block_on(async {
+            let ds = Dataset::open(&dir.path_str()).await.unwrap();
+            let tags = ds.tags();
+            tags.create("release", 1).await.unwrap();
+            let writer = async {
+                for i in 0..32 {
+                    let metadata = [("sequence".to_owned(), i.to_string())].into();
+                    tags.replace_metadata("release", metadata).await.unwrap();
+                }
+            };
+            let reader = async {
+                for _ in 0..64 {
+                    let tag = crate::ffi::versions::resolve_tag(&ds, "release")
+                        .await
+                        .unwrap();
+                    assert!(matches!(tag, Ref::Version(None, Some(1))));
+                }
+            };
+            tokio::join!(writer, reader);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn interrupted_tag_lookup_preserves_the_tag() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        unsafe extern "C" fn interrupt_during_lookup(ctx: *mut c_void) -> i32 {
+            // Allow the first poll, then interrupt before the result can be used.
+            let polls = unsafe { &*ctx.cast::<AtomicUsize>() };
+            i32::from(polls.fetch_add(1, Ordering::SeqCst) >= 2)
+        }
+
+        let dir = std::env::temp_dir().join(format!("ffi-tag-drop-{}", rand::random::<u64>()));
+        let uri = dir.to_str().unwrap();
+        external_write(uri, vec![1], WriteMode::Create);
+        let ds = runtime::block_on(Dataset::open(uri)).unwrap().unwrap();
+        let mut handle = DatasetHandle::new(Arc::new(ds));
+        let handle_ptr = (&mut handle as *mut DatasetHandle).cast();
+        let tag = c"release";
+        let mutate = crate::ffi::versions::lance_dataset_mutate_tag;
+        assert_eq!(unsafe { mutate(handle_ptr, tag.as_ptr(), &1) }, 0);
+        let mut polls = AtomicUsize::new(0);
+        runtime::set_interrupt_hook(Some(runtime::InterruptHook::new(
+            interrupt_during_lookup,
+            (&mut polls as *mut AtomicUsize).cast(),
+        )));
+        let status = unsafe { mutate(handle_ptr, tag.as_ptr(), std::ptr::null()) };
+        runtime::set_interrupt_hook(None);
+        assert_eq!(status, -1);
+        assert_eq!(
+            runtime::block_on(handle.dataset.tags().get_version("release"))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

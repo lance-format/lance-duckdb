@@ -1008,3 +1008,31 @@ SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_
 - `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
 - `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
 - Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.
+
+On a writable directory attachment, use `ALTER TABLE` to tag a committed
+version or drop a tag. Both statements require autocommit.
+
+```sql
+ALTER TABLE ns.main.my_table CREATE TAG 'Release-2' AT VERSION 7;
+SELECT * FROM ns.main.my_table AT (VERSION => 'tag:Release-2');
+ALTER TABLE ns.main.my_table DROP TAG 'Release-2';
+```
+
+Creating a tag requires a new name and an existing positive version. New tag
+names may contain ASCII letters, digits, underscores, hyphens and dots, subject
+to Lance's naming rules. Dropping a tag takes its exact name and leaves the
+version in place, subject to ordinary cleanup. Neither statement advances the
+table version. When another client or attachment uses the same storage,
+coordinate table replacement and operations that delete or re-create the same
+tag (including case variants on case-insensitive filesystems). REST attachments
+do not support these two write statements.
+
+Run `CREATE TAG` and any cleanup that could remove its target version at
+different times, even when both connections use the same attachment. This
+includes automatic cleanup after ordinary writes. Cleanup reads the tag list
+once and can delete a version whose tag was created after that read.
+
+With Lance 14.0.3, `CREATE TAG` rejects local dataset paths whose components
+would change when Lance builds the staging path, such as `warehouse~tags/t.lance`.
+This restriction can be lifted after the extension picks up
+[Lance's local staging fix](https://github.com/lance-format/lance/pull/11220).

@@ -10,6 +10,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include "lance_common.hpp"
 #include "lance_ffi.hpp"
@@ -92,6 +93,62 @@ struct LanceMaintenanceGlobalState final : public GlobalTableFunctionState {
 static unique_ptr<GlobalTableFunctionState>
 LanceMaintenanceInitGlobal(ClientContext &, TableFunctionInitInput &) {
   return make_uniq<LanceMaintenanceGlobalState>();
+}
+
+struct LanceTagBindData final : public FunctionData {
+  LanceTagBindData(LanceDatasetReference table_p, idx_t oid_p, string tag_p,
+                   Value version_p)
+      : table(std::move(table_p)), oid(oid_p), tag(std::move(tag_p)),
+        version(std::move(version_p)) {}
+  LanceDatasetReference table;
+  idx_t oid;
+  string tag;
+  Value version;
+
+  unique_ptr<FunctionData> Copy() const override {
+    return make_uniq<LanceTagBindData>(table, oid, tag, version);
+  }
+  bool Equals(const FunctionData &other_p) const override {
+    auto &other = other_p.Cast<LanceTagBindData>();
+    return table == other.table && oid == other.oid && tag == other.tag &&
+           Value::NotDistinctFrom(version, other.version);
+  }
+};
+
+static unique_ptr<FunctionData> LanceTagBind(ClientContext &,
+                                             TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types,
+                                             vector<Identifier> &names) {
+  return_types = {LogicalType::BOOLEAN};
+  names = {"Success"};
+  return make_uniq<LanceTagBindData>(
+      LanceDatasetReference{input.inputs[0].GetValue<string>(), true},
+      input.inputs[1].GetValue<uint64_t>(), input.inputs[2].GetValue<string>(),
+      input.inputs[3]);
+}
+
+static void LanceTagExecute(ClientContext &context, TableFunctionInput &input,
+                            DataChunk &) {
+  auto &state = input.global_state->Cast<LanceMaintenanceGlobalState>();
+  if (state.finished) {
+    return;
+  }
+  state.finished = true;
+  if (!context.transaction.IsAutoCommit()) {
+    throw TransactionException("Lance tag changes require autocommit");
+  }
+  auto &data = input.bind_data->Cast<LanceTagBindData>();
+  auto target = data.table.Resolve(context);
+  if (target.table->oid != data.oid) {
+    throw TransactionException(
+        "Lance table changed concurrently; retry tag operation");
+  }
+  if (data.version.IsNull()) {
+    target.table->MutateTag(context, data.tag, nullptr);
+  } else {
+    auto version = data.version.GetValue<int64_t>();
+    target.table->MutateTag(context, data.tag, &version);
+  }
 }
 
 static unique_ptr<FunctionData>
@@ -556,6 +613,8 @@ enum class LanceMaintenanceStmtKind : uint8_t {
   SET_AUTO_CLEANUP = 4,
   UNSET_AUTO_CLEANUP = 5,
   SHOW_AUTO_CLEANUP = 6,
+  CREATE_TAG,
+  DROP_TAG,
 };
 
 static bool IsSpace(char c) {
@@ -960,17 +1019,24 @@ static bool TryParseAutoCleanupSetOptions(const string &with_clause_sql,
 }
 
 static bool TryParseIdentifier(const string &sql, string &out_ident,
-                               idx_t &out_consumed) {
+                               idx_t &out_consumed, bool table_name = false) {
   out_ident.clear();
   out_consumed = 0;
   if (sql.empty()) {
     return false;
   }
   idx_t i = 0;
-  while (i < sql.size() && IsIdentChar(sql[i])) {
-    i++;
+  bool quoted = false;
+  for (; i < sql.size(); i++) {
+    if (table_name && sql[i] == '"') {
+      quoted = !quoted;
+    } else if (!quoted && !IsIdentChar(sql[i]) &&
+               !(table_name && (static_cast<unsigned char>(sql[i]) >= 128 ||
+                                sql[i] == '$'))) {
+      break;
+    }
   }
-  if (i == 0) {
+  if (i == 0 || quoted || (table_name && sql[i - 1] == '.')) {
     return false;
   }
   out_ident = sql.substr(0, i);
@@ -983,6 +1049,8 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
       : kind(kind_p) {}
 
   LanceMaintenanceStmtKind kind;
+  string tag;
+  int64_t tag_version = 0;
   bool target_is_path = false;
   string dataset_uri;
   string target_sql;
@@ -995,6 +1063,8 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
 
   unique_ptr<ParserExtensionParseData> Copy() const override {
     auto out = make_uniq<LanceMaintenanceParseData>(kind);
+    out->tag = tag;
+    out->tag_version = tag_version;
     out->target_is_path = target_is_path;
     out->dataset_uri = dataset_uri;
     out->target_sql = target_sql;
@@ -1009,6 +1079,12 @@ struct LanceMaintenanceParseData final : public ParserExtensionParseData {
 
   string ToString() const override {
     switch (kind) {
+    case LanceMaintenanceStmtKind::CREATE_TAG:
+      return "ALTER TABLE " + target_sql + " CREATE TAG " +
+             Value(tag).ToSQLString() + " AT VERSION " + to_string(tag_version);
+    case LanceMaintenanceStmtKind::DROP_TAG:
+      return "ALTER TABLE " + target_sql + " DROP TAG " +
+             Value(tag).ToSQLString();
     case LanceMaintenanceStmtKind::COMPACT:
       return "OPTIMIZE " + target_sql;
     case LanceMaintenanceStmtKind::CLEANUP:
@@ -1054,7 +1130,7 @@ static bool TryParseTarget(string &rest, bool &target_is_path,
   }
 
   string ident;
-  if (!TryParseIdentifier(rest, ident, consumed)) {
+  if (!TryParseIdentifier(rest, ident, consumed, true)) {
     out_error = "expected dataset path or table identifier";
     return false;
   }
@@ -1209,6 +1285,40 @@ static ParserExtensionParseResult LanceMaintenanceParse(ParserExtensionInfo *,
       return ParserExtensionParseResult(parse_error);
     }
 
+    bool create_tag = ConsumeKeyword(rest, "create");
+    if (create_tag || ConsumeKeyword(rest, "drop")) {
+      if (!ConsumeKeyword(rest, "tag")) {
+        return ParserExtensionParseResult();
+      }
+      if (target_is_path) {
+        return ParserExtensionParseResult(
+            "tag changes require an attached Lance table");
+      }
+      auto out = make_uniq<LanceMaintenanceParseData>(
+          create_tag ? LanceMaintenanceStmtKind::CREATE_TAG
+                     : LanceMaintenanceStmtKind::DROP_TAG);
+      out->target_sql = target_sql;
+      idx_t consumed;
+      if (!TryParseSqlStringLiteral(rest, out->tag, consumed) ||
+          out->tag.empty() || out->tag.find('\0') != string::npos) {
+        return ParserExtensionParseResult(
+            "expected a non-empty tag name as a string literal");
+      }
+      rest = TrimCopy(rest.substr(consumed));
+      if (create_tag) {
+        if (!ConsumeKeyword(rest, "at") || !ConsumeKeyword(rest, "version") ||
+            !TryParseIntegerLiteral(rest, out->tag_version) ||
+            out->tag_version <= 0) {
+          return ParserExtensionParseResult(
+              "CREATE TAG requires AT VERSION followed by a positive integer");
+        }
+      } else if (!rest.empty()) {
+        return ParserExtensionParseResult(
+            "unexpected trailing tokens after DROP TAG");
+      }
+      return ParserExtensionParseResult(std::move(out));
+    }
+
     if (ConsumeKeyword(rest, "set")) {
       if (!ConsumeKeyword(rest, "auto_cleanup")) {
         return ParserExtensionParseResult(
@@ -1289,18 +1399,52 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
         "LanceMaintenancePlan received unexpected parse data");
   }
 
+  ParserExtensionPlanResult result;
   string target;
   if (parse_data->target_is_path) {
     target = parse_data->dataset_uri;
   } else {
-    auto qname = QualifiedName::Parse(parse_data->target_sql);
-    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname)
-                      .Cast<TableCatalogEntry>();
-    qname = entry.schema.GetQualifiedName(entry.name);
-    target = qname.ToString();
+    QualifiedName qname;
+    string error;
+    if (!QualifiedName::TryParse(parse_data->target_sql, qname, error)) {
+      throw ParserException(error);
+    }
+    Binder::BindSchemaOrCatalog(context, qname);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname);
+    if (parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG ||
+        parse_data->kind == LanceMaintenanceStmtKind::DROP_TAG) {
+      auto *table = dynamic_cast<LanceTableEntry *>(&entry);
+      if (!table) {
+        throw BinderException("Tag changes require an attached Lance table");
+      }
+      if (!table->IsNamespaceBacked() ||
+          !table->NamespaceConfig().IsDirectory()) {
+        throw NotImplementedException(
+            "Tag changes require a directory-attached Lance table");
+      }
+      target = table->schema.GetQualifiedName(table->name).ToString();
+      StatementProperties properties;
+      properties.RegisterDBModify(entry.ParentCatalog(), context,
+                                  DatabaseModificationType::ALTER_TABLE);
+      result.modified_databases = std::move(properties.modified_databases);
+      // Bind the write directly so only the ALTER statement can execute it.
+      result.function = TableFunction(
+          "__lance_mutate_tag",
+          {LogicalType::VARCHAR, LogicalType::UBIGINT, LogicalType::VARCHAR,
+           LogicalType::BIGINT},
+          LanceTagExecute, LanceTagBind, LanceMaintenanceInitGlobal);
+      result.function.verify_serialization = false;
+      result.parameters = {
+          Value(target), Value::UBIGINT(entry.oid), Value(parse_data->tag),
+          parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG
+              ? Value::BIGINT(parse_data->tag_version)
+              : Value(LogicalType::BIGINT)};
+      return result;
+    }
+    auto &table = entry.Cast<TableCatalogEntry>();
+    target = table.schema.GetQualifiedName(table.name).ToString();
   }
 
-  ParserExtensionPlanResult result;
   switch (parse_data->kind) {
   case LanceMaintenanceStmtKind::COMPACT:
     result.function = LanceInternalCompactTableFunction();

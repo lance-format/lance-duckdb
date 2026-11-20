@@ -1,0 +1,277 @@
+# name: test/sql/tag_ddl.test
+# description: create and retire named snapshots on an attached Lance table
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}' AS tag_ns (TYPE LANCE);
+
+# Lance 14.0.3 re-encodes the local staging parent (lance-format/lance#11220).
+# Once the dependency includes the fix, expect CREATE to succeed and read the tag.
+statement ok
+COPY (SELECT 7 AS id) TO '{TEST_DIR}/warehouse~tags/t.lance' (FORMAT lance);
+
+statement ok
+ATTACH '{TEST_DIR}/warehouse~tags' AS encoded_ns (TYPE LANCE);
+
+statement error
+ALTER TABLE encoded_ns.main.t CREATE TAG 'release' AT VERSION 1;
+----
+cannot stage a tag under this local dataset path
+
+query I
+SELECT count(*) FROM lance_tags('encoded_ns.main.t');
+----
+0
+
+query I
+SELECT id FROM encoded_ns.main.t;
+----
+7
+
+statement ok
+DETACH encoded_ns;
+
+statement ok
+CREATE TABLE tag_ns.main."tag.case" AS SELECT 11::BIGINT AS id;
+
+statement ok
+INSERT INTO tag_ns.main."tag.case" VALUES (22);
+
+statement ok
+ALTER TABLE tag_ns."tag.case" CREATE TAG 'Release-2' AT VERSION 1;
+
+query II reader
+SELECT (SELECT sum(id) FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2')),
+       (SELECT sum(id) FROM tag_ns.main."tag.case");
+----
+11	33
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'Release-2' AT VERSION 2;
+----
+already exists
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'RELEASE-2';
+----
+does not exist
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'é' AT VERSION 2;
+----
+ASCII tag name
+
+query II
+SELECT (SELECT count(*) FROM lance_versions('tag_ns.main."tag.case"')),
+       (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"') WHERE tag = 'Release-2');
+----
+2	1
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'bad-version' AT VERSION 99;
+----
+does not exist
+
+query II
+SELECT count(*), max(version) FROM lance_tags('tag_ns.main."tag.case"');
+----
+1	1
+
+statement ok
+BEGIN;
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'Release-2';
+----
+autocommit
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'blocked' AT VERSION 2;
+----
+read-only mode
+
+statement ok
+ROLLBACK;
+
+query TI
+SELECT tag, version FROM lance_tags('tag_ns.main."tag.case"');
+----
+Release-2	1
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'zero' AT VERSION 0;
+----
+positive integer
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'a/b' AT VERSION 2;
+----
+Ref is invalid
+
+statement error
+ALTER TABLE '{TEST_DIR}/tag.case.lance' CREATE TAG 'bypass' AT VERSION 1;
+----
+attached Lance table
+
+statement ok
+CREATE TEMP TABLE ordinary_table (n INT);
+
+statement error
+ALTER TABLE ordinary_table CREATE TAG 'irrelevant' AT VERSION 1;
+----
+attached Lance table
+
+statement ok
+CREATE TEMP VIEW ordinary_view AS SELECT * FROM tag_ns.main."tag.case";
+
+statement error
+ALTER TABLE ordinary_view CREATE TAG 'through_view' AT VERSION 1;
+----
+attached Lance table
+
+statement error
+SELECT * FROM __lance_mutate_tag('tag_ns.main."tag.case"', 'bypass', 2);
+----
+does not exist
+
+statement ok
+SET debug_verify_serializer=true;
+
+statement ok
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG '2' AT VERSION 1;
+
+statement ok
+RESET debug_verify_serializer;
+
+query I
+SELECT sum(id) FROM tag_ns.main."tag.case" AT (VERSION => 'tag:2');
+----
+11
+
+statement ok
+ALTER TABLE tag_ns.main."tag.case" DROP TAG '2';
+
+statement ok
+ALTER TABLE tag_ns."tag.case" DROP TAG 'Release-2';
+
+statement error reader
+SELECT * FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2');
+----
+does not exist
+
+query III
+SELECT (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"')),
+       (SELECT max(version) FROM lance_versions('tag_ns.main."tag.case"')),
+       (SELECT sum(id) FROM tag_ns.main."tag.case");
+----
+0	2	33
+
+statement ok
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'release-2' AT VERSION 2;
+
+statement error reader
+SELECT * FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2');
+----
+does not exist
+
+query I reader
+SELECT sum(id) FROM tag_ns.main."tag.case" AT (VERSION => 'tag:release-2');
+----
+33
+
+statement error
+ALTER TABLE tag_ns.."tag.case" DROP TAG 'release-2';
+----
+Zero-length identifier
+
+query I
+SELECT version FROM lance_tags('tag_ns.main."tag.case"') WHERE tag='release-2';
+----
+2
+
+statement ok
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'release-2';
+
+statement error
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'Release-2';
+----
+does not exist
+
+# A tag for v2 must never appear on the v1 replacement, whichever connection wins.
+concurrentloop client 0 2
+
+onlyif client=0
+statement maybe
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'old' AT VERSION 2;
+----
+<REGEX>:.*(does not exist|not found in catalog|changed concurrently).*
+
+onlyif client=1
+statement ok
+DROP TABLE tag_ns.main."tag.case";
+
+onlyif client=1
+statement ok
+CREATE TABLE tag_ns.main."tag.case" AS SELECT 33::BIGINT AS id;
+
+endloop
+
+query II
+SELECT (SELECT max(version) FROM lance_versions('tag_ns.main."tag.case"')),
+       (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"'));
+----
+1	0
+
+statement ok
+CREATE SCHEMA memory.tag_ns;
+
+statement error
+ALTER TABLE tag_ns."tag.case" CREATE TAG 'ambiguous' AT VERSION 1;
+----
+Ambiguous reference to catalog or schema
+
+query I
+SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"');
+----
+0
+
+# The shared memory store keeps case-distinct physical tables on every platform.
+statement ok
+ATTACH 'shared-memory://tag-ddl/root' AS case_ns (TYPE LANCE);
+
+statement ok
+COPY (SELECT 1 AS id) TO 'shared-memory://tag-ddl/root/Sales.lance' (FORMAT lance);
+
+statement ok
+ALTER TABLE case_ns.main.Sales CREATE TAG 'original' AT VERSION 1;
+
+statement ok
+COPY (SELECT 2 AS id) TO 'shared-memory://tag-ddl/root/sales.lance' (FORMAT lance);
+
+statement error
+ALTER TABLE case_ns.main.sales DROP TAG 'original';
+----
+Ambiguous Lance directory table names
+
+statement error
+ALTER TABLE case_ns.main.sales CREATE TAG 'new' AT VERSION 1;
+----
+Ambiguous Lance directory table names
+
+query T
+SELECT tag FROM lance_tags('shared-memory://tag-ddl/root/Sales.lance');
+----
+original
+
+query I
+SELECT count(*) FROM lance_tags('shared-memory://tag-ddl/root/sales.lance');
+----
+0

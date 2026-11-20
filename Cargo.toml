@@ -59,6 +59,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rand = "0.8"
 url = "2"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", windows))'.dependencies]
+filepath = "0.2"
+
 [dev-dependencies]
 lance-file = "14.0.3"
 lance-io = { version = "14.0.3", features = ["test-util"] }

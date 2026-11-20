@@ -242,6 +242,9 @@ const char *lance_dataset_list_indices(void *dataset);
 // `tag, version, branch, created_micros, updated_micros`.
 const char *lance_dataset_list_versions(void *dataset);
 const char *lance_dataset_list_tags(void *dataset);
+// A null version deletes the tag. Otherwise create it at the supplied version.
+int32_t lance_dataset_mutate_tag(void *dataset, const char *tag,
+                                 const int64_t *version);
 int32_t lance_dataset_create_scalar_index(void *dataset, const char *column,
                                           const char *index_name,
                                           uint8_t replace);
