@@ -444,9 +444,14 @@ unsafe fn checkout_ref(
     let checked_out = match runtime::block_on(async {
         // Lance can retain a branch's manifests after deleting its ref, e.g.
         // when a nested branch still uses the directory. The ref owns the name.
-        if let Ref::Version(Some(branch), _) = &reference {
-            handle.dataset.branches().get(branch).await?;
-        }
+        let reference = match &reference {
+            Ref::Tag(tag) => super::versions::resolve_tag(&handle.dataset, tag).await?,
+            Ref::Version(Some(branch), _) => {
+                handle.dataset.branches().get(branch).await?;
+                reference
+            }
+            _ => reference,
+        };
         handle.dataset.checkout_version(reference).await
     }) {
         Ok(Ok(dataset)) => dataset,

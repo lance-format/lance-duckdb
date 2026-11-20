@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void};
+use std::sync::Arc;
+
+use lance::dataset::refs::{Ref, TagContents};
+use lance_io::object_store::ObjectStore;
+use object_store::{GetOptions, ObjectMeta};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
@@ -10,26 +15,51 @@ fn version_error(message: String) -> FfiError {
     FfiError::new(ErrorCode::DatasetVersions, message)
 }
 
-async fn check_drop_tag_name(dataset: &lance::Dataset, tag: &str) -> lance::Result<()> {
+async fn exact_local_tag(
+    dataset: &lance::Dataset,
+    tag: &str,
+) -> lance::Result<Option<(Arc<ObjectStore>, ObjectMeta)>> {
     let store = dataset.object_store(None).await?;
-    if store.is_local() || store.scheme() == "file-object-store" {
-        // A case-insensitive volume can open another spelling of this name.
-        // Compare the stored directory entry before asking Lance to delete it.
-        let root = dataset.refs.root()?.path;
-        let path = lance::dataset::refs::tag_path(&root, tag);
-        let dir = lance::dataset::refs::base_tags_path(&root);
-        let entries = store.list_with_delimiter(Some(&dir)).await?;
-        if !entries
-            .objects
-            .iter()
-            .any(|e| e.location.filename() == path.filename())
-        {
-            return Err(lance::Error::RefNotFound {
-                message: format!("tag {tag} does not exist"),
-            });
-        }
+    if !store.is_local() && store.scheme() != "file-object-store" {
+        return Ok(None);
     }
-    Ok(())
+    // On a case-insensitive volume, opening a name does not verify its spelling.
+    lance::dataset::refs::check_valid_tag(tag)?;
+    let root = dataset.refs.root()?.path;
+    let path = lance::dataset::refs::tag_path(&root, tag);
+    let dir = lance::dataset::refs::base_tags_path(&root);
+    let entries = store.list_with_delimiter(Some(&dir)).await?;
+    let entry = entries
+        .objects
+        .into_iter()
+        .find(|e| e.location.filename() == path.filename())
+        .ok_or_else(|| lance::Error::RefNotFound {
+            message: format!("tag {tag} does not exist"),
+        })?;
+    Ok(Some((store, entry)))
+}
+
+pub(super) async fn resolve_tag(dataset: &lance::Dataset, tag: &str) -> lance::Result<Ref> {
+    let Some((store, entry)) = exact_local_tag(dataset, tag).await? else {
+        return Ok(Ref::from(tag));
+    };
+    // Bind the bytes to the exact directory entry even if a concurrent writer
+    // replaces it with a different spelling between listing and opening.
+    let etag = entry
+        .e_tag
+        .ok_or_else(|| lance::Error::io("Missing ETag for local tag file"))?;
+    let opts = GetOptions {
+        if_match: Some(etag),
+        ..Default::default()
+    };
+    let bytes = store
+        .inner
+        .get_opts(&entry.location, opts)
+        .await?
+        .bytes()
+        .await?;
+    let contents: TagContents = serde_json::from_slice(&bytes)?;
+    Ok(Ref::Version(contents.branch, Some(contents.version)))
 }
 
 /// Create a tag at the supplied version, or delete it when version is null.
@@ -73,9 +103,11 @@ fn mutate_tag_inner(
             ))
         }
         Some(v) if v <= 0 => return Err(version_error("tag version must be positive".into())),
-        None => runtime::block_on(check_drop_tag_name(&handle.dataset, tag))
-            .map_err(|err| FfiError::new(ErrorCode::Runtime, err.to_string()))?
-            .map_err(|err| version_error(err.to_string()))?,
+        None => {
+            runtime::block_on(exact_local_tag(&handle.dataset, tag))
+                .map_err(|err| FfiError::new(ErrorCode::Runtime, err.to_string()))?
+                .map_err(|err| version_error(err.to_string()))?;
+        }
         Some(_) => {}
     }
     let rt = runtime::runtime()

@@ -1404,7 +1404,11 @@ LanceMaintenancePlan(ParserExtensionInfo *, ClientContext &context,
   if (parse_data->target_is_path) {
     target = parse_data->dataset_uri;
   } else {
-    auto qname = QualifiedName::Parse(parse_data->target_sql);
+    QualifiedName qname;
+    string error;
+    if (!QualifiedName::TryParse(parse_data->target_sql, qname, error)) {
+      throw ParserException(error);
+    }
     Binder::BindSchemaOrCatalog(context, qname);
     auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qname);
     if (parse_data->kind == LanceMaintenanceStmtKind::CREATE_TAG ||

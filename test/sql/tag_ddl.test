@@ -148,6 +148,32 @@ SELECT (SELECT count(*) FROM lance_tags('tag_ns.main."tag.case"')),
 ----
 0	2	33
 
+statement ok
+ALTER TABLE tag_ns.main."tag.case" CREATE TAG 'release-2' AT VERSION 2;
+
+statement error reader
+SELECT * FROM tag_ns.main."tag.case" AT (VERSION => 'tag:Release-2');
+----
+does not exist
+
+query I reader
+SELECT sum(id) FROM tag_ns.main."tag.case" AT (VERSION => 'tag:release-2');
+----
+33
+
+statement error
+ALTER TABLE tag_ns.."tag.case" DROP TAG 'release-2';
+----
+Zero-length identifier
+
+query I
+SELECT version FROM lance_tags('tag_ns.main."tag.case"') WHERE tag='release-2';
+----
+2
+
+statement ok
+ALTER TABLE tag_ns.main."tag.case" DROP TAG 'release-2';
+
 statement error
 ALTER TABLE tag_ns.main."tag.case" DROP TAG 'Release-2';
 ----
