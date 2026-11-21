@@ -293,10 +293,11 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void, out_version
 fn newest_version_at_timestamp(
     versions: &[lance::dataset::Version],
     timestamp_micros: i64,
+    submicro_nanos: u16,
 ) -> Option<u64> {
     let cutoff = (
         timestamp_micros.div_euclid(1_000_000),
-        timestamp_micros.rem_euclid(1_000_000) as u32 * 1_000,
+        timestamp_micros.rem_euclid(1_000_000) as u32 * 1_000 + u32::from(submicro_nanos),
     );
     versions
         .iter()
@@ -310,8 +311,8 @@ fn newest_version_at_timestamp(
         .max()
 }
 
-/// Resolve the newest version committed at or before `timestamp_micros`
-/// (microseconds since the Unix epoch, UTC).
+/// Resolve the newest version committed at or before a UTC cutoff, given as
+/// whole microseconds since the Unix epoch plus 0–999 nanoseconds.
 ///
 /// Returns `0` and writes `out_version` when such a version exists, `1` when
 /// every version is newer than the timestamp (`out_version` is untouched), and
@@ -320,6 +321,7 @@ fn newest_version_at_timestamp(
 pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
     dataset: *mut c_void,
     timestamp_micros: i64,
+    submicro_nanos: u16,
     out_version: *mut u64,
 ) -> i32 {
     if out_version.is_null() {
@@ -348,7 +350,7 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
         }
     };
     clear_last_error();
-    match newest_version_at_timestamp(&versions, timestamp_micros) {
+    match newest_version_at_timestamp(&versions, timestamp_micros, submicro_nanos) {
         Some(version) => {
             unsafe {
                 *out_version = version;
@@ -1290,14 +1292,32 @@ mod tests {
         let versions = vec![version(1, 0, 0), version(2, 1, 999), version(3, 2, 0)];
 
         // Version 2 commits 999ns after this cutoff and must not be selected.
-        assert_eq!(newest_version_at_timestamp(&versions, 1_000_000), Some(1));
-        assert_eq!(newest_version_at_timestamp(&versions, 1_000_001), Some(2));
-        assert_eq!(newest_version_at_timestamp(&versions, 2_000_000), Some(3));
+        assert_eq!(
+            newest_version_at_timestamp(&versions, 1_000_000, 0),
+            Some(1)
+        );
+        assert_eq!(
+            newest_version_at_timestamp(&versions, 1_000_000, 998),
+            Some(1)
+        );
+        assert_eq!(
+            newest_version_at_timestamp(&versions, 1_000_000, 999),
+            Some(2)
+        );
+        assert_eq!(
+            newest_version_at_timestamp(&versions, 1_000_001, 0),
+            Some(2)
+        );
+        assert_eq!(
+            newest_version_at_timestamp(&versions, 2_000_000, 0),
+            Some(3)
+        );
 
         // Euclidean cutoff decomposition also keeps pre-epoch timestamps exact.
         let pre_epoch = vec![version(1, -1, 999_999_999)]; // one ns before epoch
-        assert_eq!(newest_version_at_timestamp(&pre_epoch, -1), None);
-        assert_eq!(newest_version_at_timestamp(&pre_epoch, 0), Some(1));
+        assert_eq!(newest_version_at_timestamp(&pre_epoch, -1, 998), None);
+        assert_eq!(newest_version_at_timestamp(&pre_epoch, -1, 999), Some(1));
+        assert_eq!(newest_version_at_timestamp(&pre_epoch, 0, 0), Some(1));
     }
 
     #[test]
@@ -1370,7 +1390,7 @@ mod tests {
             assert!(!handle.is_null());
             let mut version = 0u64;
             assert_eq!(
-                lance_dataset_version_at_timestamp(handle, first_cutoff, &mut version),
+                lance_dataset_version_at_timestamp(handle, first_cutoff, 0, &mut version),
                 0
             );
             assert_eq!(version, 1);
@@ -1451,7 +1471,7 @@ mod tests {
 
             let resolve = |ts: i64| {
                 let mut version = 0u64;
-                let rc = lance_dataset_version_at_timestamp(handle, ts, &mut version);
+                let rc = lance_dataset_version_at_timestamp(handle, ts, 0, &mut version);
                 (rc, version)
             };
             // The first microsecond containing the full commit time includes
@@ -1465,11 +1485,11 @@ mod tests {
 
             let mut version = 0u64;
             assert_eq!(
-                lance_dataset_version_at_timestamp(handle, ts2, ptr::null_mut()),
+                lance_dataset_version_at_timestamp(handle, ts2, 0, ptr::null_mut()),
                 -1
             );
             assert_eq!(
-                lance_dataset_version_at_timestamp(ptr::null_mut(), ts2, &mut version),
+                lance_dataset_version_at_timestamp(ptr::null_mut(), ts2, 0, &mut version),
                 -1
             );
 
