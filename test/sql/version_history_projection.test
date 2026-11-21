@@ -1,0 +1,81 @@
+# name: test/sql/version_history_projection.test
+# description: lance_versions reads only the metadata used by the query
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.main.t AS SELECT 1 AS id;
+
+statement ok
+INSERT INTO ns.main.t VALUES (2);
+
+statement ok
+ALTER TABLE ns.main.t CREATE TAG 'first' AT VERSION 1;
+
+# The output and filter can request different columns in a different order.
+query TI
+SELECT tags, version FROM lance_versions('ns.main.t') WHERE timestamp IS NOT NULL ORDER BY version;
+----
+[first]	1
+[]	2
+
+query I
+SELECT version FROM lance_versions('ns.main.t') WHERE list_contains(tags, 'first');
+----
+1
+
+# Make one tag unreadable on this disposable table. Its history is intact.
+statement ok
+COPY (SELECT '{') TO '{TEST_DIR}/t.lance/_refs/tags/broken.json' (FORMAT CSV, HEADER FALSE);
+
+query I
+SELECT version FROM lance_versions('ns.main.t') ORDER BY version DESC LIMIT 1;
+----
+2
+
+query II
+SELECT count(*), count(timestamp) FROM lance_versions('{TEST_DIR}/t.lance');
+----
+2	2
+
+query I
+SELECT count(*) FROM lance_versions('ns.main.t');
+----
+2
+
+statement error
+SELECT version FROM lance_versions('ns.main.t') WHERE list_contains(tags, 'first');
+----
+Failed to read Lance versions
+
+# A valid history reference can be enumerated without decoding an old manifest.
+# Reading its timestamp must still surface the manifest error.
+statement ok
+CREATE TABLE ns.main.m AS SELECT 1 AS id;
+
+statement ok
+SET VARIABLE first_manifest = (SELECT file FROM glob('{TEST_DIR}/m.lance/_versions/*.manifest'));
+
+statement ok
+INSERT INTO ns.main.m VALUES (2);
+
+statement ok
+ALTER TABLE ns.main.m CREATE TAG 'saved' AT VERSION 1;
+
+statement ok
+COPY (SELECT 'invalid manifest') TO (getvariable('first_manifest')) (FORMAT CSV, HEADER FALSE);
+
+query TI
+SELECT tags, version FROM lance_versions('ns.main.m') ORDER BY version;
+----
+[saved]	1
+[]	2
+
+statement error
+SELECT timestamp FROM lance_versions('ns.main.m');
+----
+Failed to read Lance versions

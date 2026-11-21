@@ -241,7 +241,8 @@ const char *lance_dataset_list_indices(void *dataset);
 // Version history. The list functions return tab separated rows:
 // `version, timestamp_micros, tags` and
 // `tag, version, branch, created_micros, updated_micros`.
-const char *lance_dataset_list_versions(void *dataset);
+const char *lance_dataset_list_versions(void *dataset, bool include_timestamp,
+                                        bool include_tags);
 const char *lance_dataset_list_tags(void *dataset);
 // A null version deletes the tag. Otherwise create it at the supplied version.
 int32_t lance_dataset_mutate_tag(void *dataset, const char *tag,
