@@ -69,6 +69,19 @@ def main() -> None:
         move_on_marker = False
         moves: list[str] = []
         tag_requests: list[str] = []
+        # The physical table sees v2 while the namespace can reach v3 at its
+        # registered manifest path. Describes always return the same table URI.
+        authority_table = Path(tmp) / "authority.lance"
+        shutil.copytree(REPO_ROOT / "test/data/branch_tag_fixture.lance", authority_table)
+        head = min((authority_table / "_versions").glob("*.manifest"))  # inverted version numbers
+        registered = Path(tmp) / head.name
+        head.rename(registered)
+        registry_on, registry_off = (Path(tmp) / name for name in ("enable.csv", "disable.csv"))
+        registry_head = {
+            "version": 3,
+            "manifest_path": registered.resolve().as_posix().lstrip("/"),
+            "manifest_size": registered.stat().st_size,
+        }
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_: object) -> None:
@@ -78,8 +91,17 @@ def main() -> None:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 path = unquote(urlparse(self.path).path)
                 status = 200
-                if path.endswith("/table/list"):
-                    response: object = {"tables": ["t", "marker"] if move_on_marker else ["t"]}
+                if "/default$authority/" in path and path.endswith("/version/list"):
+                    response: object = {"versions": [registry_head]}
+                elif "/default$authority/" in path and path.endswith("/version/describe"):
+                    assert json.loads(body)["version"] == 3
+                    response = {"version": registry_head}
+                elif "/default$authority/" in path and path.endswith("/describe"):
+                    response = {"location": str(authority_table.resolve()), "schema": SCHEMA}
+                    if registry_on.exists():
+                        response["managed_versioning"] = not registry_off.exists()
+                elif path.endswith("/table/list"):
+                    response = {"tables": ["t", "marker", "authority"] if move_on_marker else ["t", "authority"]}
                 elif path.endswith("/list") and "/namespace/" in path:
                     response = {"namespaces": []}
                 elif path.endswith("/describe") and "/table/" in path:
@@ -183,6 +205,18 @@ def main() -> None:
             (Path(dataset_a) / "_refs/branches/dev.json").unlink()
             for ref in ("branch:dev:3", "branch:dev"):
                 duckdb(read_dev.format(ref), expected_error="branch dev does not exist")
+
+            try:
+                duckdb(
+                    attach + "SET lance_namespace_query_table=false; "
+                    "PREPARE h AS SELECT id FROM ns.main.authority AT (VERSION => 'branch:main'); "
+                    "PREPARE a AS SELECT avg(id)::BIGINT FROM ns.main.authority; "
+                    f"EXECUTE h; EXECUTE a; COPY (SELECT 1) TO '{registry_on}'; EXECUTE h; EXECUTE a; "
+                    f"COPY (SELECT 1) TO '{registry_off}'; EXECUTE h; EXECUTE a;",
+                    "2\n2\n3\n3\n2\n2",
+                )
+            except RuntimeError as err:
+                raise RuntimeError("wrong head after changing managed versioning") from err
         finally:
             server.shutdown()
             server.server_close()

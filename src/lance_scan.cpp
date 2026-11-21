@@ -3598,17 +3598,9 @@ LanceExecPushdown(ClientContext &context, Optimizer &optimizer,
       exec_bind = make_uniq<LanceExecBindData>();
       exec_bind->file_path = scan_bind.file_path;
       exec_bind->exec_ir = exec_ir;
-      auto *scan_table =
-          scan_bind.table_entry
-              ? dynamic_cast<LanceTableEntry *>(scan_bind.table_entry.get())
-              : nullptr;
-      if (scan_table && scan_table->IsHistorical()) {
-        // The latest version at this path is not the one the scan reads.
-        exec_bind->dataset_entry = scan_table->HistoricalDataset();
-      } else {
-        exec_bind->dataset_entry = LanceGetOrOpenDatasetEntry(
-            context, exec_bind->file_path, &exec_bind->dataset_cache_hit);
-      }
+      // The bound scan owns the resolved snapshot and its manifest authority.
+      exec_bind->dataset_entry = scan_bind.dataset_entry;
+      exec_bind->dataset_cache_hit = scan_bind.dataset_cache_hit;
       exec_bind->dataset = exec_bind->dataset_entry
                                ? exec_bind->dataset_entry->Handle()
                                : nullptr;
