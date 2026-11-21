@@ -9,6 +9,8 @@
 #include "lance_resolver.hpp"
 #include "lance_table_entry.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 namespace {
@@ -53,6 +55,28 @@ Value MicrosToTimestampTz(const string &micros) {
     return Value(LogicalType::TIMESTAMP_TZ);
   }
   return Value::TIMESTAMPTZ(timestamp_tz_t(std::stoll(micros)));
+}
+
+enum VersionColumn : column_t { VERSION_ID, VERSION_TIMESTAMP, VERSION_TAGS };
+
+Value VersionColumnValue(column_t column, const vector<string> &fields) {
+  switch (column) {
+  case VERSION_ID:
+    return Value::BIGINT(std::stoll(fields[VERSION_ID]));
+  case VERSION_TIMESTAMP:
+    return MicrosToTimestampTz(fields[VERSION_TIMESTAMP]);
+  case VERSION_TAGS: {
+    vector<Value> tags;
+    if (!fields[VERSION_TAGS].empty()) {
+      for (auto &tag : StringUtil::Split(fields[VERSION_TAGS], ',')) {
+        tags.emplace_back(tag);
+      }
+    }
+    return Value::LIST(LogicalType::VARCHAR, std::move(tags));
+  }
+  default:
+    throw InternalException("Unexpected lance_versions column ID");
+  }
 }
 
 struct LanceVersionsBindData final : public FunctionData {
@@ -137,17 +161,21 @@ LanceVersionsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
              MicrosToTimestampTz(f[3]), MicrosToTimestampTz(f[4])});
       }
     } else {
-      for (auto &f : ParseVersionRows(lance_dataset_list_versions(dataset), 3,
-                                      "versions")) {
-        vector<Value> tag_values;
-        if (!f[2].empty()) {
-          for (auto &tag : StringUtil::Split(f[2], ',')) {
-            tag_values.emplace_back(tag);
-          }
+      const auto &columns = input.column_ids;
+      auto requested = [&](VersionColumn column) {
+        return std::find(columns.begin(), columns.end(), column) !=
+               columns.end();
+      };
+      auto rows = ParseVersionRows(
+          lance_dataset_list_versions(dataset, requested(VERSION_TIMESTAMP),
+                                      requested(VERSION_TAGS)),
+          3, "versions");
+      for (auto &fields : rows) {
+        vector<Value> projected;
+        for (auto column : columns) {
+          projected.push_back(VersionColumnValue(column, fields));
         }
-        state->rows.push_back(
-            {Value::BIGINT(std::stoll(f[0])), MicrosToTimestampTz(f[1]),
-             Value::LIST(LogicalType::VARCHAR, std::move(tag_values))});
+        state->rows.push_back(std::move(projected));
       }
     }
   } catch (...) {
@@ -174,9 +202,11 @@ void LanceVersionsFunc(ClientContext &, TableFunctionInput &data,
 } // namespace
 
 void RegisterLanceVersions(ExtensionLoader &loader) {
-  loader.RegisterFunction(
-      TableFunction("lance_versions", {LogicalType::VARCHAR}, LanceVersionsFunc,
-                    LanceListVersionsBind, LanceVersionsInitGlobal));
+  TableFunction versions("lance_versions", {LogicalType::VARCHAR},
+                         LanceVersionsFunc, LanceListVersionsBind,
+                         LanceVersionsInitGlobal);
+  versions.projection_pushdown = true;
+  loader.RegisterFunction(versions);
   loader.RegisterFunction(TableFunction("lance_tags", {LogicalType::VARCHAR},
                                         LanceVersionsFunc, LanceListTagsBind,
                                         LanceVersionsInitGlobal));

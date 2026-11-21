@@ -190,13 +190,18 @@ fn timestamp_micros(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
 
-/// List every version of the dataset as `version\ttimestamp_micros\ttags` lines.
+/// List versions as `version\ttimestamp_micros\ttags` lines. Unrequested
+/// fields are empty and their metadata is not fetched.
 ///
 /// `tags` is a comma separated list of the tags that point at the version; Lance
 /// restricts tag names to characters that never include a comma.
 #[no_mangle]
-pub unsafe extern "C" fn lance_dataset_list_versions(dataset: *mut c_void) -> *const c_char {
-    match dataset_list_versions_inner(dataset) {
+pub unsafe extern "C" fn lance_dataset_list_versions(
+    dataset: *mut c_void,
+    include_timestamp: bool,
+    include_tags: bool,
+) -> *const c_char {
+    match dataset_list_versions_inner(dataset, include_timestamp, include_tags) {
         Ok(s) => {
             clear_last_error();
             to_c_string(s).into_raw()
@@ -208,13 +213,33 @@ pub unsafe extern "C" fn lance_dataset_list_versions(dataset: *mut c_void) -> *c
     }
 }
 
-fn dataset_list_versions_inner(dataset: *mut c_void) -> FfiResult<String> {
+fn dataset_list_versions_inner(
+    dataset: *mut c_void,
+    include_timestamp: bool,
+    include_tags: bool,
+) -> FfiResult<String> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
 
-    let (mut versions, tags) = match runtime::block_on(async {
-        let versions = ds.versions().await?;
-        let tags = ds.tags().list().await?;
+    let (versions, tags) = match runtime::block_on(async {
+        let versions: Vec<_> = if include_timestamp {
+            ds.versions()
+                .await?
+                .into_iter()
+                .map(|v| (v.version, Some(timestamp_micros(v.timestamp))))
+                .collect()
+        } else {
+            ds.version_refs()
+                .await?
+                .into_iter()
+                .map(|v| (v.version, None))
+                .collect()
+        };
+        let tags = if include_tags {
+            ds.tags().list().await?
+        } else {
+            Default::default()
+        };
         Ok::<_, lance::Error>((versions, tags))
     }) {
         Ok(Ok(pair)) => pair,
@@ -239,19 +264,14 @@ fn dataset_list_versions_inner(dataset: *mut c_void) -> FfiResult<String> {
         names.sort();
     }
 
-    versions.sort_by_key(|version| version.version);
     let mut out = String::new();
-    for version in versions {
+    for (version, micros) in versions {
         let tags = tags_by_version
-            .get(&version.version)
+            .get(&version)
             .map(|names| names.join(","))
             .unwrap_or_default();
-        out.push_str(&format!(
-            "{}\t{}\t{}\n",
-            version.version,
-            timestamp_micros(version.timestamp),
-            tags
-        ));
+        let micros = micros.map(|n| n.to_string()).unwrap_or_default();
+        out.push_str(&format!("{version}\t{micros}\t{tags}\n"));
     }
     Ok(out)
 }
