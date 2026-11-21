@@ -208,10 +208,12 @@ def main() -> None:
 
             try:
                 duckdb(
-                    attach + "PREPARE h AS SELECT id FROM ns.main.authority AT (VERSION => 'branch:main'); "
-                    f"EXECUTE h; COPY (SELECT 1) TO '{registry_on}'; EXECUTE h; EXECUTE h; "
-                    f"COPY (SELECT 1) TO '{registry_off}'; EXECUTE h;",
-                    "2\n3\n3\n2",
+                    attach + "SET lance_namespace_query_table=false; "
+                    "PREPARE h AS SELECT id FROM ns.main.authority AT (VERSION => 'branch:main'); "
+                    "PREPARE a AS SELECT avg(id)::BIGINT FROM ns.main.authority; "
+                    f"EXECUTE h; EXECUTE a; COPY (SELECT 1) TO '{registry_on}'; EXECUTE h; EXECUTE a; "
+                    f"COPY (SELECT 1) TO '{registry_off}'; EXECUTE h; EXECUTE a;",
+                    "2\n2\n3\n3\n2\n2",
                 )
             except RuntimeError as err:
                 raise RuntimeError("wrong head after changing managed versioning") from err
