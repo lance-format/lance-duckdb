@@ -77,6 +77,7 @@ def main() -> None:
         registered = Path(tmp) / head.name
         head.rename(registered)
         registry_on, registry_off = (Path(tmp) / name for name in ("enable.csv", "disable.csv"))
+        version_lookups: list[int] = []
         registry_head = {
             "version": 3,
             "manifest_path": registered.resolve().as_posix().lstrip("/"),
@@ -94,7 +95,8 @@ def main() -> None:
                 if "/default$authority/" in path and path.endswith("/version/list"):
                     response: object = {"versions": [registry_head]}
                 elif "/default$authority/" in path and path.endswith("/version/describe"):
-                    assert json.loads(body)["version"] == 3
+                    version_lookups.append(json.loads(body)["version"])
+                    assert version_lookups[-1] == 3
                     response = {"version": registry_head}
                 elif "/default$authority/" in path and path.endswith("/describe"):
                     response = {"location": str(authority_table.resolve()), "schema": SCHEMA}
@@ -217,6 +219,22 @@ def main() -> None:
                 )
             except RuntimeError as err:
                 raise RuntimeError("wrong head after changing managed versioning") from err
+
+            # The registry's v3 is outside the directory, whose latest version is v2.
+            registry_off.unlink()
+            version_lookups.clear()
+            duckdb(attach + "SELECT id FROM ns.main.authority AT (TIMESTAMP => TIMESTAMPTZ 'infinity');", "3")
+            if version_lookups:
+                raise RuntimeError(f"Timestamp read reopened its bound head: {version_lookups}")
+
+            # Reading the directory's v2 head does not need its older v1 manifest.
+            oldest = max((authority_table / "_versions").glob("*.manifest"))
+            oldest.write_bytes(b"unreadable older manifest")
+            duckdb(
+                f"LOAD '{args.extension}'; ATTACH '{tmp}' AS local_ns (TYPE LANCE); "
+                "SELECT id FROM local_ns.main.authority AT (TIMESTAMP => TIMESTAMPTZ 'infinity');",
+                "2",
+            )
         finally:
             server.shutdown()
             server.server_close()
