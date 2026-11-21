@@ -207,3 +207,40 @@ Table with name missing does not exist
 
 statement ok
 DETACH ns;
+
+statement ok
+ATTACH 'test/data' AS fixture (TYPE LANCE);
+
+# The fixture's v3 committed at 05:21:17.289446 UTC. Its predecessor is
+# still visible one nanosecond earlier.
+query II
+SELECT a.id, b.id
+FROM fixture.main.branch_tag_fixture a AT (TIMESTAMP => TIMESTAMPTZ_NS '2026-11-18 05:21:17.289445999+00'),
+     fixture.main.branch_tag_fixture b AT (TIMESTAMP => TIMESTAMPTZ_NS '2026-11-18 05:21:17.289446000+00');
+----
+2	3
+
+require icu
+
+statement ok
+SET TimeZone = 'America/Los_Angeles';
+
+query II
+SELECT a.id, b.id
+FROM fixture.main.branch_tag_fixture a AT (TIMESTAMP => TIMESTAMP_NS '2026-11-17 21:21:17.289445999'),
+     fixture.main.branch_tag_fixture b AT (TIMESTAMP => TIMESTAMP_NS '2026-11-17 21:21:17.289446000');
+----
+2	3
+
+statement ok
+SET disable_timestamptz_casts = true;
+
+statement error
+SELECT id FROM fixture.main.branch_tag_fixture AT (TIMESTAMP => TIMESTAMP_NS 'infinity');
+----
+without an explicit time zone has been disabled
+
+query I
+SELECT id FROM fixture.main.branch_tag_fixture AT (TIMESTAMP => TIMESTAMPTZ_NS 'infinity');
+----
+3

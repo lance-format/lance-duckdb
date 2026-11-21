@@ -8,6 +8,8 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -305,6 +307,38 @@ LanceTableEntry::Rebuild(ClientContext &context) const {
   return BuildUpdatedLanceTableEntry(context, *this, internal);
 }
 
+struct TimestampCutoff {
+  int64_t micros;
+  uint16_t submicro_nanos;
+};
+
+static TimestampCutoff GetTimestampCutoff(ClientContext &context,
+                                          const Value &value) {
+  const auto type = value.type().id();
+  if ((type == LogicalTypeId::TIMESTAMP_NS ||
+       type == LogicalTypeId::TIMESTAMP_TZ_NS) &&
+      timestamp_ns_t(value.GetValueUnsafe<int64_t>()).IsFinite()) {
+    const auto nanos = value.GetValueUnsafe<int64_t>();
+    auto micros = nanos / Interval::NANOS_PER_MICRO;
+    auto remainder = nanos % Interval::NANOS_PER_MICRO;
+    if (type == LogicalTypeId::TIMESTAMP_NS) {
+      // DuckDB converts the whole local microseconds in the session's zone
+      // before adding back the signed nanosecond remainder.
+      micros = Value::TIMESTAMP(timestamp_t(micros))
+                   .CastAs(context, LogicalType::TIMESTAMP_TZ)
+                   .GetValueUnsafe<int64_t>();
+    }
+    if (remainder < 0) {
+      --micros;
+      remainder += Interval::NANOS_PER_MICRO;
+    }
+    return {micros, NumericCast<uint16_t>(remainder)};
+  }
+  return {value.CastAs(context, LogicalType::TIMESTAMP_TZ)
+              .GetValueUnsafe<int64_t>(),
+          0};
+}
+
 // The dataset version an AT clause names. VERSION is a Lance manifest version;
 // TIMESTAMP is the newest version committed at or before it. For TIMESTAMP,
 // also return the dataset handle whose manifests supplied that version.
@@ -339,8 +373,7 @@ static uint64_t ResolveAtClauseVersion(
     return NumericCast<uint64_t>(version);
   }
 
-  auto micros = value.CastAs(context, LogicalType::TIMESTAMP_TZ)
-                    .GetValueUnsafe<int64_t>();
+  const auto cutoff = GetTimestampCutoff(context, value);
   out_timestamp_dataset =
       LanceGetOrOpenDatasetEntryForTable(context, table, out_display_uri);
   if (!out_timestamp_dataset || !out_timestamp_dataset->Handle()) {
@@ -349,7 +382,8 @@ static uint64_t ResolveAtClauseVersion(
   }
   uint64_t version = 0;
   auto rc = lance_dataset_version_at_timestamp(out_timestamp_dataset->Handle(),
-                                               micros, &version);
+                                               cutoff.micros,
+                                               cutoff.submicro_nanos, &version);
   if (rc < 0) {
     throw IOException("Failed to resolve the Lance version at " +
                       value.ToString() + ": " + out_display_uri +

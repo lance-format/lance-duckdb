@@ -78,6 +78,7 @@ int32_t lance_dataset_version(void *dataset, uint64_t *out_version);
 // 0: found, 1: every version is newer than the timestamp, -1: error.
 int32_t lance_dataset_version_at_timestamp(void *dataset,
                                            int64_t timestamp_micros,
+                                           uint16_t submicro_nanos,
                                            uint64_t *out_version);
 int32_t lance_dataset_checkout_version(void *dataset, uint64_t version,
                                        void **out_dataset);
