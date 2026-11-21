@@ -290,25 +290,30 @@ pub unsafe extern "C" fn lance_dataset_version(dataset: *mut c_void, out_version
     }
 }
 
-fn newest_version_at_timestamp(
-    versions: &[lance::dataset::Version],
-    timestamp_micros: i64,
-    submicro_nanos: u16,
-) -> Option<u64> {
-    let cutoff = (
-        timestamp_micros.div_euclid(1_000_000),
-        timestamp_micros.rem_euclid(1_000_000) as u32 * 1_000 + u32::from(submicro_nanos),
-    );
-    versions
-        .iter()
-        .filter(|version| {
-            (
-                version.timestamp.timestamp(),
-                version.timestamp.timestamp_subsec_nanos(),
-            ) <= cutoff
-        })
-        .map(|version| version.version)
-        .max()
+struct TimestampCutoff {
+    seconds: i64,
+    nanos: u32,
+}
+
+impl TimestampCutoff {
+    fn new(micros: i64, submicro_nanos: u16) -> Self {
+        Self {
+            seconds: micros.div_euclid(1_000_000),
+            nanos: micros.rem_euclid(1_000_000) as u32 * 1_000 + u32::from(submicro_nanos),
+        }
+    }
+
+    fn includes(&self, timestamp: chrono::DateTime<chrono::Utc>) -> bool {
+        (timestamp.timestamp(), timestamp.timestamp_subsec_nanos()) <= (self.seconds, self.nanos)
+    }
+
+    fn newest_before_head(&self, versions: &[lance::dataset::Version], head: u64) -> Option<u64> {
+        versions
+            .iter()
+            .filter(|v| v.version < head && self.includes(v.timestamp))
+            .map(|v| v.version)
+            .max()
+    }
 }
 
 /// Resolve the newest version committed at or before a UTC cutoff, given as
@@ -316,7 +321,7 @@ fn newest_version_at_timestamp(
 ///
 /// Returns `0` and writes `out_version` when such a version exists, `1` when
 /// every version is newer than the timestamp (`out_version` is untouched), and
-/// `-1` on error. Reads every manifest of the dataset.
+/// `-1` on error. An eligible attached head is already pinned and needs no history lookup.
 #[no_mangle]
 pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
     dataset: *mut c_void,
@@ -335,6 +340,17 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
             return -1;
         }
     };
+    let cutoff = TimestampCutoff::new(timestamp_micros, submicro_nanos);
+    let head = handle.dataset.version_id();
+    if !lance_table::format::is_detached_version(head)
+        && cutoff.includes(handle.dataset.manifest().timestamp())
+    {
+        // The bound head is the greatest attached version visible to this statement.
+        // SAFETY: out_version was checked above and is writable for this call.
+        unsafe { *out_version = head };
+        clear_last_error();
+        return 0;
+    }
     let versions = match runtime::block_on(handle.dataset.versions()) {
         Ok(Ok(versions)) => versions,
         Ok(Err(err)) => {
@@ -350,7 +366,7 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
         }
     };
     clear_last_error();
-    match newest_version_at_timestamp(&versions, timestamp_micros, submicro_nanos) {
+    match cutoff.newest_before_head(&versions, head) {
         Some(version) => {
             unsafe {
                 *out_version = version;
@@ -1283,6 +1299,9 @@ mod tests {
 
     #[test]
     fn test_version_at_timestamp_preserves_submicrosecond_precision() {
+        let newest_version_at_timestamp = |versions: &[lance::dataset::Version], micros, nanos| {
+            TimestampCutoff::new(micros, nanos).newest_before_head(versions, u64::MAX)
+        };
         let version = |version: u64, seconds: i64, nanos: u32| lance::dataset::Version {
             version,
             timestamp: chrono::DateTime::from_timestamp(seconds, nanos).unwrap(),
@@ -1317,6 +1336,19 @@ mod tests {
         assert_eq!(newest_version_at_timestamp(&pre_epoch, -1, 998), None);
         assert_eq!(newest_version_at_timestamp(&pre_epoch, -1, 999), Some(1));
         assert_eq!(newest_version_at_timestamp(&pre_epoch, 0, 0), Some(1));
+
+        // Concurrently visible versions can have earlier clocks. The bound
+        // head and later versions cannot enter the search for an older snapshot.
+        let irregular = vec![
+            version(2, 1, 0),
+            version(1, 2, 0),
+            version(3, 0, 0),
+            version(4, 1, 0),
+        ];
+        assert_eq!(
+            TimestampCutoff::new(2_000_000, 0).newest_before_head(&irregular, 3),
+            Some(2)
+        );
     }
 
     #[test]

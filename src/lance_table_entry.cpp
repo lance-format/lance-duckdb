@@ -416,8 +416,16 @@ OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
                                         display_uri);
   void *dataset = nullptr;
   if (timestamp_dataset) {
-    if (lance_dataset_checkout_version(timestamp_dataset->Handle(), version,
-                                       &dataset) < 0) {
+    auto handle = timestamp_dataset->Handle();
+    uint64_t bound_version;
+    if (lance_dataset_version(handle, &bound_version) < 0) {
+      throw IOException("Failed to read the bound Lance version: " +
+                        display_uri + LanceFormatErrorSuffix());
+    }
+    if (version == bound_version) {
+      return timestamp_dataset;
+    }
+    if (lance_dataset_checkout_version(handle, version, &dataset) < 0) {
       dataset = nullptr;
     }
   } else {
