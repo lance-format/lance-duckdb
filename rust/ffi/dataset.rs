@@ -471,8 +471,7 @@ unsafe fn checkout_ref(
             return -1;
         }
     };
-    let new_handle =
-        Box::into_raw(Box::new(DatasetHandle::new(Arc::new(checked_out)))) as *mut c_void;
+    let new_handle = Box::into_raw(Box::new(handle.with_dataset(checked_out))) as *mut c_void;
     // SAFETY: Transfer the new handle into the validated output slot.
     unsafe {
         ptr::write_unaligned(out_dataset, new_handle);
@@ -612,7 +611,7 @@ fn checkout_latest_if_stale_inner(
 
     let new_handle = match refreshed {
         Some(refreshed_dataset) => {
-            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(refreshed_dataset)))) as *mut c_void
+            Box::into_raw(Box::new(handle.with_dataset(refreshed_dataset))) as *mut c_void
         }
         None => ptr::null_mut(),
     };

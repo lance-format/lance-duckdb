@@ -7,7 +7,6 @@ use arrow::ffi::FFI_ArrowSchema;
 use async_trait::async_trait;
 use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
-use lance::Dataset;
 use lance_core::Error as LanceError;
 
 use lance_namespace::models::{
@@ -90,6 +89,7 @@ fn build_config(
 struct NamespaceDescribeObservation {
     location: Option<String>,
     has_vended_storage_options: bool,
+    managed_versioning: bool,
 }
 
 /// Observes the single describe performed by `DatasetBuilder::from_namespace`.
@@ -129,6 +129,7 @@ impl LanceNamespace for DescribeObservingNamespace {
             .map(|table_uri| normalize_s3_uri(&table_uri));
         *self.observation.lock().unwrap() = Some(NamespaceDescribeObservation {
             location: response.location.clone(),
+            managed_versioning: response.managed_versioning == Some(true),
             has_vended_storage_options: response
                 .storage_options
                 .as_ref()
@@ -168,7 +169,7 @@ async fn load_dataset_from_namespace(
     table_id_segments: Vec<String>,
     session: Option<Arc<Session>>,
     session_ptr: *mut c_void,
-) -> FfiResult<Dataset> {
+) -> FfiResult<DatasetHandle> {
     record_namespace_describe();
     let namespace = Arc::new(DescribeObservingNamespace::new(namespace));
     let observation = namespace.observation_handle();
@@ -185,6 +186,7 @@ async fn load_dataset_from_namespace(
     }
 
     let observation = observation.lock().unwrap().clone();
+    let namespace_managed_versioning = observation.as_ref().is_some_and(|o| o.managed_versioning);
     if let Some(observation) = observation {
         // A non-empty namespace response is authoritative. Static DuckDB
         // secrets only fill the gap when the namespace did not vend options.
@@ -215,7 +217,10 @@ async fn load_dataset_from_namespace(
         activate_source_resolution_for_session(session_ptr, &dataset);
     }
     record_dataset_open();
-    Ok(dataset)
+    Ok(DatasetHandle {
+        namespace_managed_versioning,
+        ..DatasetHandle::new(Arc::new(dataset))
+    })
 }
 
 fn storage_options_to_tsv(storage_options: std::collections::HashMap<String, String>) -> String {
@@ -1109,20 +1114,18 @@ fn open_dataset_in_namespace_inner(
         .map(|s| s.to_string())
         .collect();
 
-    let (dataset, table_uri) = runtime::block_on(async move {
-        let dataset = load_dataset_from_namespace(
+    runtime::block_on(async move {
+        let handle = load_dataset_from_namespace(
             Arc::new(namespace),
             table_id_segments,
             session,
             session_ptr,
         )
         .await?;
-        let table_uri = dataset.uri().to_string();
-        Ok::<_, FfiError>((Arc::new(dataset), table_uri))
+        let table_uri = handle.dataset.uri().to_string();
+        Ok::<_, FfiError>((handle, table_uri))
     })
-    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
-
-    Ok((DatasetHandle::new(dataset), table_uri))
+    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
 }
 
 #[no_mangle]
@@ -1218,15 +1221,13 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
 /// entry point first re-describes the table through the namespace (one
 /// namespace round trip — the same order of cost as the namespace open path,
 /// which itself starts with a describe) and reopens through the namespace when
-/// the resolved location changed. When the location is unchanged, it falls
-/// back to the manifest-identity revalidation used for plain datasets, which
-/// catches both ordinary new commits and same-location re-creates (e-tag).
+/// the location or managed versioning changes. Otherwise, manifest-identity
+/// revalidation detects ordinary commits and same-location re-creates (e-tag).
 ///
 /// Namespace-vended credential rotation needs no handling here: the handle
 /// was opened via `DatasetBuilder::from_namespace`, which installs Lance's
 /// dynamic storage-options provider, so fresh credentials are fetched from
-/// the namespace by the object store itself. Revalidation only needs to
-/// detect location moves and new commits.
+/// the namespace by the object store itself.
 ///
 /// On success writes the refreshed handle (or null when the cached handle is
 /// current) to `out_new_dataset`. `out_table_uri` receives the newly resolved
@@ -1365,11 +1366,11 @@ fn namespace_checkout_latest_if_stale_inner(
         let location_matches =
             location.as_deref() == Some(cached_uri) || table_uri.as_deref() == Some(cached_uri);
 
-        if !location_matches {
-            // The table was re-pointed to a new location: reopen through the
-            // namespace path so managed versioning and namespace-provided
-            // storage options are re-applied (this re-describes internally;
-            // the extra round trip only happens on this path).
+        if !location_matches
+            || response.managed_versioning.unwrap_or(false) != handle.namespace_managed_versioning
+        {
+            // A new manifest authority can point at a different snapshot at
+            // the same URI. Rebuild using the namespace's current binding.
             let reopened = load_dataset_from_namespace(
                 Arc::new(namespace),
                 table_id_segments,
@@ -1377,8 +1378,9 @@ fn namespace_checkout_latest_if_stale_inner(
                 session_ptr,
             )
             .await?;
-            let uri = reopened.uri().to_string();
-            return Ok::<_, FfiError>((Some(reopened), Some(uri)));
+            let uri = reopened.dataset.uri();
+            let moved_uri = (uri != cached_uri).then(|| uri.to_string());
+            return Ok::<_, FfiError>((Some(reopened), moved_uri));
         }
 
         // Same location: fall back to the manifest-identity revalidation.
@@ -1393,14 +1395,12 @@ fn namespace_checkout_latest_if_stale_inner(
                     format!("dataset checkout latest if stale: {message}"),
                 )
             })?;
-        Ok((refreshed, None))
+        Ok((refreshed.map(|ds| handle.with_dataset(ds)), None))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
 
     let new_handle = match refreshed {
-        Some(refreshed_dataset) => {
-            Box::into_raw(Box::new(DatasetHandle::new(Arc::new(refreshed_dataset)))) as *mut c_void
-        }
+        Some(refreshed_dataset) => Box::into_raw(Box::new(refreshed_dataset)) as *mut c_void,
         None => ptr::null_mut(),
     };
 

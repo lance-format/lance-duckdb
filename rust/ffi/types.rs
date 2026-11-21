@@ -26,6 +26,7 @@ pub(crate) struct SessionHandle {
 
 pub(crate) struct DatasetHandle {
     pub(crate) dataset: Arc<Dataset>,
+    pub(crate) namespace_managed_versioning: bool,
     pub(crate) read_schema: SchemaHandle,
     pub(crate) base_projection: Arc<[String]>,
     pub(crate) fts_projection: Arc<[String]>,
@@ -39,9 +40,17 @@ impl DatasetHandle {
         let fts_projection = projection::build_fts_projection(&base_projection);
         Self {
             dataset,
+            namespace_managed_versioning: false,
             read_schema,
             base_projection,
             fts_projection,
+        }
+    }
+
+    pub(crate) fn with_dataset(&self, dataset: Dataset) -> Self {
+        Self {
+            namespace_managed_versioning: self.namespace_managed_versioning,
+            ..Self::new(Arc::new(dataset))
         }
     }
 }
