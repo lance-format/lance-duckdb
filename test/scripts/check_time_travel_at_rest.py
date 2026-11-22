@@ -22,6 +22,20 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA = {"fields": [{"name": "id", "nullable": True, "type": {"type": "int64"}}]}
 
 
+def manifest_time(seconds: int, nanos: int) -> bytes:
+    """Encode the two varint fields of the fixture's protobuf Timestamp."""
+
+    def varint(value: int) -> bytes:
+        encoded = bytearray()
+        while value >= 128:
+            encoded.append(128 + value % 128)
+            value //= 128
+        encoded.append(value)
+        return bytes(encoded)
+
+    return b"\x08" + varint(seconds) + b"\x10" + varint(nanos)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duckdb", type=Path, default=REPO_ROOT / "build" / "release" / "duckdb")
@@ -158,8 +172,42 @@ def main() -> None:
                 if not describes or dataset_b in describes:
                     raise RuntimeError(f"Unexpected describe locations: {describes}")
 
-            # Binding the middle table moves both the tag and the main branch head.
+            # Keep t on dataset A across the separate history and AT statements.
             move_on_marker = True
+            # Replay a submicrosecond commit through AT and check DuckDB's finite
+            # nanosecond boundary on a private copy of the fixture's v3 manifest.
+            head_a = min((Path(dataset_a) / "_versions").glob("*.manifest"))
+            original = head_a.read_bytes()
+            old = manifest_time(1794979277, 289446000)
+            assert original.count(old) == 1
+            for seconds, nanos, expected in [
+                (1794979277, 289446001, "1794979277289446001"),
+                (9223372036, 854775806, "9223372036854775806"),
+                (9223372036, 854775807, "NULL"),
+                (9223372036, 854775808, "NULL"),
+            ]:
+                new = manifest_time(seconds, nanos)
+                assert len(new) == len(old)
+                head_a.write_bytes(original.replace(old, new))
+                describes.clear()
+                duckdb(
+                    attach
+                    + "SELECT epoch_us(timestamp), timestamp_ns IS NULL, coalesce(epoch_ns(timestamp_ns)::VARCHAR, 'NULL') "
+                    "FROM lance_versions('ns.main.t') WHERE version = 3;",
+                    f"{seconds * 1000000 + nanos // 1000}|{'true' if expected == 'NULL' else 'false'}|{expected}",
+                )
+                if nanos == 289446001:
+                    for column, row in [("timestamp", "2"), ("timestamp_ns", "3")]:
+                        describes.clear()
+                        duckdb(
+                            attach
+                            + f"SET VARIABLE cutoff = (SELECT {column} FROM lance_versions('{dataset_a}') WHERE version=3); "
+                            "SELECT id FROM ns.main.t AT (TIMESTAMP => getvariable('cutoff'));",
+                            row,
+                        )
+            head_a.write_bytes(original)
+
+            # Binding the middle table moves both the tag and the main branch head.
             duckdb(
                 attach + "SELECT a.id, h.id, b.id, j.id FROM ns.main.t a AT (VERSION => 'tag:2'), "
                 "ns.main.t h AT (VERSION => 'branch:main'), ns.main.marker m AT (VERSION => 1), "

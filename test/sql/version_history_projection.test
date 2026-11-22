@@ -28,6 +28,22 @@ SELECT version FROM lance_versions('ns.main.t') WHERE list_contains(tags, 'first
 ----
 1
 
+# The exact commit time can be projected and filtered without altering SELECT *.
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM lance_versions('ns.main.t'));
+----
+version
+timestamp
+tags
+
+query TI
+SELECT typeof(timestamp_ns), version FROM lance_versions('ns.main.t')
+WHERE timestamp_ns IS NOT NULL AND epoch_us(timestamp) = epoch_ns(timestamp_ns) // 1000
+ORDER BY version;
+----
+TIMESTAMPTZ_NS	1
+TIMESTAMPTZ_NS	2
+
 # Make one tag unreadable on this disposable table. Its history is intact.
 statement ok
 COPY (SELECT '{') TO '{TEST_DIR}/t.lance/_refs/tags/broken.json' (FORMAT CSV, HEADER FALSE);
@@ -37,10 +53,10 @@ SELECT version FROM lance_versions('ns.main.t') ORDER BY version DESC LIMIT 1;
 ----
 2
 
-query II
-SELECT count(*), count(timestamp) FROM lance_versions('{TEST_DIR}/t.lance');
+query III
+SELECT count(*), count(timestamp), count(timestamp_ns) FROM lance_versions('{TEST_DIR}/t.lance');
 ----
-2	2
+2	2	2
 
 query I
 SELECT count(*) FROM lance_versions('ns.main.t');
@@ -77,5 +93,10 @@ SELECT tags, version FROM lance_versions('ns.main.m') ORDER BY version;
 
 statement error
 SELECT timestamp FROM lance_versions('ns.main.m');
+----
+Failed to read Lance versions
+
+statement error
+SELECT timestamp_ns FROM lance_versions('ns.main.m');
 ----
 Failed to read Lance versions

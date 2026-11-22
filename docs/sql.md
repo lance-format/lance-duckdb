@@ -1005,6 +1005,7 @@ SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_
 ```
 
 - `lance_versions` returns `version` (`BIGINT`), `timestamp` (`TIMESTAMP WITH TIME ZONE`) and `tags` (`VARCHAR[]`).
+- Select the virtual column `timestamp_ns` by name to read the commit time reported by Lance at nanosecond precision (`TIMESTAMPTZ_NS`). You can use it in `AT (TIMESTAMP => ...)`. It is `NULL` when DuckDB cannot represent the instant as a finite nanosecond timestamp. Use `AT (VERSION => ...)` to identify a specific version when commit times coincide or run out of order.
 - `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
 - Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.
 
