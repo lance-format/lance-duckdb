@@ -445,13 +445,12 @@ Output:
 - Among the candidates, rows that tie on `_hybrid_score` at the `k` boundary are ranked by `_rowid` (smaller first). Ties in the vector or text score at the `k * oversample_factor` candidate cut are decided by Lance.
 
 Filter semantics:
-- If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
-- If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
-- `WHERE` predicates push down for both dataset paths and attached namespace tables.
+- With `prefilter=false` (the default), DuckDB applies `WHERE` to the final fused top-k. The result can contain fewer than `k` rows.
+- With `prefilter=true`, predicates pushed into the search filter both candidate streams before fusion. A required predicate that cannot be pushed down raises an error. Both modes support dataset paths and attached table names.
 
 ### Filter pushdown notes
 
-These notes apply to all three search functions.
+These notes apply when predicate pushdown is enabled. Hybrid search enables it with `prefilter=true`.
 
 - Comparison predicates (`=`, `>`, numeric `IN`, ...) and string predicates (`starts_with`, `LIKE`, `regexp_matches`) push down into Lance.
 - `ILIKE`, `lower`/`upper`, and regular expressions that use `\d`, `\w`, `\s` or `\b` are evaluated by DuckDB, because Lance applies Unicode rules to case mapping and to these classes, so its results would differ from DuckDB's. With `prefilter=true` they raise an error; apply them after the search with `prefilter := false`.

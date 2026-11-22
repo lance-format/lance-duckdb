@@ -1683,6 +1683,11 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
         prefilter_named->second.DefaultCastAs(LogicalType::BOOLEAN)
             .GetValue<bool>();
   }
+  if (!result->prefilter) {
+    // Filtering either candidate stream would change the fused top-k.
+    input.table_function.filter_pushdown = false;
+    input.table_function.pushdown_complex_filter = nullptr;
+  }
   auto use_index_named = input.named_parameters.find("use_index");
   if (use_index_named != input.named_parameters.end() &&
       !use_index_named->second.IsNull()) {

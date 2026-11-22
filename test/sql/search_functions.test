@@ -1037,6 +1037,29 @@ ORDER BY _hybrid_score DESC
 3
 2
 
+# The fused winner is id 1. A WHERE on the final top-1 cannot promote
+# the other lexical match, even when it is in the oversampled candidates.
+foreach target test/data/search_test_data.lance search_ns.main.search_test_data
+
+query I
+SELECT count(*) FROM lance_hybrid_search('${target}', 'vec', [0,0,0,0]::FLOAT[4], 'text', 'puppy', k = 1)
+WHERE label >= 3;
+----
+0
+
+query I
+SELECT id FROM lance_hybrid_search('${target}', 'vec', [0,0,0,0]::FLOAT[4], 'text', 'puppy', k = 1, prefilter = false)
+WHERE starts_with(text, 'puppy eats') AND _score > 0;
+----
+
+query I
+SELECT id FROM lance_hybrid_search('${target}', 'vec', [0,0,0,0]::FLOAT[4], 'text', 'puppy', k = 1, prefilter = true)
+WHERE label >= 3;
+----
+3
+
+endloop
+
 statement ok
 use memory;
 
