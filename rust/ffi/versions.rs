@@ -190,8 +190,8 @@ fn timestamp_micros(timestamp: chrono::DateTime<chrono::Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
 
-/// List versions as `version\ttimestamp_micros\ttags` lines. Unrequested
-/// fields are empty and their metadata is not fetched.
+/// List versions as `version\ttimestamp_micros\ttags\ttimestamp_nanos` lines.
+/// Unrequested fields and unrepresentable nanosecond timestamps are empty.
 ///
 /// `tags` is a comma separated list of the tags that point at the version; Lance
 /// restricts tag names to characters that never include a comma.
@@ -200,8 +200,14 @@ pub unsafe extern "C" fn lance_dataset_list_versions(
     dataset: *mut c_void,
     include_timestamp: bool,
     include_tags: bool,
+    include_timestamp_ns: bool,
 ) -> *const c_char {
-    match dataset_list_versions_inner(dataset, include_timestamp, include_tags) {
+    match dataset_list_versions_inner(
+        dataset,
+        include_timestamp,
+        include_tags,
+        include_timestamp_ns,
+    ) {
         Ok(s) => {
             clear_last_error();
             to_c_string(s).into_raw()
@@ -217,16 +223,17 @@ fn dataset_list_versions_inner(
     dataset: *mut c_void,
     include_timestamp: bool,
     include_tags: bool,
+    include_timestamp_ns: bool,
 ) -> FfiResult<String> {
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
 
     let (versions, tags) = match runtime::block_on(async {
-        let versions: Vec<_> = if include_timestamp {
+        let versions: Vec<_> = if include_timestamp || include_timestamp_ns {
             ds.versions()
                 .await?
                 .into_iter()
-                .map(|v| (v.version, Some(timestamp_micros(v.timestamp))))
+                .map(|v| (v.version, Some(v.timestamp)))
                 .collect()
         } else {
             ds.version_refs()
@@ -265,13 +272,21 @@ fn dataset_list_versions_inner(
     }
 
     let mut out = String::new();
-    for (version, micros) in versions {
+    for (version, timestamp) in versions {
         let tags = tags_by_version
             .get(&version)
             .map(|names| names.join(","))
             .unwrap_or_default();
-        let micros = micros.map(|n| n.to_string()).unwrap_or_default();
-        out.push_str(&format!("{version}\t{micros}\t{tags}\n"));
+        let micros = timestamp
+            .filter(|_| include_timestamp)
+            .map(|t| t.timestamp_micros().to_string())
+            .unwrap_or_default();
+        let nanos = timestamp
+            .filter(|_| include_timestamp_ns)
+            .and_then(|t| t.timestamp_nanos_opt())
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        out.push_str(&format!("{version}\t{micros}\t{tags}\t{nanos}\n"));
     }
     Ok(out)
 }

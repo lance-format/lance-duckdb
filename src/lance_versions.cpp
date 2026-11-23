@@ -57,7 +57,18 @@ Value MicrosToTimestampTz(const string &micros) {
   return Value::TIMESTAMPTZ(timestamp_tz_t(std::stoll(micros)));
 }
 
-enum VersionColumn : column_t { VERSION_ID, VERSION_TIMESTAMP, VERSION_TAGS };
+enum VersionColumn : column_t {
+  VERSION_ID,
+  VERSION_TIMESTAMP,
+  VERSION_TAGS,
+  VERSION_TIMESTAMP_NS = UINT64_C(9223372036854775904)
+};
+
+virtual_column_map_t LanceVersionsVirtualColumns(ClientContext &,
+                                                 optional_ptr<FunctionData>) {
+  return {{VERSION_TIMESTAMP_NS,
+           TableColumn("timestamp_ns", LogicalType::TIMESTAMP_TZ_NS)}};
+}
 
 Value VersionColumnValue(column_t column, const vector<string> &fields) {
   switch (column) {
@@ -65,6 +76,16 @@ Value VersionColumnValue(column_t column, const vector<string> &fields) {
     return Value::BIGINT(std::stoll(fields[VERSION_ID]));
   case VERSION_TIMESTAMP:
     return MicrosToTimestampTz(fields[VERSION_TIMESTAMP]);
+  case VERSION_TIMESTAMP_NS: {
+    const auto &nanos = fields[3];
+    if (!nanos.empty()) {
+      timestamp_tz_ns_t ts(std::stoll(nanos));
+      if (ts.IsFinite()) {
+        return Value::TIMESTAMPTZNS(ts);
+      }
+    }
+    return Value(LogicalType::TIMESTAMP_TZ_NS);
+  }
   case VERSION_TAGS: {
     vector<Value> tags;
     if (!fields[VERSION_TAGS].empty()) {
@@ -168,8 +189,9 @@ LanceVersionsInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       };
       auto rows = ParseVersionRows(
           lance_dataset_list_versions(dataset, requested(VERSION_TIMESTAMP),
-                                      requested(VERSION_TAGS)),
-          3, "versions");
+                                      requested(VERSION_TAGS),
+                                      requested(VERSION_TIMESTAMP_NS)),
+          4, "versions");
       for (auto &fields : rows) {
         vector<Value> projected;
         for (auto column : columns) {
@@ -206,6 +228,7 @@ void RegisterLanceVersions(ExtensionLoader &loader) {
                          LanceVersionsFunc, LanceListVersionsBind,
                          LanceVersionsInitGlobal);
   versions.projection_pushdown = true;
+  versions.get_virtual_columns = LanceVersionsVirtualColumns;
   loader.RegisterFunction(versions);
   loader.RegisterFunction(TableFunction("lance_tags", {LogicalType::VARCHAR},
                                         LanceVersionsFunc, LanceListTagsBind,
