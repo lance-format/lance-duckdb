@@ -4,6 +4,7 @@
 
 namespace duckdb {
 
+class BoundAtClause;
 class LanceTableEntry;
 struct LanceNamespaceTableConfig;
 
@@ -57,7 +58,8 @@ LanceGetNamedSnapshotForTable(ClientContext &context,
 
 shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
     ClientContext &context, const LanceNamespaceTableConfig &table,
-    const string &binding_key, idx_t version, bool pinned_only);
+    const string &binding_key, const string &resolved_root,
+    const BoundAtClause &at, bool pinned_only);
 
 string LanceRestVersionKey(ClientContext &context, const string &namespace_key,
                            idx_t version);

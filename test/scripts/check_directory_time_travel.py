@@ -118,6 +118,53 @@ def main():
             assert sql("SELECT id FROM a.main.t AT (VERSION => 1)", 1) == [91]
             assert sql("SELECT id FROM b.main.t AT (VERSION => 1)", 1) == [91]
 
+            sql(f"ATTACH '{escaped}/second' AS physical (TYPE lance)")
+            register_change("append_row", lambda: sql("INSERT INTO physical.t VALUES (92)", client=writer))
+            counts = sql(
+                "SELECT (SELECT count(*) FROM physical.t AT (VERSION => 'branch:main')), "
+                "(SELECT count(*) FROM b.t AT (VERSION => CASE WHEN append_row()=1 THEN 'branch:main' END))",
+                2,
+            )
+            assert counts == [1, 1], counts
+            assert sql("SELECT count(*) FROM b.t AT (VERSION => 'branch:main')", 1) == [2]
+
+            sql("ALTER TABLE physical.t CREATE TAG 'release' AT VERSION 1", client=writer)
+
+            def move_tag():
+                sql("ALTER TABLE physical.t DROP TAG 'release'", client=writer)
+                sql("ALTER TABLE physical.t CREATE TAG 'release' AT VERSION 2", client=writer)
+
+            register_change("move_tag", move_tag)
+            counts = sql(
+                "SELECT (SELECT count(*) FROM b.t AT (VERSION => 'tag:release')), "
+                "(SELECT count(*) FROM physical.t AT (VERSION => CASE WHEN move_tag()=1 THEN 'tag:release' END))",
+                2,
+            )
+            assert counts == [1, 1], counts
+            assert sql("SELECT count(*) FROM b.t AT (VERSION => 'tag:release')", 1) == [2]
+
+            for next_read in (
+                "query_table(CASE WHEN append_row()=1 THEN 'physical.t' END)",
+                "physical.t AT (TIMESTAMP => CASE WHEN append_row()=1 THEN TIMESTAMPTZ '2100-01-01' END)",
+            ):
+                before = sql("SELECT count(*) FROM physical.t", 1)[0]
+                counts = sql(
+                    "SELECT (SELECT count(*) FROM physical.t AT (VERSION => 'branch:main')), "
+                    f"(SELECT count(*) FROM {next_read})",
+                    2,
+                )
+                assert counts == [before, before], counts
+                assert sql("SELECT count(*) FROM physical.t", 1) == [before + 1]
+
+            staged.symlink_to(root / "first", target_is_directory=True)
+            pair = sql(
+                "SELECT (SELECT count(*) FROM a.t AT (VERSION => 'branch:main')), "
+                "(SELECT min(id) FROM b.t AT (VERSION => CASE WHEN switch_root()=1 THEN 'branch:main:1' END))",
+                2,
+            )
+            assert pair == [4, 91], pair
+            assert sql("SELECT id FROM b.t AT (VERSION => 'branch:main:1')", 1) == [11]
+
         sql("ATTACH 'shared-memory://snapshots/root' AS original (TYPE lance)")
         sql("ATTACH 'shared-memory://snapshots/other/../root/.' AS alias (TYPE lance)")
         sql("CREATE TABLE original.main.t AS SELECT i FROM range(1) AS t(i)", client=writer)
@@ -169,6 +216,37 @@ def main():
         )
         assert counts == [1, 1, 1, 2], counts
         assert sql("SELECT count(*) FROM cold.main.history AT (VERSION => 1)", 1) == [2]
+
+        sql("CREATE TABLE original.main.Mixed AS SELECT 11 AS id", client=writer)
+        assert sql("SELECT id FROM original.main.mixed", 1) == [11]
+
+        def replace_spelling():
+            sql("DROP TABLE original.main.Mixed", client=writer)
+            sql("CREATE TABLE original.main.mixed AS SELECT i AS id FROM range(2) t(i)", client=writer)
+
+        register_change("replace_spelling", replace_spelling)
+        pair = sql(
+            "SELECT (SELECT count(*) FROM original.mixed AT (VERSION => 'branch:main:1')), "
+            "(SELECT count(*) FROM fresh.mixed AT (VERSION => CASE WHEN replace_spelling()=1 THEN 'branch:main:1' END))",
+            2,
+        )
+        assert pair == [1, 2], pair
+
+        base = "shared-memory://case-sensitive-history/root"
+        sql(f"ATTACH '{base}' AS warm_names (TYPE lance)")
+        sql(f"ATTACH '{base}' AS cold_names (TYPE lance)")
+        sql(f"COPY (SELECT 11 AS id) TO '{base}/Mixed.lance' (FORMAT lance)")
+        lookup = "SELECT id FROM warm_names.mixed AT (VERSION => 'branch:main')"
+        assert sql(lookup, 1) == [11]
+        sql(f"COPY (SELECT 22 AS id) TO '{base}/mixed.lance' (FORMAT lance)")
+        assert sql(lookup, 1) == [11]
+        assert sql("SELECT id FROM warm_names.mixed", 1) == [11]
+        try:
+            sql(lookup.replace("warm_names", "cold_names"), 1)
+        except RuntimeError as exc:
+            assert "Ambiguous" in str(exc), exc
+        else:
+            raise AssertionError("A fresh attachment must reject ambiguous table names")
 
 
 if __name__ == "__main__":
