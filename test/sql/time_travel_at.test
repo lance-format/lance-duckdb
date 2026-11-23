@@ -223,7 +223,7 @@ SET VARIABLE head_manifest = (SELECT file FROM glob('{TEST_DIR}/ColdSnapshot.lan
                               WHERE file <> getvariable('first_manifest'));
 
 statement ok
-COPY (SELECT 'invalid manifest') TO (getvariable('head_manifest')) (FORMAT CSV, HEADER FALSE);
+COPY (SELECT 'bad') TO (getvariable('head_manifest')) (FORMAT CSV, HEADER FALSE);
 
 statement ok
 ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
