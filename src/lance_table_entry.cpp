@@ -340,7 +340,7 @@ static TimestampCutoff GetTimestampCutoff(ClientContext &context,
           0};
 }
 
-static const string *NamedAtReference(const BoundAtClause &at) {
+const string *LanceTableEntry::NamedAtReference(const BoundAtClause &at) {
   const auto &value = at.GetValue();
   if (StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
       !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
@@ -428,7 +428,7 @@ static shared_ptr<LanceDatasetCacheEntry>
 OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
                     const BoundAtClause &at,
                     const string &expected_managed_uri) {
-  if (auto reference = NamedAtReference(at)) {
+  if (auto reference = LanceTableEntry::NamedAtReference(at)) {
     return LanceGetNamedSnapshotForTable(context, table, *reference);
   }
   shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;

@@ -297,12 +297,17 @@ static bool FindRestNamespaceTableId(const string &namespace_id,
 
 static string
 FindDirectoryNamespaceTable(const LanceDirectoryNamespaceConfig &ns,
-                            const string &table_name) {
+                            const string &table_name,
+                            const string &preferred = {}) {
   if (!IsSafeDatasetTableName(table_name)) {
     throw InvalidInputException(
         "Unsafe Lance dataset name for directory namespace: " + table_name);
   }
   auto tables = ListDirectoryNamespaceTables(ns);
+  if (!preferred.empty() &&
+      std::find(tables.begin(), tables.end(), preferred) != tables.end()) {
+    return preferred;
+  }
   const Identifier requested(table_name);
   string matched;
   for (auto &t : tables) {
@@ -345,14 +350,15 @@ public:
     if (!ns) {
       throw InternalException("Lance directory namespace config is missing");
     }
-    return CreateEntry(context, schema, *ns, entry_name_p, {}, {});
+    return CreateEntry(context, schema, *ns, entry_name_p, {}, {}, nullptr);
   }
 
   static unique_ptr<CatalogEntry>
   CreateEntry(ClientContext &context, SchemaCatalogEntry &schema,
               const LanceDirectoryNamespaceConfig &ns,
               const Identifier &entry_name_p, const string &binding_key,
-              optional_idx version, bool pinned_only = false) {
+              const string &resolved_root, const BoundAtClause *at,
+              bool pinned_only = false) {
     const auto &entry_name = entry_name_p.GetIdentifierName();
     if (!IsSafeDatasetTableName(entry_name)) {
       throw InvalidInputException(
@@ -368,13 +374,14 @@ public:
     shared_ptr<LanceDatasetCacheEntry> pinned;
     std::unique_ptr<void, decltype(&lance_close_dataset)> latest(
         nullptr, lance_close_dataset);
-    if (version.IsValid()) {
+    if (at) {
       pinned = LanceGetDirectorySnapshot(context, cfg, binding_key,
-                                         version.GetIndex(), pinned_only);
+                                         resolved_root, *at, pinned_only);
       if (pinned_only && !pinned) {
         return nullptr;
       }
       if (pinned) {
+        cfg.root = resolved_root;
         cfg.display_uri = pinned->DisplayUri();
       }
     } else {
@@ -384,10 +391,10 @@ public:
     }
     auto *dataset = pinned ? pinned->Handle() : latest.get();
     if (!dataset) {
-      if (version.IsValid() &&
+      if (at &&
           lance_last_error_code() != LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND) {
         throw IOException("Failed to open version " +
-                          to_string(version.GetIndex()) +
+                          at->GetValue().ToString() +
                           " of Lance directory table " + entry_name +
                           LanceFormatErrorSuffix());
       }
@@ -401,7 +408,7 @@ public:
     try {
       live = LanceTableSchema::FromDataset(context, dataset);
     } catch (...) {
-      if (version.IsValid()) {
+      if (at) {
         throw;
       }
       return nullptr;
@@ -1141,7 +1148,7 @@ public:
       }
     }
 
-    rest_names.erase(lance_entry->name);
+    historical_names.erase(lance_entry->name);
     tables.erase(current);
     LanceInvalidateDatasetCache(context, cache_key);
   }
@@ -1385,16 +1392,19 @@ private:
     auto binding_key = LanceBuildResolvedPathDatasetCacheKey(
         identity.get(), ns.option_keys, ns.option_values);
     auto &names = state->DirectoryName(binding_key, name);
+    const bool named = LanceTableEntry::NamedAtReference(at) != nullptr;
     auto bind = [&](const string &physical_name,
                     bool pinned_only = false) -> optional_ptr<CatalogEntry> {
-      auto version = LanceTableEntry::ParseNumericAtVersion(at);
       auto view = LanceDirectoryDefaultGenerator::CreateEntry(
-          context, *this, ns, Identifier(physical_name), binding_key, version,
-          pinned_only);
+          context, *this, *directory_ns, Identifier(physical_name), binding_key,
+          ns.root, &at, pinned_only);
       if (!view) {
         return nullptr;
       }
       names.by_attachment.emplace(this, physical_name);
+      if (named) {
+        historical_names.insert_or_assign(name, Identifier(physical_name));
+      }
       shared_ptr<CatalogEntry> pinned(std::move(view));
       state->Pin(pinned);
       return pinned.get();
@@ -1403,13 +1413,16 @@ private:
     if (previous != names.by_attachment.end()) {
       return bind(previous->second);
     }
-    if (cached) {
+    auto known = historical_names.find(name);
+    if (cached || known != historical_names.end()) {
       // Each attachment retains its exact physical spelling, including when
       // a different attachment has cached a case-equivalent directory.
-      if (auto entry = bind(cached->name.GetIdentifierName())) {
+      auto physical_name = cached ? cached->name : known->second;
+      if (auto entry = bind(physical_name.GetIdentifierName())) {
         return entry;
       }
       tables.erase(name); // Only a missing physical table permits rediscovery.
+      historical_names.erase(name);
     }
     if (names.discovered.empty()) {
       // A warm hit cannot establish uniqueness for a cold attachment.
@@ -1443,7 +1456,8 @@ private:
     }
     auto at_clause = lookup_info.GetAtClause();
     if (directory_ns && at_clause &&
-        LanceTableEntry::IsNumericAtVersion(*at_clause)) {
+        StringUtil::CIEquals(at_clause->Unit().GetIdentifierName(),
+                             "VERSION")) {
       return LookupDirectoryVersion(
           *transaction.context, name, *at_clause,
           found == tables.end() ? nullptr : found->second.get());
@@ -1451,10 +1465,10 @@ private:
     Identifier backend_name = name;
     string managed_uri;
     if (rest_ns) {
-      auto known = rest_names.find(name);
+      auto known = historical_names.find(name);
       if (found != tables.end()) {
         backend_name = found->second->name;
-      } else if (known != rest_names.end()) {
+      } else if (known != historical_names.end()) {
         backend_name = known->second;
       }
       if (at_clause && LanceTableEntry::IsNumericAtVersion(*at_clause)) {
@@ -1485,7 +1499,7 @@ private:
             // REST ID can now occupy this case-insensitive DuckDB name.
             tables.erase(name);
             found = tables.end();
-            rest_names.erase(name);
+            historical_names.erase(name);
             if (backend_name.GetIdentifierName() != name.GetIdentifierName()) {
               backend_name = name;
               view = generator.CreateVersionEntry(
@@ -1496,7 +1510,7 @@ private:
           if (view) {
             if (bound == statement_names.end()) {
               statement_names.emplace(name, backend_name);
-              rest_names.insert_or_assign(name, backend_name);
+              historical_names.insert_or_assign(name, backend_name);
             }
             return PinLanceCatalogEntry(
                 *transaction.context,
@@ -1513,8 +1527,12 @@ private:
         if (physical_name) {
           backend_name = *physical_name;
         } else {
-          auto matched = FindDirectoryNamespaceTable(*directory_ns,
-                                                     name.GetIdentifierName());
+          auto known = historical_names.find(name);
+          auto matched = FindDirectoryNamespaceTable(
+              *directory_ns, name.GetIdentifierName(),
+              known == historical_names.end()
+                  ? string()
+                  : known->second.GetIdentifierName());
           if (matched.empty()) {
             return nullptr;
           }
@@ -1525,7 +1543,7 @@ private:
           *transaction.context, backend_name);
       if (!entry && rest_ns &&
           backend_name.GetIdentifierName() != name.GetIdentifierName()) {
-        rest_names.erase(name);
+        historical_names.erase(name);
         entry = table_default_generator->CreateDefaultEntry(
             *transaction.context, name);
       }
@@ -1562,7 +1580,7 @@ private:
   void InvalidateTableEntry(const Identifier &name) {
     lock_guard<mutex> guard(table_lock);
     tables.erase(name);
-    rest_names.erase(name);
+    historical_names.erase(name);
   }
 
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
@@ -1572,7 +1590,7 @@ private:
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
   // A historical entry must not publish its columns as the live schema. Keep
   // only the exact spelling originally resolved by this DuckDB attachment.
-  identifier_map_t<Identifier> rest_names;
+  identifier_map_t<Identifier> historical_names;
 };
 
 static bool IsProtectedLanceSchema(const Identifier &name) {

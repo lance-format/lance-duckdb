@@ -20,7 +20,7 @@ static constexpr const char *LANCE_DATASET_CACHE_STATE_KEY =
     "lance_dataset_cache_state";
 
 // All methods take the state lock per-call; compound sequences (Get +
-// revalidate + Replace, or the memo check followed by MarkRevalidated) run
+// revalidate + Replace, or the memo check followed by PinStatementSource) run
 // unlocked in between. Statement binds are single-threaded, so those
 // check-then-act windows are benign; the per-call lock keeps the individual
 // container accesses safe against execution-time users of the same
@@ -74,15 +74,17 @@ public:
   // generation - the first reference revalidates (or freshly opens) the
   // entry and pins it for the statement; later references reuse the pinned
   // generation. External commits landing mid-statement are observed by the
-  // NEXT statement, whose QueryBegin clears the memo.
-  bool WasRevalidatedThisStatement(const string &key) {
+  // next statement, whose StatementBegin clears the memo.
+  shared_ptr<LanceDatasetCacheEntry> StatementSource(const string &key) {
     lock_guard<mutex> guard(lock);
-    return revalidated_keys.count(key) > 0;
+    auto it = statement_sources.find(key);
+    return it == statement_sources.end() ? nullptr : it->second;
   }
 
-  void MarkRevalidatedThisStatement(const string &key) {
+  void PinStatementSource(const string &key,
+                          shared_ptr<LanceDatasetCacheEntry> entry) {
     lock_guard<mutex> guard(lock);
-    revalidated_keys.insert(key);
+    statement_sources.emplace(key, std::move(entry));
   }
 
   void PinForWrite(idx_t query_id, const string &key,
@@ -132,7 +134,7 @@ public:
     entries.erase(key);
     // A key without a cached entry has no pinned generation: the next access
     // in this statement takes the miss path and pins whatever it opens.
-    revalidated_keys.erase(key);
+    statement_sources.erase(key);
   }
 
   void QueryBegin(ClientContext &) override {
@@ -140,12 +142,17 @@ public:
     query_hits = 0;
     query_misses = 0;
     query_revalidations = 0;
-    revalidated_keys.clear();
     write_datasets.clear();
+  }
+
+  void StatementBegin(ClientContext &) override {
+    lock_guard<mutex> guard(lock);
+    statement_sources.clear();
   }
 
   void QueryEnd() override {
     lock_guard<mutex> guard(lock);
+    statement_sources.clear();
     write_datasets.clear();
     snapshots.clear();
   }
@@ -160,9 +167,9 @@ public:
 private:
   mutex lock;
   unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> entries;
-  // Keys whose entry has already been revalidated (or freshly opened) during
-  // the current statement; cleared in QueryBegin.
-  unordered_set<string> revalidated_keys;
+  // Named snapshots can bind a source without adding it to the persistent
+  // cache. All subsequent readers in the statement use that same source.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> statement_sources;
   // Retained independently of the cache map so invalidation cannot change a
   // write's target generation while other pipelines in the statement read it.
   unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> write_datasets;
@@ -462,30 +469,22 @@ static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
     bool *out_cache_hit,
     const LanceDatasetRevalidateFn &revalidate = RevalidateDatasetHandle) {
   auto state = GetOrCreateLanceDatasetCacheState(context);
+  if (auto pinned = state->StatementSource(cache_key)) {
+    state->RecordHit();
+    if (out_cache_hit) {
+      *out_cache_hit = true;
+    }
+    return pinned;
+  }
   auto entry = state->Get(cache_key);
   if (entry) {
-    // Statement-scoped memoization: revalidating independently on every hit
-    // would let two references to the same table in one statement (e.g. a
-    // self-join's two binds) pin different dataset versions if an external
-    // commit lands between their binds. The first reference in a statement
-    // revalidates and pins the entry for the key; every later reference in
-    // the same statement shares that one immutable dataset generation.
-    // External commits landing mid-statement are observed by the NEXT
-    // statement, which starts with a cleared memo.
-    if (state->WasRevalidatedThisStatement(cache_key)) {
-      state->RecordHit();
-      if (out_cache_hit) {
-        *out_cache_hit = true;
-      }
-      return entry;
-    }
     bool refreshed = false;
     entry = RevalidateDatasetCacheEntry(*state, cache_key, std::move(entry),
                                         revalidate, refreshed);
     // Mark only after a successful revalidation: the failure path above
     // drops the entry and throws, and the next access must retry a fresh
     // open instead of trusting a memo for an entry that no longer exists.
-    state->MarkRevalidatedThisStatement(cache_key);
+    state->PinStatementSource(cache_key, entry);
     // A stale hit had to be refreshed from storage, so report it as a miss
     // both in the profiling counters and in the per-scan cache-hit flag.
     if (refreshed) {
@@ -512,7 +511,7 @@ static shared_ptr<LanceDatasetCacheEntry> GetOrOpenDatasetCacheEntry(
   // generation for its key: later references in the same statement must
   // reuse it rather than revalidate it against storage (which could observe
   // a newer external commit and split the statement across two versions).
-  state->MarkRevalidatedThisStatement(cache_key);
+  state->PinStatementSource(cache_key, result);
   return result;
 }
 
@@ -701,14 +700,25 @@ string LanceBuildDatasetCacheKeyForTable(ClientContext &context,
                                             cfg.delimiter, cfg.headers_tsv);
 }
 
-shared_ptr<LanceDatasetCacheEntry>
-LanceGetNamedSnapshotForTable(ClientContext &context,
-                              const LanceTableEntry &table,
-                              const string &reference) {
+static void *CheckoutNamedSnapshot(void *source, const string &reference,
+                                   const string &uri) {
   if (reference.find('\0') != string::npos) {
     throw BinderException(
         "Lance snapshot references cannot contain a NUL byte");
   }
+  void *snapshot = nullptr;
+  if (lance_dataset_checkout_named_ref(source, reference.c_str(), &snapshot) <
+      0) {
+    throw IOException("Failed to open snapshot '%s' of Lance dataset %s%s",
+                      reference, uri, LanceFormatErrorSuffix());
+  }
+  return snapshot;
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetNamedSnapshotForTable(ClientContext &context,
+                              const LanceTableEntry &table,
+                              const string &reference) {
   auto key = LanceBuildDatasetCacheKeyForTable(context, table);
   AppendCacheKeyPart(key, reference);
   auto state = GetOrCreateLanceDatasetCacheState(context);
@@ -722,12 +732,7 @@ LanceGetNamedSnapshotForTable(ClientContext &context,
     throw IOException("Failed to open Lance dataset: " + uri +
                       LanceFormatErrorSuffix());
   }
-  void *snapshot = nullptr;
-  if (lance_dataset_checkout_named_ref(source->Handle(), reference.c_str(),
-                                       &snapshot) < 0) {
-    throw IOException("Failed to open snapshot '%s' of Lance dataset %s%s",
-                      reference, uri, LanceFormatErrorSuffix());
-  }
+  auto *snapshot = CheckoutNamedSnapshot(source->Handle(), reference, uri);
   pinned = make_shared_ptr<LanceDatasetCacheEntry>(snapshot, uri);
   state->PinSnapshot(key, pinned);
   return pinned;
@@ -735,32 +740,69 @@ LanceGetNamedSnapshotForTable(ClientContext &context,
 
 shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
     ClientContext &context, const LanceNamespaceTableConfig &table,
-    const string &binding_key, idx_t version, bool pinned_only) {
-  auto key = "directory-version|" + binding_key;
-  AppendCacheKeyPart(key, table.table_id);
-  AppendCacheKeyPart(key, version);
+    const string &binding_key, const string &resolved_root,
+    const BoundAtClause &at, bool pinned_only) {
+  auto reference = LanceTableEntry::NamedAtReference(at);
+  auto version = reference ? 0 : LanceTableEntry::ParseNumericAtVersion(at);
+  auto table_key = binding_key;
+  AppendCacheKeyPart(table_key, table.table_id);
+  auto key = "directory-version|" + table_key;
+  AppendCacheKeyPart(key, reference ? *reference : to_string(version));
   auto state = GetOrCreateLanceDatasetCacheState(context);
-  auto pinned = state->GetSnapshot(context.transaction.GetActiveQuery(), key);
-  if (pinned || pinned_only) {
+  auto query = context.transaction.GetActiveQuery();
+  auto pinned = state->GetSnapshot(query, key);
+  if ((!reference && pinned) || (!pinned && pinned_only)) {
     return pinned;
   }
 
-  string uri;
-  std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
-      LanceOpenDatasetWithSourceSession(
-          context, LanceCreateSourceResolver(context),
-          [&](void *session) {
-            return LanceOpenDirectoryDataset(session, table.root,
-                                             table.table_id, table.option_keys,
-                                             table.option_values, uri, version);
-          }),
-      lance_close_dataset);
-  if (!dataset) {
-    return nullptr;
+  auto open = [&]() -> shared_ptr<LanceDatasetCacheEntry> {
+    string uri;
+    auto *dataset = LanceOpenDatasetWithSourceSession(
+        context, LanceCreateSourceResolver(context), [&](void *session) {
+          return LanceOpenDirectoryDataset(session, resolved_root,
+                                           table.table_id, table.option_keys,
+                                           table.option_values, uri, version);
+        });
+    return dataset ? make_shared_ptr<LanceDatasetCacheEntry>(dataset,
+                                                             std::move(uri))
+                   : nullptr;
+  };
+  if (reference) {
+    auto source_key = "directory-source|" + table_key;
+    auto attachment_key = LanceBuildDirNamespaceDatasetCacheKey(table);
+    auto source = state->GetSnapshot(query, source_key);
+    if (!source) {
+      if (table.root == resolved_root) {
+        source = state->StatementSource(attachment_key);
+      }
+      if (!source) {
+        source = open();
+      }
+      if (!source) {
+        return nullptr;
+      }
+      state->PinSnapshot(source_key, source);
+    }
+    // Ordinary and scalar timestamp bindings use the attached locator or the
+    // URI returned by the directory namespace. Pin the live source for both.
+    state->PinStatementSource(attachment_key, source);
+    state->PinStatementSource(
+        LanceBuildResolvedPathDatasetCacheKey(
+            source->DisplayUri(), table.option_keys, table.option_values),
+        source);
+    if (pinned) {
+      return pinned;
+    }
+    auto *dataset = CheckoutNamedSnapshot(source->Handle(), *reference,
+                                          source->DisplayUri());
+    pinned =
+        make_shared_ptr<LanceDatasetCacheEntry>(dataset, source->DisplayUri());
+  } else {
+    pinned = open();
+    if (!pinned) {
+      return nullptr;
+    }
   }
-  pinned =
-      make_shared_ptr<LanceDatasetCacheEntry>(dataset.get(), std::move(uri));
-  dataset.release();
   state->PinSnapshot(key, pinned);
   return pinned;
 }

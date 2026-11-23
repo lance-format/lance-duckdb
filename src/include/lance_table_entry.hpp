@@ -98,6 +98,7 @@ public:
   AtClause(ClientContext &context, const BoundAtClause &at,
            const string &expected_managed_uri = {}) const;
   static bool IsNumericAtVersion(const BoundAtClause &at);
+  static const string *NamedAtReference(const BoundAtClause &at);
   static idx_t ParseNumericAtVersion(const BoundAtClause &at);
   bool IsHistorical() const { return historical_dataset != nullptr; }
   const shared_ptr<LanceDatasetCacheEntry> &HistoricalDataset() const {
