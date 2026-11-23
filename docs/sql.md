@@ -533,6 +533,18 @@ directly.
 Use `branch:<name>` to read the latest snapshot of a named branch. References to
 the same branch head on the same table share one snapshot within a statement.
 The next execution sees any intervening branch commits.
+Directory attachments of the same table through different paths, including a
+directory symlink, share that snapshot when they use the same storage options
+and the same branch or tag selector. Each distinct selector is resolved on
+first use. Ordinary and timestamp reads through different attachment paths
+can observe a different update.
+
+DuckDB matches directory table names case-insensitively. Once an attachment
+resolves a physical table name for an ordinary read or a named selector, it
+keeps that spelling while the table exists. A fresh lookup reports ambiguity
+if two physical names differ only by case. A numeric version lookup alone
+does not establish a preferred spelling for future statements.
+
 Use `branch:<name>:<version>` to read a specific version on a named branch
 without creating a tag. For example, `branch:dev:3` reads version 3 on `dev`,
 which can contain different rows and columns from version 3 on `main`.

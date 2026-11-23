@@ -165,9 +165,30 @@ def main():
             assert pair == [4, 91], pair
             assert sql("SELECT id FROM b.t AT (VERSION => 'branch:main:1')", 1) == [11]
 
+            # IMPORT runs both schema statements in a single DuckDB submission.
+            (root / "schema.sql").write_text(
+                "CREATE TEMP TABLE first_read AS SELECT count(*) n FROM physical.t AT (VERSION => 'branch:main');"
+                "CREATE TEMP TABLE next_read AS SELECT count(*) n FROM "
+                "query_table(CASE WHEN append_row()=1 THEN 'physical.t' END);"
+            )
+            (root / "load.sql").write_text("")
+            sql(f"IMPORT DATABASE '{escaped}'")
+            counts = sql("SELECT first_read.n, next_read.n FROM first_read, next_read", 2)
+            assert counts == [4, 5], counts
+
         sql("ATTACH 'shared-memory://snapshots/root' AS original (TYPE lance)")
         sql("ATTACH 'shared-memory://snapshots/other/../root/.' AS alias (TYPE lance)")
         sql("CREATE TABLE original.main.t AS SELECT i FROM range(1) AS t(i)", client=writer)
+
+        sql("CREATE TABLE original.events AS SELECT 1 AS id", client=writer)
+        register_change("add_event", lambda: sql("INSERT INTO original.events VALUES (2)", client=writer))
+        counts = sql(
+            "SELECT (SELECT count(*) FROM original.events), "
+            "(SELECT count(*) FROM alias.events AT (VERSION => CASE WHEN add_event()=1 THEN 'branch:main' END)), "
+            "(SELECT count(*) FROM original.events AT (VERSION => 'branch:main'))",
+            3,
+        )
+        assert counts == [1, 2, 2], counts
 
         def replace_table():
             sql("DROP TABLE original.main.t", client=writer)
@@ -235,18 +256,35 @@ def main():
         base = "shared-memory://case-sensitive-history/root"
         sql(f"ATTACH '{base}' AS warm_names (TYPE lance)")
         sql(f"ATTACH '{base}' AS cold_names (TYPE lance)")
+        sql(f"ATTACH '{base}' AS numeric_names (TYPE lance)")
         sql(f"COPY (SELECT 11 AS id) TO '{base}/Mixed.lance' (FORMAT lance)")
         lookup = "SELECT id FROM warm_names.mixed AT (VERSION => 'branch:main')"
         assert sql(lookup, 1) == [11]
+        assert sql("SELECT id FROM numeric_names.mixed AT (VERSION => 1)", 1) == [11]
         sql(f"COPY (SELECT 22 AS id) TO '{base}/mixed.lance' (FORMAT lance)")
         assert sql(lookup, 1) == [11]
         assert sql("SELECT id FROM warm_names.mixed", 1) == [11]
-        try:
-            sql(lookup.replace("warm_names", "cold_names"), 1)
-        except RuntimeError as exc:
-            assert "Ambiguous" in str(exc), exc
-        else:
-            raise AssertionError("A fresh attachment must reject ambiguous table names")
+        for attachment in ("cold_names", "numeric_names"):
+            try:
+                sql(lookup.replace("warm_names", attachment), 1)
+            except RuntimeError as exc:
+                assert "Ambiguous" in str(exc), exc
+            else:
+                raise AssertionError(f"{attachment} must reject ambiguous table names")
+
+        # Distinct resolved storage options keep separate bindings for the same root.
+        root = "shared-memory://named-options/root"
+        for attachment in ("east", "west"):
+            sql(f"CREATE OR REPLACE TEMP SECRET cfg (TYPE lance, SCOPE '{root}/', USER_AGENT '{attachment}')")
+            sql(f"ATTACH '{root}' AS {attachment} (TYPE lance)")
+        sql("CREATE TABLE east.events AS SELECT 1 AS id", client=writer)
+        register_change("append_west", lambda: sql("INSERT INTO east.events VALUES (2)", client=writer))
+        counts = sql(
+            "SELECT (SELECT count(*) FROM east.events AT (VERSION => 'branch:main')), "
+            "(SELECT count(*) FROM west.events AT (VERSION => CASE WHEN append_west()=1 THEN 'branch:main' END))",
+            2,
+        )
+        assert counts == [1, 2], counts
 
 
 if __name__ == "__main__":

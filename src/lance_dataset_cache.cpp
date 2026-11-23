@@ -74,7 +74,7 @@ public:
   // generation - the first reference revalidates (or freshly opens) the
   // entry and pins it for the statement; later references reuse the pinned
   // generation. External commits landing mid-statement are observed by the
-  // NEXT statement, whose QueryBegin clears the memo.
+  // next statement, whose StatementBegin clears the memo.
   shared_ptr<LanceDatasetCacheEntry> StatementSource(const string &key) {
     lock_guard<mutex> guard(lock);
     auto it = statement_sources.find(key);
@@ -142,8 +142,12 @@ public:
     query_hits = 0;
     query_misses = 0;
     query_revalidations = 0;
-    statement_sources.clear();
     write_datasets.clear();
+  }
+
+  void StatementBegin(ClientContext &) override {
+    lock_guard<mutex> guard(lock);
+    statement_sources.clear();
   }
 
   void QueryEnd() override {
