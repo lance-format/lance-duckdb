@@ -14,6 +14,11 @@ struct LanceFilterIRBuildResult {
   vector<string> parts;
   bool all_filters_pushed = true;
   bool all_prefilterable_filters_pushed = true;
+  //! Set when the scan has dynamic filters that a join attached at execution
+  //! time and `exclude_runtime_filters` left them out of `parts`. Callers must
+  //! then keep DuckDB's residual filter evaluation enabled so those filters
+  //! still run after the scan's output is produced.
+  bool has_runtime_filters = false;
 };
 
 // `json_columns` names top-level fields whose DuckDB VARCHAR view is logical
@@ -24,10 +29,17 @@ struct LanceFilterIRBuildResult {
 // narrows what the scan reads and never counts as a pushed filter
 // (`all_filters_pushed` stays false). Do not enable it for search functions: a
 // prefilter changes which rows a top-k search returns.
+//
+// `exclude_runtime_filters` builds only from the filters DuckDB planned for the
+// scan, leaving out the dynamic filters a hash join attaches at execution time.
+// Search functions must set it: a join range applied as a prefilter changes
+// which rows enter the top-k. The caller still evaluates `input.filters` above
+// the scan when `result.has_runtime_filters` is set.
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const vector<string> &json_columns, const TableFunctionInitInput &input,
-    bool exclude_computed_columns, bool include_runtime_hints);
+    bool exclude_computed_columns, bool include_runtime_hints,
+    bool exclude_runtime_filters = false);
 
 // Probe whether every filter attached to `get.table_filters` can be encoded
 // into Lance filter IR. Owns the invariant "filters encodable → limit/offset

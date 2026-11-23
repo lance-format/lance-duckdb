@@ -824,11 +824,15 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   // Filters on `_rowid` resolve to its Lance column like any other column.
+  // Runtime join filters are left out: applying them as a search prefilter
+  // would change which rows enter the top-k, so they stay in `input.filters`
+  // and DuckDB evaluates them on the search's output instead.
   TableFunctionInitInput resolved_input(input.bind_data, global.column_ids,
-                                        input.projection_ids, input.filters);
+                                        input.projection_ids, input.filters,
+                                        input.sample_options, input.op);
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
-      true, false);
+      true, false, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     throw InvalidInputException("lance_vector_search requires filter pushdown "
                                 "for prefilterable columns when "
@@ -856,8 +860,9 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       global.lance_filter_ir.empty()) {
     throw IOException("Failed to encode Lance filter IR");
   }
-  global.filter_pushed_down =
-      table_filters.all_filters_pushed && !global.lance_filter_ir.empty();
+  global.filter_pushed_down = !table_filters.has_runtime_filters &&
+                              table_filters.all_filters_pushed &&
+                              !global.lance_filter_ir.empty();
   return state;
 }
 
@@ -1811,11 +1816,15 @@ LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
   }
 
   // Filters on `_rowid` resolve to its Lance column like any other column.
+  // Runtime join filters are left out: applying them as a search prefilter
+  // would change which rows enter the top-k, so they stay in `input.filters`
+  // and DuckDB evaluates them on the search's output instead.
   TableFunctionInitInput resolved_input(input.bind_data, global.column_ids,
-                                        input.projection_ids, input.filters);
+                                        input.projection_ids, input.filters,
+                                        input.sample_options, input.op);
   auto table_filters = BuildLanceTableFilterIRParts(
       bind_data.names, bind_data.types, bind_data.json_columns, resolved_input,
-      true, false);
+      true, false, true);
   if (bind_data.prefilter && !table_filters.all_prefilterable_filters_pushed) {
     auto function_name = bind_data.mode == LanceSearchMode::Fts
                              ? "lance_fts"
@@ -1846,8 +1855,9 @@ LanceSearchInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
       global.lance_filter_ir.empty()) {
     throw IOException("Failed to encode Lance filter IR");
   }
-  global.filter_pushed_down =
-      table_filters.all_filters_pushed && !global.lance_filter_ir.empty();
+  global.filter_pushed_down = !table_filters.has_runtime_filters &&
+                              table_filters.all_filters_pushed &&
+                              !global.lance_filter_ir.empty();
   return state;
 }
 
