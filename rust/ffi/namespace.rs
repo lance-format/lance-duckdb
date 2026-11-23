@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use lance::dataset::builder::DatasetBuilder;
 use lance::session::Session;
 use lance_core::Error as LanceError;
+use object_store::path::Path as ObjectPath;
 
 use lance_namespace::models::{
     CreateNamespaceRequest, CreateTableVersionRequest, CreateTableVersionResponse,
@@ -103,6 +104,16 @@ struct NamespaceDescribeObservation {
     managed_versioning: bool,
 }
 
+#[derive(Debug)]
+enum NamespaceSnapshot {
+    Latest,
+    Storage(i64),
+    Registered {
+        uri: String,
+        record: DescribeTableVersionResponse,
+    },
+}
+
 /// Observes the single describe performed by `DatasetBuilder::from_namespace`.
 /// The builder remains the owner of namespace-managed versioning and dynamic
 /// storage-option refresh, so all other namespace operations are delegated.
@@ -110,15 +121,15 @@ struct NamespaceDescribeObservation {
 struct DescribeObservingNamespace {
     inner: Arc<dyn LanceNamespace>,
     observation: Arc<Mutex<Option<NamespaceDescribeObservation>>>,
-    version: Option<i64>,
+    snapshot: NamespaceSnapshot,
 }
 
 impl DescribeObservingNamespace {
-    fn new(inner: Arc<dyn LanceNamespace>, version: Option<i64>) -> Self {
+    fn new(inner: Arc<dyn LanceNamespace>, snapshot: NamespaceSnapshot) -> Self {
         Self {
             inner,
             observation: Arc::new(Mutex::new(None)),
-            version,
+            snapshot,
         }
     }
 
@@ -133,8 +144,10 @@ impl LanceNamespace for DescribeObservingNamespace {
         &self,
         mut request: DescribeTableRequest,
     ) -> lance_core::Result<DescribeTableResponse> {
-        if let Some(version) = self.version {
-            request.version = Some(version);
+        if !matches!(self.snapshot, NamespaceSnapshot::Latest) {
+            if let NamespaceSnapshot::Storage(version) = self.snapshot {
+                request.version = Some(version);
+            }
             request.load_detailed_metadata = Some(false);
             request.with_table_uri = Some(true);
             request.vend_credentials = Some(true);
@@ -147,15 +160,22 @@ impl LanceNamespace for DescribeObservingNamespace {
             .table_uri
             .map(|table_uri| normalize_s3_uri(&table_uri));
         let managed = response.managed_versioning == Some(true);
-        if self.version.is_some() {
+        if !matches!(self.snapshot, NamespaceSnapshot::Latest) {
             // Lance 14's namespace builder reads only location, which can be
             // relative when a service supplies a separate complete table URI.
             if let Some(uri) = &response.table_uri {
                 response.location = Some(uri.clone());
             }
         }
+        if let NamespaceSnapshot::Registered { uri, .. } = &self.snapshot {
+            if !managed || response.location.as_ref() != Some(uri) {
+                return Err(LanceError::io(
+                    "namespace table changed while binding a managed snapshot",
+                ));
+            }
+        }
         let mut prior = self.observation.lock().unwrap();
-        if self.version.is_some()
+        if !matches!(self.snapshot, NamespaceSnapshot::Latest)
             && prior.as_ref().is_some_and(|old| {
                 old.location != response.location || old.managed_versioning != managed
             })
@@ -179,6 +199,13 @@ impl LanceNamespace for DescribeObservingNamespace {
         &self,
         request: DescribeTableVersionRequest,
     ) -> lance_core::Result<DescribeTableVersionResponse> {
+        if let NamespaceSnapshot::Registered { record, .. } = &self.snapshot {
+            if request.version == Some(record.version.version) && request.branch.is_none() {
+                // Load exactly the registration already selected for this bind. A
+                // second lookup could return staging and trigger write-side recovery.
+                return Ok(record.clone());
+            }
+        }
         self.inner.describe_table_version(request).await
     }
 
@@ -207,7 +234,8 @@ async fn load_dataset_from_namespace(
     session: Option<Arc<Session>>,
     session_ptr: *mut c_void,
 ) -> FfiResult<DatasetHandle> {
-    let (builder, binding) = describe_namespace_dataset(namespace, table_id_segments, None).await?;
+    let (builder, binding) =
+        describe_namespace_dataset(namespace, table_id_segments, NamespaceSnapshot::Latest).await?;
     load_namespace_builder(builder, binding, session, session_ptr).await
 }
 
@@ -221,10 +249,10 @@ fn namespace_describe_error(err: LanceError) -> FfiError {
 async fn describe_namespace_dataset(
     namespace: Arc<dyn LanceNamespace>,
     table_id_segments: Vec<String>,
-    version: Option<i64>,
+    snapshot: NamespaceSnapshot,
 ) -> FfiResult<(DatasetBuilder, NamespaceDescribeObservation)> {
     record_namespace_describe();
-    let namespace = Arc::new(DescribeObservingNamespace::new(namespace, version));
+    let namespace = Arc::new(DescribeObservingNamespace::new(namespace, snapshot));
     let observation = namespace.observation_handle();
     let builder = DatasetBuilder::from_namespace(namespace, table_id_segments)
         .await
@@ -1206,6 +1234,95 @@ pub unsafe extern "C" fn lance_namespace_request_identity(
     }
 }
 
+async fn open_registered_version(
+    namespace: Arc<dyn LanceNamespace>,
+    table_id: Vec<String>,
+    uri: String,
+    version: i64,
+    session_ptr: *mut c_void,
+) -> FfiResult<(Option<DatasetHandle>, String)> {
+    let record = namespace
+        .describe_table_version(DescribeTableVersionRequest {
+            id: Some(table_id.clone()),
+            version: Some(version),
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| {
+            FfiError::new(
+                namespace_error_code(&err, ErrorCode::DatasetOpen),
+                format!("namespace describe_table_version: {err}"),
+            )
+        })?;
+    if record.version.version != version {
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            "namespace returned a different version",
+        ));
+    }
+    let path = ObjectPath::parse(&record.version.manifest_path).map_err(|err| {
+        FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("invalid registered manifest path: {err}"),
+        )
+    })?;
+    let size = record
+        .version
+        .manifest_size
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| FfiError::new(ErrorCode::DatasetOpen, "invalid registered manifest size"))?;
+    if path.extension() != Some("manifest") {
+        let filename = path.filename().unwrap_or_default();
+        if let Some((base, suffix)) = filename.split_once(".manifest-") {
+            let scheme =
+                lance_table::io::commit::ManifestNamingScheme::detect_scheme_staging(filename);
+            if !suffix.is_empty()
+                && base.parse::<u64>().is_ok()
+                && scheme.parse_version(filename) == Some(version as u64)
+            {
+                // Older registries expose Lance staging names. Native recovery
+                // can issue a COPY. Preserve their storage-only read.
+                return Ok((None, uri));
+            }
+        }
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            "invalid registered manifest path",
+        ));
+    }
+    let (builder, binding) = describe_namespace_dataset(
+        namespace,
+        table_id,
+        NamespaceSnapshot::Registered {
+            uri: uri.clone(),
+            record,
+        },
+    )
+    .await?;
+    // SAFETY: the calling FFI operation keeps the optional session live.
+    let snapshot_session = unsafe { session_ptr.cast::<super::types::SessionHandle>().as_ref() }
+        .map(super::snapshot_cache::snapshot_session);
+    let handle = load_namespace_builder(
+        builder.with_version(version as u64),
+        binding,
+        snapshot_session,
+        session_ptr,
+    )
+    .await?;
+    let location = handle.dataset.manifest_location();
+    if handle.dataset.version_id() != version as u64
+        || location.path != path
+        || size.is_some_and(|expected| location.size != Some(expected))
+    {
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            format!("opened manifest does not match the registration for version {version}"),
+        ));
+    }
+    Ok((Some(handle), uri))
+}
+
 async fn open_namespace_version(
     connection: NamespaceConnection,
     session: Option<Arc<Session>>,
@@ -1253,10 +1370,21 @@ async fn open_namespace_version(
                     "missing managed table URI",
                 )
             })?;
-        return Ok((None, normalize_s3_uri(&uri)));
+        return open_registered_version(
+            namespace,
+            connection.namespace_parts,
+            normalize_s3_uri(&uri),
+            version,
+            session_ptr,
+        )
+        .await;
     }
-    let (builder, binding) =
-        describe_namespace_dataset(namespace, connection.namespace_parts, Some(version)).await?;
+    let (builder, binding) = describe_namespace_dataset(
+        namespace,
+        connection.namespace_parts,
+        NamespaceSnapshot::Storage(version),
+    )
+    .await?;
     if binding.managed_versioning {
         return Err(FfiError::new(
             ErrorCode::NamespaceDescribeTable,
@@ -1274,8 +1402,8 @@ async fn open_namespace_version(
     Ok((Some(handle), uri))
 }
 
-/// Open latest (zero) or storage-owned history. For a positive selector a
-/// null handle with a URI denotes a managed table.
+/// Open the latest dataset or a fixed snapshot. A null handle with a URI
+/// keeps the storage-only compatibility path for pending registrations.
 ///
 /// # Safety
 /// The caller supplies live C strings, an optional live session, and a writable

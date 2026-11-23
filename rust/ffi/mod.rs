@@ -18,6 +18,7 @@ mod scan;
 mod schema_evolution;
 mod search;
 mod session;
+mod snapshot_cache;
 mod source_resolver;
 mod stored_type;
 mod stream;
