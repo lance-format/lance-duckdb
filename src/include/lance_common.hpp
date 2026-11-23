@@ -139,6 +139,12 @@ void FillLanceNamespaceQueryConfig(
 
 string LanceDirectoryNamespaceDatasetUri(const LanceNamespaceTableConfig &cfg);
 
+void *LanceOpenDirectoryDataset(void *session, const string &root,
+                                const string &table_id,
+                                const vector<string> &option_keys,
+                                const vector<string> &option_values,
+                                string &out_table_uri, uint64_t version = 0);
+
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri);

@@ -110,21 +110,21 @@ public:
     return write_query_id == query_id && !write_datasets.empty();
   }
 
-  shared_ptr<LanceDatasetCacheEntry> GetNamedSnapshot(idx_t query_id,
-                                                      const string &key) {
+  shared_ptr<LanceDatasetCacheEntry> GetSnapshot(idx_t query_id,
+                                                 const string &key) {
     lock_guard<mutex> guard(lock);
     if (query_id != snapshot_query_id) {
-      named_snapshots.clear();
+      snapshots.clear();
       snapshot_query_id = query_id;
     }
-    auto found = named_snapshots.find(key);
-    return found == named_snapshots.end() ? nullptr : found->second;
+    auto found = snapshots.find(key);
+    return found == snapshots.end() ? nullptr : found->second;
   }
 
-  void PinNamedSnapshot(const string &key,
-                        shared_ptr<LanceDatasetCacheEntry> entry) {
+  void PinSnapshot(const string &key,
+                   shared_ptr<LanceDatasetCacheEntry> entry) {
     lock_guard<mutex> guard(lock);
-    named_snapshots.emplace(key, std::move(entry));
+    snapshots.emplace(key, std::move(entry));
   }
 
   void Invalidate(const string &key) {
@@ -147,7 +147,7 @@ public:
   void QueryEnd() override {
     lock_guard<mutex> guard(lock);
     write_datasets.clear();
-    named_snapshots.clear();
+    snapshots.clear();
   }
 
   void WriteProfilingInformation(std::ostream &ss) override {
@@ -169,8 +169,9 @@ private:
   // QueryBegin/QueryEnd may span a submission expanded into several statements.
   // DuckDB's active query number distinguishes those statement boundaries.
   idx_t write_query_id = DConstants::INVALID_INDEX;
-  // Another writer can move a tag or recreate a branch between statements.
-  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> named_snapshots;
+  // A writer can replace a dataset or move a named reference between
+  // statements.
+  unordered_map<string, shared_ptr<LanceDatasetCacheEntry>> snapshots;
   idx_t snapshot_query_id = DConstants::INVALID_INDEX;
   idx_t query_hits = 0;
   idx_t query_misses = 0;
@@ -385,31 +386,6 @@ OpenNamespaceDataset(void *session, const string &endpoint,
   auto *dataset = lance_open_dataset_in_namespace_with_session(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
       delimiter_ptr, headers_ptr, session, &uri_ptr);
-  if (uri_ptr) {
-    out_table_uri = uri_ptr;
-    lance_free_string(uri_ptr);
-  }
-  return dataset;
-}
-
-static void *OpenDirNamespaceDataset(void *session, const string &root,
-                                     const string &table_id,
-                                     const vector<string> &option_keys,
-                                     const vector<string> &option_values,
-                                     string &out_table_uri) {
-  out_table_uri.clear();
-
-  vector<const char *> key_ptrs;
-  vector<const char *> value_ptrs;
-  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
-                                  value_ptrs);
-
-  const char *uri_ptr = nullptr;
-  auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
-      root.c_str(), table_id.c_str(),
-      key_ptrs.empty() ? nullptr : key_ptrs.data(),
-      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
-      session, &uri_ptr);
   if (uri_ptr) {
     out_table_uri = uri_ptr;
     lance_free_string(uri_ptr);
@@ -669,9 +645,9 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetOrOpenDatasetEntryForTable(
           string table_uri;
           auto *dataset = LanceOpenDatasetWithSourceSession(
               context, source_resolver, [&](void *session) {
-                return OpenDirNamespaceDataset(session, cfg.root, cfg.table_id,
-                                               cfg.option_keys,
-                                               cfg.option_values, table_uri);
+                return LanceOpenDirectoryDataset(session, cfg.root,
+                                                 cfg.table_id, cfg.option_keys,
+                                                 cfg.option_values, table_uri);
               });
           if (!dataset) {
             return shared_ptr<LanceDatasetCacheEntry>();
@@ -736,8 +712,7 @@ LanceGetNamedSnapshotForTable(ClientContext &context,
   auto key = LanceBuildDatasetCacheKeyForTable(context, table);
   AppendCacheKeyPart(key, reference);
   auto state = GetOrCreateLanceDatasetCacheState(context);
-  auto pinned =
-      state->GetNamedSnapshot(context.transaction.GetActiveQuery(), key);
+  auto pinned = state->GetSnapshot(context.transaction.GetActiveQuery(), key);
   if (pinned) {
     return pinned;
   }
@@ -754,7 +729,39 @@ LanceGetNamedSnapshotForTable(ClientContext &context,
                       reference, uri, LanceFormatErrorSuffix());
   }
   pinned = make_shared_ptr<LanceDatasetCacheEntry>(snapshot, uri);
-  state->PinNamedSnapshot(key, pinned);
+  state->PinSnapshot(key, pinned);
+  return pinned;
+}
+
+shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
+    ClientContext &context, const LanceNamespaceTableConfig &table,
+    const string &binding_key, idx_t version, bool pinned_only) {
+  auto key = "directory-version|" + binding_key;
+  AppendCacheKeyPart(key, table.table_id);
+  AppendCacheKeyPart(key, version);
+  auto state = GetOrCreateLanceDatasetCacheState(context);
+  auto pinned = state->GetSnapshot(context.transaction.GetActiveQuery(), key);
+  if (pinned || pinned_only) {
+    return pinned;
+  }
+
+  string uri;
+  std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+      LanceOpenDatasetWithSourceSession(
+          context, LanceCreateSourceResolver(context),
+          [&](void *session) {
+            return LanceOpenDirectoryDataset(session, table.root,
+                                             table.table_id, table.option_keys,
+                                             table.option_values, uri, version);
+          }),
+      lance_close_dataset);
+  if (!dataset) {
+    return nullptr;
+  }
+  pinned =
+      make_shared_ptr<LanceDatasetCacheEntry>(dataset.get(), std::move(uri));
+  dataset.release();
+  state->PinSnapshot(key, pinned);
   return pinned;
 }
 

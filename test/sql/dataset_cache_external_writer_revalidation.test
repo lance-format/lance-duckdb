@@ -113,8 +113,18 @@ SELECT count(*) FROM '{TEST_DIR}/cache_recreate.lance';
 ----
 3
 
+query I con1
+SELECT sum(id) FROM ext_reader_ns.main.cache_recreate;
+----
+6
+
 statement ok con2
 DROP TABLE ext_writer_ns.main.cache_recreate;
+
+statement error con1
+SELECT * FROM ext_reader_ns.main.cache_recreate AT (VERSION => 1);
+----
+Table with name cache_recreate does not exist
 
 statement ok con2
 COPY (
@@ -134,6 +144,98 @@ SELECT id FROM '{TEST_DIR}/cache_recreate.lance' ORDER BY id;
 ----
 10
 20
+
+# The warm catalog name resolves v1 from the replacement dataset.
+query I con1
+SELECT sum(id) FROM ext_reader_ns.main.cache_recreate AT (VERSION => 1);
+----
+30
+
+# A case-sensitive store can replace the discovered name with another spelling.
+statement ok con1
+ATTACH 'shared-memory://recreated-version/root' AS case_reader (TYPE LANCE);
+
+statement ok con2
+ATTACH 'shared-memory://recreated-version/root' AS case_writer (TYPE LANCE);
+
+statement ok con2
+CREATE TABLE case_writer.main.Sales AS SELECT 1 AS old_id;
+
+query I con1
+SELECT old_id FROM case_reader.main.sales;
+----
+1
+
+statement ok con2
+DROP TABLE case_writer.main.Sales;
+
+statement ok con2
+CREATE TABLE case_writer.main.sales AS SELECT 42 AS new_id;
+
+query I con1
+SELECT new_id FROM case_reader.main.SALES AT (VERSION => 1);
+----
+42
+
+# Each warm attachment has an exact spelling. A fresh attachment must detect
+# the ambiguity even when the statement has already bound a warm attachment.
+statement ok con1
+ATTACH 'shared-memory://recreated-version/root' AS case_second (TYPE LANCE);
+
+statement ok con1
+ATTACH 'shared-memory://recreated-version/root' AS case_cold (TYPE LANCE);
+
+statement error con1
+SELECT * FROM case_cold.main.missing AT (VERSION => 0);
+----
+Table with name missing does not exist
+
+statement ok con2
+COPY (SELECT 11 AS id) TO 'shared-memory://recreated-version/root/Foo.lance' (FORMAT lance);
+
+query I con1
+SELECT id FROM case_reader.main.foo;
+----
+11
+
+statement ok con2
+DROP TABLE case_writer.main.Foo;
+
+statement ok con2
+COPY (SELECT 22 AS id) TO 'shared-memory://recreated-version/root/foo.lance' (FORMAT lance);
+
+query I con1
+SELECT id FROM case_second.main.foo;
+----
+22
+
+statement ok con2
+COPY (SELECT 11 AS id) TO 'shared-memory://recreated-version/root/Foo.lance' (FORMAT lance);
+
+query II con1
+SELECT a.id,b.id FROM case_reader.main.foo a AT (VERSION => 1), case_second.main.foo b AT (VERSION => 1);
+----
+11	22
+
+query II con1
+SELECT b.id,a.id FROM case_second.main.foo b AT (VERSION => 1), case_reader.main.foo a AT (VERSION => 1);
+----
+22	11
+
+statement error con1
+SELECT * FROM case_reader.main.foo a AT (VERSION => 1), case_cold.main.foo b AT (VERSION => 1);
+----
+Ambiguous Lance directory table names
+
+statement error con1
+SELECT * FROM case_cold.main.foo a AT (VERSION => 1), case_second.main.foo b AT (VERSION => 1);
+----
+Ambiguous Lance directory table names
+
+statement error con1
+SELECT * FROM case_cold.main.foo AT (VERSION => 0);
+----
+Ambiguous Lance directory table names
 
 statement ok con1
 DETACH ext_reader_ns;

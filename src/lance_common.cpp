@@ -633,6 +633,31 @@ BuildNamespaceAuthOverrideOptions(const string &bearer_token_override,
   return options;
 }
 
+void *LanceOpenDirectoryDataset(void *session, const string &root,
+                                const string &table_id,
+                                const vector<string> &option_keys,
+                                const vector<string> &option_values,
+                                string &out_table_uri, uint64_t version) {
+  out_table_uri.clear();
+
+  vector<const char *> key_ptrs;
+  vector<const char *> value_ptrs;
+  BuildStorageOptionPointerArrays(option_keys, option_values, key_ptrs,
+                                  value_ptrs);
+
+  const char *uri_ptr = nullptr;
+  auto *dataset = lance_open_dataset_in_dir_namespace_with_session(
+      root.c_str(), table_id.c_str(),
+      key_ptrs.empty() ? nullptr : key_ptrs.data(),
+      value_ptrs.empty() ? nullptr : value_ptrs.data(), option_keys.size(),
+      session, version, &uri_ptr);
+  if (uri_ptr) {
+    out_table_uri = uri_ptr;
+    lance_free_string(uri_ptr);
+  }
+  return dataset;
+}
+
 void *LanceOpenDatasetForTable(ClientContext &context,
                                const LanceTableEntry &table,
                                string &out_display_uri) {
@@ -643,27 +668,14 @@ void *LanceOpenDatasetForTable(ClientContext &context,
 
   auto &cfg = table.NamespaceConfig();
   if (cfg.IsDirectory()) {
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(cfg.option_keys, cfg.option_values,
-                                    key_ptrs, value_ptrs);
-
-    const char *uri_ptr = nullptr;
     auto source_resolver = LanceCreateSourceResolver(context);
     auto *dataset = LanceOpenDatasetWithSourceSession(
         context, source_resolver, [&](void *session) {
-          return lance_open_dataset_in_dir_namespace_with_session(
-              cfg.root.c_str(), cfg.table_id.c_str(),
-              key_ptrs.empty() ? nullptr : key_ptrs.data(),
-              value_ptrs.empty() ? nullptr : value_ptrs.data(),
-              cfg.option_keys.size(), session, &uri_ptr);
+          return LanceOpenDirectoryDataset(session, cfg.root, cfg.table_id,
+                                           cfg.option_keys, cfg.option_values,
+                                           out_display_uri);
         });
-    if (uri_ptr) {
-      out_display_uri = uri_ptr;
-      lance_free_string(uri_ptr);
-    } else if (!cfg.display_uri.empty()) {
-      out_display_uri = cfg.display_uri;
-    } else {
+    if (out_display_uri.empty()) {
       out_display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
     }
     return dataset;
