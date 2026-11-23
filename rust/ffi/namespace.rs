@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -65,21 +65,32 @@ fn parse_headers_tsv(headers_tsv: Option<&str>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-fn build_config(
+fn request_headers(
+    bearer_token: Option<&str>,
+    api_key: Option<&str>,
+    headers_tsv: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    if let Some(token) = bearer_token {
+        headers.insert("authorization".to_owned(), format!("Bearer {token}"));
+    }
+    if let Some(key) = api_key {
+        headers.insert("x-api-key".to_owned(), key.to_owned());
+    }
+    for (key, value) in parse_headers_tsv(headers_tsv) {
+        headers.insert(key.to_ascii_lowercase(), value);
+    }
+    headers
+}
+
+pub(super) fn build_config(
     endpoint: &str,
     bearer_token: Option<&str>,
     api_key: Option<&str>,
     headers_tsv: Option<&str>,
 ) -> RestNamespaceBuilder {
     let mut builder = RestNamespaceBuilder::new(endpoint);
-    if let Some(token) = bearer_token {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
-    if let Some(key) = api_key {
-        builder = builder.header("x-api-key", key.to_string());
-    }
-    // Add custom headers from TSV
-    for (key, value) in parse_headers_tsv(headers_tsv) {
+    for (key, value) in request_headers(bearer_token, api_key, headers_tsv) {
         builder = builder.header(key, value);
     }
     builder
@@ -99,13 +110,15 @@ struct NamespaceDescribeObservation {
 struct DescribeObservingNamespace {
     inner: Arc<dyn LanceNamespace>,
     observation: Arc<Mutex<Option<NamespaceDescribeObservation>>>,
+    version: Option<i64>,
 }
 
 impl DescribeObservingNamespace {
-    fn new(inner: Arc<dyn LanceNamespace>) -> Self {
+    fn new(inner: Arc<dyn LanceNamespace>, version: Option<i64>) -> Self {
         Self {
             inner,
             observation: Arc::new(Mutex::new(None)),
+            version,
         }
     }
 
@@ -118,8 +131,14 @@ impl DescribeObservingNamespace {
 impl LanceNamespace for DescribeObservingNamespace {
     async fn describe_table(
         &self,
-        request: DescribeTableRequest,
+        mut request: DescribeTableRequest,
     ) -> lance_core::Result<DescribeTableResponse> {
+        if let Some(version) = self.version {
+            request.version = Some(version);
+            request.load_detailed_metadata = Some(false);
+            request.with_table_uri = Some(true);
+            request.vend_credentials = Some(true);
+        }
         let mut response = self.inner.describe_table(request).await?;
         response.location = response
             .location
@@ -127,9 +146,27 @@ impl LanceNamespace for DescribeObservingNamespace {
         response.table_uri = response
             .table_uri
             .map(|table_uri| normalize_s3_uri(&table_uri));
-        *self.observation.lock().unwrap() = Some(NamespaceDescribeObservation {
+        let managed = response.managed_versioning == Some(true);
+        if self.version.is_some() {
+            // Lance 14's namespace builder reads only location, which can be
+            // relative when a service supplies a separate complete table URI.
+            if let Some(uri) = &response.table_uri {
+                response.location = Some(uri.clone());
+            }
+        }
+        let mut prior = self.observation.lock().unwrap();
+        if self.version.is_some()
+            && prior.as_ref().is_some_and(|old| {
+                old.location != response.location || old.managed_versioning != managed
+            })
+        {
+            return Err(LanceError::io(
+                "namespace table changed while refreshing snapshot credentials",
+            ));
+        }
+        *prior = Some(NamespaceDescribeObservation {
             location: response.location.clone(),
-            managed_versioning: response.managed_versioning == Some(true),
+            managed_versioning: managed,
             has_vended_storage_options: response
                 .storage_options
                 .as_ref()
@@ -170,43 +207,65 @@ async fn load_dataset_from_namespace(
     session: Option<Arc<Session>>,
     session_ptr: *mut c_void,
 ) -> FfiResult<DatasetHandle> {
+    let (builder, binding) = describe_namespace_dataset(namespace, table_id_segments, None).await?;
+    load_namespace_builder(builder, binding, session, session_ptr).await
+}
+
+fn namespace_describe_error(err: LanceError) -> FfiError {
+    FfiError::new(
+        namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
+        format!("namespace describe_table: {err}"),
+    )
+}
+
+async fn describe_namespace_dataset(
+    namespace: Arc<dyn LanceNamespace>,
+    table_id_segments: Vec<String>,
+    version: Option<i64>,
+) -> FfiResult<(DatasetBuilder, NamespaceDescribeObservation)> {
     record_namespace_describe();
-    let namespace = Arc::new(DescribeObservingNamespace::new(namespace));
+    let namespace = Arc::new(DescribeObservingNamespace::new(namespace, version));
     let observation = namespace.observation_handle();
-    let mut builder = DatasetBuilder::from_namespace(namespace, table_id_segments)
+    let builder = DatasetBuilder::from_namespace(namespace, table_id_segments)
         .await
-        .map_err(|err| {
-            FfiError::new(
-                namespace_error_code(&err, ErrorCode::NamespaceDescribeTable),
-                format!("namespace describe_table: {err}"),
-            )
-        })?;
+        .map_err(namespace_describe_error)?;
+    let binding = observation.lock().unwrap().clone().ok_or_else(|| {
+        FfiError::new(
+            ErrorCode::NamespaceDescribeTable,
+            "namespace builder did not describe the table",
+        )
+    })?;
+    Ok((builder, binding))
+}
+
+async fn load_namespace_builder(
+    mut builder: DatasetBuilder,
+    observation: NamespaceDescribeObservation,
+    session: Option<Arc<Session>>,
+    session_ptr: *mut c_void,
+) -> FfiResult<DatasetHandle> {
     if let Some(session) = session {
         builder = builder.with_session(session);
     }
 
-    let observation = observation.lock().unwrap().clone();
-    let namespace_managed_versioning = observation.as_ref().is_some_and(|o| o.managed_versioning);
-    if let Some(observation) = observation {
-        // A non-empty namespace response is authoritative. Static DuckDB
-        // secrets only fill the gap when the namespace did not vend options.
-        if !observation.has_vended_storage_options {
-            if let Some(location) = observation.location {
-                let fallback =
-                    unsafe { resolve_dataset_storage_options_for_session(session_ptr, &location) }
-                        .map_err(|err| {
-                            FfiError::new(
-                                ErrorCode::DatasetOpen,
-                                format!("namespace dataset storage option fallback: {err}"),
-                            )
-                        })?;
-                if let Some(options) = fallback {
-                    builder = builder.with_storage_options(options);
-                }
+    let namespace_managed_versioning = observation.managed_versioning;
+    // A non-empty namespace response is authoritative. Static DuckDB
+    // secrets only fill the gap when the namespace did not vend options.
+    if !observation.has_vended_storage_options {
+        if let Some(location) = observation.location {
+            let fallback =
+                unsafe { resolve_dataset_storage_options_for_session(session_ptr, &location) }
+                    .map_err(|err| {
+                        FfiError::new(
+                            ErrorCode::DatasetOpen,
+                            format!("namespace dataset storage option fallback: {err}"),
+                        )
+                    })?;
+            if let Some(options) = fallback {
+                builder = builder.with_storage_options(options);
             }
         }
     }
-
     let dataset = builder.load().await.map_err(|err| {
         FfiError::new(
             namespace_error_code(&err, ErrorCode::DatasetOpen),
@@ -684,7 +743,10 @@ fn describe_table_info_inner(
     api_key: *const c_char,
     delimiter: *const c_char,
     headers_tsv: *const c_char,
+    expected_managed_uri: *const c_char,
 ) -> FfiResult<(String, String)> {
+    let expected_managed_uri =
+        unsafe { optional_cstr_to_string(expected_managed_uri, "expected managed table URI")? };
     let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
     let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
     let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
@@ -728,6 +790,14 @@ fn describe_table_info_inner(
             )
         })?;
         let storage_options_tsv = storage_options_to_tsv(resp.storage_options.unwrap_or_default());
+        if let Some(uri) = expected_managed_uri {
+            if resp.managed_versioning != Some(true) || normalize_s3_uri(&location) != uri {
+                return Err(FfiError::new(
+                    ErrorCode::NamespaceDescribeTableInfo,
+                    "namespace table changed while binding a managed snapshot; retry the query",
+                ));
+            }
+        }
         Ok::<_, FfiError>((location, storage_options_tsv))
     })
     .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))??;
@@ -745,6 +815,7 @@ pub unsafe extern "C" fn lance_namespace_describe_table(
     headers_tsv: *const c_char,
     out_location: *mut *const c_char,
     out_storage_options_tsv: *mut *const c_char,
+    expected_managed_uri: *const c_char,
 ) -> i32 {
     if !out_location.is_null() {
         unsafe {
@@ -764,6 +835,7 @@ pub unsafe extern "C" fn lance_namespace_describe_table(
         api_key,
         delimiter,
         headers_tsv,
+        expected_managed_uri,
     ) {
         Ok((location, storage_options_tsv)) => {
             clear_last_error();
@@ -1080,52 +1152,191 @@ pub unsafe extern "C" fn lance_namespace_describe_table_with_schema(
     }
 }
 
-fn open_dataset_in_namespace_inner(
+/// Identify the REST table and effective request credentials across attachments.
+///
+/// # Safety
+/// Inputs must be live C strings under the same contract as a namespace open.
+/// The caller releases the returned string with `lance_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn lance_namespace_request_identity(
     endpoint: *const c_char,
     table_id: *const c_char,
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
-    headers_tsv: *const c_char,
-    session: *mut c_void,
-) -> FfiResult<(DatasetHandle, String)> {
-    let session_ptr = session;
-    let endpoint = unsafe { cstr_to_str(endpoint, "endpoint")? };
-    let table_id = unsafe { cstr_to_str(table_id, "table_id")? };
-    let delimiter = unsafe { optional_cstr_to_string(delimiter, "delimiter")? };
-    let bearer_token = unsafe { optional_cstr_to_string(bearer_token, "bearer_token")? };
-    let api_key = unsafe { optional_cstr_to_string(api_key, "api_key")? };
-    let headers_tsv = unsafe { optional_cstr_to_string(headers_tsv, "headers_tsv")? };
+    headers: *const c_char,
+) -> *const c_char {
+    // SAFETY: the caller owns the inputs until this call returns.
+    let result = unsafe {
+        parse_namespace_connection(
+            endpoint,
+            table_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers,
+        )
+    }
+    .and_then(|connection| {
+        // The REST SDK appends the operation path before reqwest parses the URL.
+        let route = format!("{}/v1/table/", connection.endpoint);
+        let route = url::Url::parse(&route)
+            .map(|url| url.to_string())
+            .unwrap_or(route);
+        let headers = request_headers(
+            connection.bearer_token.as_deref(),
+            connection.api_key.as_deref(),
+            connection.headers_tsv.as_deref(),
+        );
+        serde_json::to_vec(&(
+            route,
+            connection.delimiter,
+            connection.namespace_parts,
+            headers,
+        ))
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err.to_string()))
+    });
+    match result {
+        Ok(identity) => to_c_string(identity).into_raw(),
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null()
+        }
+    }
+}
 
-    let delimiter = delimiter.unwrap_or_else(|| "$".to_string());
-    let namespace = build_config(
-        endpoint,
-        bearer_token.as_deref(),
-        api_key.as_deref(),
-        headers_tsv.as_deref(),
-    )
-    .delimiter(delimiter.clone())
-    .build();
-    let session = unsafe { optional_session_handle(session)? };
-    // FIX: split the qualified id into namespace segments so the crate's internal
-    // describe (DatasetBuilder::from_namespace) gets the full 3-level id, not 1.
-    let table_id_segments: Vec<String> = table_id
-        .split(delimiter.as_str())
-        .map(|s| s.to_string())
-        .collect();
-
-    runtime::block_on(async move {
+async fn open_namespace_version(
+    connection: NamespaceConnection,
+    session: Option<Arc<Session>>,
+    session_ptr: *mut c_void,
+    version: i64,
+) -> FfiResult<(Option<DatasetHandle>, String)> {
+    let namespace = Arc::new(build_namespace(&connection));
+    if version == 0 {
         let handle = load_dataset_from_namespace(
-            Arc::new(namespace),
-            table_id_segments,
+            namespace,
+            connection.namespace_parts,
             session,
             session_ptr,
         )
         .await?;
-        let table_uri = handle.dataset.uri().to_string();
-        Ok::<_, FfiError>((handle, table_uri))
-    })
-    .map_err(|err| FfiError::new(ErrorCode::Runtime, format!("runtime: {err}")))?
+        let uri = handle.dataset.uri().to_owned();
+        return Ok((Some(handle), uri));
+    }
+    if version < 0 {
+        return Err(FfiError::new(
+            ErrorCode::DatasetOpen,
+            "Lance versions start at 1",
+        ));
+    }
+    // Managed servers may expose fixed versions only through their registry.
+    // A lightweight routing request avoids asking either authority to load HEAD.
+    record_namespace_describe();
+    let discovery = namespace
+        .describe_table(DescribeTableRequest {
+            id: Some(connection.namespace_parts.clone()),
+            with_table_uri: Some(true),
+            load_detailed_metadata: Some(false),
+            ..Default::default()
+        })
+        .await
+        .map_err(namespace_describe_error)?;
+    if discovery.managed_versioning == Some(true) {
+        let uri = discovery
+            .table_uri
+            .or(discovery.location)
+            .filter(|uri| !uri.is_empty())
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::NamespaceDescribeTable,
+                    "missing managed table URI",
+                )
+            })?;
+        return Ok((None, normalize_s3_uri(&uri)));
+    }
+    let (builder, binding) =
+        describe_namespace_dataset(namespace, connection.namespace_parts, Some(version)).await?;
+    if binding.managed_versioning {
+        return Err(FfiError::new(
+            ErrorCode::NamespaceDescribeTable,
+            "namespace table changed to managed versioning while binding a storage snapshot",
+        ));
+    }
+    let handle = load_namespace_builder(
+        builder.with_version(version as u64),
+        binding,
+        session,
+        session_ptr,
+    )
+    .await?;
+    let uri = handle.dataset.uri().to_owned();
+    Ok((Some(handle), uri))
+}
+
+/// Open latest (zero) or storage-owned history. For a positive selector a
+/// null handle with a URI denotes a managed table.
+///
+/// # Safety
+/// The caller supplies live C strings, an optional live session, and a writable
+/// URI pointer. It releases any returned URI and dataset with the FFI destructors.
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_namespace_version(
+    endpoint: *const c_char,
+    table_id: *const c_char,
+    bearer_token: *const c_char,
+    api_key: *const c_char,
+    delimiter: *const c_char,
+    headers: *const c_char,
+    session: *mut c_void,
+    version: i64,
+    out_uri: *mut *const c_char,
+) -> *mut c_void {
+    if version != 0 && out_uri.is_null() {
+        set_last_error(
+            ErrorCode::InvalidArgument,
+            "missing namespace version URI output",
+        );
+        return ptr::null_mut();
+    }
+    // SAFETY: out_uri is checked and writable under the caller contract.
+    if !out_uri.is_null() {
+        unsafe { ptr::write_unaligned(out_uri, ptr::null()) };
+    }
+    let result = (|| {
+        // SAFETY: all C strings and the optional session remain live until this call returns.
+        let (connection, handle) = unsafe {
+            (
+                parse_namespace_connection(
+                    endpoint,
+                    table_id,
+                    bearer_token,
+                    api_key,
+                    delimiter,
+                    headers,
+                )?,
+                optional_session_handle(session)?,
+            )
+        };
+        runtime::block_on(open_namespace_version(connection, handle, session, version))
+            .map_err(|err| FfiError::new(ErrorCode::Runtime, err.to_string()))?
+    })();
+    match result {
+        Ok((dataset, uri)) => {
+            clear_last_error();
+            // SAFETY: ownership of the allocated URI passes to the checked output slot.
+            if !out_uri.is_null() {
+                unsafe { ptr::write_unaligned(out_uri, to_c_string(uri).into_raw()) };
+            }
+            dataset.map_or(ptr::null_mut(), |handle| {
+                Box::into_raw(Box::new(handle)).cast()
+            })
+        }
+        Err(err) => {
+            set_last_error(err.code, err.message);
+            ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
@@ -1135,38 +1346,22 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
-    headers_tsv: *const c_char,
-    out_table_uri: *mut *const c_char,
+    headers: *const c_char,
+    out_uri: *mut *const c_char,
 ) -> *mut c_void {
-    if !out_table_uri.is_null() {
-        unsafe {
-            std::ptr::write_unaligned(out_table_uri, ptr::null());
-        }
-    }
-
-    match open_dataset_in_namespace_inner(
-        endpoint,
-        table_id,
-        bearer_token,
-        api_key,
-        delimiter,
-        headers_tsv,
-        ptr::null_mut(),
-    ) {
-        Ok((handle, table_uri)) => {
-            clear_last_error();
-            if !out_table_uri.is_null() {
-                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
-                unsafe {
-                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
-                }
-            }
-            Box::into_raw(Box::new(handle)) as *mut c_void
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null_mut()
-        }
+    // SAFETY: forwards the caller's C strings and optional result pointer.
+    unsafe {
+        lance_open_namespace_version(
+            endpoint,
+            table_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers,
+            ptr::null_mut(),
+            0,
+            out_uri,
+        )
     }
 }
 
@@ -1177,39 +1372,23 @@ pub unsafe extern "C" fn lance_open_dataset_in_namespace_with_session(
     bearer_token: *const c_char,
     api_key: *const c_char,
     delimiter: *const c_char,
-    headers_tsv: *const c_char,
+    headers: *const c_char,
     session: *mut c_void,
-    out_table_uri: *mut *const c_char,
+    out_uri: *mut *const c_char,
 ) -> *mut c_void {
-    if !out_table_uri.is_null() {
-        unsafe {
-            std::ptr::write_unaligned(out_table_uri, ptr::null());
-        }
-    }
-
-    match open_dataset_in_namespace_inner(
-        endpoint,
-        table_id,
-        bearer_token,
-        api_key,
-        delimiter,
-        headers_tsv,
-        session,
-    ) {
-        Ok((handle, table_uri)) => {
-            clear_last_error();
-            if !out_table_uri.is_null() {
-                let uri_c = CString::new(table_uri).unwrap_or_else(|_| to_c_string("invalid uri"));
-                unsafe {
-                    std::ptr::write_unaligned(out_table_uri, uri_c.into_raw() as *const c_char);
-                }
-            }
-            Box::into_raw(Box::new(handle)) as *mut c_void
-        }
-        Err(err) => {
-            set_last_error(err.code, err.message);
-            ptr::null_mut()
-        }
+    // SAFETY: the session and C pointers satisfy the same caller contract.
+    unsafe {
+        lance_open_namespace_version(
+            endpoint,
+            table_id,
+            bearer_token,
+            api_key,
+            delimiter,
+            headers,
+            session,
+            0,
+            out_uri,
+        )
     }
 }
 

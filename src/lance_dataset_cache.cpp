@@ -765,6 +765,26 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
   return pinned;
 }
 
+string LanceRestVersionKey(ClientContext &context, const string &namespace_key,
+                           idx_t version) {
+  auto key = "rest-version|" + namespace_key;
+  AppendCacheKeyPart(key, LanceNamespaceSecretsFingerprint(context));
+  AppendCacheKeyPart(key, version);
+  return key;
+}
+
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetPinnedSnapshot(ClientContext &context, const string &key) {
+  return GetOrCreateLanceDatasetCacheState(context)->GetSnapshot(
+      context.transaction.GetActiveQuery(), key);
+}
+
+void LancePinSnapshot(ClientContext &context, const string &key,
+                      shared_ptr<LanceDatasetCacheEntry> snapshot) {
+  GetOrCreateLanceDatasetCacheState(context)->PinSnapshot(key,
+                                                          std::move(snapshot));
+}
+
 void LanceInvalidateDatasetCache(ClientContext &context,
                                  const string &cache_key) {
   auto state = context.registered_state->Get<LanceDatasetCacheState>(

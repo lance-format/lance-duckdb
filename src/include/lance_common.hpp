@@ -104,14 +104,15 @@ void *
 LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
                             const string &table_id, const string &bearer_token,
                             const string &api_key, const string &delimiter,
-                            const string &headers_tsv, string &out_table_uri);
+                            const string &headers_tsv, string &out_table_uri,
+                            optional_idx version = {});
 
 bool TryLanceNamespaceDescribeTable(
     ClientContext &context, const string &endpoint, const string &table_id,
     const string &bearer_token, const string &api_key, const string &delimiter,
     const string &headers_tsv, string &out_location,
     vector<string> &out_option_keys, vector<string> &out_option_values,
-    string &out_error);
+    string &out_error, const string &expected_managed_uri = {});
 
 bool TryLanceNamespaceCreateEmptyTable(
     ClientContext &context, const string &endpoint, const string &table_id,
@@ -154,14 +155,13 @@ void *LanceOpenDatasetForTable(ClientContext &context,
 void *LanceOpenDatasetForTableAtVersion(ClientContext &context,
                                         const LanceTableEntry &table,
                                         uint64_t version,
-                                        string &out_display_uri);
+                                        string &out_display_uri,
+                                        const string &expected_managed_uri);
 
-void ResolveLanceStorageOptionsForTable(ClientContext &context,
-                                        const LanceTableEntry &table,
-                                        string &out_open_path,
-                                        vector<string> &out_option_keys,
-                                        vector<string> &out_option_values,
-                                        string &out_display_uri);
+void ResolveLanceStorageOptionsForTable(
+    ClientContext &context, const LanceTableEntry &table, string &out_open_path,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_display_uri, const string &expected_managed_uri = {});
 
 // Where UPDATE and MERGE spill buffered new values: DuckDB's temp directory
 // (empty when it has none, or when temp_file_encryption is on, since the spill

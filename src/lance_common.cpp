@@ -405,7 +405,7 @@ bool TryLanceNamespaceDescribeTable(
     const string &bearer_token, const string &api_key, const string &delimiter,
     const string &headers_tsv, string &out_location,
     vector<string> &out_option_keys, vector<string> &out_option_values,
-    string &out_error) {
+    string &out_error, const string &expected_managed_uri) {
   (void)context;
   out_location.clear();
   out_option_keys.clear();
@@ -422,7 +422,8 @@ bool TryLanceNamespaceDescribeTable(
   const char *options_ptr = nullptr;
   auto rc = lance_namespace_describe_table(
       endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-      delimiter_ptr, headers_ptr, &location_ptr, &options_ptr);
+      delimiter_ptr, headers_ptr, &location_ptr, &options_ptr,
+      expected_managed_uri.empty() ? nullptr : expected_managed_uri.c_str());
   if (rc != 0) {
     out_error = LanceConsumeLastError();
     if (out_error.empty()) {
@@ -537,11 +538,10 @@ bool TryLanceDirNamespaceListTables(ClientContext &context, const string &root,
   return true;
 }
 
-void *
-LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
-                            const string &table_id, const string &bearer_token,
-                            const string &api_key, const string &delimiter,
-                            const string &headers_tsv, string &out_table_uri) {
+void *LanceOpenDatasetInNamespace(
+    ClientContext &context, const string &endpoint, const string &table_id,
+    const string &bearer_token, const string &api_key, const string &delimiter,
+    const string &headers_tsv, string &out_table_uri, optional_idx version) {
   out_table_uri.clear();
   const char *bearer_ptr =
       bearer_token.empty() ? nullptr : bearer_token.c_str();
@@ -553,9 +553,11 @@ LanceOpenDatasetInNamespace(ClientContext &context, const string &endpoint,
   auto source_resolver = LanceCreateSourceResolver(context);
   auto *dataset = LanceOpenDatasetWithSourceSession(
       context, source_resolver, [&](void *session) {
-        return lance_open_dataset_in_namespace_with_session(
+        return lance_open_namespace_version(
             endpoint.c_str(), table_id.c_str(), bearer_ptr, api_key_ptr,
-            delimiter_ptr, headers_ptr, session, &uri_ptr);
+            delimiter_ptr, headers_ptr, session,
+            version.IsValid() ? NumericCast<int64_t>(version.GetIndex()) : 0,
+            &uri_ptr);
       });
   if (uri_ptr) {
     out_table_uri = uri_ptr;
@@ -703,23 +705,23 @@ void *LanceOpenDatasetForTable(ClientContext &context,
 void *LanceOpenDatasetForTableAtVersion(ClientContext &context,
                                         const LanceTableEntry &table,
                                         uint64_t version,
-                                        string &out_display_uri) {
+                                        string &out_display_uri,
+                                        const string &expected_managed_uri) {
   string open_path;
   vector<string> option_keys;
   vector<string> option_values;
   ResolveLanceStorageOptionsForTable(context, table, open_path, option_keys,
-                                     option_values, out_display_uri);
+                                     option_values, out_display_uri,
+                                     expected_managed_uri);
   return OpenResolvedDatasetAtVersion(
       context, open_path, option_keys, option_values,
       optional_idx(NumericCast<idx_t>(version)));
 }
 
-void ResolveLanceStorageOptionsForTable(ClientContext &context,
-                                        const LanceTableEntry &table,
-                                        string &out_open_path,
-                                        vector<string> &out_option_keys,
-                                        vector<string> &out_option_values,
-                                        string &out_display_uri) {
+void ResolveLanceStorageOptionsForTable(
+    ClientContext &context, const LanceTableEntry &table, string &out_open_path,
+    vector<string> &out_option_keys, vector<string> &out_option_values,
+    string &out_display_uri, const string &expected_managed_uri) {
   out_display_uri = table.DatasetUri();
   if (!table.IsNamespaceBacked()) {
     ResolveLanceStorageOptions(context, table.DatasetUri(), out_open_path,
@@ -747,10 +749,10 @@ void ResolveLanceStorageOptionsForTable(ClientContext &context,
   string error;
   vector<string> option_keys;
   vector<string> option_values;
-  if (!TryLanceNamespaceDescribeTable(context, cfg.endpoint, cfg.table_id,
-                                      bearer_token, api_key, cfg.delimiter,
-                                      cfg.headers_tsv, location, option_keys,
-                                      option_values, error)) {
+  if (!TryLanceNamespaceDescribeTable(
+          context, cfg.endpoint, cfg.table_id, bearer_token, api_key,
+          cfg.delimiter, cfg.headers_tsv, location, option_keys, option_values,
+          error, expected_managed_uri)) {
     throw IOException("Failed to describe Lance table via namespace: " +
                       (error.empty() ? "unknown error" : error));
   }

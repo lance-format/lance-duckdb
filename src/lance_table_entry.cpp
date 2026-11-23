@@ -426,7 +426,8 @@ static uint64_t ResolveAtClauseVersion(
 
 static shared_ptr<LanceDatasetCacheEntry>
 OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
-                    const BoundAtClause &at) {
+                    const BoundAtClause &at,
+                    const string &expected_managed_uri) {
   if (auto reference = NamedAtReference(at)) {
     return LanceGetNamedSnapshotForTable(context, table, *reference);
   }
@@ -449,8 +450,8 @@ OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
       dataset = nullptr;
     }
   } else {
-    dataset =
-        LanceOpenDatasetForTableAtVersion(context, table, version, display_uri);
+    dataset = LanceOpenDatasetForTableAtVersion(
+        context, table, version, display_uri, expected_managed_uri);
   }
   if (!dataset) {
     throw IOException("Failed to open version " + to_string(version) +
@@ -461,9 +462,9 @@ OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
 }
 
 unique_ptr<LanceTableEntry>
-LanceTableEntry::AtClause(ClientContext &context,
-                          const BoundAtClause &at) const {
-  auto pinned = OpenAtClauseDataset(context, *this, at);
+LanceTableEntry::AtClause(ClientContext &context, const BoundAtClause &at,
+                          const string &expected_managed_uri) const {
+  auto pinned = OpenAtClauseDataset(context, *this, at, expected_managed_uri);
   auto entry = BuildLanceTableEntryFromDataset(context, *this, internal,
                                                pinned->Handle());
   entry->historical_dataset = std::move(pinned);

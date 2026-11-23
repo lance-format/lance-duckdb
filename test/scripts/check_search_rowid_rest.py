@@ -101,7 +101,9 @@ def main() -> None:
 
                 content_type = "application/json"
                 status = 200
-                if path.endswith("/table/list"):
+                if self.headers.get("x-tenant") != "search":
+                    status, response = 403, {"code": 403, "error": "Forbidden", "message": "wrong tenant"}
+                elif path.endswith("/table/list"):
                     response: object = {"tables": ["t", "norowid"]}
                 elif path.endswith("/list") and "/namespace/" in path:
                     response = {"namespaces": []}
@@ -195,7 +197,8 @@ def main() -> None:
             prefix = (
                 f"LOAD '{args.extension}'; "
                 "ATTACH 'default' AS ns "
-                f"(TYPE LANCE, ENDPOINT 'http://127.0.0.1:{server.server_port}'); "
+                f"(TYPE LANCE, ENDPOINT 'http://127.0.0.1:{server.server_port}', "
+                "HEADER 'X-Tenant=initial;x-tenant=search'); "
             )
             output: list[dict] = []
             for case in cases:

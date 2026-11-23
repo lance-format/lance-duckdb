@@ -94,8 +94,9 @@ public:
   // A read-only view of this table at the dataset version an AT clause names
   // (VERSION or TIMESTAMP). Its schema comes from that version and it holds
   // the opened dataset, so every read of the view sees that one version.
-  unique_ptr<LanceTableEntry> AtClause(ClientContext &context,
-                                       const BoundAtClause &at) const;
+  unique_ptr<LanceTableEntry>
+  AtClause(ClientContext &context, const BoundAtClause &at,
+           const string &expected_managed_uri = {}) const;
   static bool IsNumericAtVersion(const BoundAtClause &at);
   static idx_t ParseNumericAtVersion(const BoundAtClause &at);
   bool IsHistorical() const { return historical_dataset != nullptr; }
