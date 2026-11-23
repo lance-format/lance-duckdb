@@ -5,6 +5,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -598,18 +599,40 @@ ProbeLanceTableFilterIR(LogicalGet &get, const vector<string> &names,
                                       false, false);
 }
 
+// The filters DuckDB planned for a table scan. `input.filters` also carries the
+// dynamic filters a hash join attaches at execution time; the planned set stays
+// on the PhysicalTableScan and is the only one that reflects predicates the
+// query wrote. `has_runtime_filters` reports whether dynamic filters exist.
+static const TableFilterSet *
+GetLancePlannedTableFilters(const TableFunctionInitInput &input,
+                            bool &has_runtime_filters) {
+  has_runtime_filters = false;
+  if (!input.op || input.op->type != PhysicalOperatorType::TABLE_SCAN) {
+    return input.filters.get();
+  }
+  auto &scan = input.op->Cast<PhysicalTableScan>();
+  has_runtime_filters =
+      scan.dynamic_filters && scan.dynamic_filters->HasFilters();
+  return scan.table_filters.get();
+}
+
 LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     const vector<string> &names, const vector<LogicalType> &types,
     const vector<string> &json_columns, const TableFunctionInitInput &input,
-    bool exclude_computed_columns, bool include_runtime_hints) {
+    bool exclude_computed_columns, bool include_runtime_hints,
+    bool exclude_runtime_filters) {
   LanceFilterIRBuildResult result;
-  if (!input.filters) {
+  const TableFilterSet *filters = input.filters.get();
+  if (exclude_runtime_filters) {
+    filters = GetLancePlannedTableFilters(input, result.has_runtime_filters);
+  }
+  if (!filters) {
     return result;
   }
 
-  result.parts.reserve(input.filters->FilterCount());
+  result.parts.reserve(filters->FilterCount());
 
-  for (auto &it : *input.filters) {
+  for (auto &it : *filters) {
     auto scan_col_idx = it.GetIndex();
     auto &filter = it.Filter();
 
@@ -674,7 +697,7 @@ LanceFilterIRBuildResult BuildLanceTableFilterIRParts(
     result.parts.push_back(std::move(filter_ir));
   }
 
-  for (const auto &filter : input.filters->GetMultiColumnFilters()) {
+  for (const auto &filter : filters->GetMultiColumnFilters()) {
     if (ExpressionFilter::IsOptionalFilter(*filter)) {
       result.all_filters_pushed = false;
       continue;
