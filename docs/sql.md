@@ -1009,6 +1009,11 @@ SELECT tag, version, branch, created_at, updated_at FROM lance_tags('ns.main.my_
 - `lance_tags` returns `tag`, `version`, `branch` (`NULL` for the main branch), `created_at` and `updated_at`.
 - Tags are shared by every branch of a dataset. `lance_versions` lists only the tags on the opened branch.
 
+For a REST attachment, `lance_tags`, the `tags` column of `lance_versions`,
+and `AT (VERSION => 'tag:release')` read tags from the underlying Lance dataset and
+require access to its storage. A tag stored only in the REST catalog is
+unavailable through these SQL interfaces.
+
 On a writable directory attachment, use `ALTER TABLE` to tag a committed
 version or drop a tag. Both statements require autocommit.
 

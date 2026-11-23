@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -99,7 +100,7 @@ def main() -> None:
         authority_table = Path(tmp) / "authority.lance"
         shutil.copytree(REPO_ROOT / "test/data/branch_tag_fixture.lance", authority_table)
         head = min((authority_table / "_versions").glob("*.manifest"))  # inverted version numbers
-        registered = Path(tmp) / head.name
+        registered = Path(tmp) / "registered-v3.manifest"
         head.rename(registered)
         registry_on, registry_off = (Path(tmp) / name for name in ("enable.csv", "disable.csv"))
         version_lookups: list[int] = []
@@ -154,14 +155,23 @@ def main() -> None:
                 elif "/default$authority/" in path and path.endswith("/version/list"):
                     response: object = {"versions": [registry_head]}
                 elif "/default$authority/" in path and path.endswith("/version/describe"):
-                    version_lookups.append(json.loads(body)["version"])
-                    assert version_lookups[-1] == 3
-                    response = {"version": registry_head}
+                    version = json.loads(body)["version"]
+                    version_lookups.append(version)
+                    if version == 2:
+                        v2 = authority_table / "_versions" / f"{2**64 - 3:020d}.manifest"
+                        response = {"version": {"version": 2, "manifest_path": str(v2.resolve()).lstrip("/")}}
+                    elif version == 3:
+                        response = {"version": registry_head}
+                    else:
+                        status, response = 404, {"code": 11, "error": "no such registered revision"}
                 elif "/default$authority/" in path and path.endswith("/describe"):
                     response = {"location": str(authority_table.resolve()), "schema": SCHEMA}
                     if registry_on.exists():
                         response["managed_versioning"] = not registry_off.exists()
-                    if managed_flip and json.loads(body).get("load_detailed_metadata") is None:
+                    details = json.loads(body)
+                    if managed_flip and (
+                        details.get("vend_credentials") or details.get("load_detailed_metadata") is None
+                    ):
                         response["managed_versioning"] = False
                     if response.get("managed_versioning") and json.loads(body).get("version") is not None:
                         status, response = 403, {"code": 403, "error": "Forbidden", "message": "use the registry"}
@@ -433,6 +443,76 @@ def main() -> None:
             duckdb(attach + "SELECT id FROM ns.main.authority AT (TIMESTAMP => TIMESTAMPTZ 'infinity');", "3")
             if version_lookups:
                 raise RuntimeError(f"Timestamp read reopened its bound head: {version_lookups}")
+
+            fixed_query = "SELECT id FROM ns.main.authority AT (VERSION => 3)"
+            version_lookups.clear()
+            duckdb(attach + fixed_query, "3")
+            if version_lookups != [3]:
+                raise RuntimeError(f"Expected one fixed registry lookup, saw {version_lookups}")
+            # A physical v3 can exist while the catalog publishes a different v3.
+            local = f"LOAD '{args.extension}'; ATTACH '{tmp}' AS local_ns (TYPE LANCE); "
+            duckdb(local + "UPDATE local_ns.main.authority SET id = 99")
+            try:
+                duckdb(attach + fixed_query, "3")
+                if args.library:
+                    # Local ETags use inode, length and mtime. Publish two real
+                    # v3 histories under different names with the same ETag.
+                    first = head.read_bytes()
+                    head.unlink()
+                    duckdb(local + "UPDATE local_ns.main.authority SET id = 31")
+                    second = head.read_bytes()
+                    # Commit timestamps have variable-length encodings. Pad
+                    # after each protobuf message, before its 16-byte footer.
+                    size = max(len(first), len(second)) + 1
+                    first, second = (raw[:-16] + bytes(size - len(raw)) + raw[-16:] for raw in (first, second))
+                    alias = Path(tmp) / "alternate.manifest"
+                    alias.hardlink_to(head)
+                    mtime = head.stat().st_mtime_ns
+                    original = registry_head.copy()
+                    try:
+                        with binding_connections(args.library) as (sql, _, _):
+                            sql(mount("ns"))
+                            for path, data, value in ((head, first, 99), (alias, second, 31), (head, first, 99)):
+                                path.write_bytes(data)
+                                os.utime(path, ns=(mtime, mtime))
+                                registry_head.update(
+                                    manifest_path=str(path.resolve()).lstrip("/"), manifest_size=len(data)
+                                )
+                                assert sql(fixed_query, 1) == [value]
+                    finally:
+                        registry_head.update(original)
+                        alias.unlink()
+                registered_backup = registered.with_suffix(".backup")
+                registered.rename(registered_backup)
+                try:
+                    duckdb(attach + fixed_query, expected_error="does not match the registration")
+                finally:
+                    registered_backup.rename(registered)
+                registry_head["manifest_size"] += 1
+                try:
+                    duckdb(attach + fixed_query, expected_error="does not match the registration")
+                finally:
+                    registry_head["manifest_size"] -= 1
+                duckdb(
+                    attach + "SELECT id FROM ns.main.authority AT (VERSION => 100)",
+                    expected_error="no such registered revision",
+                )
+                original = registry_head.copy()
+                try:
+                    for invalid in ("", "/", "junk.txt", "3.manifest-", "4.manifest-pending"):
+                        registry_head["manifest_path"] = invalid
+                        duckdb(attach + fixed_query, expected_error="invalid registered manifest path")
+                    staged = head.with_suffix(".manifest-pending")
+                    shutil.copyfile(head, staged)
+                    registry_head.update(manifest_path=str(staged.resolve()).lstrip("/"), manifest_size=-1)
+                    duckdb(attach + fixed_query, expected_error="invalid registered manifest size")
+                    registry_head["manifest_size"] = staged.stat().st_size
+                    duckdb(attach + fixed_query, "99")
+                    assert staged.exists()
+                finally:
+                    registry_head.update(original)
+            finally:
+                head.unlink()
 
             # Reading the directory's v2 head does not need its older v1 manifest.
             oldest = max((authority_table / "_versions").glob("*.manifest"))
