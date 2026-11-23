@@ -86,6 +86,12 @@ int32_t lance_dataset_checkout_named_ref(void *dataset, const char *reference,
                                          void **out_dataset);
 int32_t lance_dataset_uses_stable_row_ids(void *dataset,
                                           uint8_t *out_uses_stable_row_ids);
+const char *lance_directory_snapshot_root(const char *root, bool resolve_links);
+const char *lance_directory_snapshot_identity(const char *root,
+                                              const char *name,
+                                              const char **option_keys,
+                                              const char **option_values,
+                                              size_t options_len);
 int32_t lance_dir_namespace_list_tables(const char *root,
                                         const char **option_keys,
                                         const char **option_values,
@@ -98,10 +104,11 @@ int32_t lance_dir_namespace_drop_table(const char *root, const char *table_name,
 void *lance_open_dataset_in_dir_namespace(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, const char **out_table_uri);
+// Directory dataset versions start at one. Zero selects the latest manifest.
 void *lance_open_dataset_in_dir_namespace_with_session(
     const char *root, const char *table_name, const char **option_keys,
     const char **option_values, size_t options_len, void *session,
-    const char **out_table_uri);
+    uint64_t version, const char **out_table_uri);
 int32_t lance_namespace_list_tables(const char *endpoint,
                                     const char *namespace_id,
                                     const char *bearer_token,

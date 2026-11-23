@@ -59,8 +59,12 @@
 
 namespace duckdb {
 
+// Mirrored by ErrorCode::NamespaceTableNotFound in rust/error.rs.
+static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 57;
+
 struct LanceDirectoryNamespaceConfig {
   string root;
+  string snapshot_root;
   vector<string> option_keys;
   vector<string> option_values;
 };
@@ -338,32 +342,55 @@ public:
   unique_ptr<CatalogEntry>
   CreateDefaultEntry(ClientContext &context,
                      const Identifier &entry_name_p) override {
-    const auto &entry_name = entry_name_p.GetIdentifierName();
     if (!ns) {
       throw InternalException("Lance directory namespace config is missing");
     }
+    return CreateEntry(context, schema, *ns, entry_name_p, {}, {});
+  }
+
+  static unique_ptr<CatalogEntry>
+  CreateEntry(ClientContext &context, SchemaCatalogEntry &schema,
+              const LanceDirectoryNamespaceConfig &ns,
+              const Identifier &entry_name_p, const string &binding_key,
+              optional_idx version, bool pinned_only = false) {
+    const auto &entry_name = entry_name_p.GetIdentifierName();
     if (!IsSafeDatasetTableName(entry_name)) {
       throw InvalidInputException(
           "Unsafe Lance dataset name for directory namespace: " + entry_name);
     }
 
-    vector<const char *> key_ptrs;
-    vector<const char *> value_ptrs;
-    BuildStorageOptionPointerArrays(ns->option_keys, ns->option_values,
-                                    key_ptrs, value_ptrs);
-
-    const char *uri_ptr = nullptr;
-    auto *dataset = lance_open_dataset_in_dir_namespace(
-        ns->root.c_str(), entry_name.c_str(),
-        key_ptrs.empty() ? nullptr : key_ptrs.data(),
-        value_ptrs.empty() ? nullptr : value_ptrs.data(),
-        ns->option_keys.size(), &uri_ptr);
-    string dataset_uri;
-    if (uri_ptr) {
-      dataset_uri = uri_ptr;
-      lance_free_string(uri_ptr);
+    LanceNamespaceTableConfig cfg;
+    cfg.kind = LanceNamespaceKind::Directory;
+    cfg.root = ns.root;
+    cfg.table_id = entry_name;
+    cfg.option_keys = ns.option_keys;
+    cfg.option_values = ns.option_values;
+    shared_ptr<LanceDatasetCacheEntry> pinned;
+    std::unique_ptr<void, decltype(&lance_close_dataset)> latest(
+        nullptr, lance_close_dataset);
+    if (version.IsValid()) {
+      pinned = LanceGetDirectorySnapshot(context, cfg, binding_key,
+                                         version.GetIndex(), pinned_only);
+      if (pinned_only && !pinned) {
+        return nullptr;
+      }
+      if (pinned) {
+        cfg.display_uri = pinned->DisplayUri();
+      }
+    } else {
+      latest.reset(LanceOpenDirectoryDataset(nullptr, ns.root, entry_name,
+                                             ns.option_keys, ns.option_values,
+                                             cfg.display_uri));
     }
+    auto *dataset = pinned ? pinned->Handle() : latest.get();
     if (!dataset) {
+      if (version.IsValid() &&
+          lance_last_error_code() != LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND) {
+        throw IOException("Failed to open version " +
+                          to_string(version.GetIndex()) +
+                          " of Lance directory table " + entry_name +
+                          LanceFormatErrorSuffix());
+      }
       return nullptr;
     }
 
@@ -374,39 +401,24 @@ public:
     try {
       live = LanceTableSchema::FromDataset(context, dataset);
     } catch (...) {
-      lance_close_dataset(dataset);
+      if (version.IsValid()) {
+        throw;
+      }
       return nullptr;
     }
-    try {
-      live.LoadTableComment(dataset);
-    } catch (...) {
-      lance_close_dataset(dataset);
-      throw;
-    }
-    lance_close_dataset(dataset);
+    live.LoadTableComment(dataset);
     info.columns = std::move(live.columns);
     info.constraints = std::move(live.constraints);
     info.comment = live.comment;
-    auto coerced = std::move(live.coerced_columns);
-    auto json_columns = std::move(live.json_columns);
-    auto blob_columns = std::move(live.blob_columns);
-    auto writable_blob_v2_columns = std::move(live.writable_blob_v2_columns);
-
-    LanceNamespaceTableConfig cfg;
-    cfg.kind = LanceNamespaceKind::Directory;
-    cfg.root = ns->root;
-    cfg.table_id = entry_name;
-    cfg.option_keys = ns->option_keys;
-    cfg.option_values = ns->option_values;
-    cfg.display_uri = dataset_uri.empty()
-                          ? LanceDirectoryNamespaceDatasetUri(cfg)
-                          : std::move(dataset_uri);
-    auto entry =
-        make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
-    entry->SetCoercedColumnNames(std::move(coerced));
-    entry->SetJsonColumnNames(std::move(json_columns));
-    entry->SetBlobColumns(std::move(blob_columns));
-    entry->SetWritableBlobV2Columns(std::move(writable_blob_v2_columns));
+    if (cfg.display_uri.empty()) {
+      cfg.display_uri = LanceDirectoryNamespaceDatasetUri(cfg);
+    }
+    auto entry = make_uniq<LanceTableEntry>(schema.catalog, schema, info,
+                                            std::move(cfg), std::move(pinned));
+    entry->SetCoercedColumnNames(std::move(live.coerced_columns));
+    entry->SetJsonColumnNames(std::move(live.json_columns));
+    entry->SetBlobColumns(std::move(live.blob_columns));
+    entry->SetWritableBlobV2Columns(std::move(live.writable_blob_v2_columns));
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
@@ -582,8 +594,6 @@ private:
     return unique_ptr_cast<LanceTableEntry, CatalogEntry>(std::move(entry));
   }
 
-  // Mirrored by ErrorCode::NamespaceTableNotFound in rust/error.rs.
-  static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 57;
   SchemaCatalogEntry &schema;
   string endpoint;
   string namespace_id;
@@ -696,15 +706,72 @@ static void CheckCreateTableOptions(const CreateTableInfo &create_info) {
 // cache, not DuckDB native storage. Queries pin every generation they bind so a
 // refresh, ALTER or DROP cannot destroy an entry still used by another
 // executing plan.
+static string ResolveDirectoryRoot(const string &root, bool resolve_links) {
+  std::unique_ptr<const char, decltype(&lance_free_string)> value(
+      lance_directory_snapshot_root(root.c_str(), resolve_links),
+      lance_free_string);
+  if (!value) {
+    throw IOException("Failed to resolve Lance directory root%s",
+                      LanceFormatErrorSuffix());
+  }
+  return value.get();
+}
+
 class LanceCatalogQueryState final : public ClientContextState {
 public:
+  struct DirectoryNames {
+    string discovered;
+    unordered_map<SchemaCatalogEntry *, string> by_attachment;
+
+    string OnlyBoundName() const {
+      if (by_attachment.empty()) {
+        return {};
+      }
+      const auto &first = by_attachment.begin()->second;
+      for (const auto &entry : by_attachment) {
+        if (entry.second != first) {
+          return {};
+        }
+      }
+      return first;
+    }
+  };
+
+  string DirectoryRoot(ClientContext &context, const string &root) {
+    auto query_id = context.transaction.GetActiveQuery();
+    if (query_id != snapshot_query_id) {
+      directory_names.clear();
+      directory_roots.clear();
+      snapshot_query_id = query_id;
+    }
+    auto found = directory_roots.find(root);
+    if (found == directory_roots.end()) {
+      // Hold the target of a local directory symlink for the whole statement.
+      found =
+          directory_roots.emplace(root, ResolveDirectoryRoot(root, true)).first;
+    }
+    return found->second;
+  }
+
+  DirectoryNames &DirectoryName(const string &binding_key,
+                                const Identifier &name) {
+    return directory_names[binding_key][name];
+  }
+
   void Pin(const shared_ptr<CatalogEntry> &entry) {
     entries.emplace(entry.get(), entry);
   }
-  void QueryEnd() override { entries.clear(); }
+  void QueryEnd() override {
+    entries.clear();
+    directory_names.clear();
+    directory_roots.clear();
+  }
 
 private:
+  unordered_map<string, string> directory_roots;
   unordered_map<CatalogEntry *, shared_ptr<CatalogEntry>> entries;
+  idx_t snapshot_query_id = DConstants::INVALID_INDEX;
+  unordered_map<string, identifier_map_t<DirectoryNames>> directory_names;
 };
 
 static optional_ptr<CatalogEntry>
@@ -1231,6 +1298,70 @@ public:
 
 private:
   optional_ptr<CatalogEntry>
+  LookupDirectoryVersion(ClientContext &context, const Identifier &name,
+                         const BoundAtClause &at,
+                         optional_ptr<CatalogEntry> cached) {
+    auto state = context.registered_state->GetOrCreate<LanceCatalogQueryState>(
+        "lance_catalog_entries");
+    auto ns = *directory_ns;
+    ns.root = state->DirectoryRoot(context, ns.snapshot_root);
+    vector<const char *> key_ptrs, value_ptrs;
+    BuildStorageOptionPointerArrays(ns.option_keys, ns.option_values, key_ptrs,
+                                    value_ptrs);
+    std::unique_ptr<const char, decltype(&lance_free_string)> identity(
+        lance_directory_snapshot_identity(
+            ns.root.c_str(),
+            StringUtil::Lower(name.GetIdentifierName()).c_str(),
+            key_ptrs.data(), value_ptrs.data(), key_ptrs.size()),
+        lance_free_string);
+    if (!identity) {
+      throw IOException("Failed to identify Lance directory table%s",
+                        LanceFormatErrorSuffix());
+    }
+    auto binding_key = LanceBuildResolvedPathDatasetCacheKey(
+        identity.get(), ns.option_keys, ns.option_values);
+    auto &names = state->DirectoryName(binding_key, name);
+    auto bind = [&](const string &physical_name,
+                    bool pinned_only = false) -> optional_ptr<CatalogEntry> {
+      auto version = LanceTableEntry::ParseNumericAtVersion(at);
+      auto view = LanceDirectoryDefaultGenerator::CreateEntry(
+          context, *this, ns, Identifier(physical_name), binding_key, version,
+          pinned_only);
+      if (!view) {
+        return nullptr;
+      }
+      names.by_attachment.emplace(this, physical_name);
+      shared_ptr<CatalogEntry> pinned(std::move(view));
+      state->Pin(pinned);
+      return pinned.get();
+    };
+    auto previous = names.by_attachment.find(this);
+    if (previous != names.by_attachment.end()) {
+      return bind(previous->second);
+    }
+    if (cached) {
+      // Each attachment retains its exact physical spelling, including when
+      // a different attachment has cached a case-equivalent directory.
+      if (auto entry = bind(cached->name.GetIdentifierName())) {
+        return entry;
+      }
+      tables.erase(name); // Only a missing physical table permits rediscovery.
+    }
+    if (names.discovered.empty()) {
+      // A warm hit cannot establish uniqueness for a cold attachment.
+      names.discovered =
+          FindDirectoryNamespaceTable(ns, name.GetIdentifierName());
+      if (names.discovered.empty()) {
+        // A concurrent DROP can remove the name after an earlier binding.
+        // Only reuse an unambiguous snapshot already pinned at this version.
+        auto previous_name = names.OnlyBoundName();
+        return previous_name.empty() ? nullptr : bind(previous_name, true);
+      }
+    }
+    return bind(names.discovered);
+  }
+
+  optional_ptr<CatalogEntry>
   LookupEntryInternal(CatalogTransaction transaction,
                       const EntryLookupInfo &lookup_info,
                       optional_ptr<const Identifier> physical_name = nullptr) {
@@ -1245,6 +1376,13 @@ private:
       // Native dependency commit checks have no query context. Keep cached
       // tables visible without opening datasets or resolving credentials.
       return found == tables.end() ? nullptr : found->second.get();
+    }
+    auto at_clause = lookup_info.GetAtClause();
+    if (directory_ns && at_clause &&
+        LanceTableEntry::IsNumericAtVersion(*at_clause)) {
+      return LookupDirectoryVersion(
+          *transaction.context, name, *at_clause,
+          found == tables.end() ? nullptr : found->second.get());
     }
     if (found == tables.end()) {
       Identifier backend_name = name;
@@ -1281,7 +1419,6 @@ private:
       }
     }
     auto latest = PinLanceCatalogEntry(*transaction.context, found->second);
-    auto at_clause = lookup_info.GetAtClause();
     if (!at_clause) {
       return latest;
     }
@@ -2228,6 +2365,9 @@ LanceStorageAttach(optional_ptr<StorageExtensionInfo>, ClientContext &context,
           list_error);
     }
     directory_ns = make_shared_ptr<LanceDirectoryNamespaceConfig>();
+    // Bind a relative historical locator at ATTACH. Resolve symlinks when
+    // binding each statement and retain the original URI for catalog output.
+    directory_ns->snapshot_root = ResolveDirectoryRoot(open_root, false);
     directory_ns->root = std::move(open_root);
     directory_ns->option_keys = std::move(option_keys);
     directory_ns->option_values = std::move(option_values);

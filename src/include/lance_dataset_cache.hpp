@@ -5,6 +5,7 @@
 namespace duckdb {
 
 class LanceTableEntry;
+struct LanceNamespaceTableConfig;
 
 class LanceDatasetCacheEntry {
 public:
@@ -53,6 +54,10 @@ shared_ptr<LanceDatasetCacheEntry>
 LanceGetNamedSnapshotForTable(ClientContext &context,
                               const LanceTableEntry &table,
                               const string &reference);
+
+shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
+    ClientContext &context, const LanceNamespaceTableConfig &table,
+    const string &binding_key, idx_t version, bool pinned_only);
 
 // A write's target reads must use its pinned generation across the complete
 // statement, even when DuckDB plans CTE producers outside the write subtree.

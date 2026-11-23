@@ -78,7 +78,8 @@ public:
   LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                   CreateTableInfo &info, string dataset_uri);
   LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
-                  CreateTableInfo &info, LanceNamespaceTableConfig config);
+                  CreateTableInfo &info, LanceNamespaceTableConfig config,
+                  shared_ptr<LanceDatasetCacheEntry> historical = nullptr);
 
   unique_ptr<CatalogEntry> AlterEntry(ClientContext &context,
                                       AlterInfo &info) override;
@@ -95,6 +96,8 @@ public:
   // the opened dataset, so every read of the view sees that one version.
   unique_ptr<LanceTableEntry> AtClause(ClientContext &context,
                                        const BoundAtClause &at) const;
+  static bool IsNumericAtVersion(const BoundAtClause &at);
+  static idx_t ParseNumericAtVersion(const BoundAtClause &at);
   bool IsHistorical() const { return historical_dataset != nullptr; }
   const shared_ptr<LanceDatasetCacheEntry> &HistoricalDataset() const {
     return historical_dataset;
@@ -219,7 +222,7 @@ private:
   vector<string> json_column_names;
   vector<bool> blob_column_flags;
   vector<string> writable_blob_v2_columns;
-  // Set only on views built by AtClause.
+  // Keeps a historical entry bound to the dataset that supplied its schema.
   shared_ptr<LanceDatasetCacheEntry> historical_dataset;
 };
 

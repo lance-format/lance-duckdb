@@ -99,14 +99,16 @@ pub(crate) fn datafusion_error_code(
 }
 
 pub(crate) fn downcast_namespace_error(
-    err: &LanceError,
+    mut err: &LanceError,
 ) -> Option<&lance_namespace::NamespaceError> {
-    match err {
-        LanceError::Namespace { source, .. } => {
-            source.downcast_ref::<lance_namespace::NamespaceError>()
+    // DatasetBuilder::from_namespace wraps a namespace's Lance error once more.
+    while let LanceError::Namespace { source, .. } = err {
+        if let Some(error) = source.downcast_ref::<lance_namespace::NamespaceError>() {
+            return Some(error);
         }
-        _ => None,
+        err = source.downcast_ref::<LanceError>()?;
     }
+    None
 }
 
 pub(crate) fn namespace_error_code(err: &LanceError, fallback: ErrorCode) -> ErrorCode {

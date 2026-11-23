@@ -140,12 +140,13 @@ LanceNamespaceDisplayUri(const LanceNamespaceTableConfig &config) {
 
 LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                  CreateTableInfo &info,
-                                 LanceNamespaceTableConfig config)
+                                 LanceNamespaceTableConfig config,
+                                 shared_ptr<LanceDatasetCacheEntry> historical)
     : TableCatalogEntry(catalog, schema, info),
       columns(std::move(info.columns)),
       dataset_uri(LanceNamespaceDisplayUri(config)),
-      namespace_config(
-          make_uniq<LanceNamespaceTableConfig>(std::move(config))) {
+      namespace_config(make_uniq<LanceNamespaceTableConfig>(std::move(config))),
+      historical_dataset(std::move(historical)) {
   timestamp = 0;
 }
 
@@ -339,6 +340,44 @@ static TimestampCutoff GetTimestampCutoff(ClientContext &context,
           0};
 }
 
+static const string *NamedAtReference(const BoundAtClause &at) {
+  const auto &value = at.GetValue();
+  if (StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
+      !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
+    const auto &reference = StringValue::Get(value);
+    if (StringUtil::StartsWith(reference, "tag:") ||
+        StringUtil::StartsWith(reference, "branch:")) {
+      return &reference;
+    }
+  }
+  return nullptr;
+}
+
+bool LanceTableEntry::IsNumericAtVersion(const BoundAtClause &at) {
+  return StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
+         !NamedAtReference(at);
+}
+
+idx_t LanceTableEntry::ParseNumericAtVersion(const BoundAtClause &at) {
+  const auto &value = at.GetValue();
+  if (value.IsNull()) {
+    throw BinderException("AT (VERSION => ...) requires a non-NULL value");
+  }
+  auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
+  if (version_value.DefaultCastAs(value.type()) != value) {
+    throw BinderException(
+        "AT (VERSION => ...) requires an integer value, got %s",
+        value.ToString());
+  }
+  auto version = version_value.GetValue<int64_t>();
+  if (version < 1) {
+    throw BinderException(
+        "Lance table versions start at 1, got AT (VERSION => %lld)",
+        static_cast<long long>(version));
+  }
+  return NumericCast<idx_t>(version);
+}
+
 // The dataset version an AT clause names. VERSION is a Lance manifest version;
 // TIMESTAMP is the newest version committed at or before it. For TIMESTAMP,
 // also return the dataset handle whose manifests supplied that version.
@@ -347,30 +386,17 @@ static uint64_t ResolveAtClauseVersion(
     const BoundAtClause &at,
     shared_ptr<LanceDatasetCacheEntry> &out_timestamp_dataset,
     string &out_display_uri) {
-  const auto unit = StringUtil::Upper(at.Unit().GetIdentifierName());
+  if (LanceTableEntry::IsNumericAtVersion(at)) {
+    return LanceTableEntry::ParseNumericAtVersion(at);
+  }
   const auto &value = at.GetValue();
-  if (unit != "VERSION" && unit != "TIMESTAMP") {
+  if (!StringUtil::CIEquals(at.Unit().GetIdentifierName(), "TIMESTAMP")) {
     throw BinderException("Lance tables support AT (VERSION => ...) and "
                           "AT (TIMESTAMP => ...), not AT (%s => ...)",
                           at.Unit().GetIdentifierName());
   }
   if (value.IsNull()) {
-    throw BinderException("AT (%s => ...) requires a non-NULL value", unit);
-  }
-  if (unit == "VERSION") {
-    auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
-    if (version_value.DefaultCastAs(value.type()) != value) {
-      throw BinderException(
-          "AT (VERSION => ...) requires an integer value, got %s",
-          value.ToString());
-    }
-    auto version = version_value.GetValue<int64_t>();
-    if (version < 1) {
-      throw BinderException(
-          "Lance table versions start at 1, got AT (VERSION => %lld)",
-          static_cast<long long>(version));
-    }
-    return NumericCast<uint64_t>(version);
+    throw BinderException("AT (TIMESTAMP => ...) requires a non-NULL value");
   }
 
   const auto cutoff = GetTimestampCutoff(context, value);
@@ -401,14 +427,8 @@ static uint64_t ResolveAtClauseVersion(
 static shared_ptr<LanceDatasetCacheEntry>
 OpenAtClauseDataset(ClientContext &context, const LanceTableEntry &table,
                     const BoundAtClause &at) {
-  const auto &value = at.GetValue();
-  if (StringUtil::CIEquals(at.Unit().GetIdentifierName(), "VERSION") &&
-      !value.IsNull() && value.type().id() == LogicalTypeId::VARCHAR) {
-    const auto &reference = StringValue::Get(value);
-    if (StringUtil::StartsWith(reference, "tag:") ||
-        StringUtil::StartsWith(reference, "branch:")) {
-      return LanceGetNamedSnapshotForTable(context, table, reference);
-    }
+  if (auto reference = NamedAtReference(at)) {
+    return LanceGetNamedSnapshotForTable(context, table, *reference);
   }
   shared_ptr<LanceDatasetCacheEntry> timestamp_dataset;
   string display_uri;

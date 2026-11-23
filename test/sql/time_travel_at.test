@@ -205,6 +205,39 @@ SELECT * FROM ns.main.missing AT (VERSION => 1)
 ----
 Table with name missing does not exist
 
+# A fresh catalog can read a fixed version even when its head cannot be decoded.
+statement ok
+CREATE TABLE ns.main."ColdSnapshot" AS SELECT 11 AS old_id;
+
+statement ok
+SET VARIABLE first_manifest = (SELECT file FROM glob('{TEST_DIR}/ColdSnapshot.lance/_versions/*.manifest'));
+
+statement ok
+ALTER TABLE ns.main.ColdSnapshot ADD COLUMN newer VARCHAR;
+
+statement ok
+DETACH ns;
+
+statement ok
+SET VARIABLE head_manifest = (SELECT file FROM glob('{TEST_DIR}/ColdSnapshot.lance/_versions/*.manifest')
+                              WHERE file <> getvariable('first_manifest'));
+
+statement ok
+COPY (SELECT 'invalid manifest') TO (getvariable('head_manifest')) (FORMAT CSV, HEADER FALSE);
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+query I
+SELECT * FROM ns.main.coldsnapshot AT (VERSION => '1');
+----
+11
+
+statement error
+SELECT * FROM ns.main.coldsnapshot AT (VERSION => 2);
+----
+Failed to open version 2
+
 statement ok
 DETACH ns;
 

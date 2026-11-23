@@ -122,6 +122,9 @@ jobs:
       - name: Check DML RETURNING lifecycle
         run: python3 test/scripts/check_dml_returning_lifecycle.py --library build/release/src/libduckdb.so
 
+      - name: Check directory time travel across a root change
+        run: python3 test/scripts/check_directory_time_travel.py --library build/release/src/libduckdb.so
+
   test_s3:
     name: Test S3 (MinIO)
     runs-on: ubuntu-24.04
