@@ -545,6 +545,55 @@ public:
     return MakeNamespaceEntry(entry_name, table_id, std::move(live));
   }
 
+  unique_ptr<CatalogEntry> CreateVersionEntry(ClientContext &context,
+                                              const Identifier &name,
+                                              idx_t version,
+                                              string &managed_uri) {
+    const auto &entry_name = name.GetIdentifierName();
+    auto table_id = AppendRestNamespaceId(namespace_id, entry_name, delimiter);
+    string bearer_token, api_key;
+    ResolveAuth(context, bearer_token, api_key);
+    std::unique_ptr<const char, decltype(&lance_free_string)> identity(
+        lance_namespace_request_identity(
+            endpoint.c_str(), table_id.c_str(), bearer_token.c_str(),
+            api_key.c_str(), delimiter.c_str(), headers_tsv.c_str()),
+        lance_free_string);
+    if (!identity) {
+      throw IOException("Could not identify the Lance REST table" +
+                        LanceFormatErrorSuffix());
+    }
+    auto key = LanceRestVersionKey(context, identity.get(), version);
+    auto pin = LanceGetPinnedSnapshot(context, key);
+    if (!pin) {
+      string uri;
+      std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+          LanceOpenDatasetInNamespace(context, endpoint, table_id, bearer_token,
+                                      api_key, delimiter, headers_tsv, uri,
+                                      version),
+          lance_close_dataset);
+      if (!dataset) {
+        if (!uri.empty()) {
+          managed_uri = std::move(uri);
+          return nullptr;
+        }
+        if (lance_last_error_code() == LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND) {
+          return nullptr;
+        }
+        throw IOException(
+            "Failed to open version %llu of Lance namespace table %s%s",
+            version, table_id, LanceFormatErrorSuffix());
+      }
+      pin = make_shared_ptr<LanceDatasetCacheEntry>(dataset.get(),
+                                                    std::move(uri));
+      dataset.release();
+      LancePinSnapshot(context, key, pin);
+    }
+    auto live = LanceTableSchema::FromDataset(context, pin->Handle());
+    live.LoadTableComment(pin->Handle());
+    return MakeNamespaceEntry(entry_name, table_id, std::move(live),
+                              std::move(pin));
+  }
+
   vector<Identifier> GetDefaultEntries(ClientContext &context) override {
     string bearer_token;
     string api_key;
@@ -568,9 +617,10 @@ private:
                               api_key);
   }
 
-  unique_ptr<CatalogEntry> MakeNamespaceEntry(const string &entry_name,
-                                              const string &table_id,
-                                              LanceTableSchema live) {
+  unique_ptr<CatalogEntry>
+  MakeNamespaceEntry(const string &entry_name, const string &table_id,
+                     LanceTableSchema live,
+                     shared_ptr<LanceDatasetCacheEntry> snapshot = nullptr) {
     CreateTableInfo info(schema, Identifier(entry_name));
     info.internal = true;
     info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
@@ -585,8 +635,8 @@ private:
     cfg.bearer_token_override = bearer_token_override;
     cfg.api_key_override = api_key_override;
     cfg.headers_tsv = headers_tsv;
-    auto entry =
-        make_uniq<LanceTableEntry>(catalog, schema, info, std::move(cfg));
+    auto entry = make_uniq<LanceTableEntry>(
+        catalog, schema, info, std::move(cfg), std::move(snapshot));
     entry->SetCoercedColumnNames(std::move(live.coerced_columns));
     entry->SetJsonColumnNames(std::move(live.json_columns));
     entry->SetBlobColumns(std::move(live.blob_columns));
@@ -737,13 +787,18 @@ public:
     }
   };
 
-  string DirectoryRoot(ClientContext &context, const string &root) {
+  void BeginSnapshotBinding(ClientContext &context) {
     auto query_id = context.transaction.GetActiveQuery();
     if (query_id != snapshot_query_id) {
       directory_names.clear();
       directory_roots.clear();
+      rest_names.clear();
       snapshot_query_id = query_id;
     }
+  }
+
+  string DirectoryRoot(ClientContext &context, const string &root) {
+    BeginSnapshotBinding(context);
     auto found = directory_roots.find(root);
     if (found == directory_roots.end()) {
       // Hold the target of a local directory symlink for the whole statement.
@@ -758,6 +813,12 @@ public:
     return directory_names[binding_key][name];
   }
 
+  identifier_map_t<Identifier> &RestNames(ClientContext &context,
+                                          SchemaCatalogEntry &schema) {
+    BeginSnapshotBinding(context);
+    return rest_names[&schema];
+  }
+
   void Pin(const shared_ptr<CatalogEntry> &entry) {
     entries.emplace(entry.get(), entry);
   }
@@ -765,6 +826,7 @@ public:
     entries.clear();
     directory_names.clear();
     directory_roots.clear();
+    rest_names.clear();
   }
 
 private:
@@ -772,6 +834,7 @@ private:
   unordered_map<CatalogEntry *, shared_ptr<CatalogEntry>> entries;
   idx_t snapshot_query_id = DConstants::INVALID_INDEX;
   unordered_map<string, identifier_map_t<DirectoryNames>> directory_names;
+  unordered_map<SchemaCatalogEntry *, identifier_map_t<Identifier>> rest_names;
 };
 
 static optional_ptr<CatalogEntry>
@@ -1078,6 +1141,7 @@ public:
       }
     }
 
+    rest_names.erase(lance_entry->name);
     tables.erase(current);
     LanceInvalidateDatasetCache(context, cache_key);
   }
@@ -1384,8 +1448,67 @@ private:
           *transaction.context, name, *at_clause,
           found == tables.end() ? nullptr : found->second.get());
     }
+    Identifier backend_name = name;
+    string managed_uri;
+    if (rest_ns) {
+      auto known = rest_names.find(name);
+      if (found != tables.end()) {
+        backend_name = found->second->name;
+      } else if (known != rest_names.end()) {
+        backend_name = known->second;
+      }
+      if (at_clause && LanceTableEntry::IsNumericAtVersion(*at_clause)) {
+        optional_idx version;
+        try {
+          version = LanceTableEntry::ParseNumericAtVersion(*at_clause);
+        } catch (const Exception &) {
+          // Let normal catalog lookup diagnose a missing table before the
+          // regular AT binder reports an invalid selector.
+        }
+        if (version.IsValid()) {
+          auto &context = *transaction.context;
+          auto state =
+              context.registered_state->GetOrCreate<LanceCatalogQueryState>(
+                  "lance_catalog_entries");
+          auto &statement_names = state->RestNames(context, *this);
+          auto bound = statement_names.find(name);
+          if (bound != statement_names.end()) {
+            backend_name = bound->second;
+          }
+          auto &generator = static_cast<LanceRestNamespaceDefaultGenerator &>(
+              *table_default_generator);
+          auto view =
+              generator.CreateVersionEntry(*transaction.context, backend_name,
+                                           version.GetIndex(), managed_uri);
+          if (!view && managed_uri.empty() && bound == statement_names.end()) {
+            // The exact cached spelling disappeared. A different case-sensitive
+            // REST ID can now occupy this case-insensitive DuckDB name.
+            tables.erase(name);
+            found = tables.end();
+            rest_names.erase(name);
+            if (backend_name.GetIdentifierName() != name.GetIdentifierName()) {
+              backend_name = name;
+              view = generator.CreateVersionEntry(
+                  *transaction.context, backend_name, version.GetIndex(),
+                  managed_uri);
+            }
+          }
+          if (view) {
+            if (bound == statement_names.end()) {
+              statement_names.emplace(name, backend_name);
+              rest_names.insert_or_assign(name, backend_name);
+            }
+            return PinLanceCatalogEntry(
+                *transaction.context,
+                shared_ptr<CatalogEntry>(std::move(view)));
+          }
+          if (managed_uri.empty()) {
+            return nullptr;
+          }
+        }
+      }
+    }
     if (found == tables.end()) {
-      Identifier backend_name = name;
       if (directory_ns) {
         if (physical_name) {
           backend_name = *physical_name;
@@ -1400,6 +1523,12 @@ private:
       }
       auto entry = table_default_generator->CreateDefaultEntry(
           *transaction.context, backend_name);
+      if (!entry && rest_ns &&
+          backend_name.GetIdentifierName() != name.GetIdentifierName()) {
+        rest_names.erase(name);
+        entry = table_default_generator->CreateDefaultEntry(
+            *transaction.context, name);
+      }
       if (!entry) {
         return nullptr;
       }
@@ -1424,8 +1553,8 @@ private:
     }
     // Resolved against the latest entry so a missing table fails the same way;
     // the view is per lookup and never cached. The query pins it.
-    auto view = latest->Cast<LanceTableEntry>().AtClause(*transaction.context,
-                                                         *at_clause);
+    auto view = latest->Cast<LanceTableEntry>().AtClause(
+        *transaction.context, *at_clause, managed_uri);
     return PinLanceCatalogEntry(*transaction.context,
                                 shared_ptr<CatalogEntry>(std::move(view)));
   }
@@ -1433,6 +1562,7 @@ private:
   void InvalidateTableEntry(const Identifier &name) {
     lock_guard<mutex> guard(table_lock);
     tables.erase(name);
+    rest_names.erase(name);
   }
 
   shared_ptr<LanceDirectoryNamespaceConfig> directory_ns;
@@ -1440,6 +1570,9 @@ private:
   unique_ptr<LanceTableGenerator> table_default_generator;
   mutex table_lock;
   identifier_map_t<shared_ptr<CatalogEntry>> tables;
+  // A historical entry must not publish its columns as the live schema. Keep
+  // only the exact spelling originally resolved by this DuckDB attachment.
+  identifier_map_t<Identifier> rest_names;
 };
 
 static bool IsProtectedLanceSchema(const Identifier &name) {

@@ -59,6 +59,13 @@ shared_ptr<LanceDatasetCacheEntry> LanceGetDirectorySnapshot(
     ClientContext &context, const LanceNamespaceTableConfig &table,
     const string &binding_key, idx_t version, bool pinned_only);
 
+string LanceRestVersionKey(ClientContext &context, const string &namespace_key,
+                           idx_t version);
+shared_ptr<LanceDatasetCacheEntry>
+LanceGetPinnedSnapshot(ClientContext &context, const string &key);
+void LancePinSnapshot(ClientContext &context, const string &key,
+                      shared_ptr<LanceDatasetCacheEntry> snapshot);
+
 // A write's target reads must use its pinned generation across the complete
 // statement, even when DuckDB plans CTE producers outside the write subtree.
 void LancePinDatasetForWrite(ClientContext &context,

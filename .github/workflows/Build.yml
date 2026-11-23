@@ -66,7 +66,7 @@ jobs:
           GEN=ninja make release -j 4
 
       - name: Check AT TIMESTAMP dataset identity
-        run: python3 test/scripts/check_time_travel_at_rest.py
+        run: python3 test/scripts/check_time_travel_at_rest.py --library build/release/src/libduckdb.so
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7

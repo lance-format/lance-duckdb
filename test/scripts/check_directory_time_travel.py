@@ -4,6 +4,7 @@ import argparse
 import ctypes as c
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -18,10 +19,9 @@ class Result(c.Structure):
     ]
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--library", required=True, type=Path)
-    lib = c.CDLL(str(parser.parse_args().library.resolve()))
+@contextmanager
+def binding_connections(library):
+    lib = c.CDLL(str(library.resolve()))
     ptr = c.c_void_p
 
     def bind(name, result, *args):
@@ -78,6 +78,18 @@ def main():
         callbacks.append(change_binding)  # DuckDB borrows the Python callback.
 
     try:
+        yield sql, writer, register_change
+    finally:
+        disconnect = bind("disconnect", None, c.POINTER(ptr))
+        disconnect(c.byref(writer))
+        disconnect(c.byref(connection))
+        bind("close", None, c.POINTER(ptr))(c.byref(database))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--library", required=True, type=Path)
+    with binding_connections(parser.parse_args().library) as (sql, writer, register_change):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             original_cwd = Path.cwd()
@@ -157,11 +169,6 @@ def main():
         )
         assert counts == [1, 1, 1, 2], counts
         assert sql("SELECT count(*) FROM cold.main.history AT (VERSION => 1)", 1) == [2]
-    finally:
-        disconnect = bind("disconnect", None, c.POINTER(ptr))
-        disconnect(c.byref(writer))
-        disconnect(c.byref(connection))
-        bind("close", None, c.POINTER(ptr))(c.byref(database))
 
 
 if __name__ == "__main__":

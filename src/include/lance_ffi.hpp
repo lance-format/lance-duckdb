@@ -139,7 +139,8 @@ int32_t lance_namespace_describe_table_with_schema(
 int32_t lance_namespace_describe_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
-    const char **out_location, const char **out_storage_options_tsv);
+    const char **out_location, const char **out_storage_options_tsv,
+    const char *expected_managed_uri);
 int32_t lance_namespace_create_empty_table(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
@@ -157,6 +158,15 @@ void *lance_open_dataset_in_namespace_with_session(
     const char *endpoint, const char *table_id, const char *bearer_token,
     const char *api_key, const char *delimiter, const char *headers_tsv,
     void *session, const char **out_table_uri);
+void *lance_open_namespace_version(const char *endpoint, const char *table_id,
+                                   const char *bearer_token,
+                                   const char *api_key, const char *delimiter,
+                                   const char *headers_tsv, void *session,
+                                   int64_t version, const char **out_table_uri);
+const char *
+lance_namespace_request_identity(const char *endpoint, const char *table_id,
+                                 const char *bearer_token, const char *api_key,
+                                 const char *delimiter, const char *headers);
 int32_t lance_dataset_checkout_latest_if_stale(void *dataset,
                                                void **out_new_dataset);
 int32_t lance_dataset_namespace_checkout_latest_if_stale(

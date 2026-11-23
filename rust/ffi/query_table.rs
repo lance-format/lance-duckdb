@@ -18,12 +18,13 @@ use lance_namespace::models::{
     QueryTableRequestVector, StringFtsQuery, StructuredFtsQuery,
 };
 use lance_namespace::LanceNamespace;
-use lance_namespace_impls::{DirectoryNamespaceBuilder, RestNamespaceBuilder};
+use lance_namespace_impls::DirectoryNamespaceBuilder;
 
 use crate::constants::ROW_ID_COLUMN;
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
 use crate::runtime;
 
+use super::namespace::build_config as rest_namespace_builder;
 use super::search::parse_fts_query_json;
 use super::types::StreamHandle;
 use super::util::{
@@ -84,7 +85,7 @@ enum NamespaceBackend {
         bearer_token: Option<String>,
         api_key: Option<String>,
         delimiter: Option<String>,
-        headers: Vec<(String, String)>,
+        headers_tsv: Option<String>,
     },
 }
 
@@ -160,22 +161,6 @@ unsafe fn parse_storage_options(
     Ok(keys.into_iter().zip(values).collect())
 }
 
-fn parse_headers_tsv(headers_tsv: Option<&str>) -> Vec<(String, String)> {
-    headers_tsv
-        .map(|tsv| {
-            tsv.lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, '\t');
-                    match (parts.next(), parts.next()) {
-                        (Some(k), Some(v)) if !k.is_empty() => Some((k.to_string(), v.to_string())),
-                        _ => None,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 unsafe fn parse_config(
     config: *const LanceNamespaceQueryConfig,
 ) -> FfiResult<ParsedNamespaceQueryConfig> {
@@ -217,13 +202,12 @@ unsafe fn parse_config(
             let delimiter = unsafe { optional_cstr_to_string(config.delimiter, "delimiter")? };
             let headers_tsv =
                 unsafe { optional_cstr_to_string(config.headers_tsv, "headers_tsv")? };
-            let headers = parse_headers_tsv(headers_tsv.as_deref());
             NamespaceBackend::Rest {
                 endpoint,
                 bearer_token,
                 api_key,
                 delimiter,
-                headers,
+                headers_tsv,
             }
         }
         other => {
@@ -302,18 +286,14 @@ async fn execute_query_table(
             bearer_token,
             api_key,
             delimiter,
-            headers,
+            headers_tsv,
         } => {
-            let mut builder = RestNamespaceBuilder::new(&endpoint);
-            if let Some(token) = bearer_token {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
-            if let Some(key) = api_key {
-                builder = builder.header("x-api-key", key);
-            }
-            for (key, value) in headers {
-                builder = builder.header(key, value);
-            }
+            let mut builder = rest_namespace_builder(
+                &endpoint,
+                bearer_token.as_deref(),
+                api_key.as_deref(),
+                headers_tsv.as_deref(),
+            );
             if let Some(delimiter) = delimiter {
                 builder = builder.delimiter(delimiter);
             }
@@ -995,7 +975,7 @@ mod tests {
                 bearer_token: None,
                 api_key: None,
                 delimiter: Some("$".to_string()),
-                headers: Vec::new(),
+                headers_tsv: None,
             },
             table_id: "parent$child$table".to_string(),
             columns: columns.iter().map(|column| (*column).to_string()).collect(),

@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from check_directory_time_travel import binding_connections
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA = {"fields": [{"name": "id", "nullable": True, "type": {"type": "int64"}}]}
@@ -25,6 +26,7 @@ SCHEMA = {"fields": [{"name": "id", "nullable": True, "type": {"type": "int64"}}
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duckdb", type=Path, default=REPO_ROOT / "build" / "release" / "duckdb")
+    parser.add_argument("--library", type=Path, help="Run the two-connection catalog binding check")
     parser.add_argument(
         "--extension",
         type=Path,
@@ -69,6 +71,15 @@ def main() -> None:
         move_on_marker = False
         moves: list[str] = []
         tag_requests: list[str] = []
+        historical = Path(tmp) / "historical.lance"
+        shutil.copytree(REPO_ROOT / "test/data/branch_tag_fixture.lance", historical)
+        min((historical / "_versions").glob("*.manifest")).write_bytes(b"bad\n")
+        fixed_requests = []
+        fixed_managed = False
+        fixed_denied = False
+        swapped = False
+        managed_flip = False
+        casepair_exists = True
         # The physical table sees v2 while the namespace can reach v3 at its
         # registered manifest path. Describes always return the same table URI.
         authority_table = Path(tmp) / "authority.lance"
@@ -89,10 +100,44 @@ def main() -> None:
                 pass
 
             def handle_request(self) -> None:
+                nonlocal swapped, casepair_exists
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 path = unquote(urlparse(self.path).path)
                 status = 200
-                if "/default$authority/" in path and path.endswith("/version/list"):
+                if "/default$historical/" in path and path.endswith("/describe"):
+                    request = json.loads(body)
+                    fixed_requests.append(request)
+                    response = {"location": str(historical)}
+                    if request.get("load_detailed_metadata"):
+                        status, response = 500, {"code": 500, "error": "unreadable current manifest"}
+                    elif request.get("version") is not None:
+                        response = {
+                            "location": "relative/location",
+                            "table_uri": historical.resolve().as_uri(),
+                            "managed_versioning": fixed_managed,
+                        }
+                        if fixed_denied:
+                            status = 403
+                            response = {"code": 403, "error": "Forbidden", "message": "version access denied"}
+                elif "/default$swapping/" in path and path.endswith("/describe"):
+                    response = {"location": dataset_b if swapped else dataset_a}
+                elif "/default$SWAPPING/" in path and path.endswith("/describe"):
+                    status, response = 404, {"code": 4, "error": "table not found"}
+                elif "/default$CasePair/" in path and path.endswith("/drop"):
+                    casepair_exists = False
+                    response = {}
+                elif "/default$CasePair/" in path and not casepair_exists:
+                    status, response = 404, {"code": 4, "error": "table not found", "message": "CasePair was dropped"}
+                elif "/default$CasePair/" in path and path.endswith("/describe"):
+                    response = {"location": dataset_a}
+                elif "/default$casepair/" in path and path.endswith("/describe"):
+                    response = {"location": dataset_b}
+                elif "/default$restricted/" in path and path.endswith("/describe"):
+                    response = {"location": dataset_b if self.headers.get("x-api-key") == "secondary" else dataset_a}
+                elif "/default$switch/" in path and path.endswith("/describe"):
+                    swapped = True
+                    response = {"location": dataset_a}
+                elif "/default$authority/" in path and path.endswith("/version/list"):
                     response: object = {"versions": [registry_head]}
                 elif "/default$authority/" in path and path.endswith("/version/describe"):
                     version_lookups.append(json.loads(body)["version"])
@@ -102,6 +147,10 @@ def main() -> None:
                     response = {"location": str(authority_table.resolve()), "schema": SCHEMA}
                     if registry_on.exists():
                         response["managed_versioning"] = not registry_off.exists()
+                    if managed_flip and json.loads(body).get("load_detailed_metadata") is None:
+                        response["managed_versioning"] = False
+                    if response.get("managed_versioning") and json.loads(body).get("version") is not None:
+                        status, response = 403, {"code": 403, "error": "Forbidden", "message": "use the registry"}
                 elif path.endswith("/table/list"):
                     response = {"tables": ["t", "marker", "authority"] if move_on_marker else ["t", "authority"]}
                 elif path.endswith("/list") and "/namespace/" in path:
@@ -137,9 +186,111 @@ def main() -> None:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            attach = (
-                f"LOAD '{args.extension}'; ATTACH 'default' AS ns "
-                f"(TYPE LANCE, ENDPOINT 'http://127.0.0.1:{server.server_port}'); "
+            endpoint = f"http://127.0.0.1:{server.server_port}"
+
+            def mount(alias, url=endpoint, options=""):
+                return f"ATTACH 'default' AS {alias} (TYPE LANCE, ENDPOINT '{url}'{options}); "
+
+            load = f"LOAD '{args.extension}'; "
+            attach = load + mount("ns")
+            for push_query in ("true", "false"):
+                fixed_requests.clear()
+                duckdb(
+                    attach + f"SET lance_namespace_query_table={push_query}; "
+                    "SELECT avg(id) FROM ns.main.historical AT (VERSION => 1);",
+                    "1.0",
+                )
+                if (
+                    len(fixed_requests) != 2
+                    or fixed_requests[0].get("version") is not None
+                    or fixed_requests[0].get("load_detailed_metadata")
+                ):
+                    raise RuntimeError(f"unexpected cold discovery: {fixed_requests}")
+                fixed = fixed_requests[1]
+                if (
+                    fixed.get("version"),
+                    fixed.get("with_table_uri"),
+                    fixed.get("vend_credentials"),
+                    fixed.get("load_detailed_metadata"),
+                ) != (1, True, True, False):
+                    raise RuntimeError(f"unexpected historical describe: {fixed}")
+            duckdb(
+                attach + "SELECT * FROM ns.main.historical AT (VERSION => 3);",
+                expected_error="Failed to open version 3",
+            )
+            fixed_managed = True
+            duckdb(
+                attach + "SELECT * FROM ns.main.historical AT (VERSION => 1);",
+                expected_error="changed to managed versioning",
+            )
+            fixed_managed = False
+            fixed_denied = True
+            duckdb(attach + "SELECT * FROM ns.main.historical AT (VERSION => 1);", expected_error="Forbidden")
+            fixed_denied = False
+
+            # A previously bound attachment and a cold alias must agree even
+            # when binding the intervening relation moves the namespace table.
+            for first, last in (("ns", "alias"), ("alias", "ns")):
+                swapped = False
+                duckdb(
+                    load
+                    + mount("ns", options=", API_KEY 'secondary', HEADER 'X-One=one;x-two=two'")
+                    + mount(
+                        "alias",
+                        endpoint.replace("http:", "HTTP:"),
+                        ", HEADER 'X-TWO=two;X-Api-Key=secondary;x-one=one'",
+                    )
+                    + "SET lance_namespace_query_table=false; SELECT count(*) FROM ns.main.swapping; "
+                    f"SELECT a.n,b.n FROM (SELECT count(*) n FROM {first}.main.swapping AT (VERSION => 1)) a, "
+                    "(SELECT count(*) FROM ns.main.switch AT (VERSION => 1)) marker, "
+                    f"(SELECT count(*) n FROM {last}.main.swapping AT (VERSION => 1)) b; "
+                    "SELECT count(*) FROM alias.main.swapping AT (VERSION => 1);",
+                    "1\n1|1\n10",
+                )
+            swapped = False
+            duckdb(
+                attach + "SET lance_namespace_query_table=false; "
+                "SELECT a.id,b.id FROM ns.main.swapping a AT (VERSION => 1), ns.main.SWAPPING b AT (VERSION => 1); "
+                "SELECT id FROM ns.main.SWAPPING AT (VERSION => 1); SELECT count(*) FROM ns.main.SWAPPING;",
+                "1|1\n1\n1",
+            )
+            duckdb(
+                attach + mount("alias") + "SELECT (SELECT count(*) FROM ns.main.CasePair AT (VERSION => 1)), "
+                "(SELECT count(*) FROM alias.main.casepair AT (VERSION => 1));",
+                "1|10",
+            )
+            if args.library:
+                with binding_connections(args.library) as (sql, writer, register_change):
+                    sql(mount("ns"))
+
+                    def rebind_casepair():
+                        sql("DROP TABLE ns.main.CasePair", client=writer)
+                        observed = sql("SELECT count(*) FROM ns.main.casepair AT (VERSION => 1)", 1, writer)
+                        if observed != [10]:
+                            raise RuntimeError(f"writer selected the wrong REST table: {observed}")
+
+                    register_change("rebind_casepair", rebind_casepair)
+                    assert sql(
+                        "SELECT (SELECT count(*) FROM ns.main.CasePair AT (VERSION => 1)), "
+                        "(SELECT count(*) FROM ns.main.casepair AT (VERSION => rebind_casepair()))",
+                        2,
+                    ) == [1, 1]
+                    assert sql("SELECT count(*) FROM ns.main.casepair AT (VERSION => 1)", 1) == [10]
+                # After DROP, the caller's spelling resolves afresh even if the
+                # old exact ID has since been registered again.
+                casepair_exists = True
+                with binding_connections(args.library) as (sql, _, _register_change):
+                    sql(mount("ns"))
+                    assert sql("SELECT count(*) FROM ns.main.CasePair AT (VERSION => 1)", 1) == [1]
+                    sql("DROP TABLE ns.main.CasePair")
+                    casepair_exists = True
+                    assert sql("SELECT count(*) FROM ns.main.casepair AT (VERSION => 1)", 1) == [10]
+            duckdb(
+                attach
+                + mount("limited", options=", API_KEY 'secondary'")
+                + "SELECT (SELECT count(*) FROM ns.main.restricted AT (VERSION => 1)), "
+                "(SELECT count(*) FROM limited.main.restricted AT (VERSION => 1));",
+                "1|10",
             )
             for operation in ("CREATE TAG 'new' AT VERSION 1", "DROP TAG 'dev_tag'"):
                 describes.clear()
@@ -222,6 +373,14 @@ def main() -> None:
 
             # The registry's v3 is outside the directory, whose latest version is v2.
             registry_off.unlink()
+            version_lookups.clear()
+            duckdb(attach + "SELECT id FROM ns.main.authority AT (VERSION => 2);", "2")
+            managed_flip = True
+            duckdb(
+                attach + "SELECT id FROM ns.main.authority AT (VERSION => 2);",
+                expected_error="namespace table changed while binding a managed snapshot",
+            )
+            managed_flip = False
             version_lookups.clear()
             duckdb(attach + "SELECT id FROM ns.main.authority AT (TIMESTAMP => TIMESTAMPTZ 'infinity');", "3")
             if version_lookups:
