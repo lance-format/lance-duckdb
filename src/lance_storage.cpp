@@ -766,6 +766,13 @@ static void CheckCreateTableOptions(const CreateTableInfo &create_info) {
   }
 }
 
+static void CheckLanceTableColumns(const ColumnList &columns) {
+  // DuckDB excludes virtual generated columns from the physical column list.
+  if (columns.LogicalColumnCount() != columns.PhysicalColumnCount()) {
+    throw CatalogException("Lance tables do not support generated columns");
+  }
+}
+
 // The namespace is authoritative; these entries are an in-memory metadata
 // cache, not DuckDB native storage. Queries pin every generation they bind so a
 // refresh, ALTER or DROP cannot destroy an entry still used by another
@@ -1213,6 +1220,7 @@ public:
           exists) {
         throw IOException("Lance table already exists: " + table_id_for_ops);
       }
+      CheckLanceTableColumns(create_info.columns);
       if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT &&
           exists) {
         string drop_error;
@@ -1268,7 +1276,7 @@ public:
           exists) {
         throw IOException("Lance dataset already exists: " + dataset_path);
       }
-
+      CheckLanceTableColumns(create_info.columns);
       option_keys = directory_ns->option_keys;
       option_values = directory_ns->option_values;
     }

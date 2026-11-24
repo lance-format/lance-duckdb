@@ -22,6 +22,14 @@ statement ok
 CREATE TABLE ns."${LANCE_TEST_SCHEMA}".routed_table AS SELECT 42 AS id;
 
 statement ok
+CREATE TABLE IF NOT EXISTS ns."${LANCE_TEST_SCHEMA}".routed_table (id INTEGER, twice AS (id * 2));
+
+statement error
+CREATE OR REPLACE TABLE ns."${LANCE_TEST_SCHEMA}".routed_table (id INTEGER, twice AS (id * 2));
+----
+Lance tables do not support generated columns
+
+statement ok
 DETACH ns;
 
 statement ok
@@ -31,6 +39,11 @@ query T
 SHOW TABLES FROM ns."${LANCE_TEST_SCHEMA}"
 ----
 routed_table
+
+query I
+SELECT id FROM ns."${LANCE_TEST_SCHEMA}".routed_table;
+----
+42
 
 query I
 SELECT count(*) FROM duckdb_tables()
