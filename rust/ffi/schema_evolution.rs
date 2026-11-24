@@ -8,7 +8,7 @@ use crate::runtime;
 use arrow::compute;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use lance::dataset::cleanup::CleanupPolicyBuilder;
 use lance::dataset::optimize::{compact_files, CompactionOptions};
 use lance::dataset::{BatchUDF, ColumnAlteration, NewColumnTransform};
@@ -111,7 +111,8 @@ struct CompactFilesOptionsInput {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CleanupOldVersionsOptionsInput {
-    older_than_seconds: i64,
+    #[serde(deserialize_with = "deserialize_cleanup_age")]
+    older_than_seconds: Option<i64>,
     delete_unverified: bool,
     error_if_tagged_old_versions: bool,
     retain_n_versions: Option<u64>,
@@ -127,12 +128,44 @@ struct CleanupOldVersionsMetricsOutput {
 impl Default for CleanupOldVersionsOptionsInput {
     fn default() -> Self {
         Self {
-            older_than_seconds: 0,
+            older_than_seconds: None,
             delete_unverified: false,
             error_if_tagged_old_versions: true,
             retain_n_versions: None,
         }
     }
+}
+
+impl CleanupOldVersionsOptionsInput {
+    fn cutoff(&self, now: DateTime<Utc>) -> FfiResult<DateTime<Utc>> {
+        // PyLance applies its two-week window only when both selectors are omitted.
+        let seconds = match (self.older_than_seconds, self.retain_n_versions) {
+            (Some(age), _) => age,
+            (None, Some(_)) => 0,
+            (None, None) => 14 * 24 * 60 * 60,
+        };
+        if seconds < 0 {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "older_than_seconds must be >= 0",
+            ));
+        }
+        Duration::try_seconds(seconds)
+            .and_then(|age| now.checked_sub_signed(age))
+            .ok_or_else(|| {
+                FfiError::new(
+                    ErrorCode::InvalidArgument,
+                    "older_than_seconds is too large",
+                )
+            })
+    }
+}
+
+// An omitted age selects the retention default. Explicit JSON null is invalid.
+fn deserialize_cleanup_age<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error> {
+    i64::deserialize(deserializer).map(Some)
 }
 
 fn parse_compaction_options_json(options_json: *const c_char) -> FfiResult<CompactionOptions> {
@@ -910,7 +943,7 @@ pub unsafe extern "C" fn lance_dataset_cleanup_old_versions(
     delete_unverified: u8,
 ) -> i32 {
     let options = CleanupOldVersionsOptionsInput {
-        older_than_seconds,
+        older_than_seconds: Some(older_than_seconds),
         delete_unverified: delete_unverified != 0,
         ..Default::default()
     };
@@ -968,12 +1001,7 @@ fn dataset_cleanup_old_versions_with_options_struct(
     options: CleanupOldVersionsOptionsInput,
     out_metrics_json: *mut *const c_char,
 ) -> FfiResult<()> {
-    if options.older_than_seconds < 0 {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "older_than_seconds must be >= 0",
-        ));
-    }
+    let cutoff = options.cutoff(Utc::now())?;
     if options.retain_n_versions == Some(0) {
         return Err(FfiError::new(
             ErrorCode::InvalidArgument,
@@ -984,7 +1012,7 @@ fn dataset_cleanup_old_versions_with_options_struct(
     let handle = unsafe { super::util::dataset_handle(dataset)? };
     let ds = (*handle.dataset).clone();
     let mut builder = CleanupPolicyBuilder::default()
-        .before_timestamp(Utc::now() - Duration::seconds(options.older_than_seconds))
+        .before_timestamp(cutoff)
         .delete_unverified(options.delete_unverified)
         .error_if_tagged_old_versions(options.error_if_tagged_old_versions);
 
@@ -1248,7 +1276,25 @@ fn dataset_create_scalar_index_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use std::ffi::CString;
+
+    #[test]
+    fn cleanup_cutoff_defaults_to_fourteen_days_only_without_selectors() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 24, 12, 0, 0).unwrap();
+        let cutoff = |json| {
+            serde_json::from_str::<CleanupOldVersionsOptionsInput>(json)
+                .unwrap()
+                .cutoff(now)
+                .unwrap()
+        };
+        assert_eq!(
+            cutoff("{}"),
+            Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap()
+        );
+        assert_eq!(cutoff(r#"{"older_than_seconds":0}"#), now);
+        assert_eq!(cutoff(r#"{"retain_n_versions":2}"#), now);
+    }
 
     fn compaction_options_from_json(json: &str) -> CompactionOptions {
         let owned = CString::new(json).expect("json holds no interior nul");
