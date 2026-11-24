@@ -1,0 +1,74 @@
+# name: test/sql/namespace_directory_ddl_transaction.test
+# description: Directory table DDL must not publish changes that cannot be rolled back
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/directory_ddl_transaction' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.kept AS SELECT 7 AS i;
+
+statement ok
+BEGIN;
+
+statement error
+DROP TABLE ns.kept;
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+CREATE TABLE ns.created(i INTEGER);
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+CREATE OR REPLACE TABLE ns.kept AS SELECT 99 AS i;
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+EXPLAIN CREATE TABLE ns.planned AS SELECT 1 AS i;
+
+statement error
+EXPLAIN ANALYZE CREATE TABLE ns.planned AS SELECT 1 AS i;
+----
+Not implemented Error: Lance table DDL does not support explicit transactions
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/directory_ddl_transaction' AS ns (TYPE LANCE);
+
+query T
+SHOW TABLES FROM ns;
+----
+kept
+
+query I
+SELECT i FROM ns.kept;
+----
+7

@@ -59,6 +59,13 @@
 
 namespace duckdb {
 
+void RequireLanceTableDDLAutocommit(ClientContext &context) {
+  if (!context.transaction.IsAutoCommit()) {
+    throw NotImplementedException(
+        "Lance table DDL does not support explicit transactions");
+  }
+}
+
 // Mirrored by ErrorCode::NamespaceTableNotFound in rust/error.rs.
 static constexpr int32_t LANCE_FFI_NAMESPACE_TABLE_NOT_FOUND = 57;
 
@@ -1078,10 +1085,7 @@ public:
       DuckSchemaEntry::DropEntry(context, info);
       return;
     }
-    if (rest_ns && !context.transaction.IsAutoCommit()) {
-      throw NotImplementedException(
-          "Lance table DDL does not support explicit transactions");
-    }
+    RequireLanceTableDDLAutocommit(context);
     auto cache_key = LanceBuildDatasetCacheKeyForTable(context, *lance_entry);
     lock_guard<mutex> guard(table_lock);
     auto current = tables.find(lance_entry->name);
@@ -1165,10 +1169,7 @@ public:
           "Lance CREATE TABLE does not support constraints");
     }
     auto &context = transaction.GetContext();
-    if (rest_ns && !context.transaction.IsAutoCommit()) {
-      throw NotImplementedException(
-          "Lance table DDL does not support explicit transactions");
-    }
+    RequireLanceTableDDLAutocommit(context);
     auto data_storage_version =
         GetCreateTableDataStorageVersionOption(create_info);
     auto enable_stable_row_ids = GetCreateTableStableRowIdsOption(create_info);
@@ -2000,9 +2001,8 @@ public:
                                       LogicalCreateTable &op,
                                       PhysicalOperator &plan) override {
     auto &create_info = op.info->Base();
-    if (rest_ns && !context.transaction.IsAutoCommit()) {
-      throw NotImplementedException(
-          "Lance table DDL does not support explicit transactions");
+    if (rest_ns) {
+      RequireLanceTableDDLAutocommit(context);
     }
     CheckCreateTableOptions(create_info);
     auto data_storage_version =
@@ -2417,7 +2417,7 @@ public:
           Value::BOOLEAN(enable_stable_row_ids == 1)};
     }
 
-    return PlanLanceCopy(
+    return PlanLanceDirectoryCTAS(
         context, planner, copy_info,
         StringsToIdentifiers(create_info.columns.GetColumnNames()),
         create_info.columns.GetColumnTypes(), plan);

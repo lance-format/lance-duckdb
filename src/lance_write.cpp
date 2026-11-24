@@ -19,6 +19,7 @@
 #include "lance_dataset_cache.hpp"
 #include "lance_ffi.hpp"
 #include "lance_session_state.hpp"
+#include "lance_storage.hpp"
 
 #include <cstdint>
 
@@ -26,6 +27,7 @@ namespace duckdb {
 
 struct LanceWriteBindData {
   string mode = "create";
+  bool is_directory_ctas = false;
   bool write_empty_file = true;
   string data_storage_version = LANCE_DEFAULT_DATA_STORAGE_VERSION;
   int8_t enable_stable_row_ids = LANCE_STABLE_ROW_IDS_UNSPECIFIED;
@@ -264,6 +266,9 @@ public:
 
   unique_ptr<GlobalSinkState>
   GetGlobalSinkState(ClientContext &context) const override {
+    if (bind_data.is_directory_ctas) {
+      RequireLanceTableDDLAutocommit(context);
+    }
     return LanceWriteInitGlobal(context, bind_data, path);
   }
 
@@ -298,14 +303,16 @@ private:
   LanceWriteBindData bind_data;
 };
 
-PhysicalOperator &PlanLanceCopy(ClientContext &context,
-                                PhysicalPlanGenerator &planner, CopyInfo &info,
-                                const vector<Identifier> &names,
-                                const vector<LogicalType> &types,
-                                PhysicalOperator &child) {
+PhysicalOperator &PlanLanceDirectoryCTAS(ClientContext &context,
+                                         PhysicalPlanGenerator &planner,
+                                         CopyInfo &info,
+                                         const vector<Identifier> &names,
+                                         const vector<LogicalType> &types,
+                                         PhysicalOperator &child) {
+  auto bind_data = LanceWriteBind(context, info, names, types);
+  bind_data.is_directory_ctas = true;
   auto &copy = planner.Make<PhysicalLanceCopy>(
-      info.file_path, LanceWriteBind(context, info, names, types),
-      child.estimated_cardinality);
+      info.file_path, std::move(bind_data), child.estimated_cardinality);
   copy.children.push_back(child);
   return copy;
 }
