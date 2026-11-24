@@ -480,6 +480,15 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
     throw NotImplementedException(
         "Lance DDL does not support explicit transactions yet");
   }
+  if (!context.ActiveQueryIsLastStatement() &&
+      info.type == AlterType::ALTER_TABLE &&
+      info.Cast<AlterTableInfo>().alter_table_type ==
+          AlterTableType::ADD_COLUMN) {
+    // DuckDB runs expanded statements in one transaction. Lance publishes the
+    // added field immediately and cannot roll it back if a later step fails.
+    throw NotImplementedException("Lance ADD COLUMN cannot run before another "
+                                  "step of the same statement");
+  }
 
   string display_uri;
   void *dataset = LanceOpenDatasetForTable(context, *this, display_uri);

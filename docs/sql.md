@@ -828,9 +828,15 @@ DETACH ns;
 
 Stored defaults must pass DuckDB's default binder; they cannot reference other
 columns or use DataFusion-only functions. Use literal or cast-literal defaults
-with the current DuckDB target. DuckDB rewrites other `ADD COLUMN ... DEFAULT`
-forms into multiple statements ending in `ALTER COLUMN ... SET DEFAULT`, which
-Lance does not support. Such a statement can fail after the column is added.
+with the current DuckDB target. DuckDB normally expands nonliteral defaults
+and inline `NOT NULL` or `UNIQUE` constraints into multiple steps. An
+`ADD COLUMN IF NOT EXISTS` without inline constraints skips this expansion,
+so a supported expression such as `DEFAULT (4 + 2)` can be applied directly.
+Lance rejects an addition before publishing the column if another step follows
+in the same statement. This also applies to a plain addition followed by
+another command inside `IMPORT DATABASE`. To add a non-nullable column with
+a literal default, issue `ADD COLUMN ... DEFAULT ...` and then
+`ALTER COLUMN ... SET NOT NULL` as separate statements. Each commits separately.
 
 Table and column comments:
 
