@@ -6,9 +6,10 @@
 namespace duckdb {
 bool IsLanceCopy(LogicalOperator &op);
 
-PhysicalOperator &PlanLanceCopy(ClientContext &context,
-                                PhysicalPlanGenerator &planner, CopyInfo &info,
-                                const vector<Identifier> &names,
-                                const vector<LogicalType> &types,
-                                PhysicalOperator &child);
+PhysicalOperator &PlanLanceDirectoryCTAS(ClientContext &context,
+                                         PhysicalPlanGenerator &planner,
+                                         CopyInfo &info,
+                                         const vector<Identifier> &names,
+                                         const vector<LogicalType> &types,
+                                         PhysicalOperator &child);
 } // namespace duckdb

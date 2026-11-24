@@ -754,6 +754,10 @@ DETACH ns;
 
 ### Transactions
 
+Run `CREATE TABLE`, `CREATE TABLE AS` and `DROP TABLE` on attached Lance tables
+in autocommit mode. These operations change the namespace immediately and
+cannot be rolled back.
+
 Every `INSERT`, `UPDATE`, `DELETE` and `MERGE` on an attached Lance table builds its own Lance
 transaction against the table version its scan read. `COMMIT` publishes them one at a time, each
 as its own Lance commit. Lance has no commit that spans several statements or several datasets, and
