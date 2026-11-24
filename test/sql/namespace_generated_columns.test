@@ -1,0 +1,51 @@
+# name: test/sql/namespace_generated_columns.test
+# description: Lance table definitions must not silently discard generated expressions
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/generated_columns_namespace' AS ns (TYPE LANCE);
+
+statement error
+CREATE TABLE ns.derived (i INTEGER, twice INTEGER GENERATED ALWAYS AS (i * 2) VIRTUAL);
+----
+Lance tables do not support generated columns
+
+statement ok
+CREATE TABLE source (i INTEGER, twice AS (i * 2));
+
+statement ok
+INSERT INTO source (i) VALUES (3);
+
+statement ok
+CREATE TABLE ns.materialized AS SELECT * FROM source;
+
+statement ok
+CREATE TABLE IF NOT EXISTS ns.materialized (i INTEGER, twice AS (i * 2));
+
+statement error
+CREATE TABLE IF NOT EXISTS ns.missing (i INTEGER, twice AS (i * 2));
+----
+Lance tables do not support generated columns
+
+statement error
+CREATE OR REPLACE TABLE ns.materialized (twice AS (i * 2), i INTEGER);
+----
+Lance tables do not support generated columns
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/generated_columns_namespace' AS ns (TYPE LANCE);
+
+query T
+SHOW TABLES FROM ns;
+----
+materialized
+
+query II
+SELECT i, twice FROM ns.materialized;
+----
+3	6

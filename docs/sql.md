@@ -618,6 +618,9 @@ DETACH ns;
 `CREATE TABLE` and CTAS default to data storage version `2.2`. Override it with
 `WITH (data_storage_version = '<version>')` when another version is required.
 
+Directory and REST Lance tables do not support generated column definitions.
+Use CTAS to store the result of a computed expression as an ordinary column.
+
 `WITH (enable_stable_row_ids = true)` creates the table with stable row ids, as for `COPY`, including for
 tables created through a REST namespace. In a directory namespace, `CREATE OR REPLACE TABLE` keeps the
 existing table's setting and fails when the option asks for another one; in a REST namespace it drops and
