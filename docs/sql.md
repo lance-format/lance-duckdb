@@ -552,6 +552,19 @@ Use the exact Lance branch name and a positive decimal version without leading
 zeros. An unknown branch or version raises an error. This selector applies only
 to the table reference in the query.
 
+With Lance 14.0.3, a fresh directory attachment opens the current `main`
+snapshot to resolve a tag or branch. If `main` uses a reader feature the
+extension does not support, the named lookup can fail even when its target is
+readable. Use `AT (VERSION => n)` if you know the retained, readable version
+on `main`. For a target on another branch, use a reader that supports the
+features on `main`.
+
+Keep the physical dataset at its original path until historical queries finish.
+Replacing the directory in place with a different dataset at the same version
+number can make a running query use the replacement's index and return rows
+that fail its filter. To publish a replacement while reads are active, use a
+distinct path and retain the original dataset.
+
 ## Write datasets
 
 ### `COPY ... TO ... (FORMAT lance, ...)`
