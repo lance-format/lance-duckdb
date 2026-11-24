@@ -358,6 +358,9 @@ the result batch.
 Set `use_index = false` to scan the vectors exactly in either function. Set
 `distance_type` to the index's metric to preserve the ranking metric. The
 exact scan reads the candidate vectors and can cost more than an index lookup.
+In hybrid search, this option applies only to the vector branch. If text
+matches still trigger the batch error, rebuild the full-text index retained
+through compaction using its original settings, then retry the exact search.
 
 ### Full-text search: `lance_fts`
 
