@@ -1,0 +1,69 @@
+# name: test/sql/alter_add_column_atomicity.test
+# description: Reject expanded ADD COLUMN before a later step can leave a partial schema change
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/add_column_atomicity' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.t AS SELECT 11 AS id;
+
+statement error
+ALTER TABLE ns.t ADD COLUMN ref_default INTEGER DEFAULT (id + 1);
+----
+Lance ADD COLUMN cannot run before another step of the same statement
+
+statement error
+ALTER TABLE ns.t ADD COLUMN computed INTEGER DEFAULT (4 + 2);
+----
+Lance ADD COLUMN cannot run before another step of the same statement
+
+statement error
+ALTER TABLE ns.t ADD COLUMN constrained INTEGER DEFAULT 42 NOT NULL;
+----
+Lance ADD COLUMN cannot run before another step of the same statement
+
+statement error
+ALTER TABLE ns.t ADD COLUMN unique_col INTEGER UNIQUE;
+----
+Lance ADD COLUMN cannot run before another step of the same statement
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/add_column_atomicity' AS ns (TYPE LANCE);
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 't';
+----
+id
+
+query I
+SELECT version FROM lance_versions('ns.main.t');
+----
+1
+
+statement ok
+ALTER TABLE ns.t ADD COLUMN literal INTEGER DEFAULT '42'::INTEGER;
+
+statement ok
+ALTER TABLE ns.t ALTER COLUMN literal SET NOT NULL;
+
+query II
+SELECT id, literal FROM ns.t;
+----
+11	42
+
+statement ok
+ALTER TABLE ns.t ADD COLUMN IF NOT EXISTS direct INTEGER DEFAULT (4 + 2);
+
+query I
+SELECT direct FROM ns.t;
+----
+6
+
+statement ok
+DETACH ns;
