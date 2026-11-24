@@ -347,6 +347,18 @@ Filter semantics:
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
 - `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
 
+#### Stable row IDs after compaction
+
+With Lance 14.0.3, a search on a dataset path can return fewer than `k` live
+rows when the dataset uses stable row IDs and retains an `IVF_FLAT` index
+across deletion and compaction. This can happen even when enough live rows
+qualify. On the same dataset, `lance_hybrid_search` can fail while assembling
+the result batch.
+
+Set `use_index = false` to scan the vectors exactly in either function. Set
+`distance_type` to the index's metric to preserve the ranking metric. The
+exact scan reads the candidate vectors and can cost more than an index lookup.
+
 ### Full-text search: `lance_fts`
 
 ```sql
@@ -435,7 +447,7 @@ Named parameters:
 - `ef` (BIGINT, optional): HNSW search-time candidate list size for the vector branch. Must be > 0 and at least `k * oversample_factor` (times `refine_factor` if set), otherwise Lance fails the query with `ef must be greater than or equal to k`.
 - `distance_type` (VARCHAR, optional): Distance metric of the vector branch, as for `lance_vector_search`.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-- `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage for the vector branch when available. If `false`, the vector branch runs exact KNN.
+- `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage for the vector branch when available. If `false`, the vector branch runs exact KNN. See [stable row IDs after compaction](#stable-row-ids-after-compaction).
 - `alpha` (FLOAT, default `0.5`): Vector/text mixing weight. Larger values weigh vector similarity more heavily.
 - `oversample_factor` (INTEGER, default `4`): Oversample factor for candidate generation. If provided, must be > 0.
 
