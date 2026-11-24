@@ -1,0 +1,69 @@
+# name: test/sql/maintenance_vacuum_retention.test
+# description: VACUUM retains recent history by default and respects explicit selectors
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/vacuum_retention' AS vac (TYPE LANCE);
+
+statement ok
+CREATE TABLE vac.t AS SELECT 1 AS i;
+
+statement ok
+INSERT INTO vac.t VALUES (2);
+
+query TTT
+VACUUM LANCE vac.t;
+----
+cleanup	{TEST_DIR}/vacuum_retention/t.lance	<REGEX>:\{.*"old_versions":0.*\}
+
+query I
+SELECT i FROM vac.t AT (VERSION => 1);
+----
+1
+
+statement ok
+VACUUM LANCE vac.t WITH (delete_unverified = false);
+
+query I
+SELECT count(*) FROM lance_versions('{TEST_DIR}/vacuum_retention/t.lance');
+----
+2
+
+statement ok
+VACUUM LANCE vac.t WITH (older_than_seconds = 1209600, retain_n_versions = 1);
+
+query I
+SELECT count(*) FROM lance_versions('{TEST_DIR}/vacuum_retention/t.lance');
+----
+2
+
+statement error
+SELECT * FROM __lance_cleanup_old_versions('{TEST_DIR}/vacuum_retention/t.lance', '{"older_than_seconds":null}');
+----
+invalid type
+
+statement error
+VACUUM LANCE vac.t WITH (older_than_seconds = 9223372036854775807);
+----
+older_than_seconds is too large
+
+statement ok
+VACUUM LANCE vac.t WITH (retain_n_versions = 1);
+
+query I
+SELECT version FROM lance_versions('{TEST_DIR}/vacuum_retention/t.lance');
+----
+2
+
+statement ok
+INSERT INTO vac.t VALUES (3);
+
+statement ok
+VACUUM LANCE vac.t WITH (older_than_seconds = 0);
+
+query I
+SELECT version FROM lance_versions('{TEST_DIR}/vacuum_retention/t.lance');
+----
+3

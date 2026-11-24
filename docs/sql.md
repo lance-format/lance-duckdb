@@ -952,6 +952,15 @@ Returns:
 
 ### `VACUUM LANCE`
 
+When both `older_than_seconds` and `retain_n_versions` are omitted, cleanup retains
+versions from the last 14 days. This also applies when only the safety flags are
+supplied. Set `older_than_seconds = 0` to use the current time as the cutoff, or
+set `retain_n_versions` alone to keep the most recent versions by count. When both
+selectors are supplied, a version must fall outside both retention windows to be
+eligible for removal. Lance always keeps the current version. If a tagged version
+would expire, cleanup fails by default. Set `error_if_tagged_old_versions = false`
+to preserve that version and continue cleaning up the others.
+
 ```sql
 VACUUM LANCE 'path/to/dataset.lance' WITH (
   older_than_seconds = 1209600,
