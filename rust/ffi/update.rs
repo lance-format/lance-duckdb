@@ -166,6 +166,7 @@ struct RawArrowSchema {
 pub(super) fn import_struct_batch(
     array: *mut c_void,
     schema: *mut c_void,
+    list_names_from: Option<&ArrowSchema>,
 ) -> FfiResult<RecordBatch> {
     if array.is_null() || schema.is_null() {
         return Err(FfiError::new(
@@ -185,12 +186,15 @@ pub(super) fn import_struct_batch(
         (*(schema as *mut RawArrowSchema)).release = None;
     }
     let ffi_schema: arrow_schema::ffi::FFI_ArrowSchema = unsafe { std::mem::transmute(raw_schema) };
-    let arrow_schema = ArrowSchema::try_from(&ffi_schema).map_err(|err| {
+    let mut arrow_schema = ArrowSchema::try_from(&ffi_schema).map_err(|err| {
         FfiError::new(ErrorCode::InvalidArgument, format!("schema import: {err}"))
     })?;
-    let data_type = DataType::try_from(&ffi_schema).map_err(|err| {
-        FfiError::new(ErrorCode::InvalidArgument, format!("schema import: {err}"))
-    })?;
+    if let Some(fields) = list_names_from.and_then(|stored| {
+        super::write::align_list_field_names(arrow_schema.fields(), stored.fields())
+    }) {
+        arrow_schema.fields = fields;
+    }
+    let data_type = DataType::Struct(arrow_schema.fields().clone());
     let array_data = unsafe { arrow_array::ffi::from_ffi_and_data_type(ffi_array, data_type) }
         .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, format!("array import: {err}")))?;
     let array = arrow_array::make_array(array_data);
@@ -348,7 +352,7 @@ fn update_add_value_batch_inner(
         ));
     }
     let handle = unsafe { &mut *(update_handle as *mut UpdateHandle) };
-    let batch = import_struct_batch(array, schema)?;
+    let batch = import_struct_batch(array, schema, None)?;
     let columns = take_update_batch_fields(&batch)?;
     let source_options = super::write::parse_batch_source_options(
         source_uris,
@@ -574,7 +578,7 @@ fn blob_inputs_to_binary_inner(
             "out_schema/out_array is null",
         ));
     }
-    let batch = import_struct_batch(array, schema)?;
+    let batch = import_struct_batch(array, schema, None)?;
     let source_options = super::write::parse_batch_source_options(
         source_uris,
         source_uri_keys,
