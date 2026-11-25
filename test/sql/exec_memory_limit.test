@@ -14,9 +14,17 @@ statement ok
 COPY (SELECT i::BIGINT AS id, (i % 100)::BIGINT AS g, (i % 100)::DOUBLE AS v FROM range(600000) r(i))
 TO '{TEST_DIR}/exec_memory.lance' (FORMAT lance, max_rows_per_file 65536);
 
+# Planner assertions run before the limit is lowered to provoke a failure:
+# EXPLAIN itself allocates, and the next phase exhausts the budget on purpose.
 query II
 EXPLAIN (FORMAT JSON)
 SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id;
+----
+physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
+
+query II
+EXPLAIN (FORMAT JSON)
+SELECT g, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY g;
 ----
 physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
 
@@ -34,12 +42,6 @@ FROM (SELECT id, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
 memory
 
 # Small aggregates still work under the same limit.
-query II
-EXPLAIN (FORMAT JSON)
-SELECT g, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY g;
-----
-physical_plan	<REGEX>:[\s\S]*"Lance Exec IR Bytes": "[1-9][0-9]*"[\s\S]*
-
 query II
 SELECT count(*), sum(s)::BIGINT
 FROM (SELECT g, sum(v) AS s FROM '{TEST_DIR}/exec_memory.lance' GROUP BY g);
@@ -75,8 +77,16 @@ SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROU
 ----
 Out of Memory Error
 
+# Releasing the native table needs room the exhausted 32MB budget cannot give,
+# so raise the limit for the DROP and restore it before re-running the aggregate.
+statement ok
+SET memory_limit = '256MB';
+
 statement ok
 DROP TABLE native_memory;
+
+statement ok
+SET memory_limit = '32MB';
 
 query I
 SELECT count(*) FROM (SELECT id, sum(v) FROM '{TEST_DIR}/exec_memory.lance' GROUP BY id);
