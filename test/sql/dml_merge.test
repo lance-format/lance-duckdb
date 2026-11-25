@@ -233,4 +233,27 @@ SELECT id, v FROM merge_ns.main.lance_merge_two_fragments_key ORDER BY id;
 4	400
 
 statement ok
+CREATE TABLE merge_ns.main.merge_lists (id INTEGER, tags INTEGER[]);
+
+statement ok
+INSERT INTO merge_ns.main.merge_lists VALUES (1, [10]);
+
+query I
+MERGE INTO merge_ns.main.merge_lists AS t
+USING (VALUES (1, [11]), (2, [20, NULL, 30]), (3, []), (4, NULL)) AS s(id, tags)
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET tags = s.tags
+WHEN NOT MATCHED THEN INSERT (id, tags) VALUES (s.id, s.tags);
+----
+4
+
+query IT
+SELECT id, tags FROM merge_ns.main.merge_lists ORDER BY id;
+----
+1	[11]
+2	[20, NULL, 30]
+3	[]
+4	NULL
+
+statement ok
 DETACH merge_ns;

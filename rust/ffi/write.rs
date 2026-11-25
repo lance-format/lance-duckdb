@@ -615,20 +615,21 @@ fn stable_row_ids_request(value: i8) -> FfiResult<Option<bool>> {
 /// can answer `array_has_*` from a LABEL_LIST index. Datasets written before
 /// that change still carry `l`, and Lance rejects an append whose schema
 /// disagrees, so an append has to speak whatever the destination already uses.
-fn align_list_field_names(fields: &Fields, reference: &Fields) -> Option<Fields> {
-    let mut aligned = fields.as_ref().to_vec();
-    let mut changed = false;
-    for slot in &mut aligned {
-        let Some(reference_field) = reference.iter().find(|f| f.name() == slot.name()) else {
+pub(super) fn align_list_field_names(fields: &Fields, reference: &Fields) -> Option<Fields> {
+    let mut aligned = None;
+    for (idx, field) in fields.iter().enumerate() {
+        if !field.data_type().is_nested() {
             continue;
-        };
-        let Some(field) = align_list_field(slot, reference_field) else {
-            continue;
-        };
-        *slot = field;
-        changed = true;
+        }
+        let stored = reference
+            .get(idx)
+            .filter(|f| f.name() == field.name())
+            .or_else(|| reference.find(field.name()).map(|(_, f)| f));
+        if let Some(renamed) = stored.and_then(|stored| align_list_field(field, stored)) {
+            aligned.get_or_insert_with(|| fields.to_vec())[idx] = renamed;
+        }
     }
-    changed.then(|| Fields::from(aligned))
+    aligned.map(Fields::from)
 }
 
 fn align_list_field(field: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
@@ -641,34 +642,32 @@ fn align_list_field(field: &FieldRef, reference: &FieldRef) -> Option<FieldRef> 
             let child = align_list_child(child, reference_child)?;
             DataType::LargeList(child)
         }
+        (DataType::FixedSizeList(child, len), DataType::FixedSizeList(other, _)) => {
+            DataType::FixedSizeList(align_list_field(child, other)?, *len)
+        }
+        (DataType::Map(entries, sorted), DataType::Map(other, _)) => {
+            DataType::Map(align_list_field(entries, other)?, *sorted)
+        }
         (DataType::Struct(children), DataType::Struct(reference_children)) => {
             DataType::Struct(align_list_field_names(children, reference_children)?)
         }
         _ => return None,
     };
-    Some(Arc::new(
-        Field::new(field.name(), data_type, field.is_nullable())
-            .with_metadata(field.metadata().clone()),
-    ))
+    Some(Arc::new(field.as_ref().clone().with_data_type(data_type)))
 }
 
 fn align_list_child(child: &FieldRef, reference: &FieldRef) -> Option<FieldRef> {
-    let nested = match (child.data_type(), reference.data_type()) {
-        (DataType::Struct(children), DataType::Struct(reference_children)) => {
-            align_list_field_names(children, reference_children).map(DataType::Struct)
-        }
-        _ => None,
-    };
-    if child.name() == reference.name() && nested.is_none() {
-        return None;
+    let nested = align_list_field(child, reference);
+    if child.name() == reference.name() {
+        return nested;
     }
     Some(Arc::new(
-        Field::new(
-            reference.name(),
-            nested.unwrap_or_else(|| child.data_type().clone()),
-            child.is_nullable(),
-        )
-        .with_metadata(child.metadata().clone()),
+        nested
+            .as_ref()
+            .unwrap_or(child)
+            .as_ref()
+            .clone()
+            .with_name(reference.name()),
     ))
 }
 
@@ -2099,6 +2098,27 @@ mod align_tests {
         let stored = bits(with_extension(item, OPAQUE, Some(BIT_META)));
         let incoming = bits(Field::new("item", DataType::Binary, true));
         assert_eq!(align_append_fields(&incoming, &stored), Some(stored));
+    }
+
+    #[test]
+    fn aligns_nested_list_names_without_changing_the_input_representation() {
+        let lists = |outer, inner: Field| {
+            Fields::from(vec![Field::new_list(
+                "v",
+                Field::new_list(outer, inner, true),
+                true,
+            )])
+        };
+        let binary = Field::new("l", DataType::LargeBinary, true);
+        let stored_item = with_extension(
+            Field::new("entry", DataType::LargeBinary, false),
+            JSON_EXT_NAME,
+            None,
+        );
+        assert_eq!(
+            align_list_field_names(&lists("l", binary.clone()), &lists("legacy", stored_item)),
+            Some(lists("legacy", binary.with_name("entry")))
+        );
     }
 
     #[test]

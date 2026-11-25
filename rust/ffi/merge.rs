@@ -327,7 +327,7 @@ fn merge_add_update_batch_inner(
         ));
     }
     let handle = unsafe { &mut *(merge_handle as *mut MergeHandle) };
-    let batch = super::update::import_struct_batch(array, schema)?;
+    let batch = super::update::import_struct_batch(array, schema, None)?;
     let columns = super::update::take_update_batch_fields(&batch)?;
     let source_options = super::write::parse_batch_source_options(
         source_uris,
@@ -395,7 +395,7 @@ fn merge_add_insert_batch_inner(
         ));
     }
     let handle = unsafe { &mut *(merge_handle as *mut MergeHandle) };
-    let batch = super::update::import_struct_batch(array, schema)?;
+    let batch = super::update::import_struct_batch(array, schema, Some(&handle.existing_schema))?;
     let source_options = super::write::parse_batch_source_options(
         source_uris,
         source_uri_keys,
