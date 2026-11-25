@@ -69,4 +69,37 @@ SELECT sum(id) FROM ns.main.lance_insert_append;
 10
 
 statement ok
+CREATE TABLE ns.main.lance_float_lists (id INTEGER, samples FLOAT[], weights DOUBLE[], embedding FLOAT[2]);
+
+statement ok
+INSERT INTO ns.main.lance_float_lists VALUES (1, [1, 2], [3], [4, 5]);
+
+statement ok
+INSERT INTO ns.main.lance_float_lists VALUES
+    (2, [], [NULL, 6.5], [7, 8]),
+    (3, [9.5, NULL, 10], NULL, [11.25, 12]),
+    (4, NULL, [], [13, 14]);
+
+# COPY can supply list columns by name in a different order from the destination.
+statement ok
+COPY (SELECT 5 AS id, [19, 20]::FLOAT[] AS embedding, [16, 17, 18]::DOUBLE[] AS weights, [15]::FLOAT[] AS samples)
+TO '{TEST_DIR}/lance_float_lists.lance' (FORMAT lance, mode 'append');
+
+statement error
+COPY (SELECT 6 AS id, [21]::FLOAT[] AS samples, []::DOUBLE[] AS weights, [22, 23, 24]::FLOAT[] AS embedding)
+TO '{TEST_DIR}/lance_float_lists.lance' (FORMAT lance, mode 'append');
+----
+fixed_size_list
+
+query ITTT
+SELECT id, samples, weights, embedding
+FROM '{TEST_DIR}/lance_float_lists.lance' ORDER BY id;
+----
+1	[1.0, 2.0]	[3.0]	[4.0, 5.0]
+2	[]	[NULL, 6.5]	[7.0, 8.0]
+3	[9.5, NULL, 10.0]	NULL	[11.25, 12.0]
+4	NULL	[]	[13.0, 14.0]
+5	[15.0]	[16.0, 17.0, 18.0]	[19.0, 20.0]
+
+statement ok
 DETACH ns;

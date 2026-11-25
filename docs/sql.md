@@ -619,9 +619,12 @@ Notes:
   setting takes effect when the dataset is created. Appending to or overwriting a dataset with a
   different setting is an error, and omitting the option keeps the dataset's setting.
 - `write_empty_file` defaults to `true` and controls whether an empty dataset is materialized when the input produces zero rows.
-- Floating-point list columns with consistent, nonzero dimensions are written as
-  fixed-size vectors. Prefer explicit `FLOAT[N]` / `DOUBLE[N]` types when writing
-  vectors; inconsistent list dimensions raise an error.
+- When creating or overwriting a dataset, the writer can infer a fixed-size
+  vector from a floating-point list. Once a dimension is inferred, a different
+  list length raises an error. Use `FLOAT[N]` or `DOUBLE[N]` to declare the
+  dimension explicitly.
+  When appending to an existing `FLOAT[]` or `DOUBLE[]` column, lists can
+  have different lengths, including zero.
 
 ### `CREATE TABLE` / `CTAS` in an attached namespace
 

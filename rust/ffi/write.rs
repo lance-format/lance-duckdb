@@ -1287,14 +1287,29 @@ fn open_writer_inner(
 
     let mut vector_candidates = Vec::<VectorConversion>::new();
     for (idx, field) in schema.fields().iter().enumerate() {
-        if let Some((list_kind, element_type)) = is_variable_list_vector_type(field.data_type()) {
-            vector_candidates.push(VectorConversion {
-                col_idx: idx,
-                dim: 0,
-                list_kind,
-                element_type,
-            });
+        let Some((list_kind, element_type)) = is_variable_list_vector_type(field.data_type())
+        else {
+            continue;
+        };
+        // A variable-length destination accepts even empty and ragged lists.
+        if let Some(reference) = &append_reference {
+            let stored = reference
+                .get(idx)
+                .filter(|stored| stored.name() == field.name())
+                .or_else(|| reference.find(field.name()).map(|(_, stored)| stored));
+            if matches!(
+                stored.map(|f| f.data_type()),
+                Some(DataType::List(_) | DataType::LargeList(_))
+            ) {
+                continue;
+            }
         }
+        vector_candidates.push(VectorConversion {
+            col_idx: idx,
+            dim: 0,
+            list_kind,
+            element_type,
+        });
     }
 
     let writer_error = Arc::new(Mutex::new(None));
