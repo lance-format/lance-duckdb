@@ -602,6 +602,39 @@ static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
          cmp.GetExpressionType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
+static optional_idx BindSearchVersion(const TableFunctionBindInput &input,
+                                      const LanceResolvedDataset &target) {
+  auto it = input.named_parameters.find("version");
+  if (it == input.named_parameters.end()) {
+    return optional_idx();
+  }
+  if (target.table) {
+    throw BinderException("Search by version requires a dataset path or URI");
+  }
+  const auto &value = it->second;
+  if (!value.IsNull() && !value.type().IsNumeric() &&
+      value.type().id() != LogicalTypeId::BIGNUM) {
+    throw BinderException("Search version requires a positive integer");
+  }
+  return LanceParseNumericVersion(value, "Search version");
+}
+
+static shared_ptr<LanceDatasetCacheEntry>
+OpenSearchDataset(ClientContext &context, const LanceResolvedDataset &target,
+                  optional_idx version, string &display_uri, bool &cache_hit) {
+  if (!version.IsValid()) {
+    return target.GetOrOpenCached(context, display_uri, &cache_hit);
+  }
+  display_uri = target.path;
+  auto *dataset = LanceOpenDatasetAtVersion(context, target.path, version);
+  if (!dataset) {
+    throw IOException("Failed to open version %llu of Lance dataset %s%s",
+                      version.GetIndex(), target.path,
+                      LanceFormatErrorSuffix());
+  }
+  return make_shared_ptr<LanceDatasetCacheEntry>(dataset, target.path);
+}
+
 static unique_ptr<FunctionData>
 LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                       vector<LogicalType> &return_types,
@@ -707,6 +740,7 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   auto target = ResolveLanceDataset(context, input.inputs[0],
                                     LanceResolvePolicy::FALLBACK_TO_PATH,
                                     "lance_vector_search");
+  auto version = BindSearchVersion(input, target);
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
     if (result->query.is_uint8) {
@@ -736,9 +770,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         "namespace-backed tables");
   }
 
-  result->file_path.clear();
-  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
-                                                 &result->dataset_cache_hit);
+  result->dataset_entry = OpenSearchDataset(
+      context, target, version, result->file_path, result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -1205,6 +1238,9 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
 static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      // Preserve the input value so a fractional version cannot round to an
+      // adjacent snapshot before the bind function sees it.
+      options.Add("version", LogicalType::ANY);
       options.Add("k", LogicalType::BIGINT);
       options.Add("nprobs", LogicalType::BIGINT);
       options.Add("refine_factor", LogicalType::BIGINT);

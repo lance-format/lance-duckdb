@@ -321,6 +321,7 @@ Positional arguments:
 - `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a direct local dataset with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Namespace-backed tables reject UINT8 queries.
 
 Named parameters:
+- `version` (optional): A positive integer in the `BIGINT` range, for example `version = 3`. For a dataset path or object store URI, the vector index, output columns, row IDs and distances come from that version. Omit it to search the current version. An unavailable version raises an error.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage when available.
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.

@@ -44,6 +44,13 @@ SELECT count(*) FROM 's3://{LANCE_S3_BUCKET}/{LANCE_S3_SEARCH_DATASET_PREFIX}';
 5
 
 query I
+SELECT id FROM lance_vector_search(
+  's3://{LANCE_S3_BUCKET}/{LANCE_S3_SEARCH_DATASET_PREFIX}', 'vec',
+  [0, 0, 0, 0]::FLOAT[4], version = 1, k = 1);
+----
+1
+
+query I
 SELECT count(*) FROM lance_fts(
   's3://{LANCE_S3_BUCKET}/{LANCE_S3_SEARCH_DATASET_PREFIX}',
   'text',

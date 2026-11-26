@@ -611,6 +611,23 @@ static void *OpenResolvedDatasetAtVersion(ClientContext &context,
       });
 }
 
+idx_t LanceParseNumericVersion(const Value &value, const char *selector) {
+  if (value.IsNull()) {
+    throw BinderException("%s requires a non-NULL value", selector);
+  }
+  auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
+  if (version_value.DefaultCastAs(value.type()) != value) {
+    throw BinderException("%s requires an integer value, got %s", selector,
+                          value.ToString());
+  }
+  auto version = version_value.GetValue<int64_t>();
+  if (version < 1) {
+    throw BinderException("Lance table versions start at 1, got %lld for %s",
+                          static_cast<long long>(version), selector);
+  }
+  return NumericCast<idx_t>(version);
+}
+
 void *LanceOpenDatasetAtVersion(ClientContext &context, const string &path,
                                 const optional_idx &version) {
   string open_path;
