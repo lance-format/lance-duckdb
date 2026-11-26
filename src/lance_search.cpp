@@ -1538,16 +1538,17 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
             .GetValue<bool>();
   }
 
-  auto target =
-      ResolveLanceDataset(context, input.inputs[0],
-                          LanceResolvePolicy::FALLBACK_TO_PATH, "lance_fts");
+  auto version = BindSearchVersion(input);
+  auto target = ResolveLanceDataset(context, input.inputs[0],
+                                    LanceResolvePolicy::FALLBACK_TO_PATH,
+                                    "lance_fts", version);
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
     if (!structured_query) {
       result->text_column = RequireNamespaceSearchColumn(
           *table, result->text_column, "lance_fts", "text_column");
     }
-    if (!table->HasBlobColumns()) {
+    if (!version.IsValid() && !table->HasBlobColumns()) {
       result->namespace_backed = true;
       result->namespace_config = table->NamespaceConfig();
       result->target = target.Reference();
@@ -1566,9 +1567,8 @@ static unique_ptr<FunctionData> LanceFtsBind(ClientContext &context,
         "tables");
   }
 
-  result->file_path.clear();
-  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
-                                                 &result->dataset_cache_hit);
+  result->dataset_entry = OpenSearchDataset(
+      context, target, version, result->file_path, result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
 
@@ -2137,6 +2137,7 @@ static void LanceSearchGetMetrics(TableFunctionGetMetricsInput &input) {
 static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("version", LogicalType::ANY);
       options.Add("k", LogicalType::BIGINT);
       options.Add("prefilter", LogicalType::BOOLEAN);
       options.Add("filter", LogicalType::VARCHAR);

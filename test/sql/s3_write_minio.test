@@ -95,4 +95,21 @@ SELECT id, _distance FROM lance_vector_search('s3_copy_ns.main.versioned_vectors
 11	1
 
 statement ok
+DROP TABLE IF EXISTS s3_copy_ns.main.versioned_text;
+
+statement ok
+CREATE TABLE s3_copy_ns.main.versioned_text AS SELECT 11 AS id, 'orchid' AS body;
+
+statement ok
+CREATE INDEX old_text ON s3_copy_ns.main.versioned_text (body) USING INVERTED;
+
+statement ok
+CREATE OR REPLACE TABLE s3_copy_ns.main.versioned_text AS SELECT 91 AS id, 'fir' AS title;
+
+query I
+SELECT id FROM lance_fts('s3_copy_ns.main.versioned_text', 'body', 'orchid', version = 2);
+----
+11
+
+statement ok
 DETACH s3_copy_ns;
