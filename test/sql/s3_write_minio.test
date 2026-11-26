@@ -80,19 +80,4 @@ SELECT count(*) FROM duckdb_extensions() WHERE extension_name='httpfs' AND loade
 0
 
 statement ok
-DROP TABLE IF EXISTS s3_copy_ns.main.versioned_vectors;
-
-statement ok
-CREATE TABLE s3_copy_ns.main.versioned_vectors AS SELECT 11 AS id, [1,0]::FLOAT[2] AS vec;
-
-statement ok
-INSERT INTO s3_copy_ns.main.versioned_vectors VALUES (91, [0,0]::FLOAT[2]);
-
-query II
-SELECT id, _distance FROM lance_vector_search('s3_copy_ns.main.versioned_vectors', 'vec',
-    [0,0]::FLOAT[2], version = 1, k = 1);
-----
-11	1
-
-statement ok
 DETACH s3_copy_ns;

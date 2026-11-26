@@ -99,8 +99,6 @@ def main():
                 path.mkdir()
                 target = str(path / "t.lance").replace("'", "''")
                 sql(f"COPY (SELECT {marker} AS id) TO '{target}' (FORMAT lance)")
-                vectors = str(path / "vectors.lance").replace("'", "''")
-                sql(f"COPY (SELECT {marker} AS id, [0, 0]::FLOAT[2] AS vec) TO '{vectors}' (FORMAT lance)")
             escaped = str(root).replace("'", "''")
             current.symlink_to(root / "first", target_is_directory=True)
             staged.symlink_to(root / "second", target_is_directory=True)
@@ -166,38 +164,6 @@ def main():
             )
             assert pair == [4, 91], pair
             assert sql("SELECT id FROM b.t AT (VERSION => 'branch:main:1')", 1) == [11]
-
-            staged.symlink_to(root / "second", target_is_directory=True)
-            pair = sql(
-                "SELECT (SELECT id FROM a.main.vectors AT (VERSION => 1)), "
-                "(SELECT id FROM lance_vector_search('b.main.vectors', 'vec', [0,0]::FLOAT[2], version=switch_root()))",
-                2,
-            )
-            assert pair == [11, 11], pair
-            assert sql("SELECT id FROM lance_vector_search('b.main.vectors','vec',[0,0]::FLOAT[2],version=1)", 1) == [
-                91
-            ]
-
-            # A cold historical lookup can bind an old schema even when HEAD is unreadable.
-            path = root / "snapshots"
-            path.mkdir()
-            vectors = path / "items.lance"
-            sql(f"COPY (SELECT 11 AS id, [1,0]::FLOAT[2] AS vec) TO '{vectors}' (FORMAT lance)")
-            manifests = vectors / "_versions"
-            old = set(manifests.glob("*.manifest"))
-            sql(f"COPY (SELECT 91 AS id, [0,0]::FLOAT[2] AS vec) TO '{vectors}' (FORMAT lance, MODE 'overwrite')")
-            (head,) = set(manifests.glob("*.manifest")) - old
-            head.write_bytes(b"unreadable head")
-            sql(f"ATTACH '{path}' AS snapshots (TYPE lance)")
-            sql("SET search_path='memory.main,snapshots.main'")
-            try:
-                os.chdir(path)
-                for name in ("snapshots.main.items", "snapshots.items", "items", "items.lance"):
-                    result = sql(f"SELECT id FROM lance_vector_search('{name}','vec',[0,0]::FLOAT[2],version=1)", 1)
-                    assert result == [11], (name, result)
-            finally:
-                os.chdir(original_cwd)
-                sql("RESET search_path")
 
             # IMPORT runs both schema statements in a single DuckDB submission.
             (root / "schema.sql").write_text(
