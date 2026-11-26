@@ -114,6 +114,16 @@ statement ok
 COPY (SELECT 91 AS id, [0, 0]::FLOAT[2] AS replacement_vec)
 TO '{TEST_DIR}/items.lance' (FORMAT lance, mode 'overwrite');
 
+statement ok
+ATTACH '{TEST_DIR}' AS replay (TYPE lance, DEFAULT_TABLE 'items');
+
+query I
+SELECT count(*) FROM lance_vector_search('replay', 'vec', [0,0]::FLOAT[2], version = 2, k = 1) h
+JOIN replay t AT (VERSION => 2) ON (h.id, h._rowid) = (t.id, t.rowid)
+JOIN expected e ON (h.id, h.label, h._rowid, h._distance) = (e.id, e.label, e.rid, e.dist);
+----
+1
+
 query I
 SELECT count(*) FROM lance_vector_search(
     'ns.main.Items', 'VeC', [0, 0]::FLOAT[2], version = 2, k = 1) h

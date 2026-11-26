@@ -34,6 +34,14 @@ static bool CanResolveDirectoryTable(ClientContext &context,
   if (!name.Catalog().empty()) {
     return is_directory(name.Catalog());
   }
+  if (name.Path().size() == 1) {
+    // DuckDB also resolves a bare catalog name to its ATTACH DEFAULT_TABLE.
+    auto catalog = Catalog::GetCatalogEntry(context, name.Name());
+    if (catalog && catalog->HasDefaultTable() &&
+        IsLanceDirectoryCatalog(*catalog)) {
+      return true;
+    }
+  }
   auto &search_path = *ClientData::Get(context).catalog_search_path;
   for (const auto &entry : search_path.Get()) {
     if ((name.Schema().empty() || entry.GetSchema() == name.Schema()) &&
