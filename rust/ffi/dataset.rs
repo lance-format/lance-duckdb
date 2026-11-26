@@ -316,6 +316,28 @@ impl TimestampCutoff {
     }
 }
 
+// Directory attachments use the URI's native commit handler. Read metadata
+// from the bound branch and store without caching a speculative checkout.
+async fn directory_version_manifest(
+    dataset: &lance::Dataset,
+    version: u64,
+) -> Option<lance_table::format::Manifest> {
+    let store = dataset.object_store(None).await.ok()?;
+    let handler = lance_table::io::commit::commit_handler_from_url(
+        dataset.uri(),
+        &dataset.store_params().cloned(),
+    )
+    .await
+    .ok()?;
+    let location = handler
+        .resolve_version_location(dataset.refs.base(), version, &store.inner)
+        .await
+        .ok()?;
+    lance_table::io::manifest::read_manifest(&store, &location.path, location.size)
+        .await
+        .ok()
+}
+
 /// Resolve the newest version committed at or before a UTC cutoff, given as
 /// whole microseconds since the Unix epoch plus 0–999 nanoseconds.
 ///
@@ -327,6 +349,7 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
     dataset: *mut c_void,
     timestamp_micros: i64,
     submicro_nanos: u16,
+    directory: bool,
     out_version: *mut u64,
 ) -> i32 {
     if out_version.is_null() {
@@ -351,8 +374,25 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
         clear_last_error();
         return 0;
     }
-    let versions = match runtime::block_on(handle.dataset.versions()) {
-        Ok(Ok(versions)) => versions,
+    let selected = match runtime::block_on(async {
+        let dataset = &handle.dataset;
+        if directory && !lance_table::format::is_detached_version(head) && head > 1 {
+            let previous = head - 1;
+            if let Some(manifest) = directory_version_manifest(dataset, previous).await {
+                if manifest.version == previous
+                    && manifest.branch == dataset.manifest().branch
+                    && cutoff.includes(manifest.timestamp())
+                {
+                    return Ok(Some(previous));
+                }
+            }
+        }
+        dataset
+            .versions()
+            .await
+            .map(|versions| cutoff.newest_before_head(&versions, head))
+    }) {
+        Ok(Ok(selected)) => selected,
         Ok(Err(err)) => {
             set_last_error(
                 ErrorCode::DatasetOpen,
@@ -366,7 +406,7 @@ pub unsafe extern "C" fn lance_dataset_version_at_timestamp(
         }
     };
     clear_last_error();
-    match cutoff.newest_before_head(&versions, head) {
+    match selected {
         Some(version) => {
             unsafe {
                 *out_version = version;
@@ -1421,7 +1461,7 @@ mod tests {
             assert!(!handle.is_null());
             let mut version = 0u64;
             assert_eq!(
-                lance_dataset_version_at_timestamp(handle, first_cutoff, 0, &mut version),
+                lance_dataset_version_at_timestamp(handle, first_cutoff, 0, true, &mut version),
                 0
             );
             assert_eq!(version, 1);
@@ -1500,27 +1540,28 @@ mod tests {
             let handle = lance_open_dataset(uri_c.as_ptr());
             assert!(!handle.is_null());
 
-            let resolve = |ts: i64| {
+            let resolve = |ts: i64, directory: bool| {
                 let mut version = 0u64;
-                let rc = lance_dataset_version_at_timestamp(handle, ts, 0, &mut version);
+                let rc = lance_dataset_version_at_timestamp(handle, ts, 0, directory, &mut version);
                 (rc, version)
             };
             // The first microsecond containing the full commit time includes
             // it; one microsecond earlier does not, even within the same
             // truncated microsecond as the commit.
-            assert_eq!(resolve(ts2), (0, 2));
-            assert_eq!(resolve(ts2 - 1), (0, 1));
-            assert_eq!(resolve(ts3 + 1_000_000), (0, 3));
-            // Every version is newer than the timestamp: no error, no version.
-            assert_eq!(resolve(ts1 - 1), (1, 0));
+            for directory in [true, false] {
+                assert_eq!(resolve(ts2, directory), (0, 2));
+                assert_eq!(resolve(ts2 - 1, directory), (0, 1));
+                assert_eq!(resolve(ts3 + 1_000_000, directory), (0, 3));
+                assert_eq!(resolve(ts1 - 1, directory), (1, 0));
+            }
 
             let mut version = 0u64;
             assert_eq!(
-                lance_dataset_version_at_timestamp(handle, ts2, 0, ptr::null_mut()),
+                lance_dataset_version_at_timestamp(handle, ts2, 0, true, ptr::null_mut()),
                 -1
             );
             assert_eq!(
-                lance_dataset_version_at_timestamp(ptr::null_mut(), ts2, 0, &mut version),
+                lance_dataset_version_at_timestamp(ptr::null_mut(), ts2, 0, true, &mut version),
                 -1
             );
 

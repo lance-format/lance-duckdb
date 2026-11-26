@@ -83,6 +83,12 @@ statement ok
 ALTER TABLE ns.main.m CREATE TAG 'saved' AT VERSION 1;
 
 statement ok
+SET VARIABLE second_commit = (SELECT timestamp_ns FROM lance_versions('ns.main.m') WHERE version = 2);
+
+statement ok
+SET VARIABLE first_commit = (SELECT timestamp_ns FROM lance_versions('ns.main.m') WHERE version = 1);
+
+statement ok
 COPY (SELECT 'invalid manifest') TO (getvariable('first_manifest')) (FORMAT CSV, HEADER FALSE);
 
 query TI
@@ -100,3 +106,19 @@ statement error
 SELECT timestamp_ns FROM lance_versions('ns.main.m');
 ----
 Failed to read Lance versions
+
+# Resolving v2 from v3 only needs the two latest manifests.
+statement ok
+INSERT INTO ns.main.m VALUES (3);
+
+query I
+SELECT id FROM ns.main.m AT (TIMESTAMP => getvariable('second_commit')) ORDER BY id;
+----
+1
+2
+
+# A cutoff that actually needs the damaged manifest must still report the error.
+statement error
+SELECT id FROM ns.main.m AT (TIMESTAMP => getvariable('first_commit'));
+----
+Failed to resolve the Lance version
