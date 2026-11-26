@@ -741,8 +741,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   if (table && table->IsNamespaceBacked()) {
     if (result->query.is_uint8 && !version.IsValid()) {
       throw InvalidInputException(
-          "lance_vector_search UINT8 query vectors are supported only for "
-          "direct local datasets, not namespace-backed tables");
+          "lance_vector_search UINT8 query vectors require a dataset path, "
+          "URI or directory-attached table with an explicit version");
     }
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");

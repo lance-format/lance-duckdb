@@ -318,7 +318,7 @@ Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
-- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a dataset path or versioned directory table with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Unversioned namespace table searches reject UINT8 queries.
+- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. To pass a `UTINYINT[]` or `UTINYINT[dim]` query, use a dataset path, an object store URI, or a directory-attached table with an explicit `version`. Binary vector columns use Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32.
 
 Named parameters:
 - `version` (optional): A positive integer in the `BIGINT` range, for example `version = 3`. Dataset paths, object store URIs and directory-attached names such as `'ns.main.items'` support this option. The vector index, output columns, row IDs and distances come from that version. Omit it to search the current version. An unavailable version or a versioned search of a managed REST table raises an error.
