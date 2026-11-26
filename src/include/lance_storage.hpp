@@ -5,5 +5,6 @@ class Catalog;
 class ClientContext;
 
 bool IsLanceCatalog(Catalog &catalog);
+bool IsLanceDirectoryCatalog(Catalog &catalog);
 void RequireLanceTableDDLAutocommit(ClientContext &context);
 } // namespace duckdb

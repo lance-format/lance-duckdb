@@ -43,5 +43,10 @@ FROM lance_vector_search(
 ----
 Invalid Input Error: lance_vector_search requires vector_column to name an existing column on namespace-backed table: __lance_nonexistent_vector_column_for_namespace_search_test__
 
+statement error
+SELECT id FROM lance_vector_search('ns.main."{LANCE_NAMESPACE_TABLE}"', 'vec', [0,0]::FLOAT[2], version = 1);
+----
+Search by version requires a dataset path, URI or directory-attached Lance table
+
 statement ok
 DETACH ns;

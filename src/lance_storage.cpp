@@ -1785,6 +1785,8 @@ public:
   // LanceSchemaEntry::LookupEntryInternal).
   bool SupportsTimeTravel() const override { return true; }
 
+  bool IsDirectory() const { return directory_ns != nullptr; }
+
   bool SupportsMultipleDMLCTEs() const override { return false; }
 
   ErrorData SupportsCreateSchema(CreateSchemaInfo &info) override {
@@ -2468,6 +2470,11 @@ private:
 
 bool IsLanceCatalog(Catalog &catalog) {
   return dynamic_cast<LanceDuckCatalog *>(&catalog) != nullptr;
+}
+
+bool IsLanceDirectoryCatalog(Catalog &catalog) {
+  auto *lance = dynamic_cast<LanceDuckCatalog *>(&catalog);
+  return lance && lance->IsDirectory();
 }
 
 PhysicalOperator &LanceDuckCatalog::PlanDelete(ClientContext &context,
