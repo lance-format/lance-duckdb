@@ -407,9 +407,11 @@ static uint64_t ResolveAtClauseVersion(
                       LanceFormatErrorSuffix());
   }
   uint64_t version = 0;
-  auto rc = lance_dataset_version_at_timestamp(out_timestamp_dataset->Handle(),
-                                               cutoff.micros,
-                                               cutoff.submicro_nanos, &version);
+  const bool directory =
+      table.IsNamespaceBacked() && table.NamespaceConfig().IsDirectory();
+  auto rc = lance_dataset_version_at_timestamp(
+      out_timestamp_dataset->Handle(), cutoff.micros, cutoff.submicro_nanos,
+      directory, &version);
   if (rc < 0) {
     throw IOException("Failed to resolve the Lance version at " +
                       value.ToString() + ": " + out_display_uri +
