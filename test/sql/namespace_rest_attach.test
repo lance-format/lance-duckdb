@@ -32,6 +32,12 @@ SELECT count(*) FROM ns.main."{LANCE_NAMESPACE_TABLE}"
 <REGEX>:[0-9]+
 
 statement error
+SELECT id FROM lance_hybrid_search('ns.main."{LANCE_NAMESPACE_TABLE}"', 'vec',
+    [0,0]::FLOAT[2], 'text', 'orchid', version = 1);
+----
+Search by version requires a dataset path, URI or directory-attached Lance table
+
+statement error
 SELECT count(*)
 FROM lance_vector_search(
   'ns.main."{LANCE_NAMESPACE_TABLE}"',

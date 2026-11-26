@@ -96,3 +96,29 @@ SELECT id, _distance FROM lance_vector_search('s3_copy_ns.main.versioned_vectors
 
 statement ok
 DETACH s3_copy_ns;
+
+statement ok
+ATTACH 's3://{LANCE_S3_BUCKET}/hybrid_namespace' AS s3_hybrid_ns (TYPE LANCE);
+
+statement ok
+DROP TABLE IF EXISTS s3_hybrid_ns.main.docs;
+
+statement ok
+CREATE TABLE s3_hybrid_ns.main.docs AS SELECT 11 AS id, [1,0]::FLOAT[2] AS vec, 'orchid' AS body;
+
+statement ok
+CREATE INDEX old_fts ON s3_hybrid_ns.main.docs (body) USING INVERTED;
+
+statement ok
+CREATE OR REPLACE TABLE s3_hybrid_ns.main.docs AS SELECT 91 AS id;
+
+query III
+SELECT h.id, h._distance, h._hybrid_score = p._hybrid_score
+FROM lance_hybrid_search('s3_hybrid_ns.main.docs', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', version = 2) h
+JOIN lance_hybrid_search('s3://{LANCE_S3_BUCKET}/hybrid_namespace/docs.lance', 'vec', [0,0]::FLOAT[2],
+    '{"match":{"terms":"orchid"}}', version = 2) p ON (h.id, h._rowid, h._score) = (p.id, p._rowid, p._score);
+----
+11	1	true
+
+statement ok
+DETACH s3_hybrid_ns;

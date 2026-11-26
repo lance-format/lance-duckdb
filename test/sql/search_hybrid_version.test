@@ -1,0 +1,126 @@
+# name: test/sql/search_hybrid_version.test
+# description: Versioned hybrid search ranks and materializes both branches on the selected dataset
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 11 + i AS id, [i, 0]::FLOAT[2] AS vec,
+    CASE i WHEN 0 THEN 'orchid petal seed' WHEN 1 THEN 'orchid' WHEN 2 THEN 'orchid orchid' ELSE 'fir' END AS body
+    FROM range(128) t(i)) TO '{TEST_DIR}/docs.lance' (FORMAT lance);
+
+statement ok
+CREATE INDEX old_vec ON '{TEST_DIR}/docs.lance' (vec) USING IVF_FLAT WITH (num_partitions = 1, metric_type = 'l2');
+
+statement ok
+CREATE INDEX old_text ON '{TEST_DIR}/docs.lance' (body) USING INVERTED;
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TEMP TABLE expected AS SELECT id, body, _rowid AS rid, _distance AS dist, _score AS score, _hybrid_score AS fused
+FROM lance_hybrid_search('{TEST_DIR}/docs.lance', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', k = 4);
+
+statement ok
+PREPARE live AS SELECT min(p.id), min(n.id)
+FROM lance_hybrid_search('{TEST_DIR}/docs.lance', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', k = 4) p,
+     lance_hybrid_search('ns.main.docs', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', k = 4) n;
+
+query II
+EXECUTE live;
+----
+11	11
+
+statement ok
+COPY (SELECT 91 AS id, [0,0]::FLOAT[2] AS vec, 'orchid' AS body)
+TO '{TEST_DIR}/docs.lance' (FORMAT lance, mode 'overwrite');
+
+statement ok
+CREATE INDEX new_text ON '{TEST_DIR}/docs.lance' (body) USING INVERTED;
+
+query II
+EXECUTE live;
+----
+91	91
+
+statement ok
+COPY (SELECT 92 AS id) TO '{TEST_DIR}/docs.lance' (FORMAT lance, mode 'overwrite');
+
+# Capture all branch scores, including NULL for a vector-only hit. Compare the entire ordered top-k.
+query TI
+WITH hits AS (
+    SELECT 'path' AS form, *, _rowid AS rid FROM lance_hybrid_search(
+        '{TEST_DIR}/docs.lance', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', k = 4, version = 3)
+    UNION ALL
+    SELECT 'path_json', *, _rowid AS rid FROM lance_hybrid_search(
+        '{TEST_DIR}/docs.lance', 'vec', [0,0]::DOUBLE[], '{"match":{"terms":"orchid"}}', k = 4, version = 3)
+    UNION ALL
+    SELECT 'table', *, _rowid AS rid FROM lance_hybrid_search(
+        'ns.main.docs', 'vec', [0,0]::DOUBLE[2], 'body', 'orchid', k = 4, version = 3)
+    UNION ALL
+    SELECT 'table_json', *, _rowid AS rid FROM lance_hybrid_search(
+        'ns.main.docs', 'vec', [0,0]::FLOAT[], '{"match":{"terms":"orchid"}}', k = 4, version = 3))
+SELECT form, list(row(h.id, h.body, h.rid, _distance, _score, _hybrid_score) ORDER BY _hybrid_score DESC, h.rid) =
+    (SELECT list(row(id, body, rid, dist, score, fused) ORDER BY fused DESC, rid) FROM expected)
+FROM hits h JOIN ns.main.docs t AT (VERSION => 3) ON (h.id, h.rid) = (t.id, t.rowid)
+GROUP BY form ORDER BY form;
+----
+path	true
+path_json	true
+table	true
+table_json	true
+
+# Postfilter removes the complete fused top four. Prefilter selects the nearest qualifying vectors.
+query II
+SELECT count(*), count(*) = (SELECT count(*) FROM expected WHERE id >= 20)
+FROM lance_hybrid_search('ns.main.docs', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', k = 4, version = 3)
+WHERE id >= 20;
+----
+0	true
+
+query I rowsort
+SELECT id FROM lance_hybrid_search('ns.main.docs', 'vec', [0,0]::FLOAT[2], 'body', 'orchid',
+    k = 4, prefilter = true, version = 3) WHERE id >= 20;
+----
+20
+21
+22
+23
+
+statement ok
+VACUUM LANCE ns.main.docs WITH (retain_n_versions = 1);
+
+statement error
+SELECT id FROM lance_hybrid_search('{TEST_DIR}/docs.lance', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', version = 3);
+----
+Failed to open version 3
+
+statement error
+SELECT id FROM lance_hybrid_search('ns.main.docs', 'vec', [0,0]::FLOAT[2], 'body', 'orchid', version = 3);
+----
+Failed to open version 3
+
+# Keep Lance's escaped field path intact in both overloads.
+statement ok
+COPY (SELECT id, struct_pack("vec.v1" := vec) AS embedding, body FROM (VALUES
+    (11, [15,0]::UTINYINT[2], 'orchid'), (12, [3,0]::UTINYINT[2], 'orchid seed')
+) t(id, vec, body)) TO '{TEST_DIR}/binary_docs.lance' (FORMAT lance);
+
+statement ok
+CREATE INDEX binary_text ON '{TEST_DIR}/binary_docs.lance' (body) USING INVERTED;
+
+statement ok
+COPY (SELECT 91 AS id) TO '{TEST_DIR}/binary_docs.lance' (FORMAT lance, mode 'overwrite');
+
+query II
+SELECT h.id, h._distance
+FROM lance_hybrid_search('ns.main.binary_docs', 'embedding.`vec.v1`', [15,0]::UTINYINT[2],
+    'body', 'orchid', k = 2, version = 2, use_index = false) h
+JOIN lance_hybrid_search('{TEST_DIR}/binary_docs.lance', 'embedding.`vec.v1`', [15,0]::UTINYINT[],
+    '{"match":{"terms":"orchid"}}', k = 2, version = 2, use_index = false) p
+    ON (h._rowid, h._distance, h._score, h._hybrid_score) = (p._rowid, p._distance, p._score, p._hybrid_score)
+ORDER BY h.id;
+----
+11	0
+12	2
