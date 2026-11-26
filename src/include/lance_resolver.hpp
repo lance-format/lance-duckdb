@@ -40,6 +40,7 @@ struct LanceResolvedDataset {
 LanceResolvedDataset ResolveLanceDataset(ClientContext &context,
                                          const Value &input,
                                          LanceResolvePolicy policy,
-                                         const string &function_name);
+                                         const string &function_name,
+                                         optional_idx search_version = {});
 
 } // namespace duckdb

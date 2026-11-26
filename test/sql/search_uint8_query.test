@@ -227,7 +227,7 @@ FROM lance_vector_search(
   k = 1
 );
 ----
-Invalid Input Error: lance_vector_search UINT8 query vectors are supported only for direct local datasets, not namespace-backed tables
+Invalid Input Error: lance_vector_search UINT8 query vectors require a dataset path, URI or directory-attached table with an explicit version
 
 statement error
 SELECT id

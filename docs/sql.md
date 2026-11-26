@@ -318,10 +318,10 @@ Signature: `lance_vector_search(uri, vector_column, query_vector, ...)`
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
-- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a direct local dataset with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Namespace-backed tables reject UINT8 queries.
+- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. To pass a `UTINYINT[]` or `UTINYINT[dim]` query, use a dataset path, an object store URI, or a directory-attached table with an explicit `version`. Binary vector columns use Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32.
 
 Named parameters:
-- `version` (optional): A positive integer in the `BIGINT` range, for example `version = 3`. For a dataset path or object store URI, the vector index, output columns, row IDs and distances come from that version. Omit it to search the current version. An unavailable version raises an error.
+- `version` (optional): A positive integer in the `BIGINT` range, for example `version = 3`. Dataset paths, object store URIs and directory-attached names such as `'ns.main.items'` support this option. The vector index, output columns, row IDs and distances come from that version. Omit it to search the current version. An unavailable version or a versioned search of a managed REST table raises an error.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `use_index` (BOOLEAN, default `true`): If `true`, allow ANN index usage when available.
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
@@ -330,7 +330,7 @@ Named parameters:
 - `distance_type` (VARCHAR, optional): Distance metric of `_distance`: `l2` (or `euclidean`), `cosine`, `dot`, or `hamming`, case-insensitive. If unset, a search that uses a vector index ranks by the index's metric, while an exact search (`use_index = false`, or no index) uses Lance's default for the column type (`l2` for floating-point vectors, `hamming` for binary vectors). Set it to the index's `metric_type` to compare ANN results with exact ones. Lance does not use an index built with a different metric; it runs an exact search instead.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
 - `explain_verbose` (BOOLEAN, default `false`): Emit a more verbose Lance plan in `EXPLAIN` output.
-- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
+- `filter` (VARCHAR, optional): Filter expression for an attached Lance table. An explicit `filter` and pushed `WHERE` predicates combine with `AND`.
 
 Output:
 - Dataset columns plus `_distance` (smaller is closer).
@@ -338,7 +338,8 @@ Output:
   scan of the same dataset version returns (`_rowid` on a dataset path, `rowid` on an attached
   table; the physical row address unless the dataset enables stable row ids). Select or filter it
   by name; `SELECT *` leaves it out, so alias it to keep it in written results, for example
-  `SELECT *, _rowid AS hit_rowid`. Inside a `DELETE`, a search of the attached target table reads
+  `SELECT *, _rowid AS hit_rowid`. An explicit `version` returns row IDs from the selected snapshot.
+  Inside a `DELETE`, an unversioned search of the attached target table reads
   the version the `DELETE` scans, so
   `DELETE FROM ns.main.t WHERE rowid IN (SELECT _rowid FROM lance_fts('ns.main.t', ...))` deletes
   the hits. This does not hold inside `UPDATE` or `MERGE` yet.
@@ -346,7 +347,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
-- `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
+- `WHERE` predicates push down for both dataset paths and attached namespace tables. An unversioned namespace search sends pushed predicates to the namespace `query_table` endpoint. A versioned directory search applies them to the selected Lance snapshot.
 
 #### Stable row IDs after compaction
 

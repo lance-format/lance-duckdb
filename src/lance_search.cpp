@@ -602,14 +602,10 @@ static bool LancePushdownExpression(ClientContext &, const LogicalGet &,
          cmp.GetExpressionType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM;
 }
 
-static optional_idx BindSearchVersion(const TableFunctionBindInput &input,
-                                      const LanceResolvedDataset &target) {
+static optional_idx BindSearchVersion(const TableFunctionBindInput &input) {
   auto it = input.named_parameters.find("version");
   if (it == input.named_parameters.end()) {
     return optional_idx();
-  }
-  if (target.table) {
-    throw BinderException("Search by version requires a dataset path or URI");
   }
   const auto &value = it->second;
   if (!value.IsNull() && !value.type().IsNumeric() &&
@@ -622,7 +618,7 @@ static optional_idx BindSearchVersion(const TableFunctionBindInput &input,
 static shared_ptr<LanceDatasetCacheEntry>
 OpenSearchDataset(ClientContext &context, const LanceResolvedDataset &target,
                   optional_idx version, string &display_uri, bool &cache_hit) {
-  if (!version.IsValid()) {
+  if (!version.IsValid() || target.table) {
     return target.GetOrOpenCached(context, display_uri, &cache_hit);
   }
   display_uri = target.path;
@@ -737,20 +733,20 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
             .GetValue<bool>();
   }
 
+  auto version = BindSearchVersion(input);
   auto target = ResolveLanceDataset(context, input.inputs[0],
                                     LanceResolvePolicy::FALLBACK_TO_PATH,
-                                    "lance_vector_search");
-  auto version = BindSearchVersion(input, target);
+                                    "lance_vector_search", version);
   auto table = target.table;
   if (table && table->IsNamespaceBacked()) {
-    if (result->query.is_uint8) {
+    if (result->query.is_uint8 && !version.IsValid()) {
       throw InvalidInputException(
-          "lance_vector_search UINT8 query vectors are supported only for "
-          "direct local datasets, not namespace-backed tables");
+          "lance_vector_search UINT8 query vectors require a dataset path, "
+          "URI or directory-attached table with an explicit version");
     }
     result->vector_column = RequireNamespaceSearchColumn(
         *table, result->vector_column, "lance_vector_search", "vector_column");
-    if (!table->HasBlobColumns()) {
+    if (!version.IsValid() && !table->HasBlobColumns()) {
       result->namespace_backed = true;
       result->namespace_config = table->NamespaceConfig();
       result->target = target.Reference();
