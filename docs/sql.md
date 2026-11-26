@@ -351,7 +351,7 @@ Filter semantics:
 
 #### Stable row IDs after compaction
 
-With Lance 14.0.3, a search on a dataset path can return fewer than `k` live
+With Lance 14.0.3, a search on a dataset path, URI or versioned directory table can return fewer than `k` live
 rows when the dataset uses stable row IDs and retains an `IVF_FLAT` index
 across deletion and compaction. This can happen even when enough live rows
 qualify. On the same dataset, `lance_hybrid_search` can fail while assembling
@@ -363,6 +363,7 @@ exact scan reads the candidate vectors and can cost more than an index lookup.
 In hybrid search, this option applies only to the vector branch. If text
 matches still trigger the batch error, rebuild the full-text index retained
 through compaction using its original settings, then retry the exact search.
+Rebuilding an index creates a new version. A replay of the earlier version still uses its original indices.
 
 ### Full-text search: `lance_fts`
 
@@ -442,11 +443,12 @@ Signatures:
 Positional arguments:
 - `uri` (VARCHAR): Dataset root path, object store URI (e.g. `s3://...`), or an attached Lance table name.
 - `vector_column` (VARCHAR): Vector column name.
-- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. For a direct local dataset with a binary vector column, `UTINYINT[]` / `UTINYINT[dim]` supplies a native binary query and uses Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32. Namespace-backed tables reject UINT8 queries.
+- `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. To pass a `UTINYINT[]` or `UTINYINT[dim]` query, use a dataset path, an object store URI, or a directory-attached table with an explicit `version`. Binary vector columns use Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32.
 - `text_column` (VARCHAR): Text column name.
 - `query` (VARCHAR): Query string, or a structured query in the four-argument form.
 
 Named parameters:
+- `version` (optional): A positive integer selecting a snapshot of a dataset path, object store URI or directory-attached table. Vector and text retrieval, fusion and output rows all use that snapshot. Omit it to search the current version. An unavailable version or a versioned search of a managed REST table raises an error.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `nprobs` (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be > 0. Only affects IVF-based vector indices.
 - `refine_factor` (BIGINT, optional): Refine factor for the vector branch. Must be > 0.

@@ -1637,21 +1637,21 @@ LanceHybridBind(ClientContext &context, TableFunctionBindInput &input,
 
   auto result = make_uniq<LanceSearchBindData>();
   result->mode = LanceSearchMode::Hybrid;
-  result->file_path.clear();
   result->vector_column = input.inputs[1].GetValue<string>();
   result->vector_query =
       ParseQueryVector(input.inputs[2], "lance_hybrid_search");
+  auto version = BindSearchVersion(input);
   auto target = ResolveLanceDataset(context, input.inputs[0],
                                     LanceResolvePolicy::FALLBACK_TO_PATH,
-                                    "lance_hybrid_search");
-  if (target.table && target.table->IsNamespaceBacked() &&
+                                    "lance_hybrid_search", version);
+  if (!version.IsValid() && target.table && target.table->IsNamespaceBacked() &&
       result->vector_query.is_uint8) {
     throw InvalidInputException(
-        "lance_hybrid_search UINT8 query vectors are supported only for "
-        "direct local datasets, not namespace-backed tables");
+        "lance_hybrid_search UINT8 query vectors require a dataset path, "
+        "URI or directory-attached table with an explicit version");
   }
-  result->dataset_entry = target.GetOrOpenCached(context, result->file_path,
-                                                 &result->dataset_cache_hit);
+  result->dataset_entry = OpenSearchDataset(
+      context, target, version, result->file_path, result->dataset_cache_hit);
   result->dataset =
       result->dataset_entry ? result->dataset_entry->Handle() : nullptr;
   result->structured_query = structured_query;
@@ -2171,6 +2171,7 @@ static void RegisterLanceFtsSearch(ExtensionLoader &loader) {
 static void RegisterLanceHybridSearch(ExtensionLoader &loader) {
   auto configure = [](TableFunction &fun) {
     fun.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+      options.Add("version", LogicalType::ANY);
       options.Add("k", LogicalType::BIGINT);
       options.Add("nprobs", LogicalType::BIGINT);
       options.Add("refine_factor", LogicalType::BIGINT);

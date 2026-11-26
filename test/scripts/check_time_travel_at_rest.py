@@ -217,6 +217,11 @@ def main() -> None:
 
             load = f"LOAD '{args.extension}'; "
             attach = load + mount("ns")
+            duckdb(
+                attach + "SELECT * FROM lance_hybrid_search('ns.main.CasePair', 'vec', "
+                "[0,0]::FLOAT[2], 'text', 'orchid', version=1);",
+                expected_error="Search by version requires a dataset path, URI or directory-attached Lance table",
+            )
             for push_query in ("true", "false"):
                 fixed_requests.clear()
                 duckdb(
