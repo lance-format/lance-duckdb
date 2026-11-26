@@ -359,23 +359,7 @@ bool LanceTableEntry::IsNumericAtVersion(const BoundAtClause &at) {
 }
 
 idx_t LanceTableEntry::ParseNumericAtVersion(const BoundAtClause &at) {
-  const auto &value = at.GetValue();
-  if (value.IsNull()) {
-    throw BinderException("AT (VERSION => ...) requires a non-NULL value");
-  }
-  auto version_value = value.DefaultCastAs(LogicalType::BIGINT);
-  if (version_value.DefaultCastAs(value.type()) != value) {
-    throw BinderException(
-        "AT (VERSION => ...) requires an integer value, got %s",
-        value.ToString());
-  }
-  auto version = version_value.GetValue<int64_t>();
-  if (version < 1) {
-    throw BinderException(
-        "Lance table versions start at 1, got AT (VERSION => %lld)",
-        static_cast<long long>(version));
-  }
-  return NumericCast<idx_t>(version);
+  return LanceParseNumericVersion(at.GetValue(), "AT (VERSION => ...)");
 }
 
 // The dataset version an AT clause names. VERSION is a Lance manifest version;

@@ -1,0 +1,114 @@
+# name: test/sql/search_vector_version.test
+# description: Historical vector search uses one snapshot for schema, index, distances and rows
+# group: [sql]
+
+require lance
+
+statement ok
+COPY (SELECT 11 + i AS id, [1 + i, 0]::FLOAT[2] AS vec, 'old' AS label FROM range(128) t(i))
+TO '{TEST_DIR}/items.lance' (FORMAT lance);
+
+statement ok
+CREATE INDEX old_vec_idx ON '{TEST_DIR}/items.lance' (vec)
+USING IVF_FLAT WITH (num_partitions = 1, metric_type = 'l2');
+
+statement ok
+PREPARE latest AS SELECT id FROM lance_vector_search('{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], k = 1);
+
+query I
+EXECUTE latest;
+----
+11
+
+# Capture the result while the indexed snapshot is still current.
+statement ok
+CREATE TEMP TABLE expected AS SELECT id, label, _rowid AS rid, _distance AS dist
+FROM lance_vector_search('{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], k = 1);
+
+statement ok
+COPY (SELECT 91 AS id, [0, 0]::FLOAT[2] AS vec)
+TO '{TEST_DIR}/items.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+EXECUTE latest;
+----
+91
+
+query ITII
+SELECT id, label, _rowid, _distance FROM lance_vector_search(
+    '{TEST_DIR}/items.lance', 'vec', [0, 0]::DOUBLE[], version = 1, k = 1, use_index = false);
+----
+11	old	0	1
+
+query I
+SELECT count(*) FROM lance_vector_search(
+    '{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1) h
+JOIN expected e ON (h.id, h.label, h._rowid, h._distance) = (e.id, e.label, e.rid, e.dist);
+----
+1
+
+query TT
+EXPLAIN (FORMAT JSON) SELECT id FROM lance_vector_search(
+    '{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1, explain_verbose = true);
+----
+physical_plan	<REGEX>:[\s\S]*ANNSubIndex: name=old_vec_idx[\s\S]*
+
+statement ok
+PREPARE replay AS SELECT id FROM lance_vector_search(
+    '{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], version = $1, k = 1);
+
+query I
+EXECUTE replay(2::BIGNUM);
+----
+11
+
+query I
+EXECUTE replay(3);
+----
+91
+
+statement error
+EXECUTE replay(NULL);
+----
+requires a non-NULL value
+
+statement error
+EXECUTE replay(0);
+----
+Lance table versions start at 1
+
+statement error
+EXECUTE replay(1.5);
+----
+requires an integer value
+
+statement error
+EXECUTE replay(true);
+----
+Search version requires a positive integer
+
+statement error
+EXECUTE replay(99);
+----
+Failed to open version 99
+
+statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement error
+SELECT id FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2], version = 1);
+----
+Search by version requires a dataset path or URI
+
+statement ok
+VACUUM LANCE ns.main.items WITH (retain_n_versions = 1);
+
+statement error
+EXECUTE replay(2);
+----
+Failed to open version 2
+
+query I
+EXECUTE latest;
+----
+91
