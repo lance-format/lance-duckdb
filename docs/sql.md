@@ -383,9 +383,10 @@ Positional arguments:
 - `query` (VARCHAR): Query string, or a structured query in the two-argument form.
 
 Named parameters:
+- `version` (optional): Search a fixed version of a dataset path, object store URI or directory-attached table, as in `lance_vector_search`. Both FTS signatures use that version's text columns, index and term statistics to compute `_score`. Omit it to search the current version. Managed REST tables reject this option.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.
 - `prefilter` (BOOLEAN, default `false`): If `true`, filters are applied before top-k selection.
-- `filter` (VARCHAR, optional): Namespace `query_table` filter expression. Only supported when `uri` resolves to an attached Lance namespace table. Combined with pushed `WHERE` predicates using `AND`.
+- `filter` (VARCHAR, optional): Filter expression for an attached Lance table.
 
 Output:
 - Dataset columns plus `_score` (larger is better).
@@ -394,7 +395,7 @@ Output:
 Filter semantics:
 - If `prefilter=false`, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
 - If `prefilter=true`, prefilterable filters must be pushed down, otherwise the query fails with an error.
-- `WHERE` predicates push down for both dataset paths and attached namespace tables. For namespace tables, pushed predicates are translated to a Lance Namespace `query_table` filter; a pushed predicate and an explicit `filter` combine with `AND`.
+- A pushed `WHERE` predicate and an explicit `filter` combine with `AND` for attached tables. Versioned directory searches apply the filter to the selected snapshot.
 
 Structured queries:
 
@@ -413,7 +414,7 @@ FROM lance_fts('path/to/dataset.lance',
 - Fuzzy terms are expanded from the INVERTED index, so rows appended after the index was built match them only once the index covers those rows (`ALTER INDEX ... OPTIMIZE`).
 - A query without `column` searches every column with an INVERTED index.
 - Invalid JSON, an unknown column, or a phrase query on an index without positions fails the query.
-- On attached namespace tables the query is sent as the `query_table` `structured_query`. That API cannot express `combined_fields`, `document_granularity`, or a `match` without `fuzziness`, so these fail; set `fuzziness` (`0` for exact terms).
+- When an unversioned search uses the namespace `query_table` API, its `structured_query` cannot express `combined_fields`, `document_granularity`, or a `match` without `fuzziness`. Set `fuzziness` (`0` for exact terms) on those match queries. Versioned directory searches accept the same structured queries as dataset paths.
 
 ### Hybrid search: `lance_hybrid_search`
 

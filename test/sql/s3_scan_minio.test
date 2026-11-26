@@ -60,6 +60,14 @@ SELECT count(*) FROM lance_fts(
 ----
 2
 
+query I rowsort
+SELECT id FROM lance_fts(
+  's3://{LANCE_S3_BUCKET}/{LANCE_S3_SEARCH_DATASET_PREFIX}',
+  'text', 'puppy', version = 2);
+----
+1
+3
+
 query I
 SELECT id
 FROM lance_hybrid_search(

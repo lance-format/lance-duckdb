@@ -48,5 +48,10 @@ SELECT id FROM lance_vector_search('ns.main."{LANCE_NAMESPACE_TABLE}"', 'vec', [
 ----
 Search by version requires a dataset path, URI or directory-attached Lance table
 
+statement error
+SELECT id FROM lance_fts('ns.main."{LANCE_NAMESPACE_TABLE}"', 'text', 'orchid', version = 1);
+----
+Search by version requires a dataset path, URI or directory-attached Lance table
+
 statement ok
 DETACH ns;
