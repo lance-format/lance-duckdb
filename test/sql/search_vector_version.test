@@ -13,6 +13,18 @@ CREATE INDEX old_vec_idx ON '{TEST_DIR}/items.lance' (vec)
 USING IVF_FLAT WITH (num_partitions = 1, metric_type = 'l2');
 
 statement ok
+ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
+
+statement ok
+PREPARE latest_by_name AS SELECT id
+FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2], k = 1);
+
+query I
+EXECUTE latest_by_name;
+----
+11
+
+statement ok
 PREPARE latest AS SELECT id FROM lance_vector_search('{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], k = 1);
 
 query I
@@ -92,13 +104,47 @@ EXECUTE replay(99);
 ----
 Failed to open version 99
 
-statement ok
-ATTACH '{TEST_DIR}' AS ns (TYPE LANCE);
-
-statement error
-SELECT id FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2], version = 1);
+query I
+EXECUTE latest_by_name;
 ----
-Search by version requires a dataset path or URI
+91
+
+# The live schema no longer has the column used by the historical index.
+statement ok
+COPY (SELECT 91 AS id, [0, 0]::FLOAT[2] AS replacement_vec)
+TO '{TEST_DIR}/items.lance' (FORMAT lance, mode 'overwrite');
+
+query I
+SELECT count(*) FROM lance_vector_search(
+    'ns.main.Items', 'VeC', [0, 0]::FLOAT[2], version = 2, k = 1) h
+JOIN lance_vector_search('{TEST_DIR}/items.lance', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1) p
+    ON (p.id, p.label, p._rowid, p._distance) = (h.id, h.label, h._rowid, h._distance)
+JOIN expected e ON (h.id, h.label, h._rowid, h._distance) = (e.id, e.label, e.rid, e.dist)
+JOIN ns.main.items t AT (VERSION => 2) ON t.rowid = h._rowid AND t.id = h.id;
+----
+1
+
+query TT
+EXPLAIN (FORMAT JSON) SELECT id FROM lance_vector_search(
+    'ns.main.items', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1, explain_verbose = true);
+----
+physical_plan	<REGEX>:[\s\S]*ANNSubIndex: name=old_vec_idx[\s\S]*
+
+query I
+SELECT id FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2],
+    version = 1, k = 1, prefilter = true, filter = 'id >= 12') WHERE id < 15;
+----
+12
+
+# An explicit historical search nested in DELETE keeps its selected snapshot.
+statement ok
+DELETE FROM ns.main.items WHERE rowid IN (
+    SELECT _rowid FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1));
+
+query I
+SELECT id FROM ns.main.items;
+----
+91
 
 statement ok
 VACUUM LANCE ns.main.items WITH (retain_n_versions = 1);
@@ -108,7 +154,12 @@ EXECUTE replay(2);
 ----
 Failed to open version 2
 
+statement error
+SELECT id FROM lance_vector_search('ns.main.items', 'vec', [0, 0]::FLOAT[2], version = 2, k = 1);
+----
+Failed to open version 2
+
 query I
-EXECUTE latest;
+SELECT id FROM lance_vector_search('ns.main.items', 'replacement_vec', [0, 0]::FLOAT[2], k = 1);
 ----
 91
