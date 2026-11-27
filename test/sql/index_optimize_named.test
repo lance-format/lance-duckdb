@@ -1,0 +1,40 @@
+# name: test/sql/index_optimize_named.test
+# description: Named index optimization requires a registered index
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/named_optimize' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.docs AS SELECT 1 AS id, 'ordinary' AS words;
+
+statement ok
+CREATE INDEX idx_text ON ns.main.docs (words) USING INVERTED;
+
+statement ok
+INSERT INTO ns.docs VALUES (2, 'orchid');
+
+statement error
+ALTER INDEX id_text ON ns.main.docs OPTIMIZE;
+----
+name=id_text
+
+query I
+SELECT count(*) FROM lance_fts('{TEST_DIR}/named_optimize/docs.lance',
+    '{"match":{"column":"words","terms":"orchd","fuzziness":1}}');
+----
+0
+
+statement ok
+ALTER INDEX idx_text ON ns.main.docs OPTIMIZE;
+
+query I
+SELECT id FROM lance_fts('{TEST_DIR}/named_optimize/docs.lance',
+    '{"match":{"column":"words","terms":"orchd","fuzziness":1}}');
+----
+2
+
+statement ok
+ALTER INDEX idx_text ON ns.main.docs OPTIMIZE;

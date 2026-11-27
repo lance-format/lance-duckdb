@@ -1030,6 +1030,8 @@ OPTIMIZE WITH (
 ALTER TABLE 'path/to/dataset.lance' OPTIMIZE INDEXES [WITH (...)];
 ```
 
+`ALTER INDEX ... OPTIMIZE` requires the named index to exist. An existing index with no new rows can complete successfully.
+
 `ALTER TABLE ... OPTIMIZE INDEXES` optimizes every index of the table in one statement and accepts the same options (`index_name` is `null` in the metrics; a table without indices is a no-op). Lance may skip an index it cannot rewrite (for example one of an unknown type or a newer segment version) and only logs a warning that this extension does not surface; the metrics do not list skipped indices, so check `SHOW INDEXES` when it matters.
 
 Supported `mode` values:
