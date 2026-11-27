@@ -767,6 +767,11 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
         use_index_named->second.DefaultCastAs(LogicalType::BOOLEAN)
             .GetValue<bool>();
   }
+  if (result->query.token_width) {
+    // Lance 14.0.3 counts separate ANN batches as additional query tokens.
+    // Use exact scoring until the pin includes lance-format/lance#10860.
+    result->use_index = false;
+  }
 
   auto version = BindSearchVersion(input);
   auto target = ResolveLanceDataset(context, input.inputs[0],

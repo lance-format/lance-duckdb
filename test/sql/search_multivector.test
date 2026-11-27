@@ -41,14 +41,14 @@ FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
 ORDER BY _distance;
 ----
 12	0.0
-23	1.0
-34	2.0
+23	2.0
+34	4.0
 
 query II
 EXPLAIN (FORMAT JSON) SELECT id FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
-    [[1, 0], [0, 1]]::FLOAT[][], explain_verbose = true);
+    [[1, 0], [0, 1]]::FLOAT[][], distance_type = 'cosine', use_index = true, explain_verbose = true);
 ----
-physical_plan	<REGEX>:[\s\S]*MultivectorScoring[\s\S]*
+physical_plan	<REGEX>:[\s\S]*"Lance Use Index": "false"[\s\S]*KNNVectorDistance: metric=cosine[\s\S]*
 
 query IR
 SELECT id, _distance FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
@@ -102,3 +102,20 @@ statement error
 SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [[1, NULL]]::FLOAT[][]);
 ----
 contains NULL
+
+# More than one batch of indexed token candidates for each query token.
+statement ok
+CREATE TABLE multi.repeated AS SELECT i AS id,
+    list_transform(range(8), lambda unused: [1, 0]::FLOAT[2]) AS emb
+FROM range(2000) rows(i);
+
+statement ok
+CREATE INDEX repeated_tokens ON multi.main.repeated (emb)
+USING IVF_FLAT WITH (num_partitions = 1, metric_type = 'cosine');
+
+query IRR
+SELECT count(*), min(_distance), max(_distance)
+FROM lance_vector_search('{TEST_DIR}/multi_search/repeated.lance', 'emb',
+    [[1, 0], [1, 0]]::FLOAT[][], k = 1000, distance_type = 'cosine', use_index = true);
+----
+1000	0.0	0.0
