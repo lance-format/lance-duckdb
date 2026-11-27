@@ -1,0 +1,163 @@
+# name: test/sql/attached_column_ddl.test
+# description: Resolve attached column DDL against top-level SQL identifiers
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/column_ddl' AS ns (TYPE LANCE);
+
+statement ok
+CREATE TABLE ns.docs AS SELECT 7 AS "Mixed", 9 AS "Neighbor", {'child': 11} AS s;
+
+statement ok
+COMMENT ON COLUMN ns.docs."Neighbor" IS 'keep';
+
+statement ok
+ALTER TABLE ns.docs RENAME COLUMN mixed TO "NewName";
+
+statement ok
+ALTER TABLE ns.docs ALTER COLUMN newname TYPE BIGINT;
+
+statement ok
+ALTER TABLE ns.docs ALTER COLUMN NEWNAME SET NOT NULL;
+
+query TT
+SELECT data_type, is_nullable FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'docs' AND column_name = 'NewName';
+----
+BIGINT	false
+
+statement ok
+ALTER TABLE ns.docs ALTER COLUMN nEwNaMe DROP NOT NULL;
+
+query T
+SELECT is_nullable FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'docs' AND column_name = 'NewName';
+----
+true
+
+statement ok
+COMMENT ON COLUMN ns.docs.NEWNAME IS 'updated';
+
+statement ok
+ALTER TABLE ns.docs RENAME COLUMN newname TO "NEWNAME";
+
+statement error
+ALTER TABLE ns.docs RENAME COLUMN newname TO "NEIGHBOR";
+----
+already exists
+
+statement error
+ALTER TABLE ns.docs RENAME COLUMN "s.missing" TO wrong;
+----
+does not exist
+
+statement error
+COMMENT ON COLUMN ns.docs."s.missing" IS 'wrong';
+----
+not found
+
+# Preserve the native nested-path RENAME syntax.
+statement ok
+ALTER TABLE ns.docs RENAME COLUMN "s.child" TO moved;
+
+query I
+SELECT s.moved FROM ns.docs;
+----
+11
+
+statement ok
+ALTER TABLE ns.docs RENAME COLUMN "s.moved" TO child;
+
+statement ok
+DETACH ns;
+
+statement ok
+ATTACH '{TEST_DIR}/column_ddl' AS ns (TYPE LANCE);
+
+query TT rowsort
+SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'docs';
+----
+NEWNAME	updated
+Neighbor	keep
+s	NULL
+
+query III
+SELECT newname, neighbor, s.child FROM ns.docs;
+----
+7	9	11
+
+statement ok
+COMMENT ON COLUMN ns.docs.NeWnAmE IS NULL;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'docs' AND column_name = 'NEWNAME' AND comment IS NULL;
+----
+1
+
+# COPY preserves the source spellings. The attached catalog exposes the first
+# three fields as Foo, foo_1 and foo_1_1.
+statement ok
+COPY (SELECT 10 AS "Foo", 20 AS "foo", 30 AS "foo_1", 40 AS "Tick`Col") TO '{TEST_DIR}/column_ddl/aliases.lance' (FORMAT lance);
+
+statement ok
+COMMENT ON COLUMN ns.aliases.foo_1 IS 'second';
+
+statement ok
+ALTER TABLE ns.aliases RENAME COLUMN FOO_1_1 TO "Third";
+
+query TT
+SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'aliases' ORDER BY column_index;
+----
+Foo	NULL
+foo_1	second
+Third	NULL
+Tick`Col	NULL
+
+statement ok
+COMMENT ON COLUMN ns.aliases."tick`col" IS 'literal';
+
+statement ok
+ALTER TABLE ns.aliases RENAME COLUMN "tick`col" TO "Fourth";
+
+statement ok
+ALTER TABLE ns.aliases RENAME COLUMN FOO_1 TO "Second";
+
+query IIII
+SELECT foo, second, third, fourth FROM ns.aliases;
+----
+10	20	30	40
+
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'aliases' AND column_name = 'Fourth';
+----
+literal
+
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'aliases' AND column_name = 'Second';
+----
+second
+
+statement ok
+CREATE TABLE ns.labels AS SELECT [4, 7] AS tags;
+
+statement ok
+ALTER TABLE ns.labels RENAME COLUMN "tags.item" TO l;
+
+statement ok
+ALTER TABLE ns.labels RENAME COLUMN "tags.l" TO item;
+
+query I
+SELECT tags[2] FROM ns.labels;
+----
+7
+
+statement ok
+CREATE TABLE ns.special AS SELECT {'child': 1, 'sibling': 2} AS "Odd`Parent", 3 AS marker;
+
+statement ok
+ALTER TABLE ns.special RENAME COLUMN "odd`parent" TO regular;
+
+query II
+SELECT regular.child, regular.sibling FROM ns.special;
+----
+1	2

@@ -862,6 +862,11 @@ ALTER TABLE ns.main.my_table ALTER COLUMN age DROP NOT NULL;
 DETACH ns;
 ```
 
+When renaming a top-level column or changing its type, nullability, or comment,
+use the name shown by `DESCRIBE`. DuckDB matches these names case-insensitively
+and adds suffixes when external field names collide. A rename preserves the
+requested spelling of the new name.
+
 Stored defaults must pass DuckDB's default binder; they cannot reference other
 columns or use DataFusion-only functions. Use literal or cast-literal defaults
 with the current DuckDB target. DuckDB normally expands nonliteral defaults
