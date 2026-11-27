@@ -44,6 +44,7 @@ struct LanceQueryVector {
   vector<float> float32_values;
   vector<uint8_t> uint8_values;
   bool is_uint8 = false;
+  int32_t token_width = 0;
 
   size_t size() const {
     return is_uint8 ? uint8_values.size() : float32_values.size();
@@ -55,6 +56,12 @@ struct LanceQueryVector {
   }
   const float *float32_data() const { return float32_values.data(); }
   uint8_t ffi_element_type() const { return is_uint8 ? 1 : 0; }
+  size_t dimension() const {
+    return token_width ? NumericCast<size_t>(token_width) : size();
+  }
+  LanceKnnQuery knn_query() const {
+    return {data(), size(), token_width, ffi_element_type()};
+  }
 };
 
 static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
@@ -84,8 +91,8 @@ static bool TryLanceExplainKnn(void *dataset, const string &vector_column,
   }
 
   auto *plan_ptr = lance_explain_knn_scan_ir(
-      dataset, vector_column.c_str(), query.data(), query.size(),
-      query.ffi_element_type(), k, nprobes, refine_factor, ef,
+      dataset, vector_column.c_str(), query.knn_query(), k, nprobes,
+      refine_factor, ef,
       distance_type.empty() ? nullptr : distance_type.c_str(), filter_ptr,
       NumericCast<size_t>(filter_len), prefilter ? 1 : 0, use_index ? 1 : 0,
       verbose ? 1 : 0);
@@ -113,12 +120,12 @@ static LanceQueryVector ParseQueryVector(const Value &value,
     throw InvalidInputException(function_name +
                                 " requires query vector to be a LIST or ARRAY");
   }
-  vector<Value> children;
-  if (value.type().id() == LogicalTypeId::LIST) {
-    children = ListValue::GetChildren(value);
-  } else {
-    children = ArrayValue::GetChildren(value);
-  }
+  const auto get_children = [](const Value &list) -> const vector<Value> & {
+    return list.type().id() == LogicalTypeId::LIST
+               ? ListValue::GetChildren(list)
+               : ArrayValue::GetChildren(list);
+  };
+  const auto &children = get_children(value);
   if (children.empty()) {
     throw InvalidInputException(function_name +
                                 " requires a non-empty query vector");
@@ -155,8 +162,7 @@ static LanceQueryVector ParseQueryVector(const Value &value,
     return static_cast<float>(v);
   };
 
-  result.float32_values.reserve(children.size());
-  for (auto &child : children) {
+  const auto append_float = [&](const Value &child) {
     if (child.IsNull()) {
       throw InvalidInputException(function_name +
                                   " query vector contains NULL");
@@ -190,6 +196,35 @@ static LanceQueryVector ParseQueryVector(const Value &value,
         throw InvalidInputException(function_name +
                                     " query vector elements must be numeric");
       }
+    }
+  };
+  if (element_type.id() == LogicalTypeId::LIST ||
+      element_type.id() == LogicalTypeId::ARRAY) {
+    for (const auto &token : children) {
+      if (token.IsNull()) {
+        throw InvalidInputException(function_name +
+                                    " query vector contains a NULL token");
+      }
+      const auto &values = get_children(token);
+      if (values.empty()) {
+        throw InvalidInputException(function_name +
+                                    " requires non-empty query tokens");
+      }
+      auto width = NumericCast<int32_t>(values.size());
+      if (result.token_width && result.token_width != width) {
+        throw InvalidInputException(
+            function_name +
+            " requires all query tokens to have the same dimension");
+      }
+      result.token_width = width;
+      for (const auto &child : values) {
+        append_float(child);
+      }
+    }
+  } else {
+    result.float32_values.reserve(children.size());
+    for (const auto &child : children) {
+      append_float(child);
     }
   }
   return result;
@@ -738,6 +773,10 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
                                     LanceResolvePolicy::FALLBACK_TO_PATH,
                                     "lance_vector_search", version);
   auto table = target.table;
+  if (table && result->query.token_width) {
+    throw InvalidInputException("lance_vector_search multi-vector queries "
+                                "require a dataset path or URI");
+  }
   if (table && table->IsNamespaceBacked()) {
     if (result->query.is_uint8 && !version.IsValid()) {
       throw InvalidInputException(
@@ -777,9 +816,8 @@ LanceSearchVectorBind(ClientContext &context, TableFunctionBindInput &input,
   }
 
   auto *schema_handle = lance_get_knn_schema(
-      result->dataset, result->vector_column.c_str(), result->query.data(),
-      result->query.size(), result->query.ffi_element_type(), result->k,
-      result->nprobes, result->refine_factor, result->ef,
+      result->dataset, result->vector_column.c_str(), result->query.knn_query(),
+      result->k, result->nprobes, result->refine_factor, result->ef,
       result->distance_type.empty() ? nullptr : result->distance_type.c_str(),
       result->prefilter ? 1 : 0, result->use_index ? 1 : 0);
   if (!schema_handle) {
@@ -825,8 +863,7 @@ LanceKnnInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
         context,
         lance_get_knn_schema(
             global.pinned_dataset->Handle(), bind_data.vector_column.c_str(),
-            bind_data.query.data(), bind_data.query.size(),
-            bind_data.query.ffi_element_type(), bind_data.k, bind_data.nprobes,
+            bind_data.query.knn_query(), bind_data.k, bind_data.nprobes,
             bind_data.refine_factor, bind_data.ef,
             bind_data.distance_type.empty() ? nullptr
                                             : bind_data.distance_type.c_str(),
@@ -966,10 +1003,9 @@ LanceKnnLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
       global, *result, bind_data.prefilter,
       [&](const uint8_t *ir, size_t ir_len) {
         return lance_create_knn_stream_ir(
-            dataset, bind_data.vector_column.c_str(), bind_data.query.data(),
-            bind_data.query.size(), bind_data.query.ffi_element_type(),
-            bind_data.k, bind_data.nprobes, bind_data.refine_factor,
-            bind_data.ef,
+            dataset, bind_data.vector_column.c_str(),
+            bind_data.query.knn_query(), bind_data.k, bind_data.nprobes,
+            bind_data.refine_factor, bind_data.ef,
             bind_data.distance_type.empty() ? nullptr
                                             : bind_data.distance_type.c_str(),
             native_column_ptrs.empty() ? nullptr : native_column_ptrs.data(),
@@ -1105,7 +1141,7 @@ LanceKnnToString(TableFunctionToStringInput &input) {
   if (!bind_data.distance_type.empty()) {
     result["Lance Distance Type"] = bind_data.distance_type;
   }
-  result["Lance Query Dim"] = to_string(bind_data.query.size());
+  result["Lance Query Dim"] = to_string(bind_data.query.dimension());
   result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
   result["Lance Explain Verbose"] =
@@ -1166,7 +1202,7 @@ static void LanceKnnGetMetrics(TableFunctionGetMetricsInput &input) {
   if (!bind_data.distance_type.empty()) {
     result["Lance Distance Type"] = bind_data.distance_type;
   }
-  result["Lance Query Dim"] = to_string(bind_data.query.size());
+  result["Lance Query Dim"] = to_string(bind_data.query.dimension());
   result["Lance Prefilter"] = bind_data.prefilter ? "true" : "false";
   result["Lance Use Index"] = bind_data.use_index ? "true" : "false";
   result["Lance Explain Verbose"] =
@@ -1280,6 +1316,16 @@ static void RegisterLanceVectorSearch(ExtensionLoader &loader) {
                           LanceKnnInitGlobal, LanceKnnLocalInit);
   configure(search_u8);
   loader.RegisterFunction(search_u8);
+
+  for (const auto &type : {LogicalType::FLOAT, LogicalType::DOUBLE}) {
+    TableFunction multi("lance_vector_search",
+                        {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                         LogicalType::LIST(LogicalType::LIST(type))},
+                        LanceKnnFunc, LanceSearchVectorBind, LanceKnnInitGlobal,
+                        LanceKnnLocalInit);
+    configure(multi);
+    loader.RegisterFunction(multi);
+  }
 }
 
 // --- FTS / hybrid search ---

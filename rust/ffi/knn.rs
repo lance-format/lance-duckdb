@@ -6,7 +6,7 @@ use crate::runtime;
 use crate::scanner::LanceStream;
 
 use super::projection;
-use super::query_vector::{query_array, validate_query_vector};
+use super::query_vector::{validate_query_vector, LanceKnnQuery};
 use super::types::{SchemaHandle, StreamHandle};
 use super::util::{
     apply_scanner_filter, cstr_to_str, nonzero_u64_to_usize, optional_cstr_array,
@@ -42,9 +42,7 @@ pub unsafe extern "C" fn lance_normalize_distance_type(
 pub unsafe extern "C" fn lance_get_knn_schema(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -56,9 +54,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
     match get_knn_schema_inner(
         dataset,
         vector_column,
-        query_values,
-        query_len,
-        query_element_type,
+        query,
         k,
         nprobes,
         refine_factor,
@@ -82,9 +78,7 @@ pub unsafe extern "C" fn lance_get_knn_schema(
 fn get_knn_schema_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -93,14 +87,8 @@ fn get_knn_schema_inner(
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<SchemaHandle> {
-    if query_len == 0 {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "query vector must be non-empty",
-        ));
-    }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
+    let query = unsafe { query.into_array()? };
     let k_usize = nonzero_u64_to_usize(k, "k")?;
     let distance_type = unsafe { optional_distance_type(distance_type)? };
 
@@ -146,9 +134,7 @@ fn get_knn_schema_inner(
 pub unsafe extern "C" fn lance_create_knn_stream_ir(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -165,9 +151,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
     match create_knn_stream_ir_inner(
         dataset,
         vector_column,
-        query_values,
-        query_len,
-        query_element_type,
+        query,
         k,
         nprobes,
         refine_factor,
@@ -196,9 +180,7 @@ pub unsafe extern "C" fn lance_create_knn_stream_ir(
 fn create_knn_stream_ir_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -212,14 +194,8 @@ fn create_knn_stream_ir_inner(
     prefilter: u8,
     use_index: u8,
 ) -> FfiResult<StreamHandle> {
-    if query_len == 0 {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "query vector must be non-empty",
-        ));
-    }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
+    let query = unsafe { query.into_array()? };
     let mut projection_columns = unsafe { optional_cstr_array(columns, columns_len, "columns")? };
     let filter = unsafe {
         parse_optional_filter_ir(
@@ -302,9 +278,7 @@ fn create_knn_stream_ir_inner(
 pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -319,9 +293,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
     match explain_knn_scan_ir_inner(
         dataset,
         vector_column,
-        query_values,
-        query_len,
-        query_element_type,
+        query,
         k,
         nprobes,
         refine_factor,
@@ -348,9 +320,7 @@ pub unsafe extern "C" fn lance_explain_knn_scan_ir(
 fn explain_knn_scan_ir_inner(
     dataset: *mut c_void,
     vector_column: *const c_char,
-    query_values: *const c_void,
-    query_len: usize,
-    query_element_type: u8,
+    query: LanceKnnQuery,
     k: u64,
     nprobes: u64,
     refine_factor: u64,
@@ -362,14 +332,8 @@ fn explain_knn_scan_ir_inner(
     use_index: u8,
     verbose: u8,
 ) -> FfiResult<String> {
-    if query_len == 0 {
-        return Err(FfiError::new(
-            ErrorCode::InvalidArgument,
-            "query vector must be non-empty",
-        ));
-    }
     let vector_column = unsafe { cstr_to_str(vector_column, "vector_column")? };
-    let query = unsafe { query_array(query_values, query_len, query_element_type)? };
+    let query = unsafe { query.into_array()? };
     let filter = unsafe {
         parse_optional_filter_ir(
             filter_ir,

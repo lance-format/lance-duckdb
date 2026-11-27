@@ -416,15 +416,21 @@ const char *lance_explain_dataset_scan_ir(void *dataset, const char **columns,
                                           size_t filter_ir_len, int64_t limit,
                                           int64_t offset, uint8_t verbose);
 
+struct LanceKnnQuery {
+  const void *values;
+  size_t len;
+  // Zero for a flat query, otherwise the number of elements per token.
+  int32_t token_width;
+  uint8_t element_type;
+};
+
 void *lance_get_knn_schema(void *dataset, const char *vector_column,
-                           const void *query_values, size_t query_len,
-                           uint8_t query_element_type, uint64_t k,
-                           uint64_t nprobes, uint64_t refine_factor,
-                           uint64_t ef, const char *distance_type,
-                           uint8_t prefilter, uint8_t use_index);
+                           LanceKnnQuery query, uint64_t k, uint64_t nprobes,
+                           uint64_t refine_factor, uint64_t ef,
+                           const char *distance_type, uint8_t prefilter,
+                           uint8_t use_index);
 void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
-                                 const void *query_values, size_t query_len,
-                                 uint8_t query_element_type, uint64_t k,
+                                 LanceKnnQuery query, uint64_t k,
                                  uint64_t nprobes, uint64_t refine_factor,
                                  uint64_t ef, const char *distance_type,
                                  const char **columns, size_t columns_len,
@@ -433,12 +439,13 @@ void *lance_create_knn_stream_ir(void *dataset, const char *vector_column,
                                  uint8_t use_index);
 
 const char *lance_normalize_distance_type(const char *distance_type);
-const char *lance_explain_knn_scan_ir(
-    void *dataset, const char *vector_column, const void *query_values,
-    size_t query_len, uint8_t query_element_type, uint64_t k, uint64_t nprobes,
-    uint64_t refine_factor, uint64_t ef, const char *distance_type,
-    const uint8_t *filter_ir, size_t filter_ir_len, uint8_t prefilter,
-    uint8_t use_index, uint8_t verbose);
+const char *lance_explain_knn_scan_ir(void *dataset, const char *vector_column,
+                                      LanceKnnQuery query, uint64_t k,
+                                      uint64_t nprobes, uint64_t refine_factor,
+                                      uint64_t ef, const char *distance_type,
+                                      const uint8_t *filter_ir,
+                                      size_t filter_ir_len, uint8_t prefilter,
+                                      uint8_t use_index, uint8_t verbose);
 
 // In the FTS and hybrid calls, a null text_column means the query is a Lance
 // FtsQuery in its JSON form.

@@ -1,8 +1,8 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float32Array, UInt8Array};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
+use arrow::datatypes::{DataType, Field};
 use lance::index::vector::utils::get_vector_type;
 use lance_linalg::distance::DistanceType;
 
@@ -13,6 +13,40 @@ use super::util::{slice_from_ptr, FfiError, FfiResult};
 
 pub(crate) const QUERY_ELEMENT_FLOAT32: u8 = 0;
 pub(crate) const QUERY_ELEMENT_UINT8: u8 = 1;
+
+#[repr(C)]
+pub struct LanceKnnQuery {
+    values: *const c_void,
+    len: usize,
+    token_width: i32,
+    element_type: u8,
+}
+
+impl LanceKnnQuery {
+    pub(super) unsafe fn into_array(self) -> FfiResult<ArrayRef> {
+        let values = unsafe { query_array(self.values, self.len, self.element_type)? };
+        if self.token_width == 0 {
+            return Ok(values);
+        }
+        if self.element_type != QUERY_ELEMENT_FLOAT32
+            || self.token_width < 0
+            || !self.len.is_multiple_of(self.token_width as usize)
+        {
+            return Err(FfiError::new(
+                ErrorCode::InvalidArgument,
+                "invalid multi-vector query shape or element type",
+            ));
+        }
+        let tokens = FixedSizeListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Float32, false)),
+            self.token_width,
+            values,
+            None,
+        )
+        .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err.to_string()))?;
+        Ok(Arc::new(tokens))
+    }
+}
 
 pub(crate) unsafe fn query_array(
     query_values: *const c_void,
@@ -53,9 +87,19 @@ pub(crate) fn validate_query_vector(
     query: ArrayRef,
     distance_type: Option<&DistanceType>,
 ) -> FfiResult<ArrayRef> {
-    let (_, stored_type) = get_vector_type(handle.dataset.schema(), vector_column)
+    let (column_type, stored_type) = get_vector_type(handle.dataset.schema(), vector_column)
         .map_err(|err| FfiError::new(ErrorCode::InvalidArgument, err.to_string()))?;
     let query_type = query.data_type().clone();
+
+    if matches!(query_type, DataType::FixedSizeList(_, _)) {
+        // Lance interprets a nested query on a single-vector column as a batch.
+        if !matches!(column_type, DataType::List(_)) || !stored_type.is_floating() {
+            return Err(FfiError::new(ErrorCode::InvalidArgument, format!(
+                "Multi-vector queries require a floating-point multi-vector column, got {column_type} for {vector_column}"
+            )));
+        }
+        return Ok(query);
+    }
 
     // Preserve the existing numeric-cast behavior on floating-point columns.
     // UInt8 keeps its native binary meaning only on a UInt8 column.

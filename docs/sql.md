@@ -320,6 +320,8 @@ Positional arguments:
 - `vector_column` (VARCHAR): Vector column name.
 - `query_vector`: Non-empty query vector. `FLOAT[dim]` / `DOUBLE[dim]` are preferred; `FLOAT[]` / `DOUBLE[]` are also accepted and cast to float32. To pass a `UTINYINT[]` or `UTINYINT[dim]` query, use a dataset path, an object store URI, or a directory-attached table with an explicit `version`. Binary vector columns use Hamming distance. On floating-point columns, UINT8 follows the ordinary numeric cast to float32.
 
+For a multi-vector column such as `FLOAT[dim][]`, a dataset path or URI also accepts a nested query such as `[[1, 0], [0, 1]]::FLOAT[][]`. Each inner vector represents one query token and must have the column's dimension. The search returns one row per matching document. For exact cosine MaxSim, set `distance_type = 'cosine'` and `use_index = false`. The distance sums each query token's smallest cosine distance to any token in the document. To search a cosine vector index, enable `use_index`.
+
 Named parameters:
 - `version` (optional): A positive integer in the `BIGINT` range, for example `version = 3`. Dataset paths, object store URIs and directory-attached names such as `'ns.main.items'` support this option. The vector index, output columns, row IDs and distances come from that version. Omit it to search the current version. An unavailable version or a versioned search of a managed REST table raises an error.
 - `k` (BIGINT, default `10`): Number of results to return. Must be > 0.

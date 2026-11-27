@@ -1,0 +1,104 @@
+# name: test/sql/search_multivector.test
+# description: A multi-vector query ranks documents by their token vectors
+# group: [sql]
+
+require lance
+
+statement ok
+ATTACH '{TEST_DIR}/multi_search' AS multi (TYPE LANCE);
+
+statement ok
+CREATE TABLE multi.docs AS
+SELECT id, tokens::FLOAT[2][] AS emb, [1, 0]::FLOAT[2] AS flat
+FROM (VALUES (12, [[1, 0], [0, 1]]), (23, [[1, 0], [1, 0]]),
+             (34, [[-1, 0], [0, -1]])) docs(id, tokens);
+
+query IR
+SELECT id, _distance
+FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+                         [[1, 0], [0, 1]]::FLOAT[][], k = 3, distance_type = 'cosine', use_index = false)
+ORDER BY _distance;
+----
+12	0.0
+23	1.0
+34	2.0
+
+query IR
+SELECT id, _distance FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+    [[1, 0], [0, 1]]::FLOAT[][], k = 3, use_index = false) ORDER BY _distance;
+----
+12	0.0
+23	2.0
+34	4.0
+
+statement ok
+CREATE INDEX doc_tokens ON multi.main.docs (emb) USING IVF_FLAT WITH (num_partitions = 1, metric_type = 'cosine');
+
+query IR
+SELECT id, _distance
+FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+                         [[1, 0], [0, 1]]::DOUBLE[2][2], k = 3)
+ORDER BY _distance;
+----
+12	0.0
+23	1.0
+34	2.0
+
+query II
+EXPLAIN (FORMAT JSON) SELECT id FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+    [[1, 0], [0, 1]]::FLOAT[][], explain_verbose = true);
+----
+physical_plan	<REGEX>:[\s\S]*MultivectorScoring[\s\S]*
+
+query IR
+SELECT id, _distance FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+    [[1, 0], [0, 1]]::FLOAT[][], k = 1, version = 1, distance_type = 'cosine', prefilter = true)
+WHERE id > 12;
+----
+23	1.0
+
+query I
+SELECT count(*) FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb',
+    [[0, 1]]::FLOAT[][], k = 1, distance_type = 'cosine');
+----
+1
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'flat', [[1, 0]]::FLOAT[][]);
+----
+multi-vector column
+
+statement error
+SELECT * FROM lance_vector_search('multi.main.docs', 'emb', [[1, 0]]::FLOAT[][]);
+----
+dataset path or URI
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [[1], [0]]::FLOAT[][]);
+----
+vector dim
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [[1, 0], [0]]::FLOAT[][]);
+----
+same dimension
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [[]]::FLOAT[][]);
+----
+non-empty query tokens
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', []::FLOAT[][]);
+----
+non-empty query vector
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [NULL]::FLOAT[][]);
+----
+NULL token
+
+statement error
+SELECT * FROM lance_vector_search('{TEST_DIR}/multi_search/docs.lance', 'emb', [[1, NULL]]::FLOAT[][]);
+----
+contains NULL
