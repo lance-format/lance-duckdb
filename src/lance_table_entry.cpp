@@ -16,6 +16,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -28,6 +29,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <optional>
 
 namespace duckdb {
 
@@ -101,23 +103,66 @@ LanceTableSchema LanceTableSchema::FromArrow(ClientContext &context,
   return result;
 }
 
-LanceTableSchema LanceTableSchema::FromDataset(ClientContext &context,
-                                               void *dataset) {
+static void ReadTableArrowSchema(void *dataset, ArrowSchemaWrapper &root) {
   std::unique_ptr<void, decltype(&lance_free_schema)> handle(
       lance_get_schema(dataset), lance_free_schema);
   if (!handle) {
     throw IOException("Failed to get schema from Lance dataset" +
                       LanceFormatErrorSuffix());
   }
-  ArrowSchemaWrapper root;
   root.arrow_schema = {};
   if (lance_schema_to_arrow(handle.get(), &root.arrow_schema) != 0) {
     throw IOException(
         "Failed to export Lance schema to Arrow C Data Interface" +
         LanceFormatErrorSuffix());
   }
+}
+
+LanceTableSchema LanceTableSchema::FromDataset(ClientContext &context,
+                                               void *dataset) {
+  ArrowSchemaWrapper root;
+  ReadTableArrowSchema(dataset, root);
   ArrowTableSchema arrow_table;
   return FromArrow(context, root.arrow_schema, arrow_table);
+}
+
+// DuckDB may expose a physical field under a deduplicated Arrow name. Resolve
+// on the mutation handle so an external schema change cannot shift an ordinal
+// between lookup and use.
+static std::optional<string>
+ResolveAlterColumn(ClientContext &context, void *dataset, Identifier name,
+                   bool if_exists = false,
+                   const Identifier *new_name = nullptr) {
+  ArrowSchemaWrapper root;
+  ReadTableArrowSchema(dataset, root);
+  ArrowTableSchema arrow_table;
+  auto live =
+      LanceTableSchema::FromArrow(context, root.arrow_schema, arrow_table);
+  auto index = live.columns.GetColumnIndex(name);
+  if (index.index >= live.columns.LogicalColumnCount()) {
+    if (if_exists) {
+      return std::nullopt;
+    }
+    // Quoted Lance paths such as "tags.l" are a documented schema-evolution
+    // entry point. Keep their native path semantics and diagnostics.
+    if (name.GetIdentifierName().find('.') != string::npos) {
+      return name.GetIdentifierName();
+    }
+    throw BinderException("Column %s does not exist", name);
+  }
+  if (new_name) {
+    auto destination = *new_name;
+    auto existing = live.columns.GetColumnIndex(destination);
+    if (existing.index < live.columns.LogicalColumnCount() &&
+        existing != index) {
+      throw CatalogException("Column with name %s already exists", *new_name);
+    }
+  }
+  string physical = root.arrow_schema.children[index.index]->name;
+  if (physical.find_first_of(".`") != string::npos || physical == "*") {
+    return KeywordHelper::WriteQuotedAndEscaped(physical, '`');
+  }
+  return physical;
 }
 
 LanceTableEntry::LanceTableEntry(Catalog &catalog, SchemaCatalogEntry &schema,
@@ -477,13 +522,14 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
   }
 
   string display_uri;
-  void *dataset = LanceOpenDatasetForTable(context, *this, display_uri);
+  std::unique_ptr<void, decltype(&lance_close_dataset)> dataset(
+      LanceOpenDatasetForTable(context, *this, display_uri),
+      lance_close_dataset);
   if (!dataset) {
     throw IOException("Failed to open Lance dataset: " + display_uri +
                       LanceFormatErrorSuffix());
   }
 
-  unique_ptr<CatalogEntry> result;
   switch (info.type) {
   case AlterType::ALTER_TABLE: {
     auto &alter = info.Cast<AlterTableInfo>();
@@ -505,52 +551,47 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       const bool has_default = add.new_column.HasDefaultValue();
       string default_sql;
       if (has_default) {
-        try {
-          // DuckDB rebinds stored defaults for subsequent DML. Validate them
-          // before committing the external schema change.
-          auto default_binder = Binder::CreateBinder(context);
-          vector<unique_ptr<Expression>> bound_defaults;
-          default_binder->BindDefaultValue(
-              add.new_column, bound_defaults,
-              catalog.GetName().GetIdentifierName(), schema.GetSchemaPath());
-          if (bound_defaults.size() != 1 || !bound_defaults[0]) {
-            throw InternalException(
-                "DuckDB default binder returned an unexpected result");
-          }
-          default_sql = add.new_column.DefaultValue().ToString();
+        // DuckDB rebinds stored defaults for subsequent DML. Validate them
+        // before committing the external schema change.
+        auto default_binder = Binder::CreateBinder(context);
+        vector<unique_ptr<Expression>> bound_defaults;
+        default_binder->BindDefaultValue(add.new_column, bound_defaults,
+                                         catalog.GetName().GetIdentifierName(),
+                                         schema.GetSchemaPath());
+        if (bound_defaults.size() != 1 || !bound_defaults[0]) {
+          throw InternalException(
+              "DuckDB default binder returned an unexpected result");
+        }
+        default_sql = add.new_column.DefaultValue().ToString();
 
-          if (types[0].id() == LogicalTypeId::BLOB) {
-            // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
-            // default with the native binder/evaluator, then hand the exact
-            // bytes to the existing expression path as a hex literal. Only
-            // constant-foldable BLOB defaults are supported: URI ingestion is
-            // a DML value contract, not a stored default.
-            auto &bound_default = *bound_defaults[0];
-            if (!bound_default.IsFoldable() || bound_default.IsVolatile()) {
-              throw NotImplementedException(
-                  "ALTER TABLE ADD COLUMN BLOB DEFAULT only supports "
-                  "constant-foldable values, not columns or volatile "
-                  "functions");
-            }
-            Value default_value;
-            if (!ExpressionExecutor::TryEvaluateScalar(context, bound_default,
-                                                       default_value)) {
-              throw NotImplementedException(
-                  "ALTER TABLE ADD COLUMN BLOB DEFAULT could not be folded to "
-                  "a constant value");
-            }
-            if (default_value.IsNull()) {
-              expressions.push_back("NULL");
-            } else {
-              auto bytes = default_value.GetValueUnsafe<string_t>().GetString();
-              expressions.push_back("X'" + LanceHexEncode(bytes) + "'");
-            }
-          } else {
-            expressions.push_back(default_sql);
+        if (types[0].id() == LogicalTypeId::BLOB) {
+          // Lance's DataFusion planner has no BLOB type. Fold the DuckDB
+          // default with the native binder/evaluator, then hand the exact
+          // bytes to the existing expression path as a hex literal. Only
+          // constant-foldable BLOB defaults are supported: URI ingestion is
+          // a DML value contract, not a stored default.
+          auto &bound_default = *bound_defaults[0];
+          if (!bound_default.IsFoldable() || bound_default.IsVolatile()) {
+            throw NotImplementedException(
+                "ALTER TABLE ADD COLUMN BLOB DEFAULT only supports "
+                "constant-foldable values, not columns or volatile "
+                "functions");
           }
-        } catch (...) {
-          lance_close_dataset(dataset);
-          throw;
+          Value default_value;
+          if (!ExpressionExecutor::TryEvaluateScalar(context, bound_default,
+                                                     default_value)) {
+            throw NotImplementedException(
+                "ALTER TABLE ADD COLUMN BLOB DEFAULT could not be folded to "
+                "a constant value");
+          }
+          if (default_value.IsNull()) {
+            expressions.push_back("NULL");
+          } else {
+            auto bytes = default_value.GetValueUnsafe<string_t>().GetString();
+            expressions.push_back("X'" + LanceHexEncode(bytes) + "'");
+          }
+        } else {
+          expressions.push_back(default_sql);
         }
       }
       vector<const char *> expr_ptrs;
@@ -561,11 +602,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto blob_flags = LanceBlobFlagsForTypes(types);
 
       auto rc = lance_dataset_add_columns(
-          dataset, &new_schema_root.arrow_schema,
+          dataset.get(), &new_schema_root.arrow_schema,
           expr_ptrs.empty() ? nullptr : expr_ptrs.data(), expr_ptrs.size(), 0,
           blob_flags.empty() ? nullptr : blob_flags.data(), blob_flags.size());
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to add column to Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
@@ -573,62 +613,48 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       // Best-effort persistence of DuckDB column defaults in Lance field
       // metadata. Re-open the dataset after schema evolution so the new field
       // is visible to the metadata updater.
-      lance_close_dataset(dataset);
-      dataset = nullptr;
+      dataset.reset();
       if (has_default) {
         string reopen_uri;
-        dataset = LanceOpenDatasetForTable(context, *this, reopen_uri);
+        dataset.reset(LanceOpenDatasetForTable(context, *this, reopen_uri));
         if (dataset) {
           (void)lance_dataset_update_field_metadata(
-              dataset, add.new_column.Name().c_str(), "duckdb_default_expr",
-              default_sql.c_str());
-          lance_close_dataset(dataset);
-          dataset = nullptr;
+              dataset.get(), add.new_column.Name().c_str(),
+              "duckdb_default_expr", default_sql.c_str());
         }
-      } else {
-        // The dataset was already closed above, keep going.
       }
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::REMOVE_COLUMN: {
       auto &drop = info.Cast<RemoveColumnInfo>();
-      if (drop.if_column_exists && !ColumnExists(drop.removed_column)) {
-        lance_close_dataset(dataset);
-        result = nullptr;
-        break;
+      auto column = ResolveAlterColumn(
+          context, dataset.get(), drop.removed_column, drop.if_column_exists);
+      if (!column) {
+        return nullptr;
       }
-      const char *cols[1] = {drop.removed_column.c_str()};
-      auto rc = lance_dataset_drop_columns(dataset, cols, 1);
+      const char *paths[] = {column->c_str()};
+      auto rc = lance_dataset_drop_columns(dataset.get(), paths, 1);
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to drop column from Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      lance_close_dataset(dataset);
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::RENAME_COLUMN: {
       auto &rename = info.Cast<RenameColumnInfo>();
+      auto column = ResolveAlterColumn(context, dataset.get(), rename.old_name,
+                                       false, &rename.new_name);
       auto rc = lance_dataset_alter_columns_rename(
-          dataset, rename.old_name.c_str(), rename.new_name.c_str());
+          dataset.get(), column->c_str(), rename.new_name.c_str());
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to rename column in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      lance_close_dataset(dataset);
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::ALTER_COLUMN_TYPE: {
       auto &cast = info.Cast<ChangeColumnTypeInfo>();
       if (cast.column_path.size() != 1) {
-        lance_close_dataset(dataset);
         throw NotImplementedException(
             "Lance ALTER COLUMN does not support nested field paths");
       }
@@ -637,74 +663,62 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
           !IsImplicitCastUsingExpression(
               *cast.expression, cast.GetColumnName().GetIdentifierName(),
               cast.target_type)) {
-        lance_close_dataset(dataset);
         throw NotImplementedException(
             "Lance ALTER COLUMN TYPE only supports implicit USING (i.e., a "
             "simple CAST of the original column)");
       }
 
+      auto column =
+          ResolveAlterColumn(context, dataset.get(), cast.GetColumnName());
       ArrowSchemaWrapper new_type_schema;
       memset(&new_type_schema.arrow_schema, 0,
              sizeof(new_type_schema.arrow_schema));
       auto props = context.GetClientProperties();
-      ArrowConverter::ToArrowSchema(
-          &new_type_schema.arrow_schema, {cast.target_type},
-          {cast.GetColumnName().GetIdentifierName()}, props);
+      ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
+                                    {cast.target_type}, {*column}, props);
       LanceNormalizeArrowListFieldNames(&new_type_schema.arrow_schema);
 
-      auto rc = lance_dataset_alter_columns_cast(
-          dataset, cast.GetColumnName().GetIdentifierName().c_str(),
-          &new_type_schema.arrow_schema);
+      auto rc = lance_dataset_alter_columns_cast(dataset.get(), column->c_str(),
+                                                 &new_type_schema.arrow_schema);
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to change column type in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      lance_close_dataset(dataset);
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::SET_NOT_NULL: {
       auto &nn = info.Cast<SetNotNullInfo>();
       if (nn.column_path.size() != 1) {
-        lance_close_dataset(dataset);
         throw NotImplementedException(
             "Lance ALTER COLUMN does not support nested field paths");
       }
-      auto rc = lance_dataset_alter_columns_set_nullable(
-          dataset, nn.column_path[0].c_str(), 0);
+      auto column =
+          ResolveAlterColumn(context, dataset.get(), nn.column_path[0]);
+      auto rc = lance_dataset_alter_columns_set_nullable(dataset.get(),
+                                                         column->c_str(), 0);
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to set NOT NULL in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      lance_close_dataset(dataset);
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     case AlterTableType::DROP_NOT_NULL: {
       auto &nn = info.Cast<DropNotNullInfo>();
       if (nn.column_path.size() != 1) {
-        lance_close_dataset(dataset);
         throw NotImplementedException(
             "Lance ALTER COLUMN does not support nested field paths");
       }
-      auto rc = lance_dataset_alter_columns_set_nullable(
-          dataset, nn.column_path[0].c_str(), 1);
+      auto column =
+          ResolveAlterColumn(context, dataset.get(), nn.column_path[0]);
+      auto rc = lance_dataset_alter_columns_set_nullable(dataset.get(),
+                                                         column->c_str(), 1);
       if (rc != 0) {
-        lance_close_dataset(dataset);
         throw IOException("Failed to drop NOT NULL in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
       }
-      lance_close_dataset(dataset);
-      LanceInvalidateDatasetCacheForTable(context, *this);
-      return BuildUpdatedLanceTableEntry(context, *this, internal);
       break;
     }
     default:
-      lance_close_dataset(dataset);
       throw NotImplementedException(
           "ALTER TABLE operation not supported for Lance tables");
     }
@@ -719,24 +733,23 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
                         .GetValue<string>();
       comment_ptr = comment_str.c_str();
     }
+    auto column =
+        ResolveAlterColumn(context, dataset.get(), comment.column_name);
     auto rc = lance_dataset_update_field_metadata(
-        dataset, comment.column_name.c_str(), "comment", comment_ptr);
+        dataset.get(), column->c_str(), "comment", comment_ptr);
     if (rc != 0) {
-      lance_close_dataset(dataset);
       throw IOException("Failed to update column comment in Lance dataset: " +
                         display_uri + LanceFormatErrorSuffix());
     }
-    lance_close_dataset(dataset);
-    LanceInvalidateDatasetCacheForTable(context, *this);
-    return BuildUpdatedLanceTableEntry(context, *this, internal);
     break;
   }
   default:
-    lance_close_dataset(dataset);
     throw NotImplementedException("ALTER is not supported for Lance tables");
   }
 
-  return result;
+  dataset.reset();
+  LanceInvalidateDatasetCacheForTable(context, *this);
+  return BuildUpdatedLanceTableEntry(context, *this, internal);
 }
 
 unique_ptr<CatalogEntry> LanceTableEntry::Copy(ClientContext &context) const {
