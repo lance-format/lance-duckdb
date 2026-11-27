@@ -13,6 +13,7 @@ use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
+use lance_table::io::manifest::read_manifest_indexes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{clear_last_error, set_last_error, ErrorCode};
@@ -627,7 +628,18 @@ fn dataset_optimize_index_with_options_inner(
 
     let mut ds: Dataset = handle.dataset.as_ref().clone();
     let metrics = run_with_large_stack(move || {
-        match runtime::block_on(async { ds.optimize_indices(&options).await }) {
+        match runtime::block_on(async {
+            if let Some(name) = &index_name_owned {
+                // Maintenance can see registered segments that load_indices() hides from queries.
+                let store = ds.object_store(None).await?;
+                let indices =
+                    read_manifest_indexes(&store, ds.manifest_location(), ds.manifest()).await?;
+                if !indices.iter().any(|index| &index.name == name) {
+                    return Err(lance_core::Error::index_not_found(format!("name={name}")));
+                }
+            }
+            ds.optimize_indices(&options).await
+        }) {
             Ok(Ok(())) => Ok(OptimizeIndexMetricsOutput {
                 index_name: index_name_owned,
                 mode,
