@@ -1,6 +1,8 @@
 # Lance DuckDB Extension
 
-[Lance](https://github.com/lance-format/lance/) is a modern columnar data format optimized for ML/AI workloads, with native cloud storage support. This extension will make `Lance` the best file/table/lakehouse formats on DuckDB.
+[Lance](https://github.com/lance-format/lance/) is a modern columnar data format
+optimized for ML/AI workloads, with native cloud storage support. This extension
+exposes Lance Rust capabilities through DuckDB SQL.
 
 Lance is a **DuckDB core extension**. lance-duckdb has no independent version
 number or release cycle: it ships with DuckDB's core extensions and follows the
@@ -186,7 +188,9 @@ backport, and official publication requirements.
 
 ## Contributing
 
-Issues and PRs are welcome. High-impact areas include pushdown, parallelism/performance, type coverage, and better diagnostics.
+Issues and PRs for DuckDB integration are welcome, including pushdown, parallel
+execution, type coverage, and diagnostics. Report Lance bugs and request Lance
+features upstream in [lance-format/lance](https://github.com/lance-format/lance/issues).
 
 ### Manual Lance dependency bumps
 

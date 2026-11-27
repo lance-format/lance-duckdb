@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository contains a DuckDB extension for querying Lance format datasets (including scan, vector search, and full-text search). The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
+lance-duckdb is a SQL binding over Lance Rust. It maps DuckDB SQL inputs to Lance APIs and preserves Lance's semantics when exposing existing capabilities such as scans, vector search, and full-text search. The DuckDB integration is implemented in C++ (under `src/`) and links a Rust static library (`lance_duckdb_ffi`) that uses the Lance Rust crate and exports data via the Arrow C Data Interface.
 
 ## Version and Release Policy
 
@@ -48,12 +48,20 @@ When in doubt, prefer SQL surface area that matches DuckDB idioms over extension
 
 ## Reuse Upstream Mechanisms First
 
-Prefer DuckDB/Lance native mechanisms over extension-specific replacements.
+Search, scoring, index selection, defaults, and correctness fixes for Lance
+behavior belong in Lance. Report missing capabilities and bugs upstream in
+[lance-format/lance](https://github.com/lance-format/lance/issues).
+
+Pick up upstream changes by upgrading to a Lance release that includes them.
+Do not add extension-specific semantics or workarounds such as forcing exact
+search, rejecting options Lance accepts, or reimplementing Lance logic.
+
+Prefer DuckDB/Lance native mechanisms for DuckDB integration.
 
 - Before adding a new mechanism, first check whether DuckDB or Lance already provides the required hook, lifecycle, cache, profiling surface, or introspection path.
 - If an upstream mechanism can satisfy the requirement with reasonable adaptation, use it instead of inventing a parallel extension-specific mechanism.
 - Prefer integration with DuckDB-native observability surfaces such as profiling, `EXPLAIN`, and catalog/state hooks over custom debug-only SQL functions.
-- Introduce new extension-specific mechanisms only when upstream surfaces cannot express the requirement cleanly, and document why reuse was insufficient.
+- Introduce extension-specific mechanisms only for necessary DuckDB integration that upstream surfaces cannot express cleanly. Document why reuse was insufficient.
 
 ## Essential Commands
 
