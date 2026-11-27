@@ -862,12 +862,10 @@ ALTER TABLE ns.main.my_table ALTER COLUMN age DROP NOT NULL;
 DETACH ns;
 ```
 
-For top-level column changes, use the names shown by `DESCRIBE`. DuckDB matches
-these names case-insensitively and adds suffixes when external field names
-collide. A rename preserves the requested spelling of the new name.
-With Lance 14.0.3, a drop involving a literal backtick can produce a plan that
-retains the field. The extension rejects that plan before creating a version.
-For a top-level field, rename it to a simple name before dropping it in that case.
+When renaming a top-level column or changing its type, nullability, or comment,
+use the name shown by `DESCRIBE`. DuckDB matches these names case-insensitively
+and adds suffixes when external field names collide. A rename preserves the
+requested spelling of the new name.
 
 Stored defaults must pass DuckDB's default binder; they cannot reference other
 columns or use DataFusion-only functions. Use literal or cast-literal defaults

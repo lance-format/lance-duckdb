@@ -47,14 +47,6 @@ ALTER TABLE ns.docs RENAME COLUMN newname TO "NEIGHBOR";
 already exists
 
 statement error
-ALTER TABLE ns.docs DROP COLUMN "s.missing";
-----
-does not exist
-
-statement ok
-ALTER TABLE ns.docs DROP COLUMN IF EXISTS "s.missing";
-
-statement error
 ALTER TABLE ns.docs RENAME COLUMN "s.missing" TO wrong;
 ----
 does not exist
@@ -102,29 +94,6 @@ SELECT count(*) FROM duckdb_columns() WHERE database_name = 'ns' AND table_name 
 ----
 1
 
-statement ok
-ALTER TABLE ns.docs DROP COLUMN IF EXISTS NeWnAmE;
-
-statement ok
-ALTER TABLE ns.docs DROP COLUMN IF EXISTS NeWnAmE;
-
-statement ok
-DETACH ns;
-
-statement ok
-ATTACH '{TEST_DIR}/column_ddl' AS ns (TYPE LANCE);
-
-query TT rowsort
-SELECT column_name, comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'docs';
-----
-Neighbor	keep
-s	NULL
-
-query II
-SELECT neighbor, s.child FROM ns.docs;
-----
-9	11
-
 # COPY preserves the source spellings. The attached catalog exposes the first
 # three fields as Foo, foo_1 and foo_1_1.
 statement ok
@@ -145,36 +114,28 @@ Third	NULL
 Tick`Col	NULL
 
 statement ok
-ALTER TABLE ns.aliases DROP COLUMN FOO_1;
-
-statement ok
 COMMENT ON COLUMN ns.aliases."tick`col" IS 'literal';
-
-statement ok
-SET VARIABLE before_drop = (SELECT max(version) FROM lance_versions('ns.main.aliases'));
-
-statement error
-ALTER TABLE ns.aliases DROP COLUMN "tick`col";
-----
-cannot remove the selected field
-
-query I
-SELECT max(version) = getvariable('before_drop') FROM lance_versions('ns.main.aliases');
-----
-true
 
 statement ok
 ALTER TABLE ns.aliases RENAME COLUMN "tick`col" TO "Fourth";
 
-query III
-SELECT foo, third, fourth FROM ns.aliases;
+statement ok
+ALTER TABLE ns.aliases RENAME COLUMN FOO_1 TO "Second";
+
+query IIII
+SELECT foo, second, third, fourth FROM ns.aliases;
 ----
-10	30	40
+10	20	30	40
 
 query T
 SELECT comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'aliases' AND column_name = 'Fourth';
 ----
 literal
+
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'ns' AND table_name = 'aliases' AND column_name = 'Second';
+----
+second
 
 statement ok
 CREATE TABLE ns.labels AS SELECT [4, 7] AS tags;
@@ -192,11 +153,6 @@ SELECT tags[2] FROM ns.labels;
 
 statement ok
 CREATE TABLE ns.special AS SELECT {'child': 1, 'sibling': 2} AS "Odd`Parent", 3 AS marker;
-
-statement error
-ALTER TABLE ns.special DROP COLUMN "`Odd``Parent`.child";
-----
-cannot remove the selected field
 
 statement ok
 ALTER TABLE ns.special RENAME COLUMN "odd`parent" TO regular;

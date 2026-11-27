@@ -530,31 +530,6 @@ fn dataset_drop_columns_inner(
 
     let mut ds = (*handle.dataset).clone();
     let col_refs = cols.iter().map(|c| c.as_str()).collect::<Vec<_>>();
-    // Lance 14.0.3 can keep a backtick-bearing field during schema exclusion.
-    // Check the native plan before publishing a version that reports a false drop.
-    let escaped_ids: Vec<_> = col_refs
-        .iter()
-        .filter(|path| path.contains('`'))
-        .filter_map(|path| ds.schema().field(path))
-        .map(|field| field.id)
-        .collect();
-    if !escaped_ids.is_empty() {
-        let planned = ds.plan_drop_columns(&col_refs).map_err(|err| {
-            FfiError::new(
-                ErrorCode::DatasetDropColumns,
-                format!("dataset drop_columns: {err}"),
-            )
-        })?;
-        if escaped_ids
-            .iter()
-            .any(|id| planned.field_by_id(*id).is_some())
-        {
-            return Err(FfiError::new(
-                ErrorCode::DatasetDropColumns,
-                "Lance cannot remove the selected field at this quoted path",
-            ));
-        }
-    }
     match runtime::block_on(ds.drop_columns(&col_refs)) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(FfiError::new(

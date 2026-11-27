@@ -29,7 +29,6 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
-#include <optional>
 
 namespace duckdb {
 
@@ -129,10 +128,9 @@ LanceTableSchema LanceTableSchema::FromDataset(ClientContext &context,
 // DuckDB may expose a physical field under a deduplicated Arrow name. Resolve
 // on the mutation handle so an external schema change cannot shift an ordinal
 // between lookup and use.
-static std::optional<string>
-ResolveAlterColumn(ClientContext &context, void *dataset, Identifier name,
-                   bool if_exists = false,
-                   const Identifier *new_name = nullptr) {
+static string ResolveAlterColumn(ClientContext &context, void *dataset,
+                                 Identifier name,
+                                 const Identifier *new_name = nullptr) {
   ArrowSchemaWrapper root;
   ReadTableArrowSchema(dataset, root);
   ArrowTableSchema arrow_table;
@@ -140,9 +138,6 @@ ResolveAlterColumn(ClientContext &context, void *dataset, Identifier name,
       LanceTableSchema::FromArrow(context, root.arrow_schema, arrow_table);
   auto index = live.columns.GetColumnIndex(name);
   if (index.index >= live.columns.LogicalColumnCount()) {
-    if (if_exists) {
-      return std::nullopt;
-    }
     // Quoted Lance paths such as "tags.l" are a documented schema-evolution
     // entry point. Keep their native path semantics and diagnostics.
     if (name.GetIdentifierName().find('.') != string::npos) {
@@ -627,13 +622,11 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
     }
     case AlterTableType::REMOVE_COLUMN: {
       auto &drop = info.Cast<RemoveColumnInfo>();
-      auto column = ResolveAlterColumn(
-          context, dataset.get(), drop.removed_column, drop.if_column_exists);
-      if (!column) {
+      if (drop.if_column_exists && !ColumnExists(drop.removed_column)) {
         return nullptr;
       }
-      const char *paths[] = {column->c_str()};
-      auto rc = lance_dataset_drop_columns(dataset.get(), paths, 1);
+      const char *cols[1] = {drop.removed_column.c_str()};
+      auto rc = lance_dataset_drop_columns(dataset.get(), cols, 1);
       if (rc != 0) {
         throw IOException("Failed to drop column from Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
@@ -643,9 +636,9 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
     case AlterTableType::RENAME_COLUMN: {
       auto &rename = info.Cast<RenameColumnInfo>();
       auto column = ResolveAlterColumn(context, dataset.get(), rename.old_name,
-                                       false, &rename.new_name);
+                                       &rename.new_name);
       auto rc = lance_dataset_alter_columns_rename(
-          dataset.get(), column->c_str(), rename.new_name.c_str());
+          dataset.get(), column.c_str(), rename.new_name.c_str());
       if (rc != 0) {
         throw IOException("Failed to rename column in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
@@ -675,10 +668,10 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
              sizeof(new_type_schema.arrow_schema));
       auto props = context.GetClientProperties();
       ArrowConverter::ToArrowSchema(&new_type_schema.arrow_schema,
-                                    {cast.target_type}, {*column}, props);
+                                    {cast.target_type}, {column}, props);
       LanceNormalizeArrowListFieldNames(&new_type_schema.arrow_schema);
 
-      auto rc = lance_dataset_alter_columns_cast(dataset.get(), column->c_str(),
+      auto rc = lance_dataset_alter_columns_cast(dataset.get(), column.c_str(),
                                                  &new_type_schema.arrow_schema);
       if (rc != 0) {
         throw IOException("Failed to change column type in Lance dataset: " +
@@ -695,7 +688,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto column =
           ResolveAlterColumn(context, dataset.get(), nn.column_path[0]);
       auto rc = lance_dataset_alter_columns_set_nullable(dataset.get(),
-                                                         column->c_str(), 0);
+                                                         column.c_str(), 0);
       if (rc != 0) {
         throw IOException("Failed to set NOT NULL in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
@@ -711,7 +704,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
       auto column =
           ResolveAlterColumn(context, dataset.get(), nn.column_path[0]);
       auto rc = lance_dataset_alter_columns_set_nullable(dataset.get(),
-                                                         column->c_str(), 1);
+                                                         column.c_str(), 1);
       if (rc != 0) {
         throw IOException("Failed to drop NOT NULL in Lance dataset: " +
                           display_uri + LanceFormatErrorSuffix());
@@ -735,8 +728,8 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
     }
     auto column =
         ResolveAlterColumn(context, dataset.get(), comment.column_name);
-    auto rc = lance_dataset_update_field_metadata(
-        dataset.get(), column->c_str(), "comment", comment_ptr);
+    auto rc = lance_dataset_update_field_metadata(dataset.get(), column.c_str(),
+                                                  "comment", comment_ptr);
     if (rc != 0) {
       throw IOException("Failed to update column comment in Lance dataset: " +
                         display_uri + LanceFormatErrorSuffix());
